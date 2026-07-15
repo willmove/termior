@@ -22,6 +22,8 @@ pub mod agent;
 pub mod approval;
 pub mod context;
 pub mod message;
+#[cfg(feature = "keyring-backend")]
+pub mod keyring_store;
 pub mod model_registry;
 pub mod provider;
 pub mod secret_store;
@@ -35,5 +37,7 @@ pub use message::{ChatEvent, Message, Role, ToolCall, ToolResult};
 pub use model_registry::{ModelRegistry, ProviderKind};
 pub use provider::{MockProvider, Provider, ProviderRequest};
 pub use secret_store::{InMemorySecretStore, SecretStore, SecretStoreError};
+#[cfg(feature = "keyring-backend")]
+pub use keyring_store::KeyringSecretStore;
 pub use session::{ProjectMemory, Session, SessionStore};
 pub use tools::{ToolError, ToolRegistry};

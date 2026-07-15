@@ -6,24 +6,46 @@
 ## 构建与测试
 
 ```bash
-cargo build --workspace      # 无警告
-cargo test  --workspace      # 216 passed, 0 failed
-cargo clippy --workspace --all-targets   # 无警告
+cargo build --workspace              # 纯逻辑 crate，无警告
+cargo test  --workspace              # 249 passed, 0 failed
+cargo build -p termior-app           # GPUI 渲染层（gpui 依赖树 warm 编译 ~5min）
+cargo test  -p termior-ai --features keyring-backend   # OS 钥匙串后端（+2 tests）
+cargo clippy --workspace --all-targets --exclude termior-app  # 无警告
 ```
+
+> `termior-app`（GPUI 入口）独立构建；gpui/gpui_platform 锁定到 zed rev `3565c49`。
+> `keyring-backend` 为可选 feature，启用后接入真实 OS 钥匙串。
 
 ### 测试分布
 
 | crate | 测试数 | 覆盖需求 |
 |---|---|---|
 | `termior-security` | 55 | FR-SEC-01/03/04/05/06/07, INV-2/3/5, NFR-10 |
-| `termior-ai` | 51 | FR-PROV-02/03/04, FR-AGENT-03/07/08/09/10, FR-SESS-01/02, FR-SEC-01 |
+| `termior-ai` | 57（含集成测试 20） | FR-PROV-02/03/04, FR-AGENT-03/07/08/09/10, FR-SESS-01/02, FR-SEC-01 |
 | `termior-terminal-core` | 29 | FR-TERM-06, 附录B, INV-4, NFR-10 |
 | `termior-store` | 24 | FR-DATA, FR-SET-01/03, INV-5 |
 | `termior-theme` | 12 | FR-THEME-01/02 |
-| `termior-diff` | 15 | FR-EDIT-04, FR-SEC-02, NFR-10 |
+| `termior-diff` | 23 | FR-EDIT-04, FR-SEC-02, NFR-10 |
 | `termior-hooks` | 11 | FR-TAGENT-03/04, NFR-10 |
 | `termior-explorer-core` | 19 | FR-EXPL-04/05/03 |
-| **合计** | **216** | |
+| `termior-app` | — | FR-WS/FR-THEME 渲染层（GPUI 入口，编译通过） |
+| **合计** | **249 单测 + 20 集成 + 2 keyring** | |
+
+## 增量进展（第二轮：渲染层接入 + 增强）
+
+- **`termior-app`（GPUI 入口）**：打开原生 GPUI 窗口，用 `termior_theme` 中央引擎解析调色板
+  驱动背景/前景/状态色/diff 色/终端 16 色条；点击热切换 default ↔ nord，验证纯逻辑主题
+  crate 驱动真实 GPU 渲染并广播重绘（FR-THEME-01/02）。gpui 依赖树 warm 编译 ~5min，
+  `termior-app` 增量 ~12s。
+- **`termior-diff`**：`render_unified()` 渲染 unified patch 供 `ai-diff` tab 展示；
+  `make_insertion_hunk()` 让 AI `write_file` 把变更包成 diff 而非直接写盘（FR-SEC-02）。
+- **`termior-ai/session`**：消息历史膨胀策略（Q3）——保留 system 前置 + 最近 N 条，中段丢弃；
+  `approx_bytes()` 供单文件 → 每会话一文件的拆分阈值判定。
+- **集成测试 `tests/agent_e2e.rs`**（4）：Agent 循环端到端——工具调用 → 审批 → hunk diff → 落盘精确。
+- **集成测试 `tests/security_redteam.rs`**（16）：红队全链路——穿越/前缀伪攻击/元数据端点/
+  userinfo 伪装/兄弟工作区/deny-list 双向拦截（验证 INV-2/3）。
+- **`keyring-backend` feature**：`KeyringSecretStore` 接入真实 OS 钥匙串
+  （Windows Credential Manager / macOS Keychain / Linux Secret Service），FR-PROV-04/INV-5。
 
 ## 范围说明（重要）
 

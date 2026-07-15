@@ -12,6 +12,14 @@ thiserror = { workspace = true }
 termior-security = { workspace = true }
 termior-diff = { workspace = true }
 termior-store = { workspace = true }
+# OS 钥匙串后端（FR-PROV-04 / FR-SEC-06）：feature gate，CI 与发行构建启用。
+keyring = { workspace = true, optional = true }
+
+[features]
+default = []
+# 启用真实 OS 钥匙串后端（macOS Keychain / Windows Credential Manager / Linux Secret Service）。
+# 关闭时仅用 InMemorySecretStore。
+keyring-backend = ["dep:keyring"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

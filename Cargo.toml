@@ -14,6 +14,7 @@ members = [
     "crates/termior-explorer-core",
     "crates/termior-ai",
     "crates/termior-hooks",
+    "crates/termior-app",
 ]
 
 [workspace.package]
@@ -37,6 +38,7 @@ dirs = "5"
 tempfile = "3"
 globset = "0.4"
 ignore = "0.4"
+keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native-sync-persistent", "crypto-rust"] }
 
 termior-theme = { path = "crates/termior-theme" }
 termior-store = { path = "crates/termior-store" }
@@ -46,6 +48,7 @@ termior-diff = { path = "crates/termior-diff" }
 termior-explorer-core = { path = "crates/termior-explorer-core" }
 termior-ai = { path = "crates/termior-ai" }
 termior-hooks = { path = "crates/termior-hooks" }
+termior-app = { path = "crates/termior-app" }
 
 [profile.release]
 # 对齐 Spec NFR-05 / NFR-11：Release 产物体积与启动时间门槛

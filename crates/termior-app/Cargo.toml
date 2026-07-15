@@ -1,0 +1,13 @@
+[package]
+name = "termior-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# GPUI 入口 crate（FR-WS / FR-THEME 渲染层接入）。
+# gpui / gpui_platform 锁定到与已验证编译通过的同一 zed rev。
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "3565c49" }
+termior-theme = { workspace = true }
