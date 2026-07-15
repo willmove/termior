@@ -43,6 +43,52 @@ impl Session {
     pub fn rename(&mut self, title: impl Into<String>) {
         self.title = title.into();
     }
+
+    /// 追加任意消息，若超过 `cap` 则按 [`truncate_for_context`] 截断（保留 system 前置 +
+    /// 最近 `cap` 条）。`cap == 0` 表示不限。
+    pub fn push_and_cap(&mut self, msg: Message, cap: usize) {
+        self.messages.push(msg);
+        if cap > 0 && self.messages.len() > cap {
+            self.messages = truncate_for_context(self.messages.clone(), cap);
+        }
+    }
+
+    /// 估算消息历史的近似字节数（用于决定何时从单文件拆分为每会话一文件，Q3）。
+    pub fn approx_bytes(&self) -> usize {
+        self.messages
+            .iter()
+            .map(|m| m.content.len() + m.tool_calls.iter().map(|c| c.arguments.len() + 32).sum::<usize>())
+            .sum()
+    }
+}
+
+/// 会话内消息历史膨胀策略（Q3）。
+///
+/// 保留：
+/// - 所有 system 消息（前置记忆/指令不应丢失）
+/// - 最近 `keep_recent` 条非 system 消息
+///
+/// 中段被丢弃。返回新 Vec。
+pub fn truncate_for_context(mut messages: Vec<Message>, keep_recent: usize) -> Vec<Message> {
+    use crate::message::Role;
+    // 先抽出所有 system 消息（保持原顺序）
+    let system: Vec<Message> = messages.iter().filter(|m| m.role == Role::System).cloned().collect();
+    let mut tail: Vec<Message> = messages
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .rev()
+        .take(keep_recent)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let mut out = system;
+    out.append(&mut tail);
+    // 静默 suppress 未使用警告
+    let _ = &mut messages;
+    out
 }
 
 /// 从首条用户消息生成标题：取首行非空文本，截断到 ~40 字符。
@@ -254,5 +300,82 @@ mod tests {
         let mut s = Session::new("s1");
         s.rename("custom title");
         assert_eq!(s.title, "custom title");
+    }
+
+    // —— Q3 消息历史膨胀策略 ——
+    #[test]
+    fn truncate_keeps_system_and_recent_tail() {
+        use crate::message::Role;
+        let msgs = vec![
+            Message::system("memory"),
+            Message::user("u1"),
+            Message::assistant("a1"),
+            Message::user("u2"),
+            Message::assistant("a2"),
+            Message::user("u3"),
+        ];
+        let out = truncate_for_context(msgs, 2);
+        // system 保留 + 最近 2 条非 system
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].role, Role::System);
+        assert_eq!(out[1].content, "a2");
+        assert_eq!(out[2].content, "u3");
+    }
+
+    #[test]
+    fn truncate_with_no_system() {
+        let msgs = vec![
+            Message::user("u1"),
+            Message::user("u2"),
+            Message::user("u3"),
+        ];
+        let out = truncate_for_context(msgs, 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, "u2");
+        assert_eq!(out[1].content, "u3");
+    }
+
+    #[test]
+    fn push_and_cap_truncates_when_exceeded() {
+        use crate::message::Role;
+        let mut s = Session::new("s1");
+        s.messages.push(Message::system("mem"));
+        for i in 0..20 {
+            s.push_and_cap(Message::user(format!("u{i}")), 5);
+        }
+        // system(1) + 最近 5 条
+        assert_eq!(s.messages.len(), 6);
+        assert_eq!(s.messages[0].role, Role::System);
+        // 最后一条是 u19
+        assert_eq!(s.messages.last().unwrap().content, "u19");
+    }
+
+    #[test]
+    fn push_and_cap_zero_means_no_limit() {
+        let mut s = Session::new("s1");
+        for i in 0..100 {
+            s.push_and_cap(Message::user(format!("u{i}")), 0);
+        }
+        assert_eq!(s.messages.len(), 100);
+    }
+
+    #[test]
+    fn approx_bytes_estimates_size() {
+        let mut s = Session::new("s1");
+        s.messages.push(Message::user("hello")); // 5 字节
+        s.messages.push(Message::assistant("world!")); // 6 字节
+        let bytes = s.approx_bytes();
+        assert!(bytes >= 11, "got {bytes}");
+    }
+
+    #[test]
+    fn title_preserved_after_truncation() {
+        let mut s = Session::new("s1");
+        s.push_user("First important question");
+        for i in 0..10 {
+            s.push_and_cap(Message::assistant(format!("a{i}")), 3);
+        }
+        // 标题不应被截断策略影响
+        assert_eq!(s.title, "First important question");
     }
 }

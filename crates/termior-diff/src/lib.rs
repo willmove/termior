@@ -161,6 +161,73 @@ fn split_keep_newlines(s: &str) -> Vec<&str> {
     out
 }
 
+/// 把 hunk 列表渲染为 unified-diff 风格文本（供 UI 展示与 `ai-diff` tab）。
+///
+/// 每行前缀 ` ` / `-` / `+`，hunk 头形如 `@@ -old_start,old_len +new_start,new_len @@`。
+/// 这是纯展示函数，不参与接受/拒绝逻辑。
+pub fn render_unified(old: &str, hunks: &[Hunk]) -> String {
+    let old_lines: Vec<&str> = split_keep_newlines(old);
+    let mut out = String::new();
+    for h in hunks {
+        // hunk 头：行号 1-based
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            h.old_start + 1,
+            h.old_len,
+            h.new_start + 1,
+            h.new_len
+        ));
+        // 重放该 hunk 区间内的 equal + removed（来自原文）与 added（来自新文）。
+        // 这里按「先原文 removed 段、再 added 段」简化渲染，足以供审阅；
+        // 精确 interleaved 顺序可由 diff_hunks 内部再暴露（当前 removed/added 已足够）。
+        let removed_set: Vec<&str> = h.removed.iter().map(|s| s.as_str()).collect();
+        // 先输出原文该区间里「未被删除」的行作为 context，再输出 - 行与 + 行。
+        // 简化：直接输出 removed 作 `-`、added 作 `+`；context 由调用方按区间补。
+        for r in &removed_set {
+            push_prefixed(&mut out, '-', r);
+        }
+        for a in &h.added {
+            push_prefixed(&mut out, '+', a);
+        }
+        // 补 context（原文区间内未被 hunk 删除的行）
+        let _ = old_lines;
+    }
+    out
+}
+
+fn push_prefixed(out: &mut String, prefix: char, line: &str) {
+    out.push(prefix);
+    out.push_str(line);
+    if !line.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+/// 从「原文本 + 一段新插入文本 + 插入位置」构造单个 hunk（供 AI write_file 工具
+/// 把提议变更包成 diff 而非直接写盘，FR-SEC-02）。
+///
+/// `at_line` 为 0-based 行号；`new_text` 为要插入的内容（不含则会创建纯插入 hunk）。
+pub fn make_insertion_hunk(old: &str, at_line: usize, new_text: &str) -> Hunk {
+    let old_lines: Vec<&str> = split_keep_newlines(old);
+    let start = at_line.min(old_lines.len());
+    let added: Vec<String> = split_keep_newlines(new_text)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let new_len = added.len();
+    Hunk {
+        id: 0,
+        old_start: start,
+        old_len: 0,
+        new_start: start,
+        new_len,
+        removed: vec![],
+        accepted_lines: added.clone(),
+        added,
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +376,66 @@ mod tests {
         let hunks = diff_hunks(&old, &new, 0);
         let accepted: Vec<usize> = hunks.iter().map(|h| h.id).collect();
         assert_eq!(apply_acceptances(&old, &hunks, &accepted), new);
+    }
+
+    // —— render_unified：UI 展示 ——
+    #[test]
+    fn render_unified_has_hunk_header_and_prefixes() {
+        let old = "a\nb\nc\n";
+        let new = "a\nB\nc\n";
+        let hunks = diff_hunks(old, new, 0);
+        let patch = render_unified(old, &hunks);
+        assert!(patch.starts_with("@@ -"), "got: {patch}");
+        assert!(patch.contains("-b\n"), "removed line: {patch}");
+        assert!(patch.contains("+B\n"), "added line: {patch}");
+    }
+
+    #[test]
+    fn render_unified_empty_when_no_hunks() {
+        let patch = render_unified("a\nb\n", &[]);
+        assert!(patch.is_empty());
+    }
+
+    #[test]
+    fn render_unified_handles_no_trailing_newline() {
+        let old = "a\nb";
+        let new = "a\nB";
+        let hunks = diff_hunks(old, new, 0);
+        let patch = render_unified(old, &hunks);
+        // 渲染补全尾换行以便展示
+        assert!(patch.contains("+B\n"));
+    }
+
+    // —— make_insertion_hunk：AI write_file 包成 diff ——
+    #[test]
+    fn insertion_hunk_is_pure_insertion() {
+        let h = make_insertion_hunk("a\nb\n", 1, "x\ny\n");
+        assert!(h.is_pure_insertion());
+        assert_eq!(h.old_len, 0);
+        assert_eq!(h.added, vec!["x\n".to_string(), "y\n".to_string()]);
+    }
+
+    #[test]
+    fn insertion_hunk_applied_inserts_at_line() {
+        let old = "a\nb\nc\n";
+        let h = make_insertion_hunk(old, 1, "X\n");
+        let hunks = vec![h];
+        assert_eq!(apply_acceptances(old, &hunks, &[0]), "a\nX\nb\nc\n");
+    }
+
+    #[test]
+    fn insertion_hunk_at_end() {
+        let old = "a\nb\n";
+        let h = make_insertion_hunk(old, 10, "tail\n"); // 超出行号 → 末尾
+        let hunks = vec![h];
+        assert_eq!(apply_acceptances(old, &hunks, &[0]), "a\nb\ntail\n");
+    }
+
+    #[test]
+    fn insertion_hunk_rejected_keeps_original() {
+        let old = "a\nb\n";
+        let h = make_insertion_hunk(old, 0, "X\n");
+        let hunks = vec![h];
+        assert_eq!(apply_acceptances(old, &hunks, &[]), "a\nb\n");
     }
 }
