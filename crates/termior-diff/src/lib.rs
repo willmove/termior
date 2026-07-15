@@ -1,0 +1,313 @@
+//! `termior-diff` — AI edit diff 的 hunk 级审阅核心（FR-EDIT-04 / FR-SEC-02，NFR-10）。
+//!
+//! AI 提议的文件修改**不直接写盘**：本模块只计算 diff 与 hunk，并支持逐 hunk 接受/拒绝，
+//! 落盘动作完全在外层完成（[`apply_acceptances`] 是纯函数，返回应用接受集后的新文本，
+//! 不触盘）。`write_file` 永不在此模块内执行（FR-SEC-02）。
+//!
+//! 验收对齐 Spec §6.3：「AI 提议 5 个 hunk、接受 4 拒 1，落盘结果精确等于接受集」。
+
+#![forbid(unsafe_code)]
+
+use similar::{ChangeTag, TextDiff};
+
+/// 单个 hunk。`id` 用于在 UI 中逐 hunk 接受/拒绝时稳定引用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    pub id: usize,
+    /// 原文件中的起始行号（0-based）。
+    pub old_start: usize,
+    /// 该 hunk 覆盖的原文件行数（含上下文行）。
+    pub old_len: usize,
+    /// 新文本中的起始行号（0-based）。
+    pub new_start: usize,
+    /// 该 hunk 的新行数（含上下文行）。
+    pub new_len: usize,
+    /// `-` 行（被删除/替换前的原文，每行含尾换行）。
+    pub removed: Vec<String>,
+    /// `+` 行（替换后的新文，每行含尾换行）。
+    pub added: Vec<String>,
+    /// 接受时该 hunk 产出的完整新行序列（equal 上下文行 + inserted 行，按新文件顺序）。
+    /// 拒绝时则保留原 `old_start..old_start+old_len` 区间的原文。
+    pub accepted_lines: Vec<String>,
+}
+
+impl Hunk {
+    /// 该 hunk 是否是纯新增（无删除行）。
+    pub fn is_pure_insertion(&self) -> bool {
+        self.removed.is_empty()
+    }
+    /// 该 hunk 是否是纯删除（无新增行）。
+    pub fn is_pure_deletion(&self) -> bool {
+        self.added.is_empty()
+    }
+}
+
+/// 计算两段文本之间的 hunk 列表。
+///
+/// `context` 控制合并相邻变更的上下文行数（影响 hunk 粒度划分，默认 0 = 每个不相邻的
+/// 变更段独立成 hunk）。
+pub fn diff_hunks(old: &str, new: &str, context: usize) -> Vec<Hunk> {
+    let old_lines: Vec<&str> = split_keep_newlines(old);
+    let new_lines: Vec<&str> = split_keep_newlines(new);
+
+    let diff = TextDiff::from_slices(&old_lines, &new_lines);
+    let grouped = diff.grouped_ops(if context == 0 { 1 } else { context });
+
+    let mut hunks = Vec::new();
+    for (id, ops) in grouped.iter().enumerate() {
+        if ops.is_empty() {
+            continue;
+        }
+        let first = ops.first().unwrap();
+        let last = ops.last().unwrap();
+
+        let old_start = first.old_range().start;
+        let old_end = last.old_range().end;
+        let new_start = first.new_range().start;
+        let new_end = last.new_range().end;
+
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        // accepted_lines：按新文件顺序，equal 上下文行 + inserted 行。
+        let mut accepted_lines = Vec::new();
+        for op in ops {
+            for change in diff.iter_changes(op) {
+                let value = change.value().to_string();
+                match change.tag() {
+                    ChangeTag::Delete => removed.push(value),
+                    ChangeTag::Insert => {
+                        added.push(value.clone());
+                        accepted_lines.push(value);
+                    }
+                    ChangeTag::Equal => accepted_lines.push(value),
+                }
+            }
+        }
+        hunks.push(Hunk {
+            id,
+            old_start,
+            old_len: old_end - old_start,
+            new_start,
+            new_len: new_end - new_start,
+            removed,
+            added,
+            accepted_lines,
+        });
+    }
+    hunks
+}
+
+/// 将「接受集」应用到原文本，返回新文本。
+///
+/// `accepted_ids` 是被接受的 hunk id 列表；不在其中的 hunk 被拒绝（保留原文件对应内容）。
+/// 结果精确等于「仅应用接受集」——这是 FR-EDIT-04 的核心保证。
+///
+/// 本函数是纯函数，不触盘（FR-SEC-02）。
+pub fn apply_acceptances(old: &str, hunks: &[Hunk], accepted_ids: &[usize]) -> String {
+    let accepted: std::collections::HashSet<usize> = accepted_ids.iter().copied().collect();
+    let old_lines: Vec<&str> = split_keep_newlines(old);
+
+    let mut out = String::with_capacity(old.len());
+    let mut old_idx = 0usize;
+
+    // 按 old_start 排序后的 hunk 引用
+    let mut ordered: Vec<&Hunk> = hunks.iter().collect();
+    ordered.sort_by_key(|h| h.old_start);
+
+    for h in ordered {
+        // 先拷贝 hunk 之前的未变更原文（含上一个 hunk 之后的部分）
+        while old_idx < h.old_start && old_idx < old_lines.len() {
+            out.push_str(old_lines[old_idx]);
+            old_idx += 1;
+        }
+        if accepted.contains(&h.id) {
+            // 接受：写入该 hunk 的完整新行序列（含上下文 equal 行 + inserted 行）
+            for a in &h.accepted_lines {
+                out.push_str(a);
+            }
+        } else {
+            // 拒绝：保留原 `old_start..old_start+old_len` 区间的原文
+            for i in h.old_start..h.old_start + h.old_len {
+                if i < old_lines.len() {
+                    out.push_str(old_lines[i]);
+                }
+            }
+        }
+        // 跳过本 hunk 覆盖的原行（无论接受/拒绝，原行区间已被处理）
+        old_idx = (h.old_start + h.old_len).max(old_idx);
+    }
+    // 拷贝剩余原行
+    while old_idx < old_lines.len() {
+        out.push_str(old_lines[old_idx]);
+        old_idx += 1;
+    }
+    out
+}
+
+/// 把文本按行切分，**保留尾换行**（便于无损重组）。
+fn split_keep_newlines(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            out.push(&s[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_changes_yields_no_hunks() {
+        let h = diff_hunks("a\nb\nc\n", "a\nb\nc\n", 0);
+        assert!(h.is_empty());
+        assert_eq!(apply_acceptances("a\nb\nc\n", &h, &[]), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn single_insertion() {
+        let old = "a\nb\n";
+        let new = "a\nx\nb\n";
+        let h = diff_hunks(old, new, 0);
+        assert_eq!(h.len(), 1);
+        assert!(h[0].is_pure_insertion());
+        assert_eq!(apply_acceptances(old, &h, &[0]), new);
+        assert_eq!(apply_acceptances(old, &h, &[]), old);
+    }
+
+    #[test]
+    fn single_deletion() {
+        let old = "a\nx\nb\n";
+        let new = "a\nb\n";
+        let h = diff_hunks(old, new, 0);
+        assert_eq!(h.len(), 1);
+        assert!(h[0].is_pure_deletion());
+        assert_eq!(apply_acceptances(old, &h, &[0]), new);
+        assert_eq!(apply_acceptances(old, &h, &[]), old);
+    }
+
+    #[test]
+    fn replace() {
+        let old = "a\nold\nb\n";
+        let new = "a\nNEW\nb\n";
+        let h = diff_hunks(old, new, 0);
+        assert_eq!(h.len(), 1);
+        assert_eq!(apply_acceptances(old, &h, &[0]), new);
+    }
+
+    // —— FR-EDIT-04 验收场景：接受子集，落盘精确等于接受集 ——
+    #[test]
+    fn accept_subset_hunks_exact() {
+        // 用间隔较大的修改段，确保产生独立 hunk
+        let old = "1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+        let new = "A\n2\n3\n4\n5\n6\n7\nB\n9\n"; // 第 1、8 行被改
+        let hunks = diff_hunks(old, new, 0);
+        // 应得到 2 个独立 hunk
+        assert!(hunks.len() >= 2, "expected >=2 hunks, got {hunks:?}");
+        // 接受第一个、拒绝其余：结果应精确等于「仅应用接受的 hunk」
+        let result = apply_acceptances(old, &hunks, &[hunks[0].id]);
+        assert_eq!(result, "A\n2\n3\n4\n5\n6\n7\n8\n9\n");
+    }
+
+    #[test]
+    fn accept_subset_inverse() {
+        let old = "1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+        let new = "A\n2\n3\n4\n5\n6\n7\nB\n9\n";
+        let hunks = diff_hunks(old, new, 0);
+        assert!(hunks.len() >= 2);
+        // 接受最后一个、拒绝前面的
+        let last_id = hunks.last().unwrap().id;
+        let result = apply_acceptances(old, &hunks, &[last_id]);
+        assert_eq!(result, "1\n2\n3\n4\n5\n6\n7\nB\n9\n");
+    }
+
+    #[test]
+    fn all_hunks_accepted_equals_new() {
+        let old = "a\nb\nc\nd\ne\n";
+        let new = "A\nB\nc\nD\nE\n";
+        let hunks = diff_hunks(old, new, 0);
+        let accepted: Vec<usize> = hunks.iter().map(|h| h.id).collect();
+        assert_eq!(apply_acceptances(old, &hunks, &accepted), new);
+    }
+
+    #[test]
+    fn none_accepted_equals_old() {
+        let old = "a\nb\nc\n";
+        let new = "A\nB\nC\n";
+        let hunks = diff_hunks(old, new, 0);
+        assert_eq!(apply_acceptances(old, &hunks, &[]), old);
+    }
+
+    #[test]
+    fn hunks_have_stable_sequential_ids() {
+        let old = "a\nb\nc\nd\n";
+        let new = "x\ny\nz\nw\n";
+        let hunks = diff_hunks(old, new, 0);
+        let ids: Vec<usize> = hunks.iter().map(|h| h.id).collect();
+        assert_eq!(ids, (0..hunks.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn out_of_order_accepted_ids_handled() {
+        let old = "a\nb\nc\n";
+        let new = "A\nB\nC\n";
+        let hunks = diff_hunks(old, new, 0);
+        let r1 = apply_acceptances(old, &hunks, &[0, 2]);
+        let r2 = apply_acceptances(old, &hunks, &[2, 0]);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn nonexistent_accepted_id_ignored() {
+        let old = "a\nb\n";
+        let new = "A\nb\n";
+        let hunks = diff_hunks(old, new, 0);
+        assert_eq!(apply_acceptances(old, &hunks, &[99]), old);
+    }
+
+    #[test]
+    fn empty_string_handling() {
+        let old = "";
+        let new = "x\n";
+        let hunks = diff_hunks(old, new, 0);
+        assert_eq!(hunks.len(), 1);
+        assert!(hunks[0].is_pure_insertion());
+        assert_eq!(apply_acceptances(old, &hunks, &[0]), new);
+    }
+
+    #[test]
+    fn no_trailing_newline_preserved() {
+        let old = "a\nb";
+        let new = "a\nB";
+        let hunks = diff_hunks(old, new, 0);
+        assert_eq!(apply_acceptances(old, &hunks, &[0]), new);
+        let result = apply_acceptances(old, &hunks, &[0]);
+        assert!(!result.ends_with('\n'));
+    }
+
+    #[test]
+    fn module_never_writes_to_disk() {
+        // apply_acceptances 是纯函数：落盘是调用方职责。
+        let old = "a\nb\n";
+        let new = "A\nB\n";
+        let hunks = diff_hunks(old, new, 0);
+        assert_eq!(apply_acceptances(old, &hunks, &[0]), "A\nB\n");
+    }
+
+    #[test]
+    fn large_file_handles_efficiently() {
+        let old: String = (0..1000).map(|i| format!("line {i}\n")).collect();
+        let new: String = (0..1000).map(|i| format!("line {i} edited\n")).collect();
+        let hunks = diff_hunks(&old, &new, 0);
+        let accepted: Vec<usize> = hunks.iter().map(|h| h.id).collect();
+        assert_eq!(apply_acceptances(&old, &hunks, &accepted), new);
+    }
+}

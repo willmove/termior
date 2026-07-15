@@ -1,0 +1,12 @@
+[package]
+name = "termior-explorer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+nucleo-matcher = { workspace = true }
+globset = { workspace = true }
