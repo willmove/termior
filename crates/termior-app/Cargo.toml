@@ -5,9 +5,15 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# GPUI 入口 crate（FR-WS / FR-THEME 渲染层接入）。
+# GPUI 入口 crate（FR-WS 骨架 / FR-THEME 渲染层接入 / FR-TERM 终端 tab）。
 # gpui / gpui_platform 锁定到与已验证编译通过的同一 zed rev。
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "3565c49" }
 termior-theme = { workspace = true }
+termior-terminal = { workspace = true }
+termior-terminal-core = { workspace = true }
+alacritty_terminal = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+env_logger = "0.11"
