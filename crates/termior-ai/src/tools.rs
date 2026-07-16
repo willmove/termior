@@ -48,7 +48,9 @@ pub struct ToolRegistry {
 
 impl Default for ToolRegistry {
     fn default() -> Self {
-        Self { workspace_auth: WorkspaceAuthRegistry::new() }
+        Self {
+            workspace_auth: WorkspaceAuthRegistry::new(),
+        }
     }
 }
 
@@ -77,7 +79,10 @@ impl ToolRegistry {
     pub fn requires_approval(&self, tool_name: &str) -> Result<bool, ToolError> {
         let id = termior_security::gating::ToolId::from_name(tool_name)
             .ok_or_else(|| ToolError::Unknown(tool_name.to_string()))?;
-        Ok(matches!(id.level(), termior_security::gating::ToolLevel::Approval))
+        Ok(matches!(
+            id.level(),
+            termior_security::gating::ToolLevel::Approval
+        ))
     }
 
     /// 对一条带 `path` 参数的工具调用做安全门控（deny-list + workspace 授权）。
@@ -122,7 +127,9 @@ fn description_for(t: termior_security::gating::ToolId) -> &'static str {
         ToolId::ListDirectory => "List directory entries (read-only, auto-executed).",
         ToolId::FsSearch => "Fuzzy file search (read-only, auto-executed).",
         ToolId::FsGrep => "Content search with grep (read-only, auto-executed).",
-        ToolId::GetTerminalContext => "Snapshot the active terminal's cwd + recent output (read-only, auto-executed).",
+        ToolId::GetTerminalContext => {
+            "Snapshot the active terminal's cwd + recent output (read-only, auto-executed)."
+        }
         ToolId::WriteFile => "Write a file (approval-gated; rendered as hunk diff).",
         ToolId::CreateDirectory => "Create a directory (approval-gated).",
         ToolId::Rename => "Rename/move a path (approval-gated).",
@@ -147,7 +154,13 @@ mod tests {
         let r = ToolRegistry::default();
         let descriptors = r.descriptors();
         let names: Vec<&str> = descriptors.iter().map(|d| d.name.as_str()).collect();
-        for expected in ["read_file", "write_file", "run_command", "get_terminal_context", "fs_grep"] {
+        for expected in [
+            "read_file",
+            "write_file",
+            "run_command",
+            "get_terminal_context",
+            "fs_grep",
+        ] {
             assert!(names.contains(&expected), "missing {expected}");
         }
     }
@@ -155,7 +168,8 @@ mod tests {
     #[test]
     fn read_file_in_workspace_allowed() {
         let r = reg_with("/proj");
-        r.check_path_access("read_file", "/proj/src/main.rs", Direction::Read).unwrap();
+        r.check_path_access("read_file", "/proj/src/main.rs", Direction::Read)
+            .unwrap();
     }
 
     #[test]
@@ -206,7 +220,10 @@ mod tests {
     #[test]
     fn unknown_tool_errors() {
         let r = ToolRegistry::default();
-        assert!(matches!(r.requires_approval("nope"), Err(ToolError::Unknown(_))));
+        assert!(matches!(
+            r.requires_approval("nope"),
+            Err(ToolError::Unknown(_))
+        ));
         assert!(matches!(
             r.check_path_access("nope", "/proj/x", Direction::Read),
             Err(ToolError::Unknown(_))

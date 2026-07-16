@@ -101,7 +101,10 @@ impl IgnoreRule {
     }
 
     fn hit(&self, path: &str) -> bool {
-        self.compiled.as_ref().map(|c| c.is_match(path)).unwrap_or(false)
+        self.compiled
+            .as_ref()
+            .map(|c| c.is_match(path))
+            .unwrap_or(false)
     }
 }
 
@@ -160,7 +163,10 @@ mod tests {
     fn ignore_negation_reincludes() {
         let rules = parse_ignore_lines("*.log\n!important.log");
         assert!(is_ignored(&rules, "debug.log"));
-        assert!(!is_ignored(&rules, "important.log"), "negation should reinclude");
+        assert!(
+            !is_ignored(&rules, "important.log"),
+            "negation should reinclude"
+        );
     }
 
     #[test]

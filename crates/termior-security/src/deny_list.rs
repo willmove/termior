@@ -76,8 +76,7 @@ impl Matcher {
             Matcher::FileName(n) => file_name == n,
             Matcher::FileNameGlob(g) => glob_file_name(g, file_name),
             Matcher::ChildOf { dir, file } => {
-                file_name == file
-                    && comps.iter().rev().nth(1).map(|c| c == dir).unwrap_or(false)
+                file_name == file && comps.iter().rev().nth(1).map(|c| c == dir).unwrap_or(false)
             }
             Matcher::AnyComponentDir(d) => comps.iter().any(|c| c == d),
         }
@@ -118,15 +117,42 @@ pub fn default_rules() -> Vec<DenyRule> {
     use DenyReason::*;
     use Matcher::*;
     vec![
-        DenyRule { reason: DotEnv, matcher: FileNameGlob(".env*".into()) },
-        DenyRule { reason: Ssh, matcher: AnyComponentDir(".ssh".into()) },
+        DenyRule {
+            reason: DotEnv,
+            matcher: FileNameGlob(".env*".into()),
+        },
+        DenyRule {
+            reason: Ssh,
+            matcher: AnyComponentDir(".ssh".into()),
+        },
         // 更具体的 ChildOf 规则须排在通用 FileName 规则之前（首个命中即返回）。
-        DenyRule { reason: AwsCredentials, matcher: ChildOf { dir: ".aws".into(), file: "credentials".into() } },
-        DenyRule { reason: Credentials, matcher: FileName("credentials".into()) },
-        DenyRule { reason: Netrc, matcher: FileName(".netrc".into()) },
-        DenyRule { reason: Keychain, matcher: AnyComponentDir("Keychains".into()) },
-        DenyRule { reason: Keychain, matcher: AnyComponentDir("Credentials".into()) },
-        DenyRule { reason: Keychain, matcher: AnyComponentDir("keyrings".into()) },
+        DenyRule {
+            reason: AwsCredentials,
+            matcher: ChildOf {
+                dir: ".aws".into(),
+                file: "credentials".into(),
+            },
+        },
+        DenyRule {
+            reason: Credentials,
+            matcher: FileName("credentials".into()),
+        },
+        DenyRule {
+            reason: Netrc,
+            matcher: FileName(".netrc".into()),
+        },
+        DenyRule {
+            reason: Keychain,
+            matcher: AnyComponentDir("Keychains".into()),
+        },
+        DenyRule {
+            reason: Keychain,
+            matcher: AnyComponentDir("Credentials".into()),
+        },
+        DenyRule {
+            reason: Keychain,
+            matcher: AnyComponentDir("keyrings".into()),
+        },
     ]
 }
 
@@ -138,7 +164,9 @@ pub struct DenyList {
 
 impl Default for DenyList {
     fn default() -> Self {
-        Self { rules: default_rules() }
+        Self {
+            rules: default_rules(),
+        }
     }
 }
 
@@ -218,7 +246,10 @@ fn join_components(comps: &[String], is_abs: bool) -> String {
         return if is_abs { "/".into() } else { ".".into() };
     }
     // Windows 盘符前缀：`C:/Users/...`
-    let is_drive = comps.first().map(|c| c.len() == 2 && c.as_bytes()[1] == b':').unwrap_or(false);
+    let is_drive = comps
+        .first()
+        .map(|c| c.len() == 2 && c.as_bytes()[1] == b':')
+        .unwrap_or(false);
     let joined = comps.join("/");
     if is_abs && !is_drive {
         format!("/{joined}")
@@ -232,7 +263,9 @@ mod tests {
     use super::*;
 
     fn deny(path: &str) -> Option<DenyReason> {
-        DenyList::default().check(&canonicalize_logical(path), Direction::Read).cloned()
+        DenyList::default()
+            .check(&canonicalize_logical(path), Direction::Read)
+            .cloned()
     }
 
     #[test]
@@ -261,7 +294,10 @@ mod tests {
 
     #[test]
     fn matches_aws_credentials_specifically() {
-        assert_eq!(deny("/home/u/.aws/credentials"), Some(DenyReason::AwsCredentials));
+        assert_eq!(
+            deny("/home/u/.aws/credentials"),
+            Some(DenyReason::AwsCredentials)
+        );
         // .aws 下其他文件不命中此规则（但 credentials 文件名规则会命中）
         assert_eq!(deny("/home/u/.aws/config"), None);
     }
@@ -273,8 +309,14 @@ mod tests {
 
     #[test]
     fn matches_keychain_dirs() {
-        assert_eq!(deny("/Users/u/Library/Keychains/login.keychain"), Some(DenyReason::Keychain));
-        assert_eq!(deny("/home/u/.local/share/keyrings/login.keyring"), Some(DenyReason::Keychain));
+        assert_eq!(
+            deny("/Users/u/Library/Keychains/login.keychain"),
+            Some(DenyReason::Keychain)
+        );
+        assert_eq!(
+            deny("/home/u/.local/share/keyrings/login.keyring"),
+            Some(DenyReason::Keychain)
+        );
     }
 
     // —— 红队：路径穿越 / 规范化绕过 ——
@@ -284,7 +326,10 @@ mod tests {
         // `..` 穿越到 .env
         assert_eq!(deny("proj/src/../../.env"), Some(DenyReason::DotEnv));
         // 多层穿越
-        assert_eq!(deny("a/b/c/../../../.ssh/id_ed25519"), Some(DenyReason::Ssh));
+        assert_eq!(
+            deny("a/b/c/../../../.ssh/id_ed25519"),
+            Some(DenyReason::Ssh)
+        );
     }
 
     #[test]
@@ -345,7 +390,10 @@ mod tests {
             matcher: Matcher::FileName("super-secret".into()),
         });
         let p = canonicalize_logical("x/super-secret");
-        assert_eq!(d.check(&p, Direction::Read), Some(&DenyReason::Custom("test-secret".into())));
+        assert_eq!(
+            d.check(&p, Direction::Read),
+            Some(&DenyReason::Custom("test-secret".into()))
+        );
     }
 
     #[test]

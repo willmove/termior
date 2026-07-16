@@ -114,10 +114,7 @@ PS1=\"$(__termior_mark_input)$PS1\"
     ShellIntegrationSnippets {
         kind: ShellKind::Zsh,
         args: vec![],
-        files: vec![
-            (".zshenv".into(), zshenv.into()),
-            (".zshrc".into(), zshrc),
-        ],
+        files: vec![(".zshenv".into(), zshenv.into()), (".zshrc".into(), zshrc)],
         env: vec![],
     }
 }
@@ -240,7 +237,13 @@ mod tests {
         assert!(names.contains(&".zshenv"));
         assert!(names.contains(&".zshrc"));
         // 内部 source 用户真实配置
-        let zshrc = s.files.iter().find(|(n, _)| n == ".zshrc").unwrap().1.as_str();
+        let zshrc = s
+            .files
+            .iter()
+            .find(|(n, _)| n == ".zshrc")
+            .unwrap()
+            .1
+            .as_str();
         assert!(zshrc.contains("TERMior_REAL_ZDOTDIR") || zshrc.contains(".zshrc"));
         // 注入 OSC 7 / 133
         assert!(zshrc.contains("]7;") || zshrc.contains("__termior_osc7"));
@@ -261,7 +264,13 @@ mod tests {
     fn pwsh_uses_file_arg_and_sources_profile() {
         let s = pwsh_snippets();
         assert!(s.args.contains(&"-File".to_string()));
-        let prof = s.files.iter().find(|(n, _)| n == "profile.ps1").unwrap().1.as_str();
+        let prof = s
+            .files
+            .iter()
+            .find(|(n, _)| n == "profile.ps1")
+            .unwrap()
+            .1
+            .as_str();
         assert!(prof.contains("TERMior_REAL_PROFILE") || prof.contains("$PROFILE"));
         assert!(prof.contains("133"));
     }

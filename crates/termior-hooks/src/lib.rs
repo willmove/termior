@@ -117,15 +117,14 @@ pub fn merge_install(existing: &str) -> Result<InstallResult, HooksError> {
     let mut root: Value = if existing.trim().is_empty() {
         Value::Object(Map::new())
     } else {
-        serde_json::from_str(existing).map_err(|e| HooksError::InvalidExistingJson(e.to_string()))?
+        serde_json::from_str(existing)
+            .map_err(|e| HooksError::InvalidExistingJson(e.to_string()))?
     };
     if !root.is_object() {
         return Err(HooksError::NotAnObject);
     }
 
-    let hooks = root
-        .get_mut("hooks")
-        .and_then(|h| h.as_object_mut());
+    let hooks = root.get_mut("hooks").and_then(|h| h.as_object_mut());
     // 确保 hooks 是对象
     if hooks.is_none() {
         root["hooks"] = Value::Object(Map::new());
@@ -187,7 +186,8 @@ pub fn merge_uninstall(existing: &str) -> Result<UninstallResult, HooksError> {
     let mut root: Value = if existing.trim().is_empty() {
         Value::Object(Map::new())
     } else {
-        serde_json::from_str(existing).map_err(|e| HooksError::InvalidExistingJson(e.to_string()))?
+        serde_json::from_str(existing)
+            .map_err(|e| HooksError::InvalidExistingJson(e.to_string()))?
     };
     if !root.is_object() {
         return Err(HooksError::NotAnObject);
@@ -245,7 +245,8 @@ pub fn is_installed(existing: &str) -> Result<InstallStatus, HooksError> {
             fully_installed: false,
         });
     } else {
-        serde_json::from_str(existing).map_err(|e| HooksError::InvalidExistingJson(e.to_string()))?
+        serde_json::from_str(existing)
+            .map_err(|e| HooksError::InvalidExistingJson(e.to_string()))?
     };
 
     let mut installed = Vec::new();
@@ -381,7 +382,13 @@ mod tests {
         assert_eq!(uninstalled.removed, 3);
         let root: Value = serde_json::from_str(&uninstalled.json).unwrap();
         // hooks 键应被移除（空对象清理）
-        assert!(root.get("hooks").is_none() || root["hooks"].as_object().map(|o| o.is_empty()).unwrap_or(true));
+        assert!(
+            root.get("hooks").is_none()
+                || root["hooks"]
+                    .as_object()
+                    .map(|o| o.is_empty())
+                    .unwrap_or(true)
+        );
     }
 
     #[test]
@@ -409,7 +416,9 @@ mod tests {
         let status = is_installed(&json).unwrap();
         assert!(!status.fully_installed);
         assert!(status.installed_events.contains(&"Stop".to_string()));
-        assert!(status.missing_events.contains(&"UserPromptSubmit".to_string()));
+        assert!(status
+            .missing_events
+            .contains(&"UserPromptSubmit".to_string()));
     }
 
     #[test]

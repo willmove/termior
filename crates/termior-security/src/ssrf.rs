@@ -58,7 +58,11 @@ impl SsrfGuard {
     /// 校验一条完整 URL。命中白名单前缀则放行；否则校验 host。
     pub fn check(&self, url: &str) -> Result<(), SsrfError> {
         let norm = normalize_base(url);
-        if self.allowed_local_bases.iter().any(|b| norm.starts_with(b.as_str())) {
+        if self
+            .allowed_local_bases
+            .iter()
+            .any(|b| norm.starts_with(b.as_str()))
+        {
             return Ok(());
         }
         let host = extract_host(url).ok_or_else(|| SsrfError::BadUrl(url.to_string()))?;
@@ -71,9 +75,7 @@ pub fn check_host(host: &str) -> Result<(), SsrfError> {
     let host = host.trim().trim_end_matches('.');
 
     // IPv6 字面量 `[::1]` 或裸 `::1`
-    let candidate = host
-        .trim_start_matches('[')
-        .trim_end_matches(']');
+    let candidate = host.trim_start_matches('[').trim_end_matches(']');
 
     if let Ok(ip) = candidate.parse::<IpAddr>() {
         return check_ip(&ip, host);
@@ -194,8 +196,12 @@ mod tests {
     // —— 公网放行 ——
     #[test]
     fn public_hosts_allowed() {
-        assert!(guard().check("https://api.anthropic.com/v1/messages").is_ok());
-        assert!(guard().check("https://api.openai.com/v1/chat/completions").is_ok());
+        assert!(guard()
+            .check("https://api.anthropic.com/v1/messages")
+            .is_ok());
+        assert!(guard()
+            .check("https://api.openai.com/v1/chat/completions")
+            .is_ok());
         assert!(guard().check("https://1.1.1.1/").is_ok());
         assert!(guard().check("https://8.8.8.8/").is_ok());
     }
@@ -203,7 +209,9 @@ mod tests {
     // —— 白名单放行 ——
     #[test]
     fn local_provider_whitelist_allowed() {
-        assert!(guard().check("http://127.0.0.1:1234/v1/chat/completions").is_ok());
+        assert!(guard()
+            .check("http://127.0.0.1:1234/v1/chat/completions")
+            .is_ok());
         assert!(guard().check("http://127.0.0.1:8080/v1").is_ok());
         assert!(guard().check("http://127.0.0.1:11434/api/chat").is_ok());
     }
@@ -244,7 +252,9 @@ mod tests {
     // —— link-local ——
     #[test]
     fn link_local_ipv4_blocked() {
-        let e = guard().check("http://169.254.169.254/latest/meta-data/").unwrap_err();
+        let e = guard()
+            .check("http://169.254.169.254/latest/meta-data/")
+            .unwrap_err();
         assert!(matches!(e, SsrfError::LinkLocal(_)), "got {e:?}");
     }
 
@@ -300,7 +310,9 @@ mod tests {
     #[test]
     fn redteam_cloud_metadata_endpoint_blocked() {
         // AWS / GCP / Azure 元数据服务（169.254.169.254 link-local）
-        assert!(guard().check("http://169.254.169.254/latest/meta-data/iam/").is_err());
+        assert!(guard()
+            .check("http://169.254.169.254/latest/meta-data/iam/")
+            .is_err());
         // metadata.google.internal 解析为 169.254.169.254，由外层 DNS 解析后 IP 层拦截；
         // 此处仅断言 IP 形态被拦。
         let e = check_host("169.254.169.254").unwrap_err();
@@ -312,19 +324,26 @@ mod tests {
         // 8进制/十进制 IP 形式（如 2130706433 = 127.0.0.1）我们的解析器不解析为 IP，
         // 当作域名放行——这是已知边界；生产中应由 DNS 解析后再校验解析出的 IP。
         // 这里仅断言「不误判为合法 loopback 白名单」。
-        assert!(guard().check("http://2130706433:1234/v1").is_err()
-                || guard().check("http://2130706433:1234/v1").is_ok());
+        assert!(
+            guard().check("http://2130706433:1234/v1").is_err()
+                || guard().check("http://2130706433:1234/v1").is_ok()
+        );
     }
 
     #[test]
     fn userinfo_stripped() {
         // http://evil@127.0.0.1 — userinfo 后的 host 仍需校验
-        let e = guard().check("http://api.anthropic.com@127.0.0.1:8080/v1").unwrap_err();
+        let e = guard()
+            .check("http://api.anthropic.com@127.0.0.1:8080/v1")
+            .unwrap_err();
         assert!(matches!(e, SsrfError::Loopback(_)), "got {e:?}");
     }
 
     #[test]
     fn bad_url_rejected() {
-        assert!(matches!(guard().check("not a url").unwrap_err(), SsrfError::BadUrl(_)));
+        assert!(matches!(
+            guard().check("not a url").unwrap_err(),
+            SsrfError::BadUrl(_)
+        ));
     }
 }

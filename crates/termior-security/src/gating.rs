@@ -97,7 +97,13 @@ mod tests {
 
     #[test]
     fn read_tools_are_auto() {
-        for t in [ToolId::ReadFile, ToolId::ListDirectory, ToolId::FsSearch, ToolId::FsGrep, ToolId::GetTerminalContext] {
+        for t in [
+            ToolId::ReadFile,
+            ToolId::ListDirectory,
+            ToolId::FsSearch,
+            ToolId::FsGrep,
+            ToolId::GetTerminalContext,
+        ] {
             assert_eq!(t.level(), ToolLevel::Auto, "{} should be Auto", t.name());
         }
     }
@@ -113,7 +119,12 @@ mod tests {
             ToolId::ShellSessionRun,
             ToolId::ShellBgSpawn,
         ] {
-            assert_eq!(t.level(), ToolLevel::Approval, "{} should be Approval", t.name());
+            assert_eq!(
+                t.level(),
+                ToolLevel::Approval,
+                "{} should be Approval",
+                t.name()
+            );
         }
     }
 

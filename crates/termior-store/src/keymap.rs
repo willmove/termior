@@ -69,16 +69,36 @@ pub struct KeyBinding {
 impl KeyBinding {
     /// 用主修饰键 + key 构造（FR-SET-03 最常见形态）。
     pub const fn primary(key: &'static str) -> Self {
-        Self { primary: true, shift: false, alt: false, key }
+        Self {
+            primary: true,
+            shift: false,
+            alt: false,
+            key,
+        }
     }
     pub const fn primary_shift(key: &'static str) -> Self {
-        Self { primary: true, shift: true, alt: false, key }
+        Self {
+            primary: true,
+            shift: true,
+            alt: false,
+            key,
+        }
     }
     pub const fn ctrl_only(key: &'static str) -> Self {
-        Self { primary: false, shift: false, alt: false, key }
+        Self {
+            primary: false,
+            shift: false,
+            alt: false,
+            key,
+        }
     }
     pub const fn ctrl_shift(key: &'static str) -> Self {
-        Self { primary: false, shift: true, alt: false, key }
+        Self {
+            primary: false,
+            shift: true,
+            alt: false,
+            key,
+        }
     }
 
     /// 渲染为平台显示串（FR-SET-03）。Mac 用 `⌘`，Win/Linux 用 `Ctrl`。
@@ -109,7 +129,11 @@ impl KeyBinding {
             });
         }
         parts.push(self.key);
-        let sep = if matches!(platform, Platform::Mac) { "" } else { "+" };
+        let sep = if matches!(platform, Platform::Mac) {
+            ""
+        } else {
+            "+"
+        };
         parts.join(sep)
     }
 }
@@ -125,29 +149,103 @@ pub struct KeymapEntry {
 pub fn default_keymap() -> Vec<KeymapEntry> {
     use KeyAction::*;
     vec![
-        KeymapEntry { action: NewTerminalTab, binding: KeyBinding::primary("T") },
-        KeymapEntry { action: NewPrivateTerminal, binding: KeyBinding::primary("R") },
-        KeymapEntry { action: NewEditorTab, binding: KeyBinding::primary("E") },
-        KeymapEntry { action: NewPreviewTab, binding: KeyBinding::primary("P") },
-        KeymapEntry { action: ClosePaneOrTab, binding: KeyBinding::primary("W") },
-        KeymapEntry { action: GotoTab1, binding: KeyBinding::primary("1") },
-        KeymapEntry { action: CycleTabs, binding: KeyBinding::ctrl_only("Tab") },
-        KeymapEntry { action: CycleTabsReverse, binding: KeyBinding::ctrl_shift("Tab") },
-        KeymapEntry { action: SplitRight, binding: KeyBinding::primary("D") },
-        KeymapEntry { action: SplitDown, binding: KeyBinding::primary_shift("D") },
-        KeymapEntry { action: FocusPanePrev, binding: KeyBinding::primary("[") },
-        KeymapEntry { action: FocusPaneNext, binding: KeyBinding::primary("]") },
-        KeymapEntry { action: InlineSearch, binding: KeyBinding::primary("F") },
-        KeymapEntry { action: ToggleSidebar, binding: KeyBinding::primary("B") },
-        KeymapEntry { action: FocusExplorer, binding: KeyBinding::primary_shift("E") },
-        KeymapEntry { action: FileFinder, binding: KeyBinding::primary_shift("F") },
-        KeymapEntry { action: SourceControlPanel, binding: KeyBinding::primary("G") },
-        KeymapEntry { action: ToggleComposer, binding: KeyBinding::primary("I") },
-        KeymapEntry { action: AskAiAboutSelection, binding: KeyBinding::primary("L") },
-        KeymapEntry { action: CommitStaged, binding: KeyBinding { primary: true, shift: true, alt: false, key: "Enter" } },
-        KeymapEntry { action: OpenSettings, binding: KeyBinding::primary(",") },
-        KeymapEntry { action: Undo, binding: KeyBinding::primary("Z") },
-        KeymapEntry { action: Redo, binding: KeyBinding::primary("Y") },
+        KeymapEntry {
+            action: NewTerminalTab,
+            binding: KeyBinding::primary("T"),
+        },
+        KeymapEntry {
+            action: NewPrivateTerminal,
+            binding: KeyBinding::primary("R"),
+        },
+        KeymapEntry {
+            action: NewEditorTab,
+            binding: KeyBinding::primary("E"),
+        },
+        KeymapEntry {
+            action: NewPreviewTab,
+            binding: KeyBinding::primary("P"),
+        },
+        KeymapEntry {
+            action: ClosePaneOrTab,
+            binding: KeyBinding::primary("W"),
+        },
+        KeymapEntry {
+            action: GotoTab1,
+            binding: KeyBinding::primary("1"),
+        },
+        KeymapEntry {
+            action: CycleTabs,
+            binding: KeyBinding::ctrl_only("Tab"),
+        },
+        KeymapEntry {
+            action: CycleTabsReverse,
+            binding: KeyBinding::ctrl_shift("Tab"),
+        },
+        KeymapEntry {
+            action: SplitRight,
+            binding: KeyBinding::primary("D"),
+        },
+        KeymapEntry {
+            action: SplitDown,
+            binding: KeyBinding::primary_shift("D"),
+        },
+        KeymapEntry {
+            action: FocusPanePrev,
+            binding: KeyBinding::primary("["),
+        },
+        KeymapEntry {
+            action: FocusPaneNext,
+            binding: KeyBinding::primary("]"),
+        },
+        KeymapEntry {
+            action: InlineSearch,
+            binding: KeyBinding::primary("F"),
+        },
+        KeymapEntry {
+            action: ToggleSidebar,
+            binding: KeyBinding::primary("B"),
+        },
+        KeymapEntry {
+            action: FocusExplorer,
+            binding: KeyBinding::primary_shift("E"),
+        },
+        KeymapEntry {
+            action: FileFinder,
+            binding: KeyBinding::primary_shift("F"),
+        },
+        KeymapEntry {
+            action: SourceControlPanel,
+            binding: KeyBinding::primary("G"),
+        },
+        KeymapEntry {
+            action: ToggleComposer,
+            binding: KeyBinding::primary("I"),
+        },
+        KeymapEntry {
+            action: AskAiAboutSelection,
+            binding: KeyBinding::primary("L"),
+        },
+        KeymapEntry {
+            action: CommitStaged,
+            binding: KeyBinding {
+                primary: true,
+                shift: true,
+                alt: false,
+                key: "Enter",
+            },
+        },
+        KeymapEntry {
+            action: OpenSettings,
+            binding: KeyBinding::primary(","),
+        },
+        KeymapEntry {
+            action: Undo,
+            binding: KeyBinding::primary("Z"),
+        },
+        KeymapEntry {
+            action: Redo,
+            binding: KeyBinding::primary("Y"),
+        },
     ]
 }
 
@@ -203,7 +301,10 @@ mod tests {
     #[test]
     fn settings_key_uses_comma() {
         let km = default_keymap();
-        let entry = km.iter().find(|e| e.action == KeyAction::OpenSettings).unwrap();
+        let entry = km
+            .iter()
+            .find(|e| e.action == KeyAction::OpenSettings)
+            .unwrap();
         assert_eq!(entry.binding.key, ",");
     }
 

@@ -108,7 +108,10 @@ impl Agent {
                         role: Role::Tool,
                         content: String::new(),
                         tool_calls: vec![],
-                        tool_result: Some(crate::message::ToolResult::success(&pending.call_id, out)),
+                        tool_result: Some(crate::message::ToolResult::success(
+                            &pending.call_id,
+                            out,
+                        )),
                     }),
                     Err(e) => messages.push(Message {
                         role: Role::Tool,
@@ -299,18 +302,16 @@ mod tests {
 
     #[test]
     fn approval_tool_suspends() {
-        let provider = MockProvider::single(vec![
-            ChatEvent::Done(Message {
-                role: Role::Assistant,
-                content: "writing".into(),
-                tool_calls: vec![crate::message::ToolCall {
-                    id: "c1".into(),
-                    name: "write_file".into(),
-                    arguments: r#"{"path":"/proj/a","content":"x"}"#.into(),
-                }],
-                tool_result: None,
-            }),
-        ]);
+        let provider = MockProvider::single(vec![ChatEvent::Done(Message {
+            role: Role::Assistant,
+            content: "writing".into(),
+            tool_calls: vec![crate::message::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"/proj/a","content":"x"}"#.into(),
+            }],
+            tool_result: None,
+        })]);
         let agent = Agent::new(Box::new(provider), ToolRegistry::default());
         let outcome = agent.run(&[Message::user("write a")], &no_op).unwrap();
         assert_eq!(outcome.state, AgentState::AwaitingApproval);
@@ -321,23 +322,26 @@ mod tests {
 
     #[test]
     fn approval_rejected_errors() {
-        let provider = MockProvider::single(vec![
-            ChatEvent::Done(Message {
-                role: Role::Assistant,
-                content: "writing".into(),
-                tool_calls: vec![crate::message::ToolCall {
-                    id: "c1".into(),
-                    name: "write_file".into(),
-                    arguments: r#"{"path":"/proj/a"}"#.into(),
-                }],
-                tool_result: None,
-            }),
-        ]);
+        let provider = MockProvider::single(vec![ChatEvent::Done(Message {
+            role: Role::Assistant,
+            content: "writing".into(),
+            tool_calls: vec![crate::message::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"/proj/a"}"#.into(),
+            }],
+            tool_result: None,
+        })]);
         let agent = Agent::new(Box::new(provider), ToolRegistry::default());
         let outcome = agent.run(&[Message::user("write")], &no_op).unwrap();
         let pending = outcome.pending_approval.unwrap();
         let err = agent
-            .resume(&outcome.messages, &no_op, ApprovalDecision::Reject, &pending)
+            .resume(
+                &outcome.messages,
+                &no_op,
+                ApprovalDecision::Reject,
+                &pending,
+            )
             .unwrap_err();
         assert!(matches!(err, AgentError::Rejected));
     }
@@ -363,7 +367,12 @@ mod tests {
         let outcome = agent.run(&[Message::user("write")], &no_op).unwrap();
         let pending = outcome.pending_approval.unwrap();
         let resumed = agent
-            .resume(&outcome.messages, &no_op, ApprovalDecision::Approve, &pending)
+            .resume(
+                &outcome.messages,
+                &no_op,
+                ApprovalDecision::Approve,
+                &pending,
+            )
             .unwrap();
         assert_eq!(resumed.state, AgentState::Finished);
     }
@@ -371,18 +380,16 @@ mod tests {
     #[test]
     fn max_steps_enforced() {
         // 无限工具调用循环：每轮都发起 read_file，但永不输出无 tool_call 的 Done
-        let looping = vec![
-            ChatEvent::Done(Message {
-                role: Role::Assistant,
-                content: "loop".into(),
-                tool_calls: vec![crate::message::ToolCall {
-                    id: "c1".into(),
-                    name: "read_file".into(),
-                    arguments: r#"{"path":"/proj/a"}"#.into(),
-                }],
-                tool_result: None,
-            }),
-        ];
+        let looping = vec![ChatEvent::Done(Message {
+            role: Role::Assistant,
+            content: "loop".into(),
+            tool_calls: vec![crate::message::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"/proj/a"}"#.into(),
+            }],
+            tool_result: None,
+        })];
         // 复制脚本使其每次调用都返回同一循环响应
         let scripts: Vec<_> = (0..100).map(|_| looping.clone()).collect();
         let provider = MockProvider::new(scripts);
@@ -405,7 +412,11 @@ mod tests {
         // 验证 ToolRegistry 携带 workspace 授权并被工具门控使用
         let reg = ToolRegistry::new(WorkspaceAuthRegistry::with_roots(["/proj".to_string()]));
         assert!(reg
-            .check_path_access("read_file", "/proj/a.rs", termior_security::deny_list::Direction::Read)
+            .check_path_access(
+                "read_file",
+                "/proj/a.rs",
+                termior_security::deny_list::Direction::Read
+            )
             .is_ok());
     }
 

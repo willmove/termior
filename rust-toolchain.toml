@@ -1,0 +1,6 @@
+# 固化工具链：贡献者与 CI 使用同一 stable 通道，确保格式/lint 行为一致。
+# 纯逻辑核心 crate 无 nightly 特性依赖（见 docs/termior-spec.md §3.1 版本与依赖纪律）。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

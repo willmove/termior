@@ -106,7 +106,10 @@ mod tests {
         let err = migrate(raw).unwrap_err();
         assert!(matches!(
             err,
-            MigrationError::UnsupportedVersion { found: 999, max: SCHEMA_VERSION }
+            MigrationError::UnsupportedVersion {
+                found: 999,
+                max: SCHEMA_VERSION
+            }
         ));
     }
 

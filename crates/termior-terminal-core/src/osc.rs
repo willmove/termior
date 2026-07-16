@@ -73,9 +73,9 @@ pub struct OscParser {
 enum State {
     #[default]
     Ground,
-    Esc,       // 看到 ESC
-    Osc,       // 看到 ESC ]，正在收集载荷
-    OscEsc,    // OSC 内看到 ESC（等待 '\' 作 ST 结束）
+    Esc,    // 看到 ESC
+    Osc,    // 看到 ESC ]，正在收集载荷
+    OscEsc, // OSC 内看到 ESC（等待 '\' 作 ST 结束）
 }
 
 impl OscParser {
@@ -221,7 +221,9 @@ fn parse_osc133(rest: &str) -> Option<OscEvent> {
     match code {
         "A" => Some(OscEvent::Prompt(PromptMark::PromptStart)),
         "B" => Some(OscEvent::Prompt(PromptMark::PromptEnd)),
-        "C" => Some(OscEvent::CommandStart { cmd: arg.to_string() }),
+        "C" => Some(OscEvent::CommandStart {
+            cmd: arg.to_string(),
+        }),
         "D" => {
             let n = arg.parse::<i32>().ok();
             Some(OscEvent::CommandExit { code: n })
@@ -261,33 +263,60 @@ mod tests {
         let ev = feed_one("\x1b]7;file://host/home/user/proj\x07");
         assert_eq!(
             ev,
-            vec![OscEvent::Cwd { host: "host".into(), path: "/home/user/proj".into() }]
+            vec![OscEvent::Cwd {
+                host: "host".into(),
+                path: "/home/user/proj".into()
+            }]
         );
     }
 
     #[test]
     fn osc7_no_host() {
         let ev = feed_one("\x1b]7;file:///home/user\x07");
-        assert_eq!(ev, vec![OscEvent::Cwd { host: "".into(), path: "/home/user".into() }]);
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "".into(),
+                path: "/home/user".into()
+            }]
+        );
     }
 
     #[test]
     fn osc7_windows_drive_normalized() {
         // `/C:/Users/u` → `C:/Users/u`
         let ev = feed_one("\x1b]7;file:///C:/Users/u/proj\x07");
-        assert_eq!(ev, vec![OscEvent::Cwd { host: "".into(), path: "C:/Users/u/proj".into() }]);
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "".into(),
+                path: "C:/Users/u/proj".into()
+            }]
+        );
     }
 
     #[test]
     fn osc7_windows_pipe_drive_normalized() {
         let ev = feed_one("\x1b]7;file:///C|/Users/u\x07");
-        assert_eq!(ev, vec![OscEvent::Cwd { host: "".into(), path: "C:/Users/u".into() }]);
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "".into(),
+                path: "C:/Users/u".into()
+            }]
+        );
     }
 
     #[test]
     fn osc7_backslash_normalized() {
         let ev = feed_one("\x1b]7;file://host/C:\\Users\\u\x07");
-        assert_eq!(ev, vec![OscEvent::Cwd { host: "host".into(), path: "C:/Users/u".into() }]);
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "host".into(),
+                path: "C:/Users/u".into()
+            }]
+        );
     }
 
     // —— OSC 133 ——
@@ -302,7 +331,12 @@ mod tests {
     #[test]
     fn osc133_command_start_with_cmd() {
         let ev = feed_one("\x1b]133;C;npm run dev\x07");
-        assert_eq!(ev, vec![OscEvent::CommandStart { cmd: "npm run dev".into() }]);
+        assert_eq!(
+            ev,
+            vec![OscEvent::CommandStart {
+                cmd: "npm run dev".into()
+            }]
+        );
     }
 
     #[test]
@@ -381,7 +415,13 @@ mod tests {
         assert!(p.feed(b"\x1b]7;file://").is_empty());
         assert!(p.feed(b"/home/u").is_empty());
         let ev = p.feed(b"/proj\x07");
-        assert_eq!(ev, vec![OscEvent::Cwd { host: "".into(), path: "/home/u/proj".into() }]);
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "".into(),
+                path: "/home/u/proj".into()
+            }]
+        );
     }
 
     #[test]
@@ -389,7 +429,13 @@ mod tests {
         let input = "\x1b]7;file:///a\x07some text\x1b]133;A\x07";
         let ev = feed_one(input);
         assert_eq!(ev.len(), 2);
-        assert_eq!(ev[0], OscEvent::Cwd { host: "".into(), path: "/a".into() });
+        assert_eq!(
+            ev[0],
+            OscEvent::Cwd {
+                host: "".into(),
+                path: "/a".into()
+            }
+        );
         assert_eq!(ev[1], OscEvent::Prompt(PromptMark::PromptStart));
     }
 

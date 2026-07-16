@@ -23,13 +23,21 @@ pub struct Session {
 
 impl Session {
     pub fn new(id: impl Into<String>) -> Self {
-        Self { id: id.into(), title: "New session".into(), messages: vec![], agent_id: None }
+        Self {
+            id: id.into(),
+            title: "New session".into(),
+            messages: vec![],
+            agent_id: None,
+        }
     }
 
     /// 追加一条用户消息，并根据首条用户消息自动生成标题（FR-SESS-01）。
     pub fn push_user(&mut self, content: impl Into<String>) {
         let content = content.into();
-        let is_first_user = !self.messages.iter().any(|m| m.role == crate::message::Role::User);
+        let is_first_user = !self
+            .messages
+            .iter()
+            .any(|m| m.role == crate::message::Role::User);
         if is_first_user {
             self.title = derive_title(&content);
         }
@@ -57,7 +65,13 @@ impl Session {
     pub fn approx_bytes(&self) -> usize {
         self.messages
             .iter()
-            .map(|m| m.content.len() + m.tool_calls.iter().map(|c| c.arguments.len() + 32).sum::<usize>())
+            .map(|m| {
+                m.content.len()
+                    + m.tool_calls
+                        .iter()
+                        .map(|c| c.arguments.len() + 32)
+                        .sum::<usize>()
+            })
             .sum()
     }
 }
@@ -72,7 +86,11 @@ impl Session {
 pub fn truncate_for_context(mut messages: Vec<Message>, keep_recent: usize) -> Vec<Message> {
     use crate::message::Role;
     // 先抽出所有 system 消息（保持原顺序）
-    let system: Vec<Message> = messages.iter().filter(|m| m.role == Role::System).cloned().collect();
+    let system: Vec<Message> = messages
+        .iter()
+        .filter(|m| m.role == Role::System)
+        .cloned()
+        .collect();
     let mut tail: Vec<Message> = messages
         .iter()
         .filter(|m| m.role != Role::System)
@@ -152,8 +170,8 @@ impl SessionStore {
 
     /// 镜像落盘到 `Termior-ai-sessions.json`（FR-SESS-01，经 termior-store 原子写）。
     pub fn persist(&self, dir: &Path) -> Result<PathBuf, std::io::Error> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let json =
+            serde_json::to_string_pretty(self).map_err(|e| std::io::Error::other(e.to_string()))?;
         let path = dir.join("Termior-ai-sessions.json");
         termior_store::atomic_write(&path, &json)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -193,13 +211,19 @@ impl ProjectMemory {
                     if single && trimmed.lines().next() == Some("Termior.md") {
                         let redirected = workspace_root.join("Termior.md");
                         if let Ok(real) = std::fs::read_to_string(&redirected) {
-                            return Some(ProjectMemory { content: real, source: "Termior.md".into() });
+                            return Some(ProjectMemory {
+                                content: real,
+                                source: "Termior.md".into(),
+                            });
                         }
                         // 重定向目标不存在：不返回空记忆
                         return None;
                     }
                 }
-                return Some(ProjectMemory { content: text, source: name.into() });
+                return Some(ProjectMemory {
+                    content: text,
+                    source: name.into(),
+                });
             }
         }
         None

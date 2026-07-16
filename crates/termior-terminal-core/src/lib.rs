@@ -13,4 +13,4 @@ pub mod osc;
 pub mod shell_integration;
 
 pub use osc::{OscEvent, OscParser, PromptMark};
-pub use shell_integration::{ShellKind, ShellIntegrationSnippets};
+pub use shell_integration::{ShellIntegrationSnippets, ShellKind};

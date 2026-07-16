@@ -1,0 +1,57 @@
+# CI — 纯逻辑核心三平台门禁
+#
+# 范围：8 个纯逻辑 crate（排除 termior-app 与 termior-terminal）。
+#   termior-app 依赖 GPUI（zed git rev 3565c49），warm 编译 ~5min、依赖树巨大。
+#   termior-terminal 依赖 portable-pty/alacritty_terminal（运行时重型依赖），
+#   且其 PTY 回环测试在 headless CI 行为不稳定，故与渲染层一并暂不进 CI。
+#   两者均在本地可编译与测试（见 README「构建」）。
+# 对齐 spec：R1（三平台 P0）、R6（CI 持续构建与测试）、NFR-10（可测性）。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同分支新 run 取消旧 run，省额度。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  pure-logic:
+    name: Pure-logic (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --exclude termior-app --exclude termior-terminal -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --exclude termior-app --exclude termior-terminal --all-targets
+
+      - name: Test
+        run: cargo test --workspace --exclude termior-app --exclude termior-terminal --all-targets

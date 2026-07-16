@@ -58,17 +58,11 @@ fn looks_like_api_key(tok: &str) -> bool {
     // 去掉首尾的引号/逗号/冒号等 JSON 标点
     let t = tok.trim_matches(|c: char| matches!(c, '"' | ',' | ':' | ' ' | '\n' | '\r' | '\t'));
     let prefixes = [
-        "sk-ant-",
-        "sk-",
-        "xai-",
-        "AIza",
-        "gho_",
-        "ghp_",
-        "ghu_",
-        "ghs_",
-        "ghr_",
+        "sk-ant-", "sk-", "xai-", "AIza", "gho_", "ghp_", "ghu_", "ghs_", "ghr_",
     ];
-    prefixes.iter().any(|p| t.starts_with(p) && t.len() > p.len() + 8)
+    prefixes
+        .iter()
+        .any(|p| t.starts_with(p) && t.len() > p.len() + 8)
 }
 
 /// 从 `s` 开头寻找下一个 `"..."` 字符串字面量，返回其内容（不含引号）。

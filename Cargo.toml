@@ -14,6 +14,7 @@ members = [
     "crates/termior-explorer-core",
     "crates/termior-ai",
     "crates/termior-hooks",
+    "crates/termior-terminal",
     "crates/termior-app",
 ]
 
@@ -40,6 +41,14 @@ globset = "0.4"
 ignore = "0.4"
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native-sync-persistent", "crypto-rust"] }
 
+# M1 终端 MVP 引入的运行时依赖（spec §3.1：portable-pty / alacritty_terminal）。
+# 仅 termior-terminal 与 termior-app 消费，纯逻辑 crate 不依赖它们。
+portable-pty = "0.9"
+alacritty_terminal = "0.26"
+vte = "0.13"
+futures = "0.3"
+log = "0.4"
+
 termior-theme = { path = "crates/termior-theme" }
 termior-store = { path = "crates/termior-store" }
 termior-security = { path = "crates/termior-security" }
@@ -48,6 +57,7 @@ termior-diff = { path = "crates/termior-diff" }
 termior-explorer-core = { path = "crates/termior-explorer-core" }
 termior-ai = { path = "crates/termior-ai" }
 termior-hooks = { path = "crates/termior-hooks" }
+termior-terminal = { path = "crates/termior-terminal" }
 termior-app = { path = "crates/termior-app" }
 
 [profile.release]

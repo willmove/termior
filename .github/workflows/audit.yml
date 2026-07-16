@@ -1,0 +1,26 @@
+# Audit — 许可核验与安全漏洞检查
+#
+# 对齐 spec NFR-09（Apache-2.0 项目，第三方 crate/资产需核验许可）、§3.1（版本与依赖纪律）、
+# 风险 R6（依赖纪律）。每周一定时跑，捕捉新披露的 CVE / 废弃依赖。
+name: Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # 每周一 06:00 UTC
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          # 排除 termior-app：其 GPUI 依赖（zed 树）含 GPL-3.0 crate（zlog/ztracing），
+          # 属上游 zed 许可问题，不在本项目（Apache-2.0）纯逻辑层的许可范围内。
+          # 与 CI 同步：纯逻辑层三平台门禁不编译 termior-app（见 ci.yml）。
+          arguments: --exclude termior-app

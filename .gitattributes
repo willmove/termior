@@ -1,0 +1,14 @@
+# 强制全仓库 LF 行尾，保证三平台 CI 的 cargo fmt --check 行为一致。
+# 对齐 spec R1/R6（三平台门槛）与 §3.1（版本与依赖纪律）。
+# Windows 本地 core.autocrlf=true 不影响：checkout 仍为 LF，避免 CRLF 污染 diff。
+* text=auto eol=lf
+
+# 二进制资产不做行尾转换。
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
