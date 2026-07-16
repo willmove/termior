@@ -1,7 +1,7 @@
 use gpui::{
-    canvas, div, prelude::*, px, App, Bounds, Context, FocusHandle, Focusable, InputHandler,
-    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, SharedString, UTF16Selection,
-    WeakEntity, Window,
+    canvas, div, prelude::*, px, App, Bounds, Context, EventEmitter, FocusHandle, Focusable,
+    InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, SharedString,
+    UTF16Selection, WeakEntity, Window,
 };
 use std::collections::HashMap;
 use std::ops::Range;
@@ -13,6 +13,7 @@ use termior_ai::{
     Role, SecretStore, SessionStore, SnippetStore, TerminalContext, TerminalContextProvider,
     ToolExecutor, ToolRegistry,
 };
+use termior_platform::AgentStatus;
 use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_store::{DataFiles, Settings};
 
@@ -247,6 +248,7 @@ impl ComposerView {
         self.cursor = 0;
         self.busy = true;
         self.status = "Agent is working…".into();
+        cx.emit(AgentStatus::Working);
         self.persist_session();
 
         let history = self.history.clone();
@@ -258,12 +260,13 @@ impl ComposerView {
                 .await;
             let _ = view.update(cx, |view, cx| {
                 view.busy = false;
-                view.apply_agent_result(result);
+                view.apply_agent_result(result, cx);
                 if plan_request && view.pending_approval.is_none() {
                     view.awaiting_plan_confirmation = true;
                     view.status =
                         "Plan ready · confirm or reject before any write-capable tool is exposed"
                             .into();
+                    cx.emit(AgentStatus::Attention);
                 } else if !plan_request {
                     view.plan_confirmed = false;
                     view.awaiting_plan_confirmation = false;
@@ -276,7 +279,7 @@ impl ComposerView {
         cx.notify();
     }
 
-    fn apply_agent_result(&mut self, result: Result<AgentOutcome, String>) {
+    fn apply_agent_result(&mut self, result: Result<AgentOutcome, String>, cx: &mut Context<Self>) {
         match result {
             Ok(outcome) => {
                 self.history = outcome.messages.clone();
@@ -286,11 +289,16 @@ impl ComposerView {
                         request,
                         history: outcome.messages,
                     });
+                    cx.emit(AgentStatus::Attention);
                 } else {
                     self.status = "Agent finished".into();
+                    cx.emit(AgentStatus::Finished);
                 }
             }
-            Err(error) => self.status = format!("Agent error: {error}"),
+            Err(error) => {
+                self.status = format!("Agent error: {error}");
+                cx.emit(AgentStatus::Error);
+            }
         }
     }
 
@@ -306,6 +314,7 @@ impl ComposerView {
         };
         self.busy = true;
         self.status = format!("Running approved tool: {}", pending.request.tool_name);
+        cx.emit(AgentStatus::Working);
         cx.spawn(async move |view, cx| {
             let result = cx
                 .background_executor()
@@ -315,16 +324,20 @@ impl ComposerView {
                 view.busy = false;
                 match result {
                     Ok((outcome, edit)) => {
-                        view.apply_agent_result(Ok(outcome));
+                        view.apply_agent_result(Ok(outcome), cx);
                         if let Some(summary) = edit {
                             view.pending_edit = Some(PendingEdit {
                                 summary,
                                 decisions: HashMap::new(),
                             });
                             view.status = "Review every proposed hunk before writing".into();
+                            cx.emit(AgentStatus::Attention);
                         }
                     }
-                    Err(error) => view.status = format!("Tool failed: {error}"),
+                    Err(error) => {
+                        view.status = format!("Tool failed: {error}");
+                        cx.emit(AgentStatus::Error);
+                    }
                 }
                 view.persist_session();
                 cx.notify();
@@ -342,6 +355,7 @@ impl ComposerView {
                 pending.request.tool_name
             )));
             self.status = "Tool call rejected".into();
+            cx.emit(AgentStatus::Finished);
             self.persist_session();
             cx.notify();
         }
@@ -371,13 +385,22 @@ impl ComposerView {
             .filter(|id| edit.decisions.get(id) == Some(&true))
             .copied()
             .collect::<Vec<_>>();
-        self.status = self
-            .runtime
-            .as_ref()
-            .map(|runtime| runtime.executor.accept_edit(&edit.summary.id, &accepted))
-            .transpose()
-            .map(|message| message.unwrap_or_else(|| "No active edit executor".into()))
-            .unwrap_or_else(|error| format!("Edit failed: {error}"));
+        match self.runtime.as_ref() {
+            Some(runtime) => match runtime.executor.accept_edit(&edit.summary.id, &accepted) {
+                Ok(message) => {
+                    self.status = message;
+                    cx.emit(AgentStatus::Finished);
+                }
+                Err(error) => {
+                    self.status = format!("Edit failed: {error}");
+                    cx.emit(AgentStatus::Error);
+                }
+            },
+            None => {
+                self.status = "No active edit executor".into();
+                cx.emit(AgentStatus::Error);
+            }
+        }
         cx.notify();
     }
 
@@ -387,6 +410,7 @@ impl ComposerView {
                 runtime.executor.reject_edit(&edit.summary.id);
             }
             self.status = "AI edit rejected; disk was not changed".into();
+            cx.emit(AgentStatus::Finished);
             cx.notify();
         }
     }
@@ -444,6 +468,7 @@ impl ComposerView {
             "The proposed plan was rejected. No write-capable tool was exposed.",
         ));
         self.status = "Plan rejected".into();
+        cx.emit(AgentStatus::Finished);
         self.persist_session();
         cx.notify();
     }
@@ -487,6 +512,8 @@ impl ComposerView {
         input
     }
 }
+
+impl EventEmitter<AgentStatus> for ComposerView {}
 
 fn run_agent(
     runtime: AgentRuntime,

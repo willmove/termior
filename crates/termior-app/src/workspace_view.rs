@@ -7,11 +7,18 @@ use gpui::{
     div, prelude::*, px, size, AnyElement, Bounds, Context, Entity, FocusHandle, Focusable,
     KeyDownEvent, MouseButton, MouseDownEvent, SharedString, Window, WindowBounds, WindowOptions,
 };
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use termior_ai::AttachmentSource;
 use termior_explorer::FileIndex;
+use termior_platform::{
+    AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationContext,
+    NotificationDecision, NotificationRouter, NotificationTarget, SystemNotifier,
+};
 use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_store::{app_data_dir, atomic_write, default_settings, migrate, Settings};
+use termior_terminal_core::osc::AgentState;
 use termior_theme::{builtin_themes, Appearance, ResolvedPalette, Theme};
 use termior_ui::{SidebarPanel, TabId, TabKind, WorkspaceState};
 use termior_ui_kit::{LayoutNode, SplitDirection};
@@ -47,6 +54,18 @@ struct AppTab {
     panes: Vec<PaneContent>,
 }
 
+#[derive(Clone)]
+struct PendingAgentUpdate {
+    indicator: AgentIndicator,
+    notification: Notification,
+}
+
+#[derive(Clone)]
+struct InAppToast {
+    id: u64,
+    notification: Notification,
+}
+
 pub struct WorkspaceView {
     model: WorkspaceState,
     tabs: Vec<AppTab>,
@@ -62,6 +81,11 @@ pub struct WorkspaceView {
     data_dir: Option<PathBuf>,
     migration_error: Option<String>,
     workspace_auth: WorkspaceAuthRegistry,
+    notification_router: NotificationRouter,
+    pending_agent_updates: BTreeMap<String, PendingAgentUpdate>,
+    toasts: Vec<InAppToast>,
+    next_toast_id: u64,
+    bell_open: bool,
 }
 
 impl WorkspaceView {
@@ -119,6 +143,28 @@ impl WorkspaceView {
                 cx,
             );
         });
+        cx.subscribe(
+            &composer,
+            |workspace, _composer, status: &AgentStatus, cx| {
+                workspace.queue_agent_update(
+                    "builtin-agent",
+                    "Built-in Agent",
+                    None,
+                    NotificationTarget::Composer,
+                    *status,
+                    cx,
+                );
+            },
+        )
+        .detach();
+        let mut notification_router = NotificationRouter::default();
+        notification_router.set_enabled(settings.agent_notifications);
+        notification_router.update_agent(AgentIndicator {
+            id: "builtin-agent".into(),
+            title: "Built-in Agent".into(),
+            status: AgentStatus::Finished,
+            tab_id: None,
+        });
         let explorer = FileIndex::build(&root, settings.show_dotfiles).ok();
         let (vcs_status, vcs_history) = load_vcs(&root, &workspace_auth);
         Self {
@@ -136,6 +182,11 @@ impl WorkspaceView {
             data_dir,
             migration_error,
             workspace_auth,
+            notification_router,
+            pending_agent_updates: BTreeMap::new(),
+            toasts: Vec::new(),
+            next_toast_id: 1,
+            bell_open: false,
         }
     }
 
@@ -214,6 +265,28 @@ impl WorkspaceView {
             };
             let _ = workspace.update(cx, |workspace, cx| {
                 let entity = cx.new(|cx| TerminalView::from_bridge(bridge, palette, cx));
+                let agent_id = format!("terminal-agent-{}-{pane_index}", tab_id.0);
+                let agent_title = workspace
+                    .model
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| format!("{} · terminal agent", tab.title))
+                    .unwrap_or_else(|| format!("Terminal {} agent", tab_id.0));
+                cx.subscribe(
+                    &entity,
+                    move |workspace, _terminal, state: &AgentState, cx| {
+                        workspace.queue_agent_update(
+                            &agent_id,
+                            &agent_title,
+                            Some(tab_id.0),
+                            NotificationTarget::Tab(tab_id.0),
+                            terminal_agent_status(*state),
+                            cx,
+                        );
+                    },
+                )
+                .detach();
                 if let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                     if let Some(pane) = tab.panes.get_mut(pane_index) {
                         *pane = PaneContent::Terminal(entity);
@@ -318,10 +391,14 @@ impl WorkspaceView {
             .unwrap_or(0);
         if self.model.close_active_pane_or_tab().is_ok() {
             if pane_count > 1 {
+                self.remove_terminal_agent(id, pane_count - 1);
                 if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
                     tab.panes.pop();
                 }
             } else {
+                for pane_index in 0..pane_count {
+                    self.remove_terminal_agent(id, pane_index);
+                }
                 self.tabs.retain(|tab| tab.id != id);
             }
             if let Some(active) = self.model.active {
@@ -366,6 +443,122 @@ impl WorkspaceView {
                 PaneContent::Editor(entity) => Some(entity),
                 _ => None,
             })
+    }
+
+    fn queue_agent_update(
+        &mut self,
+        id: &str,
+        title: &str,
+        tab_id: Option<u64>,
+        target: NotificationTarget,
+        status: AgentStatus,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_agent_updates.insert(
+            id.to_owned(),
+            PendingAgentUpdate {
+                indicator: AgentIndicator {
+                    id: id.to_owned(),
+                    title: title.to_owned(),
+                    status,
+                    tab_id,
+                },
+                notification: Notification {
+                    title: title.to_owned(),
+                    body: agent_status_message(status).to_owned(),
+                    target,
+                    status,
+                },
+            },
+        );
+        cx.notify();
+    }
+
+    fn remove_terminal_agent(&mut self, tab_id: TabId, pane_index: usize) {
+        let id = format!("terminal-agent-{}-{pane_index}", tab_id.0);
+        self.pending_agent_updates.remove(&id);
+        self.notification_router.remove_agent(&id);
+    }
+
+    fn process_agent_updates(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let updates = std::mem::take(&mut self.pending_agent_updates);
+        let context = NotificationContext {
+            window_focused: window.is_window_active(),
+            active_tab: self.model.active.map(|id| id.0),
+            composer_visible: self.model.composer_visible,
+        };
+        for update in updates.into_values() {
+            if !self.notification_router.update_agent(update.indicator) {
+                continue;
+            }
+            match self
+                .notification_router
+                .route(&update.notification, context)
+            {
+                NotificationDecision::Suppress => {}
+                NotificationDecision::InAppToast => self.enqueue_toast(update.notification, cx),
+                NotificationDecision::System => {
+                    let notification = update.notification;
+                    cx.background_executor()
+                        .spawn(async move {
+                            if let Err(error) = NativeNotifier.notify(&notification) {
+                                log::warn!("system notification failed: {error}");
+                            }
+                        })
+                        .detach();
+                }
+            }
+        }
+    }
+
+    fn enqueue_toast(&mut self, notification: Notification, cx: &mut Context<Self>) {
+        const MAX_TOASTS: usize = 4;
+        if self.toasts.len() >= MAX_TOASTS {
+            self.toasts.remove(0);
+        }
+        let id = self.next_toast_id;
+        self.next_toast_id = self.next_toast_id.saturating_add(1);
+        self.toasts.push(InAppToast { id, notification });
+        let timer = cx.background_executor().timer(Duration::from_secs(5));
+        cx.spawn(async move |workspace, cx| {
+            timer.await;
+            let _ = workspace.update(cx, |workspace, cx| {
+                workspace.toasts.retain(|toast| toast.id != id);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_bell(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.bell_open = !self.bell_open;
+        cx.notify();
+    }
+
+    fn open_agent_surface(&mut self, tab_id: Option<u64>, cx: &mut Context<Self>) {
+        let target = tab_id.map_or(NotificationTarget::Composer, NotificationTarget::Tab);
+        self.open_notification_target(target, cx);
+        self.bell_open = false;
+        cx.notify();
+    }
+
+    fn open_notification_target(&mut self, target: NotificationTarget, cx: &mut Context<Self>) {
+        match target {
+            NotificationTarget::Tab(tab_id) => {
+                let id = TabId(tab_id);
+                if self.model.tabs.iter().any(|tab| tab.id == id) {
+                    self.activate_runtime(id, cx);
+                }
+            }
+            NotificationTarget::Composer => self.model.composer_visible = true,
+            NotificationTarget::Global => {}
+        }
+        cx.notify();
     }
 
     fn attach_active_selection(&mut self, cx: &mut Context<Self>) {
@@ -444,6 +637,8 @@ impl WorkspaceView {
 
     fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         self.settings = settings;
+        self.notification_router
+            .set_enabled(self.settings.agent_notifications);
         self.theme_index = self
             .themes
             .iter()
@@ -712,7 +907,8 @@ impl Focusable for WorkspaceView {
 }
 
 impl gpui::Render for WorkspaceView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.process_agent_updates(window, cx);
         let (cwd, preview_url) = self.sync_terminal_context(cx);
         let p = self.palette.clone();
         let active = self.model.active;
@@ -833,23 +1029,111 @@ impl gpui::Render for WorkspaceView {
         };
 
         let theme_name = self.themes[self.theme_index].name.clone();
-        let agent_states = self
-            .tabs
-            .iter()
-            .flat_map(|tab| tab.panes.iter().map(move |pane| (tab.id, pane)))
-            .filter_map(|(tab_id, pane)| match pane {
-                PaneContent::Terminal(terminal) => terminal
-                    .read(cx)
-                    .agent_state()
-                    .map(|state| format!("{}:{state:?}", tab_id.0)),
-                _ => None,
-            })
+        let agent_indicators = self
+            .notification_router
+            .bell_items()
+            .into_iter()
+            .cloned()
             .collect::<Vec<_>>();
-        let bell_label = if agent_states.is_empty() {
+        let bell_label = if agent_indicators.is_empty() {
             "🔔".to_owned()
         } else {
-            format!("🔔 {}", agent_states.join(" · "))
+            format!("🔔 {}", agent_indicators.len())
         };
+        let bell_needs_attention = agent_indicators.iter().any(|indicator| {
+            matches!(
+                indicator.status,
+                AgentStatus::Attention | AgentStatus::Error
+            )
+        });
+        let bell_rows = agent_indicators
+            .into_iter()
+            .map(|indicator| {
+                let tab_id = indicator.tab_id;
+                div()
+                    .id(SharedString::from(format!("agent-state-{}", indicator.id)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .cursor_pointer()
+                    .border_b_1()
+                    .border_color(gpui_color(p.surface[1]))
+                    .child(SharedString::from(indicator.title))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(gpui_color(status_color(&p, indicator.status)))
+                            .child(status_label(indicator.status)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |workspace, _event, _window, cx| {
+                            workspace.open_agent_surface(tab_id, cx)
+                        }),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let bell_panel = self.bell_open.then(|| {
+            div()
+                .id("agent-bell-panel")
+                .flex()
+                .flex_col()
+                .bg(gpui_color(p.surface[2]))
+                .border_b_1()
+                .border_color(gpui_color(p.surface[1]))
+                .child(div().px_3().py_2().text_sm().child("Agent activity"))
+                .children(bell_rows)
+        });
+        let toast_elements = self
+            .toasts
+            .clone()
+            .into_iter()
+            .map(|toast| {
+                let id = toast.id;
+                let target = toast.notification.target;
+                let color = status_color(&p, toast.notification.status);
+                div()
+                    .id(SharedString::from(format!("agent-toast-{id}")))
+                    .mx_3()
+                    .mt_2()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(gpui_color(color))
+                    .bg(gpui_color(p.surface[1]))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(SharedString::from(toast.notification.title))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(gpui_color(color))
+                                    .child(status_label(toast.notification.status)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .child(SharedString::from(toast.notification.body)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |workspace, _event, _window, cx| {
+                            workspace.toasts.retain(|toast| toast.id != id);
+                            workspace.open_notification_target(target, cx);
+                        }),
+                    )
+            })
+            .collect::<Vec<_>>();
         div()
             .id("workspace-root")
             .track_focus(&self.focus_handle)
@@ -904,8 +1188,17 @@ impl gpui::Render for WorkspaceView {
                         div()
                             .id("agent-bell")
                             .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(if bell_needs_attention {
+                                gpui_color(p.status[2])
+                            } else {
+                                gpui_color(p.surface[2])
+                            })
                             .text_xs()
-                            .child(SharedString::from(bell_label)),
+                            .child(SharedString::from(bell_label))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::toggle_bell)),
                     )
                     .child(
                         div()
@@ -916,6 +1209,8 @@ impl gpui::Render for WorkspaceView {
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::open_settings)),
                     ),
             )
+            .children(bell_panel)
+            .children(toast_elements)
             .child(
                 div()
                     .flex()
@@ -978,6 +1273,48 @@ fn header_button(
         .cursor_pointer()
         .child(label)
         .on_mouse_down(MouseButton::Left, cx.listener(listener))
+}
+
+fn terminal_agent_status(state: AgentState) -> AgentStatus {
+    match state {
+        AgentState::Started => AgentStatus::Started,
+        AgentState::Working => AgentStatus::Working,
+        AgentState::Attention => AgentStatus::Attention,
+        AgentState::Finished => AgentStatus::Finished,
+        AgentState::Exited => AgentStatus::Exited,
+    }
+}
+
+fn status_label(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Started => "started",
+        AgentStatus::Working => "working",
+        AgentStatus::Attention => "attention",
+        AgentStatus::Finished => "finished",
+        AgentStatus::Exited => "exited",
+        AgentStatus::Error => "error",
+    }
+}
+
+fn agent_status_message(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Started => "Agent started",
+        AgentStatus::Working => "Agent is working",
+        AgentStatus::Attention => "Agent needs your attention",
+        AgentStatus::Finished => "Agent finished",
+        AgentStatus::Exited => "Agent exited",
+        AgentStatus::Error => "Agent encountered an error",
+    }
+}
+
+fn status_color(palette: &ResolvedPalette, status: AgentStatus) -> termior_theme::Color {
+    match status {
+        AgentStatus::Started | AgentStatus::Working => palette.status[0],
+        AgentStatus::Finished => palette.status[1],
+        AgentStatus::Attention => palette.status[2],
+        AgentStatus::Error => palette.status[3],
+        AgentStatus::Exited => palette.foreground,
+    }
 }
 
 fn gpui_color(color: termior_theme::Color) -> gpui::Rgba {

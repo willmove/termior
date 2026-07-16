@@ -14,10 +14,11 @@ use alacritty_terminal::{
 };
 use futures::StreamExt;
 use gpui::{
-    canvas, div, fill, point, prelude::FluentBuilder, px, App, Bounds, Context, FocusHandle,
-    Focusable, Font, FontFeatures, FontStyle, FontWeight, Hsla, InputHandler, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent,
-    SharedString, Styled, Task, TextAlign, TextRun, UTF16Selection, WeakEntity, Window,
+    canvas, div, fill, point, prelude::FluentBuilder, px, App, Bounds, Context, EventEmitter,
+    FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight, Hsla, InputHandler,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Point, Render,
+    ScrollWheelEvent, SharedString, Styled, Task, TextAlign, TextRun, UTF16Selection, WeakEntity,
+    Window,
 };
 use termior_terminal::{PtySessionConfig, TerminalBridge};
 use termior_terminal_core::osc::{AgentState, OscEvent};
@@ -115,7 +116,11 @@ impl TerminalView {
                         log::info!("OSC event: {ev:?}");
                         match ev {
                             OscEvent::Cwd { path, .. } => view.latest_cwd = Some(path),
-                            OscEvent::AgentEvent(state) => view.agent_state = Some(state),
+                            OscEvent::AgentEvent(state) if view.agent_state != Some(state) => {
+                                view.agent_state = Some(state);
+                                cx.emit(state);
+                            }
+                            OscEvent::AgentEvent(_) => {}
                             _ => {}
                         }
                     }
@@ -155,10 +160,6 @@ impl TerminalView {
 
     pub fn localhost_urls(&self) -> &[String] {
         &self.localhost_urls
-    }
-
-    pub fn agent_state(&self) -> Option<AgentState> {
-        self.agent_state
     }
 
     pub fn recent_text(&self) -> String {
@@ -256,6 +257,8 @@ impl TerminalView {
         }
     }
 }
+
+impl EventEmitter<AgentState> for TerminalView {}
 
 impl Render for TerminalView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

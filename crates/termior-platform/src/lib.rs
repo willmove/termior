@@ -6,7 +6,7 @@ mod notification;
 mod open;
 
 pub use notification::{
-    AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationDecision,
-    NotificationRouter, SystemNotifier,
+    AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationContext,
+    NotificationDecision, NotificationRouter, NotificationTarget, SystemNotifier,
 };
 pub use open::{open_external, PlatformError};

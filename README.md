@@ -25,6 +25,7 @@ Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、�
 - OpenAI、Anthropic、Gemini、Groq、xAI、Cerebras、OpenRouter、DeepSeek、Mistral、OpenAI-compatible、LM Studio、MLX、Ollama 的真实 HTTP/SSE 适配；
 - OS 钥匙串、会话/项目记忆、附件/snippets/TODO、Plan mode、子代理、自定义代理；
 - 真实 Agent 工具执行、审批卡片、命令超时、持久 shell、后台进程，以及 `write_file → AI diff → 逐 hunk 决策 → 原子写` 安全闭环；
+- 内置/终端 Agent 统一通知路由：可见时抑制、隐藏时主题 toast、窗口失焦时系统通知，并在 header 铃铛列出当前状态；
 - Claude Code OSC hooks 的安全、幂等安装与卸载。
 
 这仍是阶段性里程碑，不等于整份 spec 已最终验收。尚待继续完善的交互和非功能项记录在 [docs/desktop-milestone.md](docs/desktop-milestone.md)。
