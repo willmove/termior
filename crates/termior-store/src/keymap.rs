@@ -3,6 +3,7 @@
 //! P0 提供固定默认键位（FR-SET-02 重绑定为 P1）。macOS 使用 Cmd，Win/Linux 映射为 Ctrl。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// 当前平台（决定修饰键映射）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +144,74 @@ impl KeyBinding {
 pub struct KeymapEntry {
     pub action: KeyAction,
     pub binding: KeyBinding,
+}
+
+/// Persistable user binding used by the Shortcuts settings page (FR-SET-02).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UserKeyBinding {
+    pub primary: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub key: String,
+}
+
+impl From<&KeyBinding> for UserKeyBinding {
+    fn from(binding: &KeyBinding) -> Self {
+        Self {
+            primary: binding.primary,
+            shift: binding.shift,
+            alt: binding.alt,
+            key: binding.key.to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserKeymap {
+    pub bindings: HashMap<KeyAction, UserKeyBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("shortcut conflicts with {existing:?}")]
+pub struct KeymapConflict {
+    pub existing: KeyAction,
+}
+
+impl Default for UserKeymap {
+    fn default() -> Self {
+        Self {
+            bindings: default_keymap()
+                .iter()
+                .map(|entry| (entry.action, UserKeyBinding::from(&entry.binding)))
+                .collect(),
+        }
+    }
+}
+
+impl UserKeymap {
+    pub fn rebind(
+        &mut self,
+        action: KeyAction,
+        binding: UserKeyBinding,
+    ) -> Result<(), KeymapConflict> {
+        if let Some((existing, _)) = self
+            .bindings
+            .iter()
+            .find(|(existing, value)| **existing != action && **value == binding)
+        {
+            return Err(KeymapConflict {
+                existing: *existing,
+            });
+        }
+        self.bindings.insert(action, binding);
+        Ok(())
+    }
+
+    pub fn action_for(&self, binding: &UserKeyBinding) -> Option<KeyAction> {
+        self.bindings
+            .iter()
+            .find_map(|(action, value)| (value == binding).then_some(*action))
+    }
 }
 
 /// 默认键位表（附录A）。
@@ -318,5 +387,21 @@ mod tests {
         } else {
             assert_eq!(p, Platform::Linux);
         }
+    }
+
+    #[test]
+    fn user_keymap_rebinds_and_detects_conflicts() {
+        let mut map = UserKeymap::default();
+        let custom = UserKeyBinding {
+            primary: true,
+            shift: true,
+            alt: true,
+            key: "T".into(),
+        };
+        map.rebind(KeyAction::NewTerminalTab, custom.clone())
+            .unwrap();
+        assert_eq!(map.action_for(&custom), Some(KeyAction::NewTerminalTab));
+        let conflict = map.rebind(KeyAction::NewEditorTab, custom).unwrap_err();
+        assert_eq!(conflict.existing, KeyAction::NewTerminalTab);
     }
 }

@@ -13,7 +13,23 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "3565c49"
 termior-theme = { workspace = true }
 termior-terminal = { workspace = true }
 termior-terminal-core = { workspace = true }
+termior-editor = { workspace = true }
+termior-explorer = { workspace = true }
+termior-vcs = { workspace = true }
+termior-preview = { workspace = true }
+termior-platform = { workspace = true }
+termior-store = { workspace = true }
+termior-ui = { workspace = true }
+termior-ui-kit = { workspace = true }
+termior-security = { workspace = true }
+termior-ai = { workspace = true, features = ["keyring-backend"] }
+termior-hooks = { workspace = true }
 alacritty_terminal = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"
+serde_json = { workspace = true }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+gpui-wry = "0.5"
+wry = "0.53.3"

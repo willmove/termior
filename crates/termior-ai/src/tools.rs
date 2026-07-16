@@ -9,6 +9,7 @@
 //! `@path` 引用读取内容前也经此过滤（FR-AGENT-03）。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use termior_security::deny_list::{canonicalize_logical, check_path, DenyReason, Direction};
 use termior_security::workspace::WorkspaceAuthRegistry;
 
@@ -23,6 +24,16 @@ pub enum ToolError {
     Unknown(String),
     #[error("approval required for tool: {0}")]
     ApprovalRequired(String),
+    #[error("tool is not enabled for this agent: {0}")]
+    NotAllowed(String),
+    #[error("invalid tool arguments: {0}")]
+    InvalidArguments(String),
+    #[error("tool I/O failed: {0}")]
+    Io(String),
+    #[error("tool timed out: {0}")]
+    Timeout(String),
+    #[error("edit proposal not found: {0}")]
+    ProposalNotFound(String),
 }
 
 /// 一条工具的描述（供模型与 UI 展示）。
@@ -44,19 +55,55 @@ pub enum ToolLevelSerde {
 #[derive(Debug, Clone)]
 pub struct ToolRegistry {
     pub workspace_auth: WorkspaceAuthRegistry,
+    allowed_tools: Option<HashSet<String>>,
 }
 
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self {
             workspace_auth: WorkspaceAuthRegistry::new(),
+            allowed_tools: None,
         }
     }
 }
 
 impl ToolRegistry {
     pub fn new(workspace_auth: WorkspaceAuthRegistry) -> Self {
-        Self { workspace_auth }
+        Self {
+            workspace_auth,
+            allowed_tools: None,
+        }
+    }
+
+    /// Restrict a custom/sub-agent to an explicit tool subset (FR-PLAN-02/03).
+    pub fn subset<I, S>(mut self, tools: I) -> Result<Self, ToolError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut allowed = HashSet::new();
+        for name in tools {
+            let name = name.into();
+            termior_security::gating::ToolId::from_name(&name)
+                .ok_or_else(|| ToolError::Unknown(name.clone()))?;
+            allowed.insert(name);
+        }
+        self.allowed_tools = Some(allowed);
+        Ok(self)
+    }
+
+    pub fn allows(&self, tool_name: &str) -> bool {
+        self.allowed_tools
+            .as_ref()
+            .map_or(true, |tools| tools.contains(tool_name))
+    }
+
+    fn ensure_allowed(&self, tool_name: &str) -> Result<(), ToolError> {
+        if self.allows(tool_name) {
+            Ok(())
+        } else {
+            Err(ToolError::NotAllowed(tool_name.to_owned()))
+        }
     }
 
     /// 列出全部工具描述（FR-AGENT-09）。
@@ -64,6 +111,7 @@ impl ToolRegistry {
         use termior_security::gating::{ToolLevel, ALL_TOOLS};
         ALL_TOOLS
             .iter()
+            .filter(|tool| self.allows(tool.name()))
             .map(|t| ToolDescriptor {
                 name: t.name().to_string(),
                 level: match t.level() {
@@ -77,6 +125,7 @@ impl ToolRegistry {
 
     /// 判定工具是否需要审批（FR-SEC-01）。
     pub fn requires_approval(&self, tool_name: &str) -> Result<bool, ToolError> {
+        self.ensure_allowed(tool_name)?;
         let id = termior_security::gating::ToolId::from_name(tool_name)
             .ok_or_else(|| ToolError::Unknown(tool_name.to_string()))?;
         Ok(matches!(
@@ -96,6 +145,7 @@ impl ToolRegistry {
         direction: Direction,
     ) -> Result<(), ToolError> {
         // 工具必须存在
+        self.ensure_allowed(tool_name)?;
         let _ = termior_security::gating::ToolId::from_name(tool_name)
             .ok_or_else(|| ToolError::Unknown(tool_name.to_string()))?;
 
@@ -137,6 +187,9 @@ fn description_for(t: termior_security::gating::ToolId) -> &'static str {
         ToolId::RunCommand => "Run a one-shot subshell command (approval-gated).",
         ToolId::ShellSessionRun => "Run a command in the persistent agent shell (approval-gated).",
         ToolId::ShellBgSpawn => "Spawn a long-running background process (approval-gated).",
+        ToolId::RunSubagent => {
+            "Delegate a bounded task to a restricted child agent (approval-gated)."
+        }
     }
 }
 
@@ -227,6 +280,20 @@ mod tests {
         assert!(matches!(
             r.check_path_access("nope", "/proj/x", Direction::Read),
             Err(ToolError::Unknown(_))
+        ));
+    }
+
+    #[test]
+    fn subset_hides_and_rejects_other_tools() {
+        let registry = ToolRegistry::default()
+            .subset(["read_file", "fs_search"])
+            .unwrap();
+        assert!(registry.allows("read_file"));
+        assert!(!registry.allows("write_file"));
+        assert_eq!(registry.descriptors().len(), 2);
+        assert!(matches!(
+            registry.requires_approval("write_file"),
+            Err(ToolError::NotAllowed(_))
         ));
     }
 

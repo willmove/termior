@@ -35,6 +35,17 @@ pub struct Settings {
     pub agent_notifications: bool,
     /// WebGL→GPU 渲染等价开关占位（FR-SET-01）。
     pub prefer_software_rendering: bool,
+    /// Vim compatibility layer (FR-EDIT-06).
+    pub vim_mode: bool,
+    /// Optional WSL distribution selected by the workspace switcher (Windows, FR-WS-06).
+    pub wsl_distribution: Option<String>,
+    /// Whole-window background image configuration (FR-THEME-05).
+    pub background: BackgroundSettings,
+    /// Provider endpoints and model choices. Credentials are referenced by profile id and live
+    /// exclusively in the OS keychain.
+    pub models: ModelSettings,
+    /// User-rebindable shortcuts, validated for duplicate chords before mutation.
+    pub keymap: crate::keymap::UserKeymap,
 }
 
 fn default_version() -> u32 {
@@ -57,6 +68,9 @@ pub struct TerminalSettings {
     /// 字号 8–32（FR-TERM-09 预设档位）。
     pub font_size: u8,
     pub line_height: f32,
+    /// Additional glyph spacing in logical pixels.
+    #[serde(default)]
+    pub letter_spacing: f32,
     /// 回滚行数 200–50,000（FR-TERM-09 预设档位）。
     pub scrollback_lines: u32,
     /// shell 探测策略（FR-TERM-05）。
@@ -69,8 +83,180 @@ impl Default for TerminalSettings {
             font_family: default_font_family(),
             font_size: 14,
             line_height: 1.2,
+            letter_spacing: 0.0,
             scrollback_lines: 10_000,
             shell_detection: ShellDetection::Auto,
+        }
+    }
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        default_settings()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackgroundSettings {
+    pub image_path: Option<String>,
+    /// 0 = invisible, 1 = fully opaque.
+    pub opacity: f32,
+    /// Gaussian blur radius in logical pixels.
+    pub blur: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelProviderSettings {
+    pub id: String,
+    pub provider: String,
+    pub display_name: String,
+    pub base_url: String,
+    pub model: String,
+    pub local: bool,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelSettings {
+    pub profiles: Vec<ModelProviderSettings>,
+    pub active_chat_profile: Option<String>,
+    pub active_completion_profile: Option<String>,
+    #[serde(default)]
+    pub favorite_models: Vec<String>,
+    #[serde(default)]
+    pub recent_models: Vec<String>,
+}
+
+impl Default for ModelSettings {
+    fn default() -> Self {
+        let definitions = [
+            (
+                "anthropic",
+                "anthropic",
+                "Anthropic",
+                "https://api.anthropic.com/v1",
+                "claude-sonnet-4",
+                false,
+            ),
+            (
+                "openai",
+                "open_ai",
+                "OpenAI",
+                "https://api.openai.com/v1",
+                "gpt-4o",
+                false,
+            ),
+            (
+                "google",
+                "google",
+                "Google Gemini",
+                "https://generativelanguage.googleapis.com/v1beta",
+                "gemini-2.5-pro",
+                false,
+            ),
+            (
+                "groq",
+                "groq",
+                "Groq",
+                "https://api.groq.com/openai/v1",
+                "llama-3.3-70b-versatile",
+                false,
+            ),
+            ("xai", "xai", "xAI", "https://api.x.ai/v1", "grok-3", false),
+            (
+                "cerebras",
+                "cerebras",
+                "Cerebras",
+                "https://api.cerebras.ai/v1",
+                "llama-3.3-70b",
+                false,
+            ),
+            (
+                "openrouter",
+                "open_router",
+                "OpenRouter",
+                "https://openrouter.ai/api/v1",
+                "openai/gpt-4o",
+                false,
+            ),
+            (
+                "deepseek",
+                "deep_seek",
+                "DeepSeek",
+                "https://api.deepseek.com/v1",
+                "deepseek-chat",
+                false,
+            ),
+            (
+                "mistral",
+                "mistral",
+                "Mistral",
+                "https://api.mistral.ai/v1",
+                "mistral-large-latest",
+                false,
+            ),
+            (
+                "compatible",
+                "open_ai_compatible",
+                "OpenAI compatible",
+                "https://api.openai.com/v1",
+                "default",
+                false,
+            ),
+            (
+                "lm-studio",
+                "lm_studio",
+                "LM Studio",
+                "http://127.0.0.1:1234/v1",
+                "local-model",
+                true,
+            ),
+            (
+                "mlx",
+                "mlx",
+                "MLX",
+                "http://127.0.0.1:8080/v1",
+                "local-model",
+                true,
+            ),
+            (
+                "ollama",
+                "ollama",
+                "Ollama",
+                "http://127.0.0.1:11434",
+                "llama3.2",
+                true,
+            ),
+        ];
+        Self {
+            profiles: definitions
+                .into_iter()
+                .map(
+                    |(id, provider, display_name, base_url, model, local)| ModelProviderSettings {
+                        id: id.into(),
+                        provider: provider.into(),
+                        display_name: display_name.into(),
+                        base_url: base_url.into(),
+                        model: model.into(),
+                        local,
+                        enabled: local,
+                    },
+                )
+                .collect(),
+            active_chat_profile: None,
+            active_completion_profile: None,
+            favorite_models: Vec::new(),
+            recent_models: Vec::new(),
+        }
+    }
+}
+
+impl Default for BackgroundSettings {
+    fn default() -> Self {
+        Self {
+            image_path: None,
+            opacity: 0.2,
+            blur: 0.0,
         }
     }
 }
@@ -109,6 +295,11 @@ pub fn default_settings() -> Settings {
         show_dotfiles: true,
         agent_notifications: true,
         prefer_software_rendering: false,
+        vim_mode: false,
+        wsl_distribution: None,
+        background: BackgroundSettings::default(),
+        models: ModelSettings::default(),
+        keymap: crate::keymap::UserKeymap::default(),
     }
 }
 
@@ -125,6 +316,24 @@ impl Settings {
             return Err(SettingsError::OutOfRange {
                 field: "scrollback_lines".into(),
                 value: self.terminal.scrollback_lines.to_string(),
+            });
+        }
+        if !(0.0..=1.0).contains(&self.background.opacity) {
+            return Err(SettingsError::OutOfRange {
+                field: "background.opacity".into(),
+                value: self.background.opacity.to_string(),
+            });
+        }
+        if !(0.0..=64.0).contains(&self.background.blur) {
+            return Err(SettingsError::OutOfRange {
+                field: "background.blur".into(),
+                value: self.background.blur.to_string(),
+            });
+        }
+        if !(-2.0..=8.0).contains(&self.terminal.letter_spacing) {
+            return Err(SettingsError::OutOfRange {
+                field: "letter_spacing".into(),
+                value: self.terminal.letter_spacing.to_string(),
             });
         }
         Ok(())
@@ -204,5 +413,15 @@ mod tests {
     fn shell_detection_serializes() {
         let json = serde_json::to_string(&ShellDetection::Auto).unwrap();
         assert_eq!(json, "\"auto\"");
+    }
+
+    #[test]
+    fn background_and_letter_spacing_ranges_enforced() {
+        let mut s = default_settings();
+        s.background.opacity = 1.1;
+        assert!(s.validate().is_err());
+        s.background.opacity = 0.5;
+        s.terminal.letter_spacing = 9.0;
+        assert!(s.validate().is_err());
     }
 }

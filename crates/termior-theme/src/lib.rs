@@ -3,8 +3,7 @@
 //! 一份 Rust 主题 token 结构（语义色板）同时驱动 UI 组件、终端 16+ 色调色板、diff
 //! 颜色、通知样式（FR-THEME-01）。浅色/深色/跟随系统三态独立于色板选择。
 //!
-//! 内置 2 套主题（FR-THEME-02「首发 4 套，其余 P1」——本 P0 交付 2 套满足最低门槛）：
-//! `default`、`nord`。
+//! 内置 10 套应用主题，并支持自定义主题 JSON 导入/导出。
 //!
 //! 切换时上层（GPUI Entity）广播重绘；本模块只提供主题数据与解析，不依赖 GPUI。
 
@@ -141,9 +140,20 @@ impl Theme {
     }
 }
 
-/// 内置主题注册表。FR-THEME-02「首发 4 套」——本 P0 先交付 2 套。
+/// 内置主题注册表（FR-THEME-02 完整十套）。
 pub fn builtin_themes() -> Vec<Theme> {
-    vec![default_theme(), nord_theme()]
+    vec![
+        default_theme(),
+        nord_theme(),
+        styled_theme("tide", "Tide", 0x101820, 0x4fd1c5),
+        styled_theme("catppuccin", "Catppuccin", 0x1e1e2e, 0xcba6f7),
+        styled_theme("tokyo-night", "Tokyo Night", 0x1a1b26, 0x7aa2f7),
+        styled_theme("caffeine", "Caffeine", 0x201a17, 0xd08c60),
+        styled_theme("claude", "Claude", 0x26201d, 0xd97757),
+        styled_theme("gruvbox", "Gruvbox", 0x282828, 0xd79921),
+        styled_theme("sage", "Sage", 0x17201b, 0x8fb996),
+        styled_theme("rose-pine", "Rose Pine", 0x191724, 0xebbcba),
+    ]
 }
 
 pub fn find_theme(id: &str) -> Option<Theme> {
@@ -226,6 +236,83 @@ pub fn nord_theme() -> Theme {
     }
 }
 
+fn styled_theme(id: &str, name: &str, background: u32, accent: u32) -> Theme {
+    let mut light = base_light();
+    let mut dark = base_dark();
+    dark.background = Color::hex3(background);
+    dark.surface = [
+        Color::hex3(background),
+        blend(Color::hex3(background), Color::rgb(255, 255, 255), 0.08),
+        blend(Color::hex3(background), Color::rgb(255, 255, 255), 0.14),
+    ];
+    dark.accent = Color::hex3(accent);
+    dark.status[0] = Color::hex3(accent);
+    dark.terminal.blue = Color::hex3(accent);
+    dark.terminal.bright_blue = blend(Color::hex3(accent), Color::rgb(255, 255, 255), 0.2);
+    light.accent = Color::hex3(accent);
+    light.status[0] = Color::hex3(accent);
+    Theme {
+        id: id.into(),
+        name: name.into(),
+        tokens: ThemeTokens { light, dark },
+    }
+}
+
+fn blend(a: Color, b: Color, amount: f32) -> Color {
+    let channel =
+        |left: u8, right: u8| (left as f32 * (1.0 - amount) + right as f32 * amount).round() as u8;
+    Color::rgb(channel(a.r, b.r), channel(a.g, b.g), channel(a.b, b.b))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ThemeLibrary {
+    #[serde(default)]
+    pub custom: Vec<Theme>,
+}
+
+impl ThemeLibrary {
+    pub fn all(&self) -> Vec<Theme> {
+        let mut themes = builtin_themes();
+        themes.extend(self.custom.clone());
+        themes
+    }
+
+    pub fn save_custom(&mut self, theme: Theme) -> Result<(), ThemeError> {
+        if theme.id.trim().is_empty() {
+            return Err(ThemeError::EmptyId);
+        }
+        if builtin_themes()
+            .iter()
+            .any(|builtin| builtin.id == theme.id)
+        {
+            return Err(ThemeError::BuiltinId(theme.id));
+        }
+        if let Some(existing) = self.custom.iter_mut().find(|item| item.id == theme.id) {
+            *existing = theme;
+        } else {
+            self.custom.push(theme);
+        }
+        Ok(())
+    }
+
+    pub fn based_on(&self, source_id: &str, id: &str, name: &str) -> Option<Theme> {
+        let mut theme = self.all().into_iter().find(|theme| theme.id == source_id)?;
+        theme.id = id.to_owned();
+        theme.name = name.to_owned();
+        Some(theme)
+    }
+
+    pub fn export(theme: &Theme) -> Result<String, ThemeError> {
+        Ok(serde_json::to_string_pretty(theme)?)
+    }
+
+    pub fn import(&mut self, json: &str) -> Result<Theme, ThemeError> {
+        let theme: Theme = serde_json::from_str(json)?;
+        self.save_custom(theme.clone())?;
+        Ok(theme)
+    }
+}
+
 /// Palette 别名（语义色板）。
 pub type Palette = ResolvedPalette;
 
@@ -296,6 +383,10 @@ pub enum ThemeError {
     NotFound(String),
     #[error("invalid theme json: {0}")]
     InvalidJson(#[from] serde_json::Error),
+    #[error("theme id is empty")]
+    EmptyId,
+    #[error("cannot replace a built-in theme: {0}")]
+    BuiltinId(String),
 }
 
 /// 把主题序列化为 JSON（用于 `Termior-custom-themes.json`）。
@@ -313,9 +404,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_themes_has_two() {
+    fn builtin_themes_has_ten() {
         let t = builtin_themes();
-        assert_eq!(t.len(), 2, "FR-THEME-02 P0: 首发至少 2 套");
+        assert_eq!(t.len(), 10, "FR-THEME-02: ships the full theme set");
         let ids: Vec<String> = t.iter().map(|x| x.id.clone()).collect();
         assert!(ids.iter().any(|x| x == "default"));
         assert!(ids.iter().any(|x| x == "nord"));
@@ -400,5 +491,20 @@ mod tests {
         assert_eq!(json, "\"follow_system\"");
         let back: Appearance = serde_json::from_str(&json).unwrap();
         assert_eq!(back, Appearance::FollowSystem);
+    }
+
+    #[test]
+    fn custom_theme_import_export_and_builtin_guard() {
+        let library = ThemeLibrary::default();
+        let custom = library.based_on("nord", "my-nord", "My Nord").unwrap();
+        let json = ThemeLibrary::export(&custom).unwrap();
+        let mut target = ThemeLibrary::default();
+        let imported = target.import(&json).unwrap();
+        assert_eq!(imported.id, "my-nord");
+        assert_eq!(target.custom.len(), 1);
+        assert!(matches!(
+            target.save_custom(default_theme()),
+            Err(ThemeError::BuiltinId(_))
+        ));
     }
 }

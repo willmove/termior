@@ -11,3 +11,4 @@ pub mod pty;
 
 pub use bridge::{PtyData, TerminalBridge};
 pub use pty::{PtySession, PtySessionConfig, SpawnError};
+pub use termior_terminal_core::shell_integration::ShellKind;

@@ -1,8 +1,6 @@
 # Termior — 终端优先 AI 原生开发工作台（ADE）
 #
-# 本 workspace 仅包含可在无 GPU/无 GPUI 环境下编译与测试的纯逻辑核心 crate。
-# GPUI 渲染层、PTY spawn、真实网络 Provider 适配等留给后续里程碑在具备编译
-# 验证条件时再接入（见 docs/termior-spec.md 与本仓库 PRD）。
+# Workspace includes the native GPUI application plus independently testable domain crates.
 [workspace]
 resolver = "2"
 members = [
@@ -12,9 +10,16 @@ members = [
     "crates/termior-terminal-core",
     "crates/termior-diff",
     "crates/termior-explorer-core",
+    "crates/termior-explorer",
+    "crates/termior-vcs",
+    "crates/termior-preview",
+    "crates/termior-platform",
+    "crates/termior-ui-kit",
+    "crates/termior-ui",
     "crates/termior-ai",
     "crates/termior-hooks",
     "crates/termior-terminal",
+    "crates/termior-editor",
     "crates/termior-app",
 ]
 
@@ -30,8 +35,7 @@ repository = "https://github.com/termior/termior"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-# 纯逻辑依赖，刻意保持轻量；GPUI / portable-pty / alacritty_terminal / reqwest
-# 等重型/运行时依赖不在此处，留给后续可编译验证的里程碑。
+# 跨 crate 共享的逻辑与运行时依赖统一在此锁定版本；各 crate 只声明实际使用项。
 similar = "1"
 nucleo = "0.5"
 nucleo-matcher = "0.3"
@@ -41,13 +45,36 @@ globset = "0.4"
 ignore = "0.4"
 keyring = { version = "3", features = ["windows-native", "apple-native", "linux-native-sync-persistent", "crypto-rust"] }
 
-# M1 终端 MVP 引入的运行时依赖（spec §3.1：portable-pty / alacritty_terminal）。
-# 仅 termior-terminal 与 termior-app 消费，纯逻辑 crate 不依赖它们。
+# 终端运行时依赖（spec §3.1：portable-pty / alacritty_terminal）。
 portable-pty = "0.9"
 alacritty_terminal = "0.26"
 vte = "0.13"
 futures = "0.3"
 log = "0.4"
+ropey = "1.6"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-md = "0.5"
+notify = "8.2"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+git2 = "0.21"
+regex = "1"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+base64 = "0.22"
+wait-timeout = "0.2"
 
 termior-theme = { path = "crates/termior-theme" }
 termior-store = { path = "crates/termior-store" }
@@ -55,9 +82,16 @@ termior-security = { path = "crates/termior-security" }
 termior-terminal-core = { path = "crates/termior-terminal-core" }
 termior-diff = { path = "crates/termior-diff" }
 termior-explorer-core = { path = "crates/termior-explorer-core" }
+termior-explorer = { path = "crates/termior-explorer" }
+termior-vcs = { path = "crates/termior-vcs" }
+termior-preview = { path = "crates/termior-preview" }
+termior-platform = { path = "crates/termior-platform" }
+termior-ui-kit = { path = "crates/termior-ui-kit" }
+termior-ui = { path = "crates/termior-ui" }
 termior-ai = { path = "crates/termior-ai" }
 termior-hooks = { path = "crates/termior-hooks" }
 termior-terminal = { path = "crates/termior-terminal" }
+termior-editor = { path = "crates/termior-editor" }
 termior-app = { path = "crates/termior-app" }
 
 [profile.release]
@@ -66,3 +100,7 @@ opt-level = 3
 lto = "thin"
 strip = true
 codegen-units = 1
+
+[patch.crates-io]
+# gpui-wry must share the exact GPUI source/revision with the application.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49" }

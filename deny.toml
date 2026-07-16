@@ -29,6 +29,7 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CC0-1.0",
+    "CDLA-Permissive-2.0",
     "MPL-2.0",
 ]
 # 许可文本与 SPDX 标准文本的最低匹配置信度。

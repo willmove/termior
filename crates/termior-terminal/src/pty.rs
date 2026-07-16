@@ -32,6 +32,9 @@ pub struct PtySessionConfig {
     pub rows: u16,
     pub cols: u16,
     pub cwd: Option<String>,
+    /// Authorization granted when the workspace was explicitly opened. A configured cwd is
+    /// rejected unless it is inside this registry (FR-SEC-04).
+    pub workspace_auth: Option<termior_security::workspace::WorkspaceAuthRegistry>,
 }
 
 impl Default for PtySessionConfig {
@@ -41,6 +44,7 @@ impl Default for PtySessionConfig {
             rows: 24,
             cols: 80,
             cwd: None,
+            workspace_auth: None,
         }
     }
 }
@@ -55,11 +59,28 @@ pub struct PtySession {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     /// 保持 shell integration 脚本文件存活；drop 时随会话清理。
     _integration_dir: Option<tempfile::TempDir>,
+    #[cfg(windows)]
+    _job: WindowsJob,
 }
 
 impl PtySession {
     /// 打开 PTY 并 spawn shell，按配置注入 shell integration。
     pub fn spawn(config: &PtySessionConfig) -> Result<Self, SpawnError> {
+        if let Some(cwd) = &config.cwd {
+            let authorized = config
+                .workspace_auth
+                .as_ref()
+                .is_some_and(|registry| registry.is_authorized(cwd));
+            if !authorized {
+                return Err(SpawnError::Spawn(format!(
+                    "workspace is not authorized for PTY cwd: {cwd}"
+                )));
+            }
+        }
+        #[cfg(windows)]
+        let _spawn_guard = conpty_spawn_lock()
+            .lock()
+            .map_err(|_| SpawnError::Spawn("ConPTY spawn lock poisoned".into()))?;
         let pty_system = portable_pty::native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -75,10 +96,23 @@ impl PtySession {
         let (cmd, integration_dir) = build_command(kind, config)?;
 
         // child spawn 在 slave 上（CommandBuilder 按值消费）。
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| SpawnError::Spawn(e.to_string()))?;
+
+        #[cfg(windows)]
+        let job = match child
+            .process_id()
+            .ok_or_else(|| SpawnError::Spawn("spawned shell has no process id".into()))
+            .and_then(WindowsJob::for_process)
+        {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error);
+            }
+        };
 
         // 关键：spawn 后释放 slave 句柄，否则 PTY 不回 EOF、reader 可能挂死（spec 技术要点）。
         drop(pair.slave);
@@ -93,6 +127,8 @@ impl PtySession {
             writer: Arc::new(Mutex::new(writer)),
             child,
             _integration_dir: integration_dir,
+            #[cfg(windows)]
+            _job: job,
         })
     }
 
@@ -140,15 +176,93 @@ impl PtySession {
 /// Unix 跟随 `$SHELL`（zsh/bash/fish）；Windows 依次探测 pwsh → powershell → cmd。
 pub fn default_shell() -> ShellKind {
     if cfg!(windows) {
-        which("pwsh")
-            .or_else(|_| which("powershell"))
-            .map(|_| ShellKind::Pwsh)
-            .unwrap_or(ShellKind::Cmd)
+        if which("pwsh").is_ok() {
+            ShellKind::Pwsh
+        } else if which("powershell").is_ok() {
+            ShellKind::PowerShell
+        } else {
+            ShellKind::Cmd
+        }
     } else {
         match std::env::var("SHELL").ok().as_deref() {
             Some(s) if s.contains("zsh") => ShellKind::Zsh,
             Some(s) if s.contains("bash") => ShellKind::Bash,
             _ => ShellKind::Bash,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn conpty_spawn_lock() -> &'static Mutex<()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[cfg(windows)]
+struct WindowsJob(isize);
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn for_process(pid: u32) -> Result<Self, SpawnError> {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+
+        // SAFETY: All handles are checked for null, the information pointer and length match the
+        // Windows structure, and ownership is transferred into WindowsJob only after assignment.
+        unsafe {
+            let job: HANDLE = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return Err(SpawnError::Spawn(
+                    std::io::Error::last_os_error().to_string(),
+                ));
+            }
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const std::ffi::c_void,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+            {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(SpawnError::Spawn(error.to_string()));
+            }
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if process.is_null() {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(SpawnError::Spawn(error.to_string()));
+            }
+            let assigned = AssignProcessToJobObject(job, process);
+            CloseHandle(process);
+            if assigned == 0 {
+                let error = std::io::Error::last_os_error();
+                CloseHandle(job);
+                return Err(SpawnError::Spawn(error.to_string()));
+            }
+            Ok(Self(job as isize))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        // SAFETY: This is the unique owned job handle; closing it triggers KILL_ON_JOB_CLOSE.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(
+                self.0 as windows_sys::Win32::Foundation::HANDLE,
+            );
         }
     }
 }

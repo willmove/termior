@@ -26,6 +26,27 @@ pub enum ProviderKind {
     Ollama,
 }
 
+impl ProviderKind {
+    pub fn from_settings_id(id: &str) -> Option<Self> {
+        Some(match id {
+            "anthropic" => Self::Anthropic,
+            "open_ai" | "openai" => Self::OpenAi,
+            "google" | "gemini" => Self::Google,
+            "groq" => Self::Groq,
+            "xai" => Self::Xai,
+            "cerebras" => Self::Cerebras,
+            "open_router" | "openrouter" => Self::OpenRouter,
+            "deep_seek" | "deepseek" => Self::DeepSeek,
+            "mistral" => Self::Mistral,
+            "open_ai_compatible" | "compatible" => Self::OpenAiCompatible,
+            "lm_studio" | "lm-studio" => Self::LmStudio,
+            "mlx" => Self::Mlx,
+            "ollama" => Self::Ollama,
+            _ => return None,
+        })
+    }
+}
+
 /// 一个模型条目。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelEntry {

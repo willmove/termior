@@ -21,6 +21,8 @@ pub enum ToolId {
     RunCommand,
     ShellSessionRun,
     ShellBgSpawn,
+    /// Delegate a bounded task to a child agent; spawn remains approval-gated (FR-PLAN-02/04).
+    RunSubagent,
     /// 实时上下文桥（FR-AGENT-07）——只读快照，自动执行。
     GetTerminalContext,
 }
@@ -39,6 +41,7 @@ impl ToolId {
             ToolId::RunCommand => "run_command",
             ToolId::ShellSessionRun => "shell_session_run",
             ToolId::ShellBgSpawn => "shell_bg_spawn",
+            ToolId::RunSubagent => "run_subagent",
             ToolId::GetTerminalContext => "get_terminal_context",
         }
     }
@@ -57,7 +60,8 @@ impl ToolId {
             | ToolId::Delete
             | ToolId::RunCommand
             | ToolId::ShellSessionRun
-            | ToolId::ShellBgSpawn => ToolLevel::Approval,
+            | ToolId::ShellBgSpawn
+            | ToolId::RunSubagent => ToolLevel::Approval,
         }
     }
 
@@ -88,6 +92,7 @@ pub const ALL_TOOLS: &[ToolId] = &[
     ToolId::RunCommand,
     ToolId::ShellSessionRun,
     ToolId::ShellBgSpawn,
+    ToolId::RunSubagent,
     ToolId::GetTerminalContext,
 ];
 
@@ -118,6 +123,7 @@ mod tests {
             ToolId::RunCommand,
             ToolId::ShellSessionRun,
             ToolId::ShellBgSpawn,
+            ToolId::RunSubagent,
         ] {
             assert_eq!(
                 t.level(),

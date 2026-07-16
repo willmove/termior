@@ -12,16 +12,24 @@
 #![forbid(unsafe_code)]
 
 pub mod atomic;
+pub mod collections;
 pub mod keymap;
 pub mod migrate;
 pub mod paths;
 pub mod settings;
 
 pub use atomic::{atomic_write, AtomicWriteError};
-pub use keymap::{default_keymap, KeyAction, KeyBinding, KeymapEntry, Platform};
+pub use collections::{DataFiles, JsonStore, JsonStoreError};
+pub use keymap::{
+    default_keymap, KeyAction, KeyBinding, KeymapConflict, KeymapEntry, Platform, UserKeyBinding,
+    UserKeymap,
+};
 pub use migrate::{migrate, MigrationError, SCHEMA_VERSION};
 pub use paths::{app_data_dir, AppDataError};
-pub use settings::{default_settings, Settings, TerminalSettings};
+pub use settings::{
+    default_settings, BackgroundSettings, ModelProviderSettings, ModelSettings, Settings,
+    TerminalSettings,
+};
 
 /// FR-SEC-06 / INV-5：扫描待落盘文本是否含形似密钥的明文。命中返回错误。
 ///

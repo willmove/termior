@@ -6,7 +6,6 @@
 
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
 use termior_terminal::{PtyData, PtySessionConfig, TerminalBridge};
 
 /// 收集 channel 输出直到满足谓词或超时。
@@ -18,14 +17,13 @@ fn collect_until<F: Fn(&str) -> bool>(
     let deadline = Instant::now() + timeout;
     let mut acc = String::new();
     while Instant::now() < deadline {
-        match rx.try_next() {
-            Ok(Some(data)) => {
+        match rx.try_recv() {
+            Ok(data) => {
                 acc.push_str(&String::from_utf8_lossy(&data.bytes));
                 if pred(&acc) {
                     return acc;
                 }
             }
-            Ok(None) => break,
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
         }
     }

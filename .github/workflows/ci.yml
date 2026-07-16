@@ -1,11 +1,4 @@
-# CI — 纯逻辑核心三平台门禁
-#
-# 范围：8 个纯逻辑 crate（排除 termior-app 与 termior-terminal）。
-#   termior-app 依赖 GPUI（zed git rev 3565c49），warm 编译 ~5min、依赖树巨大。
-#   termior-terminal 依赖 portable-pty/alacritty_terminal（运行时重型依赖），
-#   且其 PTY 回环测试在 headless CI 行为不稳定，故与渲染层一并暂不进 CI。
-#   两者均在本地可编译与测试（见 README「构建」）。
-# 对齐 spec：R1（三平台 P0）、R6（CI 持续构建与测试）、NFR-10（可测性）。
+# CI — domain/runtime crates on three platforms plus a Windows desktop compile gate.
 name: CI
 
 on:
@@ -23,8 +16,8 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  pure-logic:
-    name: Pure-logic (${{ matrix.os }})
+  core:
+    name: Core (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -48,10 +41,27 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --exclude termior-app --exclude termior-terminal -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude termior-app -- -D warnings
 
       - name: Build
-        run: cargo build --workspace --exclude termior-app --exclude termior-terminal --all-targets
+        run: cargo build --workspace --exclude termior-app --all-targets
 
       - name: Test
-        run: cargo test --workspace --exclude termior-app --exclude termior-terminal --all-targets
+        run: cargo test --workspace --exclude termior-app --all-targets
+
+  desktop-check:
+    name: GPUI desktop (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - name: Check desktop application
+        run: cargo check -p termior-app
+      - name: Clippy desktop application
+        run: cargo clippy -p termior-app --all-targets -- -D warnings

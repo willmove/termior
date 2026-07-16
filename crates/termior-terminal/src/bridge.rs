@@ -11,12 +11,16 @@ use std::thread;
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::pty::{PtySession, PtySessionConfig, SpawnError};
+use termior_preview::LocalhostDetector;
+use termior_terminal_core::{OscEvent, OscStreamFilter};
 
 /// 从 PTY reader 线程流向消费方的一批数据。
 #[derive(Debug)]
 pub struct PtyData {
-    /// PTY 原始输出字节（含 ANSI/OSC 序列），消费方喂给 vte::Parser 与 OscParser。
+    /// PTY output with Termior OSC 7/133/777 removed, ready for the VTE parser.
     pub bytes: Vec<u8>,
+    pub events: Vec<OscEvent>,
+    pub localhost_urls: Vec<String>,
 }
 
 /// PTY 会话 + reader 线程 + 输出 channel 的统一句柄。
@@ -80,16 +84,38 @@ impl TerminalBridge {
     }
 }
 
+impl Drop for TerminalBridge {
+    fn drop(&mut self) {
+        // Closing a terminal tab must terminate its shell. On Windows the session's Job Object
+        // then tears down the complete child tree; on Unix this also releases the PTY master.
+        let _ = self.session.kill();
+    }
+}
+
 /// reader 线程主循环：循环 read，每批投递到 channel；PTY EOF 或 channel 关闭时退出。
 fn run_reader(reader: &mut Box<dyn Read + Send>, tx: UnboundedSender<PtyData>) {
     let mut buf = [0u8; 8192];
+    let mut osc_filter = OscStreamFilter::new();
+    let mut url_detector = LocalhostDetector::default();
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF：子进程关闭了输出
             Ok(n) => {
-                let bytes = buf[..n].to_vec();
+                let filtered = osc_filter.feed(&buf[..n]);
+                let localhost_urls = url_detector
+                    .feed(&filtered.visible)
+                    .into_iter()
+                    .map(|url| url.to_string())
+                    .collect();
                 // channel 关闭（消费方 drop）时退出循环。
-                if tx.unbounded_send(PtyData { bytes }).is_err() {
+                if tx
+                    .unbounded_send(PtyData {
+                        bytes: filtered.visible,
+                        events: filtered.events,
+                        localhost_urls,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }

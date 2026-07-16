@@ -9,8 +9,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod filter;
 pub mod osc;
+pub mod search;
 pub mod shell_integration;
+
+pub use filter::{FilteredOutput, OscStreamFilter};
+pub use search::{find_hyperlinks, SearchHit, TerminalSearch};
 
 pub use osc::{OscEvent, OscParser, PromptMark};
 pub use shell_integration::{ShellIntegrationSnippets, ShellKind};

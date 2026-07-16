@@ -10,9 +10,19 @@ portable-pty = { workspace = true }
 alacritty_terminal = { workspace = true }
 vte = { workspace = true }
 termior-terminal-core = { workspace = true }
+termior-preview = { workspace = true }
+termior-security = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]

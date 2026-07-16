@@ -1,8 +1,8 @@
 //! Provider 抽象层（FR-PROV）。
 //!
 //! `Provider` trait 统一不同模型服务的流式消息、工具调用与错误语义。
-//! 各家做请求/响应适配器（FR-PROV-01，P0 首发 Anthropic + OpenAI + OpenAI-compatible，
-//! 真实 HTTP 留待可编译验证里程碑）。本 crate 提供 [`MockProvider`] 跑通 Agent 循环。
+//! [`crate::http_provider::HttpProvider`] 负责各家请求/响应适配；本模块同时提供
+//! [`MockProvider`]，用于不访问网络地验证 Agent 循环。
 
 use crate::message::{ChatEvent, Message};
 use crate::tools::ToolRegistry;

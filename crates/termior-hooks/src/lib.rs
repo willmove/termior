@@ -107,6 +107,57 @@ pub enum HooksError {
     NotAnObject,
     #[error("json serialization failed: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("could not resolve the user home directory")]
+    HomeUnavailable,
+    #[error("hook settings I/O failed: {0}")]
+    Io(String),
+}
+
+/// Resolve Claude Code's settings through the platform directory API (never by reading HOME).
+pub fn claude_settings_path() -> Result<std::path::PathBuf, HooksError> {
+    dirs::home_dir()
+        .map(|home| home.join(".claude").join("settings.json"))
+        .ok_or(HooksError::HomeUnavailable)
+}
+
+pub fn install() -> Result<InstallResult, HooksError> {
+    install_at(&claude_settings_path()?)
+}
+
+pub fn uninstall() -> Result<UninstallResult, HooksError> {
+    uninstall_at(&claude_settings_path()?)
+}
+
+pub fn status() -> Result<InstallStatus, HooksError> {
+    status_at(&claude_settings_path()?)
+}
+
+pub fn install_at(path: &std::path::Path) -> Result<InstallResult, HooksError> {
+    let existing = read_existing(path)?;
+    let result = merge_install(&existing)?;
+    termior_store::atomic_write(path, &result.json)
+        .map_err(|error| HooksError::Io(error.to_string()))?;
+    Ok(result)
+}
+
+pub fn uninstall_at(path: &std::path::Path) -> Result<UninstallResult, HooksError> {
+    let existing = read_existing(path)?;
+    let result = merge_uninstall(&existing)?;
+    termior_store::atomic_write(path, &result.json)
+        .map_err(|error| HooksError::Io(error.to_string()))?;
+    Ok(result)
+}
+
+pub fn status_at(path: &std::path::Path) -> Result<InstallStatus, HooksError> {
+    is_installed(&read_existing(path)?)
+}
+
+fn read_existing(path: &std::path::Path) -> Result<String, HooksError> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(HooksError::Io(error.to_string())),
+    }
 }
 
 /// 把三条 Termior hook 合并进现有 settings 文本。

@@ -1,5 +1,8 @@
 # Termior P0 纯逻辑核心 — 实现报告与需求映射
 
+> **历史快照**：本文记录项目早期 P0 纯逻辑阶段，测试数量和“尚未覆盖”条目不代表当前状态。
+> 当前阶段交付边界与验证门槛见 [`desktop-milestone.md`](desktop-milestone.md)。
+
 > 本文档记录 P0 需求的实现范围、需求 → 模块/测试 的可追溯映射，以及尚未覆盖的项。
 > 对应 Spec：`docs/termior-spec.md`。
 

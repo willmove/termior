@@ -1,12 +1,12 @@
 //! `TerminalView` — GPUI 终端视图（FR-TERM-08 渲染 / FR-TERM-01 键盘）。
 //!
-//! 持有 alacritty `Term` 网格、vte `Processor`、`OscParser`，消费 PTY reader 线程的字节流。
+//! 持有 alacritty `Term` 网格与 vte `Processor`，消费 PTY reader 线程过滤后的字节流。
 //! 渲染用 canvas 逐 cell 绘制（背景 paint_quad + 前景文本 run），键盘经 keystroke 映射写回 PTY。
-//! OSC 7/133/777 经 OscParser 旁路嗅探，M1 先 log。
+//! OSC 7/133/777 经 `OscParser` 旁路嗅探，并同步 cwd、shell integration 与代理状态。
 
 use alacritty_terminal::{
     event::VoidListener,
-    grid::Dimensions,
+    grid::{Dimensions, Scroll},
     term::{Config as TermConfig, RenderableContent, Term},
     vte::ansi::{
         Color as VteColor, CursorShape, NamedColor, Processor as VteProcessor, Rgb, StdSyncHandler,
@@ -14,13 +14,16 @@ use alacritty_terminal::{
 };
 use futures::StreamExt;
 use gpui::{
-    canvas, div, fill, point, px, App, Bounds, Context, FocusHandle, Focusable, Font, FontFeatures,
-    FontStyle, FontWeight, Hsla, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
-    Pixels, Point, Render, SharedString, Styled, Task, TextAlign, TextRun, Window,
+    canvas, div, fill, point, prelude::FluentBuilder, px, App, Bounds, Context, FocusHandle,
+    Focusable, Font, FontFeatures, FontStyle, FontWeight, Hsla, InputHandler, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent,
+    SharedString, Styled, Task, TextAlign, TextRun, UTF16Selection, WeakEntity, Window,
 };
 use termior_terminal::{PtySessionConfig, TerminalBridge};
-use termior_terminal_core::OscParser;
+use termior_terminal_core::osc::{AgentState, OscEvent};
+use termior_terminal_core::{find_hyperlinks, TerminalSearch};
 use termior_theme::{Color as ThemeColor, ResolvedPalette, TerminalPalette};
+use termior_ui_kit::SearchOverlay;
 
 use crate::keystroke::keystroke_to_pty_bytes;
 
@@ -33,13 +36,19 @@ pub struct TerminalView {
     bridge: TerminalBridge,
     term: Term<VoidListener>,
     vte_processor: VteProcessor<StdSyncHandler>,
-    osc_parser: OscParser,
     palette: ResolvedPalette,
     focus_handle: FocusHandle,
     /// PTY 字节消费任务（持有以避免被取消）。
     _consumer: Task<()>,
     cols: usize,
     rows: usize,
+    latest_cwd: Option<String>,
+    localhost_urls: Vec<String>,
+    agent_state: Option<AgentState>,
+    marked_text: String,
+    search_overlay: SearchOverlay,
+    search: TerminalSearch,
+    snapshot_text: String,
 }
 
 impl TerminalView {
@@ -82,6 +91,8 @@ impl TerminalView {
             let mut first_byte_seen = false;
             while let Some(data) = rx.next().await {
                 let bytes = data.bytes;
+                let events = data.events;
+                let localhost_urls = data.localhost_urls;
                 let _ = this.update(cx, |view, cx| {
                     if !first_byte_seen {
                         first_byte_seen = true;
@@ -100,8 +111,18 @@ impl TerminalView {
                         let _ = view.bridge.writer().write_all(reply.as_bytes());
                     }
                     view.vte_processor.advance(&mut view.term, &bytes);
-                    for ev in view.osc_parser.feed(&bytes) {
+                    for ev in events {
                         log::info!("OSC event: {ev:?}");
+                        match ev {
+                            OscEvent::Cwd { path, .. } => view.latest_cwd = Some(path),
+                            OscEvent::AgentEvent(state) => view.agent_state = Some(state),
+                            _ => {}
+                        }
+                    }
+                    for url in localhost_urls {
+                        if !view.localhost_urls.contains(&url) {
+                            view.localhost_urls.push(url);
+                        }
                     }
                     cx.notify();
                 });
@@ -113,13 +134,35 @@ impl TerminalView {
             bridge,
             term,
             vte_processor: VteProcessor::<StdSyncHandler>::default(),
-            osc_parser: OscParser::new(),
             palette,
             focus_handle,
             _consumer: consumer,
             cols,
             rows,
+            latest_cwd: None,
+            localhost_urls: Vec::new(),
+            agent_state: None,
+            marked_text: String::new(),
+            search_overlay: SearchOverlay::default(),
+            search: TerminalSearch::default(),
+            snapshot_text: String::new(),
         }
+    }
+
+    pub fn latest_cwd(&self) -> Option<&str> {
+        self.latest_cwd.as_deref()
+    }
+
+    pub fn localhost_urls(&self) -> &[String] {
+        &self.localhost_urls
+    }
+
+    pub fn agent_state(&self) -> Option<AgentState> {
+        self.agent_state
+    }
+
+    pub fn recent_text(&self) -> String {
+        termior_ai::context::tail_lines(&self.snapshot_text, 300)
     }
 
     /// resize 终端网格与 PTY（窗口尺寸变化时调用；M1 预留，后续接布局事件）。
@@ -139,17 +182,77 @@ impl TerminalView {
     }
 
     /// 处理键盘输入：编码成 PTY 字节写回。
-    fn handle_key_down(
-        &mut self,
-        ev: &KeyDownEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
+    fn handle_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let modifiers = ev.keystroke.modifiers;
+        let key = ev.keystroke.key.as_str();
+        let primary = if cfg!(target_os = "macos") {
+            modifiers.platform
+        } else {
+            modifiers.control
+        };
+        if primary && key == "f" {
+            self.search_overlay.open();
+            self.update_search();
+            cx.notify();
+            return;
+        }
+        if self.search_overlay.visible {
+            match key {
+                "escape" => self.search_overlay.close(),
+                "enter" | "return" => {
+                    self.search.next(modifiers.shift);
+                    self.search_overlay.current = self.search.current;
+                }
+                "backspace" => {
+                    self.search_overlay.query.pop();
+                    self.update_search();
+                }
+                "c" if modifiers.alt => {
+                    self.search_overlay.options.case_sensitive =
+                        !self.search_overlay.options.case_sensitive;
+                    self.update_search();
+                }
+                _ => return,
+            }
+            cx.notify();
+            return;
+        }
         let bytes = keystroke_to_pty_bytes(&ev.keystroke);
+        if ev.keystroke.key_char.is_some()
+            && !modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+        {
+            // Committed text, including IME, is delivered through InputHandler.
+            return;
+        }
         if !bytes.is_empty() {
             if let Err(e) = self.bridge.writer().write_all(&bytes) {
                 log::warn!("PTY write error: {e}");
             }
+        }
+    }
+
+    fn update_search(&mut self) {
+        self.search.query = self.search_overlay.query.clone();
+        self.search.case_sensitive = self.search_overlay.options.case_sensitive;
+        self.search.update(&self.snapshot_text);
+        self.search_overlay.set_results(self.search.hits.len());
+        self.search_overlay.current = self.search.current;
+    }
+
+    fn handle_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pixels = event.delta.pixel_delta(window.line_height()).y.as_f32();
+        let line_height = window.line_height().as_f32().max(1.0);
+        let lines = (pixels / line_height).round() as i32;
+        if lines != 0 {
+            self.term.scroll_display(Scroll::Delta(lines));
+            cx.notify();
         }
     }
 }
@@ -159,10 +262,24 @@ impl Render for TerminalView {
         let bg = theme_color_to_hsla(self.palette.background);
         let fg = theme_color_to_hsla(self.palette.foreground);
         let focus = self.focus_handle.clone();
+        let input_focus = focus.clone();
+        let input_handler = TerminalInputHandler {
+            view: cx.entity().downgrade(),
+        };
 
         // 提前把 renderable content 收集成 owned 数据，避免 'static paint 闭包借用 &self.term。
         let content = self.term.renderable_content();
         let snapshot: RenderSnapshot = collect_snapshot(content);
+        self.snapshot_text = snapshot_to_text(&snapshot);
+        self.update_search();
+        let search = self.search.clone();
+        let links = find_hyperlinks(&self.snapshot_text)
+            .into_iter()
+            .filter_map(|range| self.snapshot_text.get(range).map(str::to_owned))
+            .collect::<Vec<_>>();
+        let marked_text = self.marked_text.clone();
+        let marked_col = snapshot.cursor.col;
+        let marked_row = snapshot.cursor.row.max(0) as usize;
         let palette = self.palette.clone();
         let cols = self.cols;
         let rows = self.rows;
@@ -171,11 +288,13 @@ impl Render for TerminalView {
             .id("terminal-view")
             .track_focus(&focus)
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_scroll_wheel(cx.listener(Self::handle_scroll))
             .size_full()
             .bg(bg)
             .text_color(fg)
             .child(canvas(
-                move |bounds, window, _cx| {
+                move |bounds, window, cx| {
+                    window.handle_input(&input_focus, input_handler.clone(), cx);
                     let line_height = window.line_height();
                     let cell_width = cell_advance_width(window);
                     LayoutInfo {
@@ -187,9 +306,185 @@ impl Render for TerminalView {
                     }
                 },
                 move |_bounds, layout: LayoutInfo, window, cx| {
-                    paint_terminal(&layout, &snapshot, &palette, window, cx);
+                    paint_terminal(&layout, &snapshot, &palette, &search, window, cx);
                 },
             ))
+            .when(!marked_text.is_empty(), |element| {
+                element.child(
+                    div()
+                        .absolute()
+                        .left(px(marked_col as f32 * 8.4 + 2.0))
+                        .top(px(marked_row as f32 * 18.0 + 1.0))
+                        .px_1()
+                        .bg(gpui::rgba(0x365880ff))
+                        .child(SharedString::from(marked_text)),
+                )
+            })
+            .when(self.search_overlay.visible, |element| {
+                element.child(
+                    div()
+                        .absolute()
+                        .top(px(8.0))
+                        .right(px(10.0))
+                        .flex()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(gpui::rgba(0x4f8fefff))
+                        .bg(gpui::rgba(0x202733ff))
+                        .child(SharedString::from(format!(
+                            "Find: {}▏",
+                            self.search_overlay.query
+                        )))
+                        .child(SharedString::from(format!(
+                            "{}/{} · {}",
+                            if self.search_overlay.total == 0 {
+                                0
+                            } else {
+                                self.search_overlay.current + 1
+                            },
+                            self.search_overlay.total,
+                            if self.search_overlay.options.case_sensitive {
+                                "Aa"
+                            } else {
+                                "aa"
+                            }
+                        ))),
+                )
+            })
+            .when(!links.is_empty(), |element| {
+                element.child(
+                    div()
+                        .absolute()
+                        .bottom(px(6.0))
+                        .left(px(6.0))
+                        .flex()
+                        .gap_1()
+                        .children(links.into_iter().take(3).enumerate().map(|(index, url)| {
+                            let target = url.clone();
+                            div()
+                                .id(SharedString::from(format!("terminal-link-{index}")))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(gpui::rgba(0x293241dd))
+                                .cursor_pointer()
+                                .text_xs()
+                                .child(SharedString::from(url))
+                                .on_mouse_down(gpui::MouseButton::Left, move |_, _, _| {
+                                    let _ = termior_platform::open_external(&target);
+                                })
+                        })),
+                )
+            })
+    }
+}
+
+#[derive(Clone)]
+struct TerminalInputHandler {
+    view: WeakEntity<TerminalView>,
+}
+
+impl InputHandler for TerminalInputHandler {
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<std::ops::Range<usize>> {
+        let view = self.view.upgrade()?;
+        let length = view.read(cx).marked_text.encode_utf16().count();
+        (length > 0).then_some(0..length)
+    }
+
+    fn text_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _actual_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<String> {
+        None
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _replacement_range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(view) = self.view.upgrade() {
+            view.update(cx, |view, cx| {
+                if view.search_overlay.visible {
+                    view.search_overlay.query.push_str(text);
+                    view.update_search();
+                    cx.notify();
+                    return;
+                }
+                view.marked_text.clear();
+                if let Err(error) = view.bridge.writer().write_all(text.as_bytes()) {
+                    log::warn!("PTY IME write error: {error}");
+                }
+                cx.notify();
+            });
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _replacement_range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _new_marked_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(view) = self.view.upgrade() {
+            view.update(cx, |view, cx| {
+                view.marked_text = new_text.to_owned();
+                cx.notify();
+            });
+        }
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut App) {
+        if let Some(view) = self.view.upgrade() {
+            view.update(cx, |view, cx| {
+                view.marked_text.clear();
+                cx.notify();
+            });
+        }
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range: std::ops::Range<usize>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        None
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<usize> {
+        None
     }
 }
 
@@ -241,6 +536,21 @@ fn collect_snapshot(content: RenderableContent<'_>) -> RenderSnapshot {
         row: cursor.point.line.0,
     };
     RenderSnapshot { cells, cursor }
+}
+
+fn snapshot_to_text(snapshot: &RenderSnapshot) -> String {
+    let mut rows = std::collections::BTreeMap::<i32, Vec<char>>::new();
+    for (row, column, cell) in &snapshot.cells {
+        let line = rows.entry(*row).or_default();
+        if line.len() <= *column {
+            line.resize(*column + 1, ' ');
+        }
+        line[*column] = cell.c;
+    }
+    rows.into_values()
+        .map(|line| line.into_iter().collect::<String>().trim_end().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl Focusable for TerminalView {
@@ -312,6 +622,7 @@ fn paint_terminal(
     layout: &LayoutInfo,
     snapshot: &RenderSnapshot,
     palette: &ResolvedPalette,
+    search: &TerminalSearch,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -321,6 +632,7 @@ fn paint_terminal(
     let lh = layout.line_height;
     let cw = layout.cell_width;
     let origin = layout.origin;
+    let first_row = snapshot.cells.first().map(|cell| cell.0).unwrap_or(0);
 
     // 1) 整体刷背景
     let total_bounds = Bounds {
@@ -371,6 +683,25 @@ fn paint_terminal(
                 size: gpui::size(px(cw), lh),
             };
             window.paint_quad(fill(cb, cell_bg));
+        }
+
+        let search_line = (*row - first_row).max(0) as usize;
+        if let Some((hit_index, _)) = search
+            .hits
+            .iter()
+            .enumerate()
+            .find(|(_, hit)| hit.line == search_line && hit.char_range.contains(col))
+        {
+            let bounds = Bounds {
+                origin: point(origin.x + px(*col as f32 * cw), origin.y + lh * *row as f32),
+                size: gpui::size(px(cw), lh),
+            };
+            let color = if hit_index == search.current {
+                gpui::hsla(0.10, 0.85, 0.55, 0.75)
+            } else {
+                gpui::hsla(0.12, 0.70, 0.45, 0.45)
+            };
+            window.paint_quad(fill(bounds, color));
         }
 
         // 分段：fg/bg 变化时 flush
