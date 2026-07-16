@@ -8,7 +8,7 @@ mod keystroke;
 mod terminal_view;
 
 use gpui::{
-    div, prelude::*, px, size, App, Bounds, Context, Entity, Focusable, FontWeight, MouseButton,
+    div, prelude::*, px, size, App, Bounds, Context, Entity, FontWeight, MouseButton,
     MouseDownEvent, SharedString, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
@@ -48,30 +48,35 @@ impl Workspace {
     }
 
     /// 创建第一个终端 tab（若尚无）。
-    /// PTY spawn 在 cx.new() 外完成（避免阻塞 GPUI 事件借用周期导致 RefCell 重入）。
+    /// 点击「打开终端」：把 PTY spawn 放进 cx.spawn 异步任务，避免在鼠标事件回调里
+    /// 同步阻塞（ConPTY 初始化会卡住 GPUI 事件借用周期，导致 "RefCell already borrowed"）。
     fn spawn_terminal(
         &mut self,
         _ev: &MouseDownEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.terminal.is_some() {
             return;
         }
-        // 先同步 spawn PTY（在 GPUI borrow 周期外），拿到 bridge 后再建 view。
-        let bridge = match termior_terminal::TerminalBridge::spawn(&Default::default()) {
-            Ok(b) => b,
-            Err(e) => {
-                log::error!("PTY spawn failed: {e}");
-                return;
-            }
-        };
         let palette = self.palette.clone();
-        let terminal = cx.new(|cx| TerminalView::from_bridge(bridge, palette, cx));
-        let handle = terminal.read(cx).focus_handle(cx);
-        self.terminal = Some(terminal);
-        window.focus(&handle, cx);
-        cx.notify();
+        cx.spawn(async move |ws, cx| {
+            // PTY spawn 在异步任务里同步执行（不持有事件借用周期）。
+            let bridge = match termior_terminal::TerminalBridge::spawn(&Default::default()) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::error!("PTY spawn failed: {e}");
+                    return;
+                }
+            };
+            // 回主线程建 view（焦点经 track_focus 在用户下次点击终端区域时获取）。
+            let _ = ws.update(cx, |view, cx| {
+                let terminal = cx.new(|cx| TerminalView::from_bridge(bridge, palette.clone(), cx));
+                view.terminal = Some(terminal);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 联调用：无 Window 句柄时自动 spawn 终端（不设焦点）。
