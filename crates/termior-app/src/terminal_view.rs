@@ -43,14 +43,27 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
-    /// 创建终端视图：spawn PTY、启动字节消费循环。
+    /// 创建终端视图：内部 spawn PTY、启动字节消费循环。
+    /// 生产路径用 `from_bridge`（在 GPUI borrow 周期外 spawn，避免 RefCell 重入）；
+    /// 本构造函数保留给测试/未来单测场景。
+    #[allow(dead_code)]
     pub fn new(palette: ResolvedPalette, cx: &mut Context<Self>) -> Self {
-        let config = PtySessionConfig::default();
-        let mut bridge = TerminalBridge::spawn(&config).expect("PTY spawn failed");
-        let output_rx = bridge.take_output().expect("output channel");
+        let bridge = TerminalBridge::spawn(&PtySessionConfig::default()).expect("PTY spawn failed");
+        Self::from_bridge(bridge, palette, cx)
+    }
 
-        let cols = config.cols as usize;
-        let rows = config.rows as usize;
+    /// 用已 spawn 的 bridge 创建视图。
+    /// bridge 在 GPUI borrow 周期外创建，避免阻塞事件循环导致 RefCell 重入。
+    pub fn from_bridge(
+        mut bridge: TerminalBridge,
+        palette: ResolvedPalette,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let cols = PtySessionConfig::default().cols as usize;
+        let rows = PtySessionConfig::default().rows as usize;
+        let output_rx = bridge.take_output().expect("output channel");
+        log::info!("PTY attached: cols={cols} rows={rows}");
+
         let term = Term::new(
             TermConfig::default(),
             &TermSize {
@@ -66,17 +79,34 @@ impl TerminalView {
         // Term 非 Send，只能在主线程访问，故字节通过 channel 送回主线程处理。
         let consumer = cx.spawn(async move |this, cx| {
             let mut rx = output_rx;
+            let mut first_byte_seen = false;
             while let Some(data) = rx.next().await {
                 let bytes = data.bytes;
                 let _ = this.update(cx, |view, cx| {
+                    if !first_byte_seen {
+                        first_byte_seen = true;
+                        log::info!(
+                            "first PTY bytes received ({} bytes), feeding Term grid",
+                            bytes.len()
+                        );
+                    }
+                    // 先检测光标位置查询（CPR, CSI 6n / CSI ? 6n）——shell/ConPTY 启动时
+                    // 会问终端光标在哪，不回复则很多 shell（pwsh）卡住不发提示符。
+                    // 必须在 advance 之前检测（advance 后序列已被消费），并按当前光标位回复。
+                    if contains_cpr(&bytes) {
+                        let (row, col) = current_cursor(&view.term);
+                        let reply = format!("\x1b[{row};{col}R");
+                        log::debug!("CPR query detected, replying {reply:?}");
+                        let _ = view.bridge.writer().write_all(reply.as_bytes());
+                    }
                     view.vte_processor.advance(&mut view.term, &bytes);
                     for ev in view.osc_parser.feed(&bytes) {
-                        log::debug!("OSC event: {ev:?}");
+                        log::info!("OSC event: {ev:?}");
                     }
                     cx.notify();
                 });
             }
-            log::debug!("PTY output stream ended");
+            log::info!("PTY output stream ended");
         });
 
         Self {
@@ -217,6 +247,32 @@ impl Focusable for TerminalView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
+}
+
+/// 检测字节流是否包含光标位置查询（CPR: `CSI 6 n` 或带私有的 `CSI ? 6 n`）。
+/// shell/ConPTY 启动时常发此查询，不回复则部分 shell（pwsh）卡住不发提示符。
+fn contains_cpr(bytes: &[u8]) -> bool {
+    // 简化匹配：查找 ESC [ ? 6 n 或 ESC [ 6 n（允许中间有 ;0 等参数）
+    // 用子串搜索避免手写状态机；CPR 在正常输出里极罕见，误检代价低。
+    for w in bytes.windows(4) {
+        if w == b"\x1b[6n" {
+            return true;
+        }
+    }
+    for w in bytes.windows(5) {
+        if w == b"\x1b[?6n" {
+            return true;
+        }
+    }
+    false
+}
+
+/// 取 Term 当前光标位置（1-based row/col，CPR 回复格式）。
+fn current_cursor(term: &Term<VoidListener>) -> (u16, u16) {
+    let p = &term.grid().cursor.point;
+    let row = (p.line.0 + 1).max(1) as u16;
+    let col = (p.column.0 + 1).max(1) as u16;
+    (row, col)
 }
 
 /// 等宽字体的单字 advance 宽度（cell 宽）。

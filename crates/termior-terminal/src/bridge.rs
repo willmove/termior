@@ -111,8 +111,11 @@ pub struct WriterHandle {
 }
 
 impl WriterHandle {
-    /// 写入字节（如键盘编码后的 ANSI 序列）。
+    /// 写入字节（如键盘编码后的 ANSI 序列、CPR 回复）并 flush。
     pub fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.inner.lock().unwrap().write_all(bytes)
+        let mut w = self.inner.lock().unwrap();
+        w.write_all(bytes)?;
+        w.flush()?;
+        Ok(())
     }
 }

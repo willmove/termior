@@ -48,19 +48,57 @@ impl Workspace {
     }
 
     /// 创建第一个终端 tab（若尚无）。
+    /// PTY spawn 在 cx.new() 外完成（避免阻塞 GPUI 事件借用周期导致 RefCell 重入）。
     fn spawn_terminal(
         &mut self,
         _ev: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.terminal.is_none() {
-            let palette = self.palette.clone();
-            let terminal = cx.new(|cx| TerminalView::new(palette, cx));
-            let handle = terminal.read(cx).focus_handle(cx);
-            self.terminal = Some(terminal);
-            window.focus(&handle, cx);
+        if self.terminal.is_some() {
+            return;
         }
+        // 先同步 spawn PTY（在 GPUI borrow 周期外），拿到 bridge 后再建 view。
+        let bridge = match termior_terminal::TerminalBridge::spawn(&Default::default()) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("PTY spawn failed: {e}");
+                return;
+            }
+        };
+        let palette = self.palette.clone();
+        let terminal = cx.new(|cx| TerminalView::from_bridge(bridge, palette, cx));
+        let handle = terminal.read(cx).focus_handle(cx);
+        self.terminal = Some(terminal);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// 联调用：无 Window 句柄时自动 spawn 终端（不设焦点）。
+    fn auto_spawn_terminal(&mut self, cx: &mut Context<Self>) {
+        if self.terminal.is_some() {
+            return;
+        }
+        // 联调开关：TERMior_SHELL=pwsh|powershell|cmd 覆盖默认探测。
+        let mut config = termior_terminal::PtySessionConfig::default();
+        if let Ok(shell) = std::env::var("TERMior_SHELL") {
+            match shell.as_str() {
+                "pwsh" => config.shell = Some(termior_terminal_core::ShellKind::Pwsh),
+                "powershell" => config.shell = Some(termior_terminal_core::ShellKind::PowerShell),
+                "cmd" => config.shell = Some(termior_terminal_core::ShellKind::Cmd),
+                other => log::warn!("unknown TERMior_SHELL={other}, using default"),
+            }
+        }
+        let bridge = match termior_terminal::TerminalBridge::spawn(&config) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("PTY spawn failed: {e}");
+                return;
+            }
+        };
+        let palette = self.palette.clone();
+        let terminal = cx.new(|cx| TerminalView::from_bridge(bridge, palette, cx));
+        self.terminal = Some(terminal);
         cx.notify();
     }
 }
@@ -179,6 +217,21 @@ fn run() {
             },
             |_entity, cx| {
                 let workspace: Entity<Workspace> = cx.new(|_cx| Workspace::new());
+                // 联调开关：设置 TERMior_AUTO_SPAWN=1 时，窗口打开后自动 spawn 终端，
+                // 便于无 GUI 交互的环境验证 PTY→Term→渲染 全链路。默认关闭（保持点击 spawn）。
+                if std::env::var("TERMior_AUTO_SPAWN").ok().as_deref() == Some("1") {
+                    let ws = workspace.downgrade();
+                    cx.spawn(async move |cx| {
+                        // 给窗口一点时间完成首帧。
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(300))
+                            .await;
+                        let _ = ws.update(cx, |view, cx| {
+                            view.auto_spawn_terminal(cx);
+                        });
+                    })
+                    .detach();
+                }
                 workspace
             },
         )

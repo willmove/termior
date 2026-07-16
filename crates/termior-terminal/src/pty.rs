@@ -71,6 +71,7 @@ impl PtySession {
             .map_err(|e| SpawnError::Open(e.to_string()))?;
 
         let kind = config.shell.unwrap_or_else(default_shell);
+        log::info!("PTY spawning shell: {:?} ({})", kind, shell_program(kind));
         let (cmd, integration_dir) = build_command(kind, config)?;
 
         // child spawn 在 slave 上（CommandBuilder 按值消费）。
