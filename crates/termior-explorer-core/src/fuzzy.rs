@@ -2,8 +2,8 @@
 //!
 //! 输入候选路径列表 + 查询串，返回按匹配分数降序排序的结果。Enter 打开、Esc 关闭由上层处理。
 
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
-use nucleo_matcher::pattern::{Pattern, CaseMatching, Normalization};
 
 /// 一次模糊匹配命中。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +24,10 @@ where
         // 空查询：返回全部，分数 0（上层可决定是否展示）
         return candidates
             .into_iter()
-            .map(|c| FuzzyHit { path: c.to_string(), score: 0 })
+            .map(|c| FuzzyHit {
+                path: c.to_string(),
+                score: 0,
+            })
             .collect();
     }
 
@@ -37,7 +40,10 @@ where
         .filter_map(|c| {
             let haystack = Utf32Str::new(c, &mut buf);
             let score = pattern.score(haystack, &mut matcher)?;
-            Some(FuzzyHit { path: c.to_string(), score })
+            Some(FuzzyHit {
+                path: c.to_string(),
+                score,
+            })
         })
         .collect();
 

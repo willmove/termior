@@ -1,0 +1,3 @@
+# clippy 配置：声明 MSRV，与 edition = "2021"（Rust ≥ 1.56）留余量。
+# CI 以 -D warnings 强制（见 .github/workflows/ci.yml）。
+msrv = "1.75"

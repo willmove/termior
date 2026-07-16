@@ -30,7 +30,11 @@ pub const RECENT_LINES_CAP: usize = 300;
 /// 截取缓冲末尾至多 N 行（纯函数，供实现复用）。
 pub fn tail_lines(buf: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = buf.lines().collect();
-    let start = if lines.len() > max_lines { lines.len() - max_lines } else { 0 };
+    let start = if lines.len() > max_lines {
+        lines.len() - max_lines
+    } else {
+        0
+    };
     lines[start..].join("\n")
 }
 
@@ -51,7 +55,10 @@ mod tests {
 
     #[test]
     fn tail_caps_to_max_lines() {
-        let buf = (0..1000).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let buf = (0..1000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let tail = tail_lines(&buf, 300);
         assert_eq!(tail.lines().count(), 300);
         assert!(tail.contains("line 999"));

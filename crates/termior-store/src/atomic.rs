@@ -42,7 +42,8 @@ fn persist_temp(temp: tempfile::TempPath, target: &Path) -> Result<(), AtomicWri
 
 fn persist_named(temp: tempfile::TempPath, target: &Path) -> Result<(), std::io::Error> {
     // tempfile 的 TempPath::persist 会做 rename；在 Windows 上若目标存在会先尝试删除。
-    temp.persist(target).map_err(|e| std::io::Error::other(e.to_string()))?;
+    temp.persist(target)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(())
 }
 

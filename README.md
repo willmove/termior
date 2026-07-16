@@ -4,6 +4,9 @@
 >
 > Spec：[`docs/termior-spec.md`](docs/termior-spec.md)
 
+[![CI](https://github.com/willmove/termior/actions/workflows/ci.yml/badge.svg)](https://github.com/willmove/termior/actions/workflows/ci.yml)
+[![Audit](https://github.com/willmove/termior/actions/workflows/audit.yml/badge.svg)](https://github.com/willmove/termior/actions/workflows/audit.yml)
+
 本仓库当前包含 Spec 的 **P0 纯逻辑核心 + 单元测试**（8 个 Rust crate，216 个测试全绿）。
 GPUI 渲染层（窗口/tab/终端渲染/编辑器视图/Composer UI）待后续里程碑在可编译验证环境接入。
 
@@ -27,13 +30,30 @@ crates/
 
 ## 构建
 
+纯逻辑核心（macOS / Linux / Windows 三平台，stable 工具链）：
+
 ```bash
-cargo build --workspace              # 纯逻辑 crate
-cargo test  --workspace              # 249 单测 + 20 集成 passed
-cargo build -p termior-app           # GPUI 渲染层（gpui warm 编译 ~5min）
-cargo test  -p termior-ai --features keyring-backend   # OS 钥匙串后端
-cargo clippy --workspace --all-targets --exclude termior-app
+cargo build --workspace --exclude termior-app          # 纯逻辑 crate（排除 GPUI 入口）
+cargo test  --workspace --exclude termior-app          # 单测 + 集成
+cargo fmt --all -- --check                            # 格式校验（rustfmt.toml）
+cargo clippy --workspace --all-targets --exclude termior-app -- -D warnings
+cargo deny check --exclude termior-app               # 许可核验（deny.toml，NFR-09；排除 zed 树）
 ```
+
+GPUI 渲染层单独构建（依赖 zed rev `3565c49`，warm 编译 ~5min）：
+
+```bash
+cargo build -p termior-app
+```
+
+可选 feature（默认关闭，CI 默认构建不启用）：
+
+```bash
+cargo test  -p termior-ai --features keyring-backend  # OS 钥匙串后端（FR-PROV-04）
+```
+
+CI（`.github/workflows/ci.yml`）在 macOS/Linux/Windows 三平台并行跑上述纯逻辑门禁；
+`audit.yml` 用 cargo-deny 做 weekly 许可与漏洞巡检。详见 spec §3.1 / NFR-09 / R6。
 
 ## 许可
 

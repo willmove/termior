@@ -38,7 +38,9 @@ pub struct MockProvider {
 
 impl MockProvider {
     pub fn new(scripts: Vec<Vec<ChatEvent>>) -> Self {
-        Self { scripts: std::sync::Mutex::new(scripts) }
+        Self {
+            scripts: std::sync::Mutex::new(scripts),
+        }
     }
 
     /// 单脚本便利构造。

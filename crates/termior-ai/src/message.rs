@@ -27,13 +27,28 @@ pub struct Message {
 
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: content.into(), tool_calls: vec![], tool_result: None }
+        Self {
+            role: Role::User,
+            content: content.into(),
+            tool_calls: vec![],
+            tool_result: None,
+        }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: content.into(), tool_calls: vec![], tool_result: None }
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls: vec![],
+            tool_result: None,
+        }
     }
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: content.into(), tool_calls: vec![], tool_result: None }
+        Self {
+            role: Role::System,
+            content: content.into(),
+            tool_calls: vec![],
+            tool_result: None,
+        }
     }
 }
 
@@ -59,10 +74,18 @@ pub struct ToolResult {
 
 impl ToolResult {
     pub fn success(call_id: impl Into<String>, output: impl Into<String>) -> Self {
-        Self { call_id: call_id.into(), ok: true, output: output.into() }
+        Self {
+            call_id: call_id.into(),
+            ok: true,
+            output: output.into(),
+        }
     }
     pub fn failure(call_id: impl Into<String>, output: impl Into<String>) -> Self {
-        Self { call_id: call_id.into(), ok: false, output: output.into() }
+        Self {
+            call_id: call_id.into(),
+            ok: false,
+            output: output.into(),
+        }
     }
 }
 
@@ -103,7 +126,11 @@ mod tests {
         let m = Message {
             role: Role::Assistant,
             content: "calling".into(),
-            tool_calls: vec![ToolCall { id: "1".into(), name: "read_file".into(), arguments: "{}".into() }],
+            tool_calls: vec![ToolCall {
+                id: "1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            }],
             tool_result: None,
         };
         let json = serde_json::to_string(&m).unwrap();

@@ -106,7 +106,9 @@ fn redteam_ssrf_localhost_random_port_blocked() {
 fn legit_local_provider_whitelisted() {
     let guard = SsrfGuard::new(SsrfGuard::default_local_bases());
     // LM Studio / Ollama 等本地推理应放行（FR-PROV-02）
-    assert!(guard.check("http://127.0.0.1:1234/v1/chat/completions").is_ok());
+    assert!(guard
+        .check("http://127.0.0.1:1234/v1/chat/completions")
+        .is_ok());
     assert!(guard.check("http://127.0.0.1:11434/api/chat").is_ok());
 }
 
@@ -115,15 +117,19 @@ fn legit_local_provider_whitelisted() {
 fn legit_cloud_provider_allowed() {
     let guard = SsrfGuard::new(SsrfGuard::default_local_bases());
     assert!(guard.check("https://api.anthropic.com/v1/messages").is_ok());
-    assert!(guard.check("https://api.openai.com/v1/chat/completions").is_ok());
+    assert!(guard
+        .check("https://api.openai.com/v1/chat/completions")
+        .is_ok());
 }
 
 // —— 场景 12：合法工作区内读写放行 ——
 #[test]
 fn legit_in_workspace_access_allowed() {
     let t = tools();
-    t.check_path_access("read_file", "/proj/src/main.rs", Direction::Read).unwrap();
-    t.check_path_access("write_file", "/proj/src/new.rs", Direction::Write).unwrap();
+    t.check_path_access("read_file", "/proj/src/main.rs", Direction::Read)
+        .unwrap();
+    t.check_path_access("write_file", "/proj/src/new.rs", Direction::Write)
+        .unwrap();
 }
 
 // —— 场景 13：workspace 授权注册表独立可用 ——

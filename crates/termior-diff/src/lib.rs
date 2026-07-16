@@ -227,7 +227,6 @@ pub fn make_insertion_hunk(old: &str, at_line: usize, new_text: &str) -> Hunk {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

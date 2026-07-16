@@ -42,7 +42,10 @@ impl SecretStore for InMemorySecretStore {
         Ok(self.inner.lock().unwrap().get(key).cloned())
     }
     fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
-        self.inner.lock().unwrap().insert(key.to_string(), value.to_string());
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value.to_string());
         Ok(())
     }
     fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
@@ -78,6 +81,9 @@ mod tests {
         s.set("anthropic_key", "sk-ant-xxxxx").unwrap();
         // 没有任何途径把 store 序列化到磁盘——它不实现 Serialize/Deserialize。
         // （此测试是静态断言的占位，运行时只验证能正常存取。）
-        assert_eq!(s.get("anthropic_key").unwrap().as_deref(), Some("sk-ant-xxxxx"));
+        assert_eq!(
+            s.get("anthropic_key").unwrap().as_deref(),
+            Some("sk-ant-xxxxx")
+        );
     }
 }

@@ -95,7 +95,10 @@ mod tests {
     fn authorized_root_allows_itself_and_children() {
         let reg = WorkspaceAuthRegistry::with_roots(["/home/u/proj".to_string()]);
         assert_eq!(reg.check("/home/u/proj"), WorkspaceAuthStatus::Authorized);
-        assert_eq!(reg.check("/home/u/proj/src/main.rs"), WorkspaceAuthStatus::Authorized);
+        assert_eq!(
+            reg.check("/home/u/proj/src/main.rs"),
+            WorkspaceAuthStatus::Authorized
+        );
         assert_eq!(reg.check("/home/u/proj/"), WorkspaceAuthStatus::Authorized);
     }
 
@@ -103,16 +106,28 @@ mod tests {
     fn sibling_dir_not_authorized() {
         // FR-SEC-04：代理不可触达未显式打开的同级目录
         let reg = WorkspaceAuthRegistry::with_roots(["/home/u/proj".to_string()]);
-        assert_eq!(reg.check("/home/u/other-proj"), WorkspaceAuthStatus::NeedsAuthorization);
-        assert_eq!(reg.check("/home/u/other-proj/x.rs"), WorkspaceAuthStatus::NeedsAuthorization);
+        assert_eq!(
+            reg.check("/home/u/other-proj"),
+            WorkspaceAuthStatus::NeedsAuthorization
+        );
+        assert_eq!(
+            reg.check("/home/u/other-proj/x.rs"),
+            WorkspaceAuthStatus::NeedsAuthorization
+        );
     }
 
     #[test]
     fn prefix_attack_blocked() {
         // `/home/u/proj-evil` 不应被 `/home/u/proj` 误判为子路径
         let reg = WorkspaceAuthRegistry::with_roots(["/home/u/proj".to_string()]);
-        assert_eq!(reg.check("/home/u/proj-evil"), WorkspaceAuthStatus::NeedsAuthorization);
-        assert_eq!(reg.check("/home/u/projx"), WorkspaceAuthStatus::NeedsAuthorization);
+        assert_eq!(
+            reg.check("/home/u/proj-evil"),
+            WorkspaceAuthStatus::NeedsAuthorization
+        );
+        assert_eq!(
+            reg.check("/home/u/projx"),
+            WorkspaceAuthStatus::NeedsAuthorization
+        );
     }
 
     #[test]
@@ -133,11 +148,17 @@ mod tests {
     #[test]
     fn authorize_and_revoke() {
         let mut reg = WorkspaceAuthRegistry::new();
-        assert_eq!(reg.check("/work/a"), WorkspaceAuthStatus::NeedsAuthorization);
+        assert_eq!(
+            reg.check("/work/a"),
+            WorkspaceAuthStatus::NeedsAuthorization
+        );
         reg.authorize("/work/a");
         assert_eq!(reg.check("/work/a/file"), WorkspaceAuthStatus::Authorized);
         assert!(reg.revoke("/work/a"));
-        assert_eq!(reg.check("/work/a/file"), WorkspaceAuthStatus::NeedsAuthorization);
+        assert_eq!(
+            reg.check("/work/a/file"),
+            WorkspaceAuthStatus::NeedsAuthorization
+        );
     }
 
     #[test]

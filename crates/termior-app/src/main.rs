@@ -7,11 +7,11 @@
 //! 对齐 Spec §6.1 / §6.7：Theme 结构 + 全局 Entity 是唯一主题源，切换时广播重绘。
 
 use gpui::{
-    App, Bounds, Context, Entity, FontWeight, MouseButton, MouseDownEvent,
-    SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    div, prelude::*, px, size, App, Bounds, Context, Entity, FontWeight, MouseButton,
+    MouseDownEvent, SharedString, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
-use termior_theme::{Appearance, ResolvedPalette, Theme, builtin_themes};
+use termior_theme::{builtin_themes, Appearance, ResolvedPalette, Theme};
 
 /// 工作区根状态：持有当前主题与解析后的调色板（FR-THEME-01：全局 Entity 是唯一主题源）。
 struct Workspace {
@@ -25,7 +25,11 @@ impl Workspace {
         let themes = builtin_themes();
         let current = 0;
         let palette = themes[current].resolve(Appearance::Dark, true);
-        Self { themes, current, palette }
+        Self {
+            themes,
+            current,
+            palette,
+        }
     }
 
     fn current_theme(&self) -> &Theme {
@@ -79,11 +83,10 @@ impl Render for Workspace {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(SharedString::from("Termior")),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .child(SharedString::from(format!("theme: {} ({})", theme_name, theme_id))),
-                    ),
+                    .child(div().text_xs().child(SharedString::from(format!(
+                        "theme: {} ({})",
+                        theme_name, theme_id
+                    )))),
             )
             // 主区域：主题信息 + 状态色板
             .child(
@@ -93,20 +96,17 @@ impl Render for Workspace {
                     .gap_4()
                     .p_6()
                     .child(
-                        div().text_xl().font_weight(FontWeight::SEMIBOLD).child(
-                            SharedString::from("中央主题引擎 · FR-THEME-01/02"),
-                        ),
-                    )
-                    .child(
                         div()
-                            .text_sm()
-                            .child(SharedString::from(format!(
-                                "background {}  surface[0] {}  accent {}",
-                                p.background.to_hex(),
-                                p.surface[0].to_hex(),
-                                p.accent.to_hex()
-                            ))),
+                            .text_xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(SharedString::from("中央主题引擎 · FR-THEME-01/02")),
                     )
+                    .child(div().text_sm().child(SharedString::from(format!(
+                        "background {}  surface[0] {}  accent {}",
+                        p.background.to_hex(),
+                        p.surface[0].to_hex(),
+                        p.accent.to_hex()
+                    ))))
                     // 状态色 swatches
                     .child(
                         div()
@@ -156,13 +156,9 @@ impl Render for Workspace {
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::cycle_theme)),
                     )
-                    .child(
-                        div()
-                            .ml_4()
-                            .text_xs()
-                            .italic()
-                            .child(SharedString::from("点击切换 default ↔ nord，验证主题热切换广播重绘")),
-                    ),
+                    .child(div().ml_4().text_xs().italic().child(SharedString::from(
+                        "点击切换 default ↔ nord，验证主题热切换广播重绘",
+                    ))),
             )
     }
 }

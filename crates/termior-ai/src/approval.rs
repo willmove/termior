@@ -36,7 +36,10 @@ pub struct ApprovalGate {
 
 impl ApprovalGate {
     pub fn new(request: ApprovalRequest) -> Self {
-        Self { request, decision: std::sync::Mutex::new(None) }
+        Self {
+            request,
+            decision: std::sync::Mutex::new(None),
+        }
     }
 
     pub fn request(&self) -> &ApprovalRequest {

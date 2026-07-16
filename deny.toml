@@ -1,0 +1,59 @@
+# cargo-deny 配置 — 对齐 spec NFR-09（Apache-2.0 项目，第三方 crate 需核验许可）
+# 与 spec §3.1「版本与依赖纪律」、风险 R6（依赖纪律与体积）。
+#
+# 用法：cargo deny check
+# schema 版本：cargo-deny 0.20（字段枚举以 `cargo deny init` 实测为准）
+
+# ─────────────────────────────  advisories  ─────────────────────────────
+[advisories]
+# 漏洞数据库（默认 rustsec）。
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# 已知漏洞：deny（CI 红）— 这是 cargo-deny 对 advisories 的默认行为。
+# 已废弃/无维护 crate：仅在 workspace 直接依赖里 warn（不阻断 CI，避免 transitive 误伤）。
+unmaintained = "workspace"
+# 显式忽略的 advisory id（留空；发现无法立即修的告警时在此记录并写明原因）。
+ignore = []
+
+# ─────────────────────────────  licenses  ─────────────────────────────
+[licenses]
+# 允许的许可：宽松型 + Apache，覆盖本项目纯逻辑依赖（serde/similar/nucleo/ignore/
+# globset/dirs/tempfile/thiserror 及其 transitive）的实际许可。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+# 许可文本与 SPDX 标准文本的最低匹配置信度。
+confidence-threshold = 0.8
+# 按 crate 单独放行的许可（留空；实施时按 cargo deny check licenses 报错补充）。
+exceptions = []
+
+# ─────────────────────────────  bans  ─────────────────────────────
+[bans]
+# 重复版本：警告（不阻断，避免误伤 windows/winapi 等合法多版本共存）。
+multiple-versions = "warn"
+# version = "*" 的通配依赖：警告。
+wildcards = "warn"
+# 重复依赖图高亮方式。
+highlight = "all"
+
+# ─────────────────────────────  sources  ─────────────────────────────
+[sources]
+# 未知 registry：警告。
+unknown-registry = "warn"
+# 未知 git 源：警告。
+unknown-git = "warn"
+# 允许的 registry（默认 crates.io）。
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# 允许的 git 源（gpui 来自 zed-industries/zed）。
+allow-git = [
+    "https://github.com/zed-industries/zed",
+]

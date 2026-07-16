@@ -40,8 +40,12 @@ pub fn assert_no_persistent_secret(text: &str) -> Result<(), PersistentSecretErr
 }
 
 fn looks_like_api_key(t: &str) -> bool {
-    let prefixes = ["sk-ant-", "sk-", "xai-", "AIza", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
-    prefixes.iter().any(|p| t.starts_with(p) && t.len() > p.len() + 8)
+    let prefixes = [
+        "sk-ant-", "sk-", "xai-", "AIza", "ghp_", "gho_", "ghu_", "ghs_", "ghr_",
+    ];
+    prefixes
+        .iter()
+        .any(|p| t.starts_with(p) && t.len() > p.len() + 8)
 }
 
 #[derive(Debug, thiserror::Error)]

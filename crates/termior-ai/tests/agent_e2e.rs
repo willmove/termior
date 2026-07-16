@@ -15,7 +15,10 @@ use termior_security::workspace::WorkspaceAuthRegistry;
 /// 与磁盘现有内容做 diff，返回 unified patch（而非直接覆盖）。
 fn exec_write_file(args: &str, disk_content: &str) -> Result<String, String> {
     let v: serde_json::Value = serde_json::from_str(args).map_err(|e| e.to_string())?;
-    let new_content = v.get("content").and_then(|c| c.as_str()).ok_or("missing content")?;
+    let new_content = v
+        .get("content")
+        .and_then(|c| c.as_str())
+        .ok_or("missing content")?;
     let hunks = diff_hunks(disk_content, new_content, 0);
     Ok(termior_diff::render_unified(disk_content, &hunks))
 }
@@ -35,7 +38,10 @@ fn agent_write_file_approved_becomes_hunk_diff_and_lands_exact() {
             tool_calls: vec![ToolCall {
                 id: "c1".into(),
                 name: "write_file".into(),
-                arguments: format!(r#"{{"path":"/proj/a.txt","content":{}}}"#, serde_json::Value::from(proposed)),
+                arguments: format!(
+                    r#"{{"path":"/proj/a.txt","content":{}}}"#,
+                    serde_json::Value::from(proposed)
+                ),
             }],
             tool_result: None,
         })],
@@ -58,7 +64,14 @@ fn agent_write_file_approved_becomes_hunk_diff_and_lands_exact() {
     assert_eq!(pending.tool_name, "write_file");
 
     // 2) 用户接受 → resume
-    let resumed = agent.resume(&outcome.messages, &exec, ApprovalDecision::Approve, &pending).unwrap();
+    let resumed = agent
+        .resume(
+            &outcome.messages,
+            &exec,
+            ApprovalDecision::Approve,
+            &pending,
+        )
+        .unwrap();
     assert_eq!(resumed.state, termior_ai::AgentState::Finished);
 
     // 4) 关键：write_file 不直接写盘，而是产出 hunk diff；用户逐 hunk 接受
