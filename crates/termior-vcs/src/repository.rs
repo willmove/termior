@@ -476,15 +476,11 @@ mod tests {
         let sig = Signature::now("Test", "test@example.com").unwrap();
         raw.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
             .unwrap();
+        // Authorize the same libgit2-normalized workdir representation that `open` validates.
+        // This avoids platform aliases such as `/var` → `/private/var` and Windows temp paths.
+        let root_path = raw.workdir().unwrap_or_else(|| raw.path()).to_path_buf();
         drop(tree);
         drop(raw);
-        // macOS exposes temporary directories through `/var`, while libgit2 resolves the
-        // repository workdir through the `/private/var` symlink. Authorize the physical path so
-        // the test exercises repository permissions instead of failing on the path alias.
-        #[cfg(target_os = "macos")]
-        let root_path = fs::canonicalize(dir.path()).unwrap();
-        #[cfg(not(target_os = "macos"))]
-        let root_path = dir.path().to_path_buf();
         let root = root_path.to_string_lossy().replace('\\', "/");
         let auth = WorkspaceAuthRegistry::with_roots([root]);
         let repo = GitRepository::open(dir.path(), &auth).unwrap();
