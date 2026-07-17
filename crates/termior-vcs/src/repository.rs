@@ -478,7 +478,14 @@ mod tests {
             .unwrap();
         drop(tree);
         drop(raw);
-        let root = dir.path().to_string_lossy().replace('\\', "/");
+        // macOS exposes temporary directories through `/var`, while libgit2 resolves the
+        // repository workdir through the `/private/var` symlink. Authorize the physical path so
+        // the test exercises repository permissions instead of failing on the path alias.
+        #[cfg(target_os = "macos")]
+        let root_path = fs::canonicalize(dir.path()).unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let root_path = dir.path().to_path_buf();
+        let root = root_path.to_string_lossy().replace('\\', "/");
         let auth = WorkspaceAuthRegistry::with_roots([root]);
         let repo = GitRepository::open(dir.path(), &auth).unwrap();
         (dir, auth, repo)
