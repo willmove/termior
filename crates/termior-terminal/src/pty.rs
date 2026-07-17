@@ -117,10 +117,13 @@ impl PtySession {
         let (cmd, integration_dir) = build_command(kind, &program, integration_enabled, config)?;
 
         // child spawn 在 slave 上（CommandBuilder 按值消费）。
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| SpawnError::Spawn(e.to_string()))?;
+
+        #[cfg(windows)]
+        let mut child = child;
 
         #[cfg(windows)]
         let job = match child
