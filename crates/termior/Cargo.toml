@@ -1,5 +1,5 @@
 [package]
-name = "termior-app"
+name = "termior"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -38,7 +38,7 @@ Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、�
 
 ```text
 crates/
-  termior-app              GPUI 桌面应用与视图接线
+  termior                  GPUI 桌面应用与视图接线
   termior-ui               tab/sidebar/workspace 持久状态
   termior-ui-kit           pane 布局与共享搜索模型
   termior-terminal         PTY 会话、进程生命周期和字节桥
@@ -80,7 +80,7 @@ npm run icons:check
 运行桌面应用：
 
 ```bash
-cargo run -p termior-app
+cargo run -p termior
 ```
 
 Provider 的 endpoint、模型和启用状态保存在 `Termior-settings.json`；API key 只通过设置窗口写入 OS 钥匙串，绝不会序列化进设置或会话文件。
@@ -95,5 +95,5 @@ Provider 的 endpoint、模型和启用状态保存在 `Termior-settings.json`�
 
 ## 许可
 
-Apache License 2.0。第三方依赖许可由 `cargo deny --exclude termior-app check` 审计；
+Apache License 2.0。第三方依赖许可由 `cargo deny --exclude termior check` 审计；
 GPUI 上游依赖树另行核验。

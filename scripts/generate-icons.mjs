@@ -1,34 +1,85 @@
-// Generate every application-icon format from assets/termior-logo.svg.
+// Generate every application-icon format from one SVG source.
 //
 // Usage:
 //   npm run icons        Write/update generated assets.
 //   npm run icons:check  Fail when generated assets are missing or stale.
-
-// Outputs:
-//   assets/icons/termior.png                 512px preview/general-purpose PNG
-//   assets/icons/termior.ico                 Windows executable/window icon
-//   assets/icons/termior.icns                macOS application bundle icon
-//   assets/icons/png/<size>x<size>.png        Cross-platform raster sizes
-//   assets/icons/hicolor/...                 Linux freedesktop icon theme assets
+//   node scripts/generate-icons.mjs --write \
+//     --root <project-root> --source <logo.svg> --output <icons-dir> \
+//     --name <file-stem> --app-id <desktop-app-id>
+//
+// With no path/name options, the original Termior paths remain the defaults.
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import * as png2icons from "png2icons";
 import sharp from "sharp";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const SOURCE = join(ROOT, "assets", "termior-logo.svg");
-const OUTPUT_DIR = join(ROOT, "assets", "icons");
-const APP_ID = "app.termior.Termior";
+const SCRIPT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const DEFAULTS = {
+  root: SCRIPT_ROOT,
+  source: join("assets", "termior-logo.svg"),
+  output: join("assets", "icons"),
+  name: "termior",
+  appId: "app.termior.Termior",
+};
 
 const PNG_SIZES = [16, 24, 32, 48, 64, 128, 256, 512, 1024];
 const LINUX_SIZES = PNG_SIZES.filter((size) => size <= 512);
 const MASTER_SIZE = 1024;
 
-function displayPath(path) {
-  return relative(ROOT, path).replaceAll("\\", "/");
+function parseArgs(args) {
+  const options = { ...DEFAULTS };
+  let mode = "--write";
+
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--write" || argument === "--check") {
+      mode = argument;
+      continue;
+    }
+
+    if (!["--root", "--source", "--output", "--name", "--app-id"].includes(argument)) {
+      throw new Error(`unknown option ${argument}`);
+    }
+
+    const value = args[index + 1];
+    if (!value || value.startsWith("--")) {
+      throw new Error(`${argument} requires a value`);
+    }
+    index += 1;
+
+    if (argument === "--app-id") {
+      options.appId = value;
+    } else {
+      options[argument.slice(2)] = value;
+    }
+  }
+
+  const root = resolve(options.root);
+  const resolveFromRoot = (path) =>
+    isAbsolute(path) ? resolve(path) : resolve(root, path);
+
+  if (!/^[A-Za-z0-9._-]+$/.test(options.name)) {
+    throw new Error("--name must be a safe file name without path separators");
+  }
+  if (!/^[A-Za-z0-9._-]+$/.test(options.appId)) {
+    throw new Error("--app-id contains unsupported characters");
+  }
+
+  return {
+    mode,
+    root,
+    source: resolveFromRoot(options.source),
+    outputDir: resolveFromRoot(options.output),
+    name: options.name,
+    appId: options.appId,
+  };
+}
+
+function displayPath(root, path) {
+  return relative(root, path).replaceAll("\\", "/");
 }
 
 async function renderPng(svg, size) {
@@ -82,8 +133,8 @@ function validateIcns(buffer) {
   }
 }
 
-async function buildOutputs() {
-  const svg = await readFile(SOURCE);
+async function buildOutputs(config) {
+  const svg = await readFile(config.source);
   const pngBySize = new Map();
 
   await Promise.all(
@@ -105,14 +156,14 @@ async function buildOutputs() {
   validateIcns(icns);
 
   const outputs = new Map([
-    [join(OUTPUT_DIR, "termior.png"), pngBySize.get(512)],
-    [join(OUTPUT_DIR, "termior.ico"), ico],
-    [join(OUTPUT_DIR, "termior.icns"), icns],
+    [join(config.outputDir, `${config.name}.png`), pngBySize.get(512)],
+    [join(config.outputDir, `${config.name}.ico`), ico],
+    [join(config.outputDir, `${config.name}.icns`), icns],
   ]);
 
   for (const size of PNG_SIZES) {
     outputs.set(
-      join(OUTPUT_DIR, "png", `${size}x${size}.png`),
+      join(config.outputDir, "png", `${size}x${size}.png`),
       pngBySize.get(size),
     );
   }
@@ -120,44 +171,50 @@ async function buildOutputs() {
   for (const size of LINUX_SIZES) {
     outputs.set(
       join(
-        OUTPUT_DIR,
+        config.outputDir,
         "hicolor",
         `${size}x${size}`,
         "apps",
-        `${APP_ID}.png`,
+        `${config.appId}.png`,
       ),
       pngBySize.get(size),
     );
   }
 
   outputs.set(
-    join(OUTPUT_DIR, "hicolor", "scalable", "apps", `${APP_ID}.svg`),
+    join(
+      config.outputDir,
+      "hicolor",
+      "scalable",
+      "apps",
+      `${config.appId}.svg`,
+    ),
     svg,
   );
 
   return outputs;
 }
 
-async function writeOutputs(outputs) {
+async function writeOutputs(config, outputs) {
   for (const [path, contents] of outputs) {
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, contents);
-    console.log(`wrote ${displayPath(path)}`);
+    console.log(`wrote ${displayPath(config.root, path)}`);
   }
 }
 
-async function checkOutputs(outputs) {
+async function checkOutputs(config, outputs) {
   const stale = [];
 
   for (const [path, expected] of outputs) {
     try {
       const actual = await readFile(path);
       if (!actual.equals(expected)) {
-        stale.push(`${displayPath(path)} is stale`);
+        stale.push(`${displayPath(config.root, path)} is stale`);
       }
     } catch (error) {
       if (error?.code === "ENOENT") {
-        stale.push(`${displayPath(path)} is missing`);
+        stale.push(`${displayPath(config.root, path)} is missing`);
       } else {
         throw error;
       }
@@ -166,7 +223,7 @@ async function checkOutputs(outputs) {
 
   if (stale.length > 0) {
     throw new Error(
-      `generated icons are not up to date:\n- ${stale.join("\n- ")}\nRun \`npm run icons\`.`,
+      `generated icons are not up to date:\n- ${stale.join("\n- ")}\nRun the generator with the same options and --write.`,
     );
   }
 
@@ -174,16 +231,12 @@ async function checkOutputs(outputs) {
 }
 
 async function main() {
-  const mode = process.argv[2] ?? "--write";
-  if (mode !== "--write" && mode !== "--check") {
-    throw new Error(`unknown option ${mode}; expected --write or --check`);
-  }
-
-  const outputs = await buildOutputs();
-  if (mode === "--check") {
-    await checkOutputs(outputs);
+  const config = parseArgs(process.argv.slice(2));
+  const outputs = await buildOutputs(config);
+  if (config.mode === "--check") {
+    await checkOutputs(config, outputs);
   } else {
-    await writeOutputs(outputs);
+    await writeOutputs(config, outputs);
   }
 }
 

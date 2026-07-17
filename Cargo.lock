@@ -7137,28 +7137,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "termior-ai"
-version = "0.1.0"
-dependencies = [
- "base64",
- "futures",
- "keyring",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "termior-diff",
- "termior-explorer",
- "termior-security",
- "termior-store",
- "termior-terminal",
- "thiserror 1.0.69",
- "url",
- "wait-timeout",
-]
-
-[[package]]
-name = "termior-app"
+name = "termior"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
@@ -7187,6 +7166,27 @@ dependencies = [
  "termior-vcs",
  "winresource",
  "wry",
+]
+
+[[package]]
+name = "termior-ai"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "futures",
+ "keyring",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "termior-diff",
+ "termior-explorer",
+ "termior-security",
+ "termior-store",
+ "termior-terminal",
+ "thiserror 1.0.69",
+ "url",
+ "wait-timeout",
 ]
 
 [[package]]

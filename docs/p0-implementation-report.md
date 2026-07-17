@@ -11,12 +11,12 @@
 ```bash
 cargo build --workspace              # 纯逻辑 crate，无警告
 cargo test  --workspace              # 249 passed, 0 failed
-cargo build -p termior-app           # GPUI 渲染层（gpui 依赖树 warm 编译 ~5min）
+cargo build -p termior               # GPUI 渲染层（gpui 依赖树 warm 编译 ~5min）
 cargo test  -p termior-ai --features keyring-backend   # OS 钥匙串后端（+2 tests）
-cargo clippy --workspace --all-targets --exclude termior-app  # 无警告
+cargo clippy --workspace --all-targets --exclude termior  # 无警告
 ```
 
-> `termior-app`（GPUI 入口）独立构建；gpui/gpui_platform 锁定到 zed rev `3565c49`。
+> `termior`（GPUI 入口）独立构建；gpui/gpui_platform 锁定到 zed rev `3565c49`。
 > `keyring-backend` 为可选 feature，启用后接入真实 OS 钥匙串。
 
 ### 测试分布
@@ -31,15 +31,15 @@ cargo clippy --workspace --all-targets --exclude termior-app  # 无警告
 | `termior-diff` | 23 | FR-EDIT-04, FR-SEC-02, NFR-10 |
 | `termior-hooks` | 11 | FR-TAGENT-03/04, NFR-10 |
 | `termior-explorer-core` | 19 | FR-EXPL-04/05/03 |
-| `termior-app` | — | FR-WS/FR-THEME 渲染层（GPUI 入口，编译通过） |
+| `termior` | — | FR-WS/FR-THEME 渲染层（GPUI 入口，编译通过） |
 | **合计** | **249 单测 + 20 集成 + 2 keyring** | |
 
 ## 增量进展（第二轮：渲染层接入 + 增强）
 
-- **`termior-app`（GPUI 入口）**：打开原生 GPUI 窗口，用 `termior_theme` 中央引擎解析调色板
+- **`termior`（GPUI 入口）**：打开原生 GPUI 窗口，用 `termior_theme` 中央引擎解析调色板
   驱动背景/前景/状态色/diff 色/终端 16 色条；点击热切换 default ↔ nord，验证纯逻辑主题
   crate 驱动真实 GPU 渲染并广播重绘（FR-THEME-01/02）。gpui 依赖树 warm 编译 ~5min，
-  `termior-app` 增量 ~12s。
+  `termior` 增量 ~12s。
 - **`termior-diff`**：`render_unified()` 渲染 unified patch 供 `ai-diff` tab 展示；
   `make_insertion_hunk()` 让 AI `write_file` 把变更包成 diff 而非直接写盘（FR-SEC-02）。
 - **`termior-ai/session`**：消息历史膨胀策略（Q3）——保留 system 前置 + 最近 N 条，中段丢弃；

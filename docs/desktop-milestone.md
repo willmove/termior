@@ -22,7 +22,7 @@
 2. `cargo clippy --workspace --all-targets -- -D warnings`
 3. `cargo test --workspace --all-targets`
 4. `cargo build --workspace --release`
-5. `cargo deny --exclude termior-app check`（若本机已安装 cargo-deny；GPUI 上游许可单独审计）
+5. `cargo deny --exclude termior check`（若本机已安装 cargo-deny；GPUI 上游许可单独审计）
 
 ## 后续仍需完成的 spec 项
 

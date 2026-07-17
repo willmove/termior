@@ -20,7 +20,7 @@ members = [
     "crates/termior-hooks",
     "crates/termior-terminal",
     "crates/termior-editor",
-    "crates/termior-app",
+    "crates/termior",
 ]
 
 [workspace.package]
@@ -92,7 +92,7 @@ termior-ai = { path = "crates/termior-ai" }
 termior-hooks = { path = "crates/termior-hooks" }
 termior-terminal = { path = "crates/termior-terminal" }
 termior-editor = { path = "crates/termior-editor" }
-termior-app = { path = "crates/termior-app" }
+termior = { path = "crates/termior" }
 
 [profile.release]
 # 对齐 Spec NFR-05 / NFR-11：Release 产物体积与启动时间门槛

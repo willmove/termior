@@ -19,7 +19,7 @@ fn main() {
             "FileDescription",
             "Termior AI-native development environment",
         )
-        .set("OriginalFilename", "termior-app.exe");
+        .set("OriginalFilename", "termior.exe");
     resource
         .compile()
         .expect("failed to embed the Termior Windows icon");

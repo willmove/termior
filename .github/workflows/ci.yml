@@ -54,13 +54,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --exclude termior-app -- -D warnings
+        run: cargo clippy --workspace --all-targets --exclude termior -- -D warnings
 
       - name: Build
-        run: cargo build --workspace --exclude termior-app --all-targets
+        run: cargo build --workspace --exclude termior --all-targets
 
       - name: Test
-        run: cargo test --workspace --exclude termior-app --all-targets
+        run: cargo test --workspace --exclude termior --all-targets
 
   desktop-check:
     name: GPUI desktop (Windows)
@@ -75,16 +75,16 @@ jobs:
         with:
           workspaces: "."
       - name: Check desktop application
-        run: cargo check -p termior-app
+        run: cargo check -p termior
       - name: Clippy desktop application
-        run: cargo clippy -p termior-app --all-targets -- -D warnings
+        run: cargo clippy -p termior --all-targets -- -D warnings
       - name: Build desktop application
-        run: cargo build -p termior-app
+        run: cargo build -p termior
       - name: Launch and render desktop smoke frames
         shell: pwsh
         run: |
           $env:TERMIOR_SMOKE_TEST = "1"
-          $output = cargo run -p termior-app -- --workspace . 2>&1
+          $output = cargo run -p termior -- --workspace . 2>&1
           $exitCode = $LASTEXITCODE
           $output | Write-Host
           $outputText = $output | Out-String
