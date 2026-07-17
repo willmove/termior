@@ -6,10 +6,13 @@
 //! 这条链路跨 termior-ai + termior-diff + termior-security 三个 crate，验证它们协同正确。
 
 use termior_ai::{
-    Agent, ApprovalDecision, ChatEvent, Message, MockProvider, Role, ToolCall, ToolRegistry,
+    Agent, AgentState, ApprovalDecision, ChatEvent, Message, MockProvider, Role, ToolCall,
+    ToolRegistry,
 };
 use termior_diff::{apply_acceptances, diff_hunks, make_insertion_hunk};
 use termior_security::workspace::WorkspaceAuthRegistry;
+
+fn ignore_event(_: &ChatEvent) {}
 
 /// 模拟「写文件」工具的真实副作用：把参数里的 content 当作新文本，
 /// 与磁盘现有内容做 diff，返回 unified patch（而非直接覆盖）。
@@ -27,10 +30,10 @@ fn exec_write_file(args: &str, disk_content: &str) -> Result<String, String> {
 fn agent_write_file_approved_becomes_hunk_diff_and_lands_exact() {
     // 磁盘现有内容
     let disk = "line1\nline2\nline3\n";
-    // 模型提议的新内容：替换 line2 → LINE2，并新增 line4
+    // 模型提议的新内容：替换 line2 -> LINE2，并新增 line4
     let proposed = "line1\nLINE2\nline3\nline4\n";
 
-    // 1) 第一轮：模型发起 write_file 工具调用（审批门控）→ Agent 挂起
+    // 1) 第一轮：模型发起 write_file 工具调用（审批门控）-> Agent 挂起
     let provider = MockProvider::new(vec![
         vec![ChatEvent::Done(Message {
             role: Role::Assistant,
@@ -58,31 +61,40 @@ fn agent_write_file_approved_becomes_hunk_diff_and_lands_exact() {
     }
 
     // 先 run（应停在审批门）
-    let outcome = agent.run(&[Message::user("edit a.txt")], &exec).unwrap();
-    assert_eq!(outcome.state, termior_ai::AgentState::AwaitingApproval);
+    let outcome = futures::executor::block_on(async {
+        agent
+            .run(&[Message::user("edit a.txt")], &exec, &mut ignore_event)
+            .await
+    })
+    .unwrap();
+    assert_eq!(outcome.state, AgentState::AwaitingApproval);
     let pending = outcome.pending_approval.clone().unwrap();
     assert_eq!(pending.tool_name, "write_file");
 
-    // 2) 用户接受 → resume
-    let resumed = agent
-        .resume(
-            &outcome.messages,
-            &exec,
-            ApprovalDecision::Approve,
-            &pending,
-        )
-        .unwrap();
-    assert_eq!(resumed.state, termior_ai::AgentState::Finished);
+    // 2) 用户接受 -> resume
+    let resumed = futures::executor::block_on(async {
+        agent
+            .resume(
+                &outcome.messages,
+                &exec,
+                ApprovalDecision::Approve,
+                &pending,
+                &mut ignore_event,
+            )
+            .await
+    })
+    .unwrap();
+    assert_eq!(resumed.state, AgentState::Finished);
 
     // 4) 关键：write_file 不直接写盘，而是产出 hunk diff；用户逐 hunk 接受
     let hunks = diff_hunks(disk, proposed, 0);
     assert!(!hunks.is_empty(), "应有变更");
-    // 全部接受 → 落盘等于提议
+    // 全部接受 -> 落盘等于提议
     let all: Vec<usize> = hunks.iter().map(|h| h.id).collect();
     let landed_all = apply_acceptances(disk, &hunks, &all);
     assert_eq!(landed_all, proposed);
 
-    // 全部拒绝 → 落盘等于原文
+    // 全部拒绝 -> 落盘等于原文
     let landed_partial = apply_acceptances(disk, &hunks, &[]);
     assert_eq!(landed_partial, disk);
 }
@@ -108,9 +120,14 @@ fn agent_auto_read_tool_does_not_need_approval() {
     fn exec(_t: &str, _a: &str) -> Result<String, String> {
         Ok("file content".into())
     }
-    let outcome = agent.run(&[Message::user("read a.rs")], &exec).unwrap();
-    // read_file 自动执行 → 最终 Finished，不应停在审批
-    assert_eq!(outcome.state, termior_ai::AgentState::Finished);
+    let outcome = futures::executor::block_on(async {
+        agent
+            .run(&[Message::user("read a.rs")], &exec, &mut ignore_event)
+            .await
+    })
+    .unwrap();
+    // read_file 自动执行 -> 最终 Finished，不应停在审批
+    assert_eq!(outcome.state, AgentState::Finished);
     // 历史里有 tool 结果
     assert!(outcome.messages.iter().any(|m| m.role == Role::Tool));
 }

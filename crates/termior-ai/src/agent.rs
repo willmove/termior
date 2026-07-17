@@ -1,15 +1,18 @@
 //! Agent 循环状态机（FR-AGENT-08）。
 //!
 //! 流式响应、工具调用、步数上限（[`MAX_AGENT_STEPS`]）、系统提示词可配置。
-//! 审批门控工具触发时挂起，等待 [`ApprovalGate`] 决议后续跑。
+//! 审批门控工具触发时挂起：`run` 返回 [`AgentOutcome`] 携带 `pending_approval`，
+//! 调用方决议后用 [`Agent::resume`] 续跑。决议是 `resume` 的函数参数，不经阻塞
+//! channel 或自旋等待传递。
 //!
-//! 本模块用 [`MockProvider`]（或任意 [`Provider`]）跑通「提问 → 工具调用 → 审批 → 续跑 → 完成」
+//! 本模块用 [`MockProvider`]（或任意 [`Provider`]）跑通「提问 -> 工具调用 -> 审批 -> 续跑 -> 完成」
 //! 的全链路单测。工具的实际副作用（写盘/执行命令）由调用方在审批通过后执行。
 
 use crate::approval::{ApprovalDecision, ApprovalRequest};
 use crate::message::{ChatEvent, Message, Role};
 use crate::provider::{Provider, ProviderRequest};
 use crate::tools::ToolRegistry;
+use futures::StreamExt;
 
 /// 最大步数（FR-AGENT-08 `MAX_AGENT_STEPS`）。
 pub const MAX_AGENT_STEPS: usize = 50;
@@ -79,25 +82,33 @@ impl Agent {
     /// 运行一轮：从当前历史出发，驱动 Provider 直到完成或需要审批。
     ///
     /// `exec_tool` 是工具实际执行的回调（调用方实现真实副作用）；仅在审批通过后调用。
+    /// `on_event` 在每个 [`ChatEvent`] 到达时被调用，用于把流式增量（如 `TextDelta`）
+    /// 实时推给 UI 渲染；Agent 内部仍会累积这些事件以构造最终消息。
     /// 返回 [`AgentOutcome`]；若停在 AwaitingApproval，调用方决议后用
     /// [`Self::resume`] 续跑。
-    pub fn run<F>(&self, history: &[Message], exec_tool: &F) -> Result<AgentOutcome, AgentError>
+    pub async fn run<F>(
+        &self,
+        history: &[Message],
+        exec_tool: &F,
+        on_event: &mut (dyn FnMut(&ChatEvent) + Send),
+    ) -> Result<AgentOutcome, AgentError>
     where
-        F: Fn(&str, &str) -> Result<String, String>,
+        F: Fn(&str, &str) -> Result<String, String> + Sync,
     {
-        self.drive(history, exec_tool, None)
+        self.drive(history, exec_tool, None, on_event).await
     }
 
     /// 审批决议后续跑。
-    pub fn resume<F>(
+    pub async fn resume<F>(
         &self,
         history: &[Message],
         exec_tool: &F,
         decision: ApprovalDecision,
         pending: &ApprovalRequest,
+        on_event: &mut (dyn FnMut(&ChatEvent) + Send),
     ) -> Result<AgentOutcome, AgentError>
     where
-        F: Fn(&str, &str) -> Result<String, String>,
+        F: Fn(&str, &str) -> Result<String, String> + Sync,
     {
         match decision {
             ApprovalDecision::Approve => {
@@ -120,20 +131,21 @@ impl Agent {
                         tool_result: Some(crate::message::ToolResult::failure(&pending.call_id, e)),
                     }),
                 }
-                self.drive(&messages, exec_tool, None)
+                self.drive(&messages, exec_tool, None, on_event).await
             }
             ApprovalDecision::Reject => Err(AgentError::Rejected),
         }
     }
 
-    fn drive<F>(
+    async fn drive<F>(
         &self,
         history: &[Message],
         exec_tool: &F,
         _resume_from: Option<&ApprovalRequest>,
+        on_event: &mut (dyn FnMut(&ChatEvent) + Send),
     ) -> Result<AgentOutcome, AgentError>
     where
-        F: Fn(&str, &str) -> Result<String, String>,
+        F: Fn(&str, &str) -> Result<String, String> + Sync,
     {
         let mut messages: Vec<Message> = history.to_vec();
         // 注入 system prompt（每轮前置）
@@ -154,14 +166,15 @@ impl Agent {
                 tools: self.tools.clone(),
                 system_prompt_extra: None,
             };
-            let events = self.provider.stream_chat(&req);
+            let mut stream = self.provider.stream_chat(&req);
 
-            // 收集本轮助手消息与工具调用
+            // 逐事件消费流：增量回调 + 累积成最终消息
             let mut text = String::new();
             let mut tool_calls = Vec::new();
             let mut final_msg: Option<Message> = None;
             let mut err: Option<String> = None;
-            for ev in events {
+            while let Some(ev) = stream.next().await {
+                on_event(&ev);
                 match ev {
                     ChatEvent::TextDelta(d) => text.push_str(&d),
                     ChatEvent::ToolCall(tc) => tool_calls.push(tc),
@@ -251,11 +264,14 @@ fn summarize(tool: &str, args: &str) -> String {
 mod tests {
     use super::*;
     use crate::provider::MockProvider;
+    use futures::executor::block_on;
     use termior_security::workspace::WorkspaceAuthRegistry;
 
     fn no_op(_tool: &str, _args: &str) -> Result<String, String> {
         Ok("ok".into())
     }
+
+    fn ignore_event(_: &ChatEvent) {}
 
     #[test]
     fn simple_text_response_finishes() {
@@ -264,7 +280,12 @@ mod tests {
             ChatEvent::Done(Message::assistant("Hello")),
         ]);
         let agent = Agent::new(Box::new(provider), ToolRegistry::default());
-        let outcome = agent.run(&[Message::user("hi")], &no_op).unwrap();
+        let outcome = block_on(async {
+            agent
+                .run(&[Message::user("hi")], &no_op, &mut ignore_event)
+                .await
+        })
+        .unwrap();
         assert_eq!(outcome.state, AgentState::Finished);
         assert!(outcome.pending_approval.is_none());
         assert!(outcome.steps >= 1);
@@ -272,7 +293,7 @@ mod tests {
 
     #[test]
     fn auto_tool_executes_then_finishes() {
-        // 第一轮：助手发起 read_file（自动）→ 第二轮：助手回复文本完成
+        // 第一轮：助手发起 read_file（自动）-> 第二轮：助手回复文本完成
         let provider = MockProvider::new(vec![
             vec![
                 ChatEvent::ToolCall(crate::message::ToolCall {
@@ -294,7 +315,12 @@ mod tests {
             vec![ChatEvent::Done(Message::assistant("done"))],
         ]);
         let agent = Agent::new(Box::new(provider), ToolRegistry::default());
-        let outcome = agent.run(&[Message::user("read a")], &no_op).unwrap();
+        let outcome = block_on(async {
+            agent
+                .run(&[Message::user("read a")], &no_op, &mut ignore_event)
+                .await
+        })
+        .unwrap();
         assert_eq!(outcome.state, AgentState::Finished);
         // 历史里应有 tool 结果消息
         assert!(outcome.messages.iter().any(|m| m.role == Role::Tool));
@@ -313,7 +339,12 @@ mod tests {
             tool_result: None,
         })]);
         let agent = Agent::new(Box::new(provider), ToolRegistry::default());
-        let outcome = agent.run(&[Message::user("write a")], &no_op).unwrap();
+        let outcome = block_on(async {
+            agent
+                .run(&[Message::user("write a")], &no_op, &mut ignore_event)
+                .await
+        })
+        .unwrap();
         assert_eq!(outcome.state, AgentState::AwaitingApproval);
         let pending = outcome.pending_approval.unwrap();
         assert_eq!(pending.tool_name, "write_file");
@@ -333,22 +364,31 @@ mod tests {
             tool_result: None,
         })]);
         let agent = Agent::new(Box::new(provider), ToolRegistry::default());
-        let outcome = agent.run(&[Message::user("write")], &no_op).unwrap();
+        let outcome = block_on(async {
+            agent
+                .run(&[Message::user("write")], &no_op, &mut ignore_event)
+                .await
+        })
+        .unwrap();
         let pending = outcome.pending_approval.unwrap();
-        let err = agent
-            .resume(
-                &outcome.messages,
-                &no_op,
-                ApprovalDecision::Reject,
-                &pending,
-            )
-            .unwrap_err();
+        let err = block_on(async {
+            agent
+                .resume(
+                    &outcome.messages,
+                    &no_op,
+                    ApprovalDecision::Reject,
+                    &pending,
+                    &mut ignore_event,
+                )
+                .await
+        })
+        .unwrap_err();
         assert!(matches!(err, AgentError::Rejected));
     }
 
     #[test]
     fn approval_approved_executes_and_resumes() {
-        // 第一轮（drive 内）：write_file 待审批 → outcome
+        // 第一轮（drive 内）：write_file 待审批 -> outcome
         let provider = MockProvider::new(vec![
             vec![ChatEvent::Done(Message {
                 role: Role::Assistant,
@@ -364,16 +404,25 @@ mod tests {
             vec![ChatEvent::Done(Message::assistant("written"))],
         ]);
         let agent = Agent::new(Box::new(provider), ToolRegistry::default());
-        let outcome = agent.run(&[Message::user("write")], &no_op).unwrap();
+        let outcome = block_on(async {
+            agent
+                .run(&[Message::user("write")], &no_op, &mut ignore_event)
+                .await
+        })
+        .unwrap();
         let pending = outcome.pending_approval.unwrap();
-        let resumed = agent
-            .resume(
-                &outcome.messages,
-                &no_op,
-                ApprovalDecision::Approve,
-                &pending,
-            )
-            .unwrap();
+        let resumed = block_on(async {
+            agent
+                .resume(
+                    &outcome.messages,
+                    &no_op,
+                    ApprovalDecision::Approve,
+                    &pending,
+                    &mut ignore_event,
+                )
+                .await
+        })
+        .unwrap();
         assert_eq!(resumed.state, AgentState::Finished);
     }
 
@@ -394,7 +443,12 @@ mod tests {
         let scripts: Vec<_> = (0..100).map(|_| looping.clone()).collect();
         let provider = MockProvider::new(scripts);
         let agent = Agent::new(Box::new(provider), ToolRegistry::default()).with_max_steps(5);
-        let err = agent.run(&[Message::user("loop")], &no_op).unwrap_err();
+        let err = block_on(async {
+            agent
+                .run(&[Message::user("loop")], &no_op, &mut ignore_event)
+                .await
+        })
+        .unwrap_err();
         assert!(matches!(err, AgentError::MaxStepsExceeded(5)));
     }
 
@@ -403,7 +457,12 @@ mod tests {
         let provider = MockProvider::single(vec![ChatEvent::Done(Message::assistant("ok"))]);
         let agent = Agent::new(Box::new(provider), ToolRegistry::default())
             .with_system_prompt("You are a Termior agent.");
-        let outcome = agent.run(&[Message::user("hi")], &no_op).unwrap();
+        let outcome = block_on(async {
+            agent
+                .run(&[Message::user("hi")], &no_op, &mut ignore_event)
+                .await
+        })
+        .unwrap();
         assert_eq!(outcome.state, AgentState::Finished);
     }
 
@@ -424,7 +483,12 @@ mod tests {
     fn provider_error_propagates() {
         let provider = MockProvider::single(vec![ChatEvent::Error("boom".into())]);
         let agent = Agent::new(Box::new(provider), ToolRegistry::default());
-        let err = agent.run(&[Message::user("hi")], &no_op).unwrap_err();
+        let err = block_on(async {
+            agent
+                .run(&[Message::user("hi")], &no_op, &mut ignore_event)
+                .await
+        })
+        .unwrap_err();
         assert!(matches!(err, AgentError::Provider(_)));
     }
 

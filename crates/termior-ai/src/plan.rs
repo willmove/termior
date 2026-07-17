@@ -1,6 +1,6 @@
 //! Plan mode, custom agents and restricted sub-agent execution (FR-PLAN).
 
-use crate::{Agent, AgentError, Message, Provider, ToolRegistry};
+use crate::{Agent, AgentError, ChatEvent, Message, Provider, ToolRegistry};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,7 +180,7 @@ pub struct SubagentResult {
     pub messages: Vec<Message>,
 }
 
-pub fn run_subagent<P, F>(
+pub async fn run_subagent<P, F>(
     definition: &AgentDefinition,
     provider: P,
     tools: ToolRegistry,
@@ -189,7 +189,7 @@ pub fn run_subagent<P, F>(
 ) -> Result<SubagentResult, PlanError>
 where
     P: Provider + 'static,
-    F: Fn(&str, &str) -> Result<String, String>,
+    F: Fn(&str, &str) -> Result<String, String> + Sync,
 {
     definition.validate(&tools)?;
     let restricted = tools
@@ -197,8 +197,10 @@ where
         .map_err(|error| PlanError::InvalidAgent(error.to_string()))?;
     let agent =
         Agent::new(Box::new(provider), restricted).with_system_prompt(&definition.system_prompt);
+    // subagent 的流式增量不回传 UI（子代理后台执行，仅取最终消息）。
     let outcome = agent
-        .run(&[Message::user(task)], exec_tool)
+        .run(&[Message::user(task)], exec_tool, &mut |_: &ChatEvent| {})
+        .await
         .map_err(|error: AgentError| PlanError::Subagent(error.to_string()))?;
     let answer = outcome
         .messages
@@ -281,9 +283,13 @@ mod tests {
             store
         );
         let provider = MockProvider::single(vec![ChatEvent::Done(Message::assistant("reviewed"))]);
-        let result = run_subagent(&definition(), provider, tools, "review it", &|_, _| {
-            Ok("ok".into())
-        })
+        let result = futures::executor::block_on(run_subagent(
+            &definition(),
+            provider,
+            tools,
+            "review it",
+            &|_, _| Ok("ok".into()),
+        ))
         .unwrap();
         assert_eq!(result.answer, "reviewed");
     }

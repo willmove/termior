@@ -1,3 +1,4 @@
+use futures::StreamExt;
 use gpui::{
     canvas, div, prelude::*, px, App, Bounds, Context, EventEmitter, FocusHandle, Focusable,
     InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, SharedString,
@@ -346,10 +347,22 @@ impl ComposerView {
         let history = self.history.clone();
         let plan_request = self.plan_mode && !self.plan_confirmed;
         cx.spawn(async move |view, cx| {
-            let result = cx
+            // 增量事件 channel：run_agent 在后台线程逐条推 ChatEvent，主线程边收边渲染。
+            let (event_tx, mut event_rx) =
+                futures::channel::mpsc::unbounded::<termior_ai::ChatEvent>();
+            let task = cx
                 .background_executor()
-                .spawn(async move { run_agent(runtime, history, plan_request) })
-                .await;
+                .spawn(async move { run_agent(runtime, history, plan_request, event_tx).await });
+            // 主线程消费增量：每收到一个 TextDelta 就追加到当前 assistant 草稿并重绘。
+            while let Some(event) = event_rx.next().await {
+                if let termior_ai::ChatEvent::TextDelta(delta) = event {
+                    let _ = view.update(cx, |view, cx| {
+                        view.append_text_delta(delta);
+                        cx.notify();
+                    });
+                }
+            }
+            let result = task.await;
             let _ = view.update(cx, |view, cx| {
                 view.busy = false;
                 view.apply_agent_result(result, cx);
@@ -408,10 +421,21 @@ impl ComposerView {
         self.status = format!("Running approved tool: {}", pending.request.tool_name);
         cx.emit(AgentStatus::Working);
         cx.spawn(async move |view, cx| {
-            let result = cx
+            // 增量事件 channel：resume_agent 在后台线程逐条推 ChatEvent。
+            let (event_tx, mut event_rx) =
+                futures::channel::mpsc::unbounded::<termior_ai::ChatEvent>();
+            let task = cx
                 .background_executor()
-                .spawn(async move { resume_agent(runtime, pending) })
-                .await;
+                .spawn(async move { resume_agent(runtime, pending, event_tx).await });
+            while let Some(event) = event_rx.next().await {
+                if let termior_ai::ChatEvent::TextDelta(delta) = event {
+                    let _ = view.update(cx, |view, cx| {
+                        view.append_text_delta(delta);
+                        cx.notify();
+                    });
+                }
+            }
+            let result = task.await;
             let _ = view.update(cx, |view, cx| {
                 view.busy = false;
                 match result {
@@ -450,6 +474,19 @@ impl ComposerView {
             cx.emit(AgentStatus::Finished);
             self.persist_session();
             cx.notify();
+        }
+    }
+
+    /// 追加流式文本增量：把 TextDelta 实时拼到当前 assistant 消息草稿上。
+    /// 若 history 末尾不是 assistant，先 push 一条空 assistant 作为流式占位。
+    /// 最终消息会在 apply_agent_result 时被 AgentOutcome.messages 整体覆盖。
+    fn append_text_delta(&mut self, delta: String) {
+        let needs_new = matches!(self.history.last(), Some(m) if m.role != Role::Assistant);
+        if needs_new {
+            self.history.push(Message::assistant(String::new()));
+        }
+        if let Some(last) = self.history.last_mut() {
+            last.content.push_str(&delta);
         }
     }
 
@@ -607,10 +644,11 @@ impl ComposerView {
 
 impl EventEmitter<AgentStatus> for ComposerView {}
 
-fn run_agent(
+async fn run_agent(
     runtime: AgentRuntime,
     history: Vec<Message>,
     plan_only: bool,
+    event_tx: futures::channel::mpsc::UnboundedSender<termior_ai::ChatEvent>,
 ) -> Result<AgentOutcome, String> {
     let provider = HttpProvider::new(runtime.config).map_err(|error| error.to_string())?;
     let mut prompt = runtime.system_prompt;
@@ -630,19 +668,28 @@ fn run_agent(
         runtime.tools
     };
     let agent = Agent::new(Box::new(provider), tools).with_system_prompt(prompt);
+    let mut on_event = move |ev: &termior_ai::ChatEvent| {
+        let _ = event_tx.unbounded_send(ev.clone());
+    };
     agent
-        .run(&history, &|tool, arguments| {
-            runtime
-                .executor
-                .execute_auto(tool, arguments)
-                .map_err(|error| error.to_string())
-        })
+        .run(
+            &history,
+            &|tool, arguments| {
+                runtime
+                    .executor
+                    .execute_auto(tool, arguments)
+                    .map_err(|error| error.to_string())
+            },
+            &mut on_event,
+        )
+        .await
         .map_err(|error| error.to_string())
 }
 
-fn resume_agent(
+async fn resume_agent(
     runtime: AgentRuntime,
     pending: PendingApproval,
+    event_tx: futures::channel::mpsc::UnboundedSender<termior_ai::ChatEvent>,
 ) -> Result<(AgentOutcome, Option<EditProposalSummary>), String> {
     let provider = HttpProvider::new(runtime.config).map_err(|error| error.to_string())?;
     let edit = Arc::new(Mutex::new(None));
@@ -661,13 +708,18 @@ fn resume_agent(
     };
     let agent =
         Agent::new(Box::new(provider), runtime.tools).with_system_prompt(runtime.system_prompt);
+    let mut on_event = move |ev: &termior_ai::ChatEvent| {
+        let _ = event_tx.unbounded_send(ev.clone());
+    };
     let outcome = agent
         .resume(
             &pending.history,
             &callback,
             ApprovalDecision::Approve,
             &pending.request,
+            &mut on_event,
         )
+        .await
         .map_err(|error| error.to_string())?;
     let edit = edit.lock().unwrap().clone();
     Ok((outcome, edit))

@@ -6,6 +6,7 @@
 
 use crate::message::{ChatEvent, Message};
 use crate::tools::ToolRegistry;
+use futures::stream::BoxStream;
 
 /// 一次聊天请求。
 #[derive(Debug, Clone)]
@@ -22,12 +23,13 @@ pub struct ProviderRequest {
 
 /// Provider 抽象（FR-PROV 技术要点）。
 ///
-/// 真实实现返回 `impl Stream<Item = ChatEvent>`；为兼容单测与无异步运行时环境，
-/// 本 trait 采用同步 `Vec<ChatEvent>` 接口（事件已在外层 tokio 线程收集完毕）。
-/// 迁移到真实 SSE 时，外层把流收集成 Vec 再传入即可，trait 不变。
+/// `stream_chat` 返回 [`ChatEvent`] 增量流：HTTP/SSE 由 Provider 在独立线程读取，
+/// 每解析出一个事件（`TextDelta`/`ToolCall`/`Done`/`Error`）即经 channel 投递给
+/// 消费方。调用方逐事件 `await`；流自然结束时最后一个事件为 [`ChatEvent::Done`]
+/// 或 [`ChatEvent::Error`]。
 pub trait Provider: Send + Sync {
-    /// 执行一次流式聊天，返回有序事件列表。
-    fn stream_chat(&self, req: &ProviderRequest) -> Vec<ChatEvent>;
+    /// 执行一次流式聊天，返回有序事件增量流。
+    fn stream_chat<'a>(&'a self, req: &'a ProviderRequest) -> BoxStream<'a, ChatEvent>;
 }
 
 /// 内存 Mock Provider：按预设脚本回放事件，用于 Agent 循环单测。
@@ -50,19 +52,28 @@ impl MockProvider {
 }
 
 impl Provider for MockProvider {
-    fn stream_chat(&self, _req: &ProviderRequest) -> Vec<ChatEvent> {
-        let mut guard = self.scripts.lock().unwrap();
-        if guard.is_empty() {
-            // 无脚本：返回空 Done
-            return vec![ChatEvent::Done(Message::assistant(""))];
-        }
-        guard.remove(0)
+    fn stream_chat<'a>(&'a self, _req: &'a ProviderRequest) -> BoxStream<'a, ChatEvent> {
+        let events = {
+            let mut guard = self.scripts.lock().unwrap();
+            if guard.is_empty() {
+                vec![ChatEvent::Done(Message::assistant(""))]
+            } else {
+                guard.remove(0)
+            }
+        };
+        Box::pin(futures::stream::iter(events))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
+    use futures::StreamExt;
+
+    async fn collect_stream(s: BoxStream<'_, ChatEvent>) -> Vec<ChatEvent> {
+        s.collect().await
+    }
 
     #[test]
     fn mock_provider_replays_script() {
@@ -76,7 +87,7 @@ mod tests {
             tools: ToolRegistry::default(),
             system_prompt_extra: None,
         };
-        let events = p.stream_chat(&req);
+        let events = block_on(collect_stream(p.stream_chat(&req)));
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], ChatEvent::TextDelta(_)));
     }
@@ -93,8 +104,8 @@ mod tests {
             tools: ToolRegistry::default(),
             system_prompt_extra: None,
         };
-        let e1 = p.stream_chat(&req);
-        let e2 = p.stream_chat(&req);
+        let e1 = block_on(collect_stream(p.stream_chat(&req)));
+        let e2 = block_on(collect_stream(p.stream_chat(&req)));
         assert!(matches!(e1.last(), Some(ChatEvent::Done(m)) if m.content == "first"));
         assert!(matches!(e2.last(), Some(ChatEvent::Done(m)) if m.content == "second"));
     }

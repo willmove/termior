@@ -9,7 +9,7 @@
 //! - [`model_registry`]：模型选择器数据结构（FR-PROV-03）。
 //! - [`secret_store`]：密钥接口（FR-PROV-04 / FR-SEC-06 / INV-5）。
 //! - [`tools`]：工具注册表 + 两级门控（FR-AGENT-09）。
-//! - [`approval`]：审批网关（FR-AGENT-10 / FR-SEC-01）。
+//! - [`approval`]：审批数据模型（FR-AGENT-10 / FR-SEC-01）。
 //! - [`agent`]：Agent 循环状态机（FR-AGENT-08）。
 //! - [`context`]：实时上下文桥契约（FR-AGENT-07）。
 //! - [`session`]：会话与项目记忆（FR-SESS-01/02）。
@@ -35,7 +35,7 @@ pub mod session;
 pub mod tools;
 
 pub use agent::{Agent, AgentError, AgentOutcome, AgentState, MAX_AGENT_STEPS};
-pub use approval::{ApprovalDecision, ApprovalGate, ApprovalRequest};
+pub use approval::{ApprovalDecision, ApprovalRequest};
 pub use composer::{
     Attachment, AttachmentSource, ComposerDraft, ComposerError, ComposerPayload, Snippet,
     SnippetStore, TodoItem, TodoStore,

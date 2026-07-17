@@ -3,11 +3,14 @@
 use crate::message::{ChatEvent, Message, Role, ToolCall};
 use crate::model_registry::ProviderKind;
 use crate::provider::{Provider, ProviderRequest};
-use reqwest::blocking::{Client, Response};
+use futures::channel::mpsc::{self, UnboundedSender};
+use futures::stream::BoxStream;
+use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::net::ToSocketAddrs;
+use std::thread;
 use std::time::Duration;
 use termior_security::ssrf::{check_ip, SsrfGuard};
 use url::Url;
@@ -108,7 +111,6 @@ pub enum ProviderTransportError {
 pub struct HttpProvider {
     config: ProviderConfig,
     client: Client,
-    guard: SsrfGuard,
 }
 
 impl std::fmt::Debug for HttpProvider {
@@ -121,21 +123,12 @@ impl std::fmt::Debug for HttpProvider {
 
 impl HttpProvider {
     pub fn new(config: ProviderConfig) -> Result<Self, ProviderTransportError> {
-        let allowed = if config.local {
-            vec![config.base_url.clone()]
-        } else {
-            Vec::new()
-        };
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(300))
             .user_agent(concat!("Termior/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        Ok(Self {
-            config,
-            client,
-            guard: SsrfGuard::new(allowed),
-        })
+        Ok(Self { config, client })
     }
 
     pub fn config(&self) -> &ProviderConfig {
@@ -143,7 +136,7 @@ impl HttpProvider {
     }
 
     pub fn ping(&self) -> Result<Duration, ProviderTransportError> {
-        self.check_endpoint(&self.config.base_url)?;
+        self.check_endpoint_for_ping(&self.config.base_url)?;
         let started = std::time::Instant::now();
         self.client
             .get(&self.config.base_url)
@@ -152,124 +145,104 @@ impl HttpProvider {
         Ok(started.elapsed())
     }
 
-    fn send(&self, req: &ProviderRequest) -> Result<Vec<ChatEvent>, ProviderTransportError> {
-        let model = if req.model == "default" || req.model.is_empty() {
-            &self.config.model
+    /// ping 路径复用 SSRF 校验：构造临时 [`NetReaderCtx`] 仅用于 `check_endpoint`。
+    fn check_endpoint_for_ping(&self, endpoint: &str) -> Result<(), ProviderTransportError> {
+        let allowed = if self.config.local {
+            vec![self.config.base_url.clone()]
         } else {
-            &req.model
+            Vec::new()
         };
-        match self.config.kind {
-            ProviderKind::Anthropic => self.send_anthropic(req, model),
-            ProviderKind::Google => self.send_google(req, model),
-            ProviderKind::Ollama => self.send_ollama(req, model),
-            _ => self.send_openai(req, model),
-        }
+        let ctx = NetReaderCtx {
+            client: self.client.clone(),
+            kind: self.config.kind,
+            base_url: self.config.base_url.clone(),
+            api_key: self.config.api_key.clone(),
+            local: self.config.local,
+            guard: SsrfGuard::new(allowed),
+        };
+        ctx.check_endpoint(endpoint)
     }
+}
 
-    fn send_openai(
-        &self,
-        req: &ProviderRequest,
-        model: &str,
-    ) -> Result<Vec<ChatEvent>, ProviderTransportError> {
-        let endpoint = join_endpoint(&self.config.base_url, "chat/completions")?;
-        self.check_endpoint(endpoint.as_str())?;
-        let body = json!({
-            "model": model,
-            "stream": true,
-            "messages": openai_messages(&req.messages, req.system_prompt_extra.as_deref()),
-            "tools": openai_tools(req),
-        });
-        let response = self
-            .client
-            .post(endpoint)
-            .headers(self.headers(false)?)
-            .json(&body)
-            .send()?
-            .error_for_status()?;
-        parse_sse(response, OpenAiAccumulator::default())
+impl Provider for HttpProvider {
+    fn stream_chat<'a>(&'a self, req: &'a ProviderRequest) -> BoxStream<'a, ChatEvent> {
+        let (tx, rx) = mpsc::unbounded::<ChatEvent>();
+        // 拷贝请求所需数据到线程闭包：reqwest::blocking::Client 内部 Arc 可廉价 clone；
+        // SsrfGuard 与 headers/check_endpoint 的 config 均按值复制，避免跨线程借用 self。
+        let local = self.config.local;
+        let allowed = if local {
+            vec![self.config.base_url.clone()]
+        } else {
+            Vec::new()
+        };
+        let ctx = NetReaderCtx {
+            client: self.client.clone(),
+            kind: self.config.kind,
+            base_url: self.config.base_url.clone(),
+            api_key: self.config.api_key.clone(),
+            local,
+            guard: SsrfGuard::new(allowed),
+        };
+        let config_model = self.config.model.clone();
+        let model = if req.model == "default" || req.model.is_empty() {
+            config_model
+        } else {
+            req.model.clone()
+        };
+        let owned_req = ProviderRequest {
+            messages: req.messages.clone(),
+            model,
+            tools: req.tools.clone(),
+            system_prompt_extra: req.system_prompt_extra.clone(),
+        };
+
+        thread::Builder::new()
+            .name("termior-net-reader".into())
+            .spawn(move || {
+                run_net_reader(tx, ctx, owned_req);
+            })
+            .expect("spawn termior-net-reader");
+
+        Box::pin(rx)
     }
+}
 
-    fn send_anthropic(
-        &self,
-        req: &ProviderRequest,
-        model: &str,
-    ) -> Result<Vec<ChatEvent>, ProviderTransportError> {
-        let endpoint = join_endpoint(&self.config.base_url, "messages")?;
-        self.check_endpoint(endpoint.as_str())?;
-        let (system, messages) =
-            anthropic_messages(&req.messages, req.system_prompt_extra.as_deref());
-        let body = json!({
-            "model": model,
-            "max_tokens": 8192,
-            "stream": true,
-            "system": system,
-            "messages": messages,
-            "tools": anthropic_tools(req),
-        });
-        let response = self
-            .client
-            .post(endpoint)
-            .headers(self.headers(true)?)
-            .json(&body)
-            .send()?
-            .error_for_status()?;
-        parse_sse(response, AnthropicAccumulator::default())
+/// 网络 reader 线程主循环：构造请求、解析 SSE/NDJSON，把 [`ChatEvent`] 经 `tx` 推送。
+/// 任何错误路径都推送一个 [`ChatEvent::Error`] 后返回，由 channel 关闭通知消费方流结束。
+fn run_net_reader(tx: UnboundedSender<ChatEvent>, ctx: NetReaderCtx, req: ProviderRequest) {
+    let result = match ctx.kind {
+        ProviderKind::Anthropic => send_anthropic(&ctx, &req, &tx),
+        ProviderKind::Google => send_google(&ctx, &req, &tx),
+        ProviderKind::Ollama => send_ollama(&ctx, &req, &tx),
+        _ => send_openai(&ctx, &req, &tx),
+    };
+    if let Err(error) = result {
+        send_error_event(&tx, error);
     }
+    // tx drop 时关闭 channel，消费方的 rx.next() 收到 None。
+}
 
-    fn send_google(
-        &self,
-        req: &ProviderRequest,
-        model: &str,
-    ) -> Result<Vec<ChatEvent>, ProviderTransportError> {
-        let endpoint = join_endpoint(
-            &self.config.base_url,
-            &format!("models/{model}:streamGenerateContent?alt=sse"),
-        )?;
-        self.check_endpoint(endpoint.as_str())?;
-        let body = google_body(req);
-        let response = self
-            .client
-            .post(endpoint)
-            .headers(self.headers(false)?)
-            .json(&body)
-            .send()?
-            .error_for_status()?;
-        parse_sse(response, GoogleAccumulator::default())
-    }
+/// reader 线程内的请求上下文（由 HttpProvider 字段按值复制而来，可跨线程移动）。
+struct NetReaderCtx {
+    client: Client,
+    kind: ProviderKind,
+    base_url: String,
+    api_key: Option<String>,
+    local: bool,
+    guard: SsrfGuard,
+}
 
-    fn send_ollama(
-        &self,
-        req: &ProviderRequest,
-        model: &str,
-    ) -> Result<Vec<ChatEvent>, ProviderTransportError> {
-        let endpoint = join_endpoint(&self.config.base_url, "api/chat")?;
-        self.check_endpoint(endpoint.as_str())?;
-        let body = json!({
-            "model": model,
-            "stream": true,
-            "messages": openai_messages(&req.messages, req.system_prompt_extra.as_deref()),
-            "tools": openai_tools(req),
-        });
-        let response = self
-            .client
-            .post(endpoint)
-            .headers(self.headers(false)?)
-            .json(&body)
-            .send()?
-            .error_for_status()?;
-        parse_ndjson(response, OllamaAccumulator::default())
-    }
-
+impl NetReaderCtx {
     fn headers(&self, anthropic: bool) -> Result<HeaderMap, ProviderTransportError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(key) = self.config.api_key.as_deref() {
+        if let Some(key) = self.api_key.as_deref() {
             let value = HeaderValue::from_str(key)
                 .map_err(|_| ProviderTransportError::Response("invalid API key header".into()))?;
             if anthropic {
                 headers.insert("x-api-key", value);
                 headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-            } else if self.config.kind == ProviderKind::Google {
+            } else if self.kind == ProviderKind::Google {
                 headers.insert("x-goog-api-key", value);
             } else {
                 let bearer = HeaderValue::from_str(&format!("Bearer {key}")).map_err(|_| {
@@ -287,7 +260,7 @@ impl HttpProvider {
             .map_err(|error| ProviderTransportError::Denied(error.to_string()))?;
         let url = Url::parse(endpoint)
             .map_err(|_| ProviderTransportError::InvalidUrl(endpoint.to_owned()))?;
-        if !self.config.local {
+        if !self.local {
             let host = url
                 .host_str()
                 .ok_or_else(|| ProviderTransportError::InvalidUrl(endpoint.to_owned()))?;
@@ -304,11 +277,105 @@ impl HttpProvider {
     }
 }
 
-impl Provider for HttpProvider {
-    fn stream_chat(&self, req: &ProviderRequest) -> Vec<ChatEvent> {
-        self.send(req)
-            .unwrap_or_else(|error| vec![ChatEvent::Error(error.to_string())])
-    }
+fn send_openai(
+    ctx: &NetReaderCtx,
+    req: &ProviderRequest,
+    tx: &UnboundedSender<ChatEvent>,
+) -> Result<(), ProviderTransportError> {
+    let endpoint = join_endpoint(&ctx.base_url, "chat/completions")?;
+    ctx.check_endpoint(endpoint.as_str())?;
+    let body = json!({
+        "model": req.model,
+        "stream": true,
+        "messages": openai_messages(&req.messages, req.system_prompt_extra.as_deref()),
+        "tools": openai_tools(req),
+    });
+    let response = ctx
+        .client
+        .post(endpoint)
+        .headers(ctx.headers(false)?)
+        .json(&body)
+        .send()?
+        .error_for_status()?;
+    parse_sse_streaming(BufReader::new(response), OpenAiAccumulator::default(), tx);
+    Ok(())
+}
+
+fn send_anthropic(
+    ctx: &NetReaderCtx,
+    req: &ProviderRequest,
+    tx: &UnboundedSender<ChatEvent>,
+) -> Result<(), ProviderTransportError> {
+    let endpoint = join_endpoint(&ctx.base_url, "messages")?;
+    ctx.check_endpoint(endpoint.as_str())?;
+    let (system, messages) = anthropic_messages(&req.messages, req.system_prompt_extra.as_deref());
+    let body = json!({
+        "model": req.model,
+        "max_tokens": 8192,
+        "stream": true,
+        "system": system,
+        "messages": messages,
+        "tools": anthropic_tools(req),
+    });
+    let response = ctx
+        .client
+        .post(endpoint)
+        .headers(ctx.headers(true)?)
+        .json(&body)
+        .send()?
+        .error_for_status()?;
+    parse_sse_streaming(
+        BufReader::new(response),
+        AnthropicAccumulator::default(),
+        tx,
+    );
+    Ok(())
+}
+
+fn send_google(
+    ctx: &NetReaderCtx,
+    req: &ProviderRequest,
+    tx: &UnboundedSender<ChatEvent>,
+) -> Result<(), ProviderTransportError> {
+    let endpoint = join_endpoint(
+        &ctx.base_url,
+        &format!("models/{}:streamGenerateContent?alt=sse", req.model),
+    )?;
+    ctx.check_endpoint(endpoint.as_str())?;
+    let body = google_body(req);
+    let response = ctx
+        .client
+        .post(endpoint)
+        .headers(ctx.headers(false)?)
+        .json(&body)
+        .send()?
+        .error_for_status()?;
+    parse_sse_streaming(BufReader::new(response), GoogleAccumulator::default(), tx);
+    Ok(())
+}
+
+fn send_ollama(
+    ctx: &NetReaderCtx,
+    req: &ProviderRequest,
+    tx: &UnboundedSender<ChatEvent>,
+) -> Result<(), ProviderTransportError> {
+    let endpoint = join_endpoint(&ctx.base_url, "api/chat")?;
+    ctx.check_endpoint(endpoint.as_str())?;
+    let body = json!({
+        "model": req.model,
+        "stream": true,
+        "messages": openai_messages(&req.messages, req.system_prompt_extra.as_deref()),
+        "tools": openai_tools(req),
+    });
+    let response = ctx
+        .client
+        .post(endpoint)
+        .headers(ctx.headers(false)?)
+        .json(&body)
+        .send()?
+        .error_for_status()?;
+    parse_ndjson_streaming(BufReader::new(response), OllamaAccumulator::default(), tx);
+    Ok(())
 }
 
 fn join_endpoint(base: &str, suffix: &str) -> Result<Url, ProviderTransportError> {
@@ -437,24 +504,44 @@ fn google_body(req: &ProviderRequest) -> Value {
 }
 
 trait StreamAccumulator: Default {
-    fn push_json(&mut self, value: Value, events: &mut Vec<ChatEvent>);
-    fn finish(self, events: &mut Vec<ChatEvent>);
+    /// 解析一行 SSE/NDJSON 的 JSON 负载，把产生的 [`ChatEvent`] 经 `tx` 即时推送。
+    fn push_json(&mut self, value: Value, tx: &UnboundedSender<ChatEvent>);
+    /// 流结束时推送累积的 `ToolCall` 与最终 `Done` 事件。
+    fn finish(self, tx: &UnboundedSender<ChatEvent>);
 }
 
-fn parse_sse<A: StreamAccumulator>(
-    response: Response,
+/// 同步收集辅助：用临时 channel + 后台 reader 线程把 reader 的事件收成 Vec，
+/// 供单测验证 accumulator 逻辑（生产路径走 [`parse_sse_streaming`] /
+/// [`parse_ndjson_streaming`]，事件由调用方逐条 await）。
+#[cfg(test)]
+fn accumulate_all<R: BufRead + Send + 'static, A: StreamAccumulator + Send + 'static>(
+    reader: R,
     accumulator: A,
-) -> Result<Vec<ChatEvent>, ProviderTransportError> {
-    parse_sse_lines(BufReader::new(response), accumulator)
+) -> Vec<ChatEvent> {
+    use futures::StreamExt;
+    let (tx, mut rx) = mpsc::unbounded::<ChatEvent>();
+    let handle = thread::Builder::new()
+        .name("termior-test-reader".into())
+        .spawn(move || {
+            parse_sse_streaming(reader, accumulator, &tx);
+            // reader 线程结束时 drop tx，使消费方的 rx.next() 收到 None。
+        })
+        .expect("spawn termior-test-reader");
+    let mut events = Vec::new();
+    while let Some(event) = futures::executor::block_on(rx.next()) {
+        events.push(event);
+    }
+    handle.join().expect("test reader thread panicked");
+    events
 }
 
-fn parse_sse_lines<R: BufRead, A: StreamAccumulator>(
+fn parse_sse_streaming<R: BufRead, A: StreamAccumulator>(
     reader: R,
     mut accumulator: A,
-) -> Result<Vec<ChatEvent>, ProviderTransportError> {
-    let mut events = Vec::new();
+    tx: &UnboundedSender<ChatEvent>,
+) {
     for line in reader.lines() {
-        let line = line?;
+        let Ok(line) = line else { break };
         let Some(data) = line.strip_prefix("data:") else {
             continue;
         };
@@ -463,32 +550,28 @@ fn parse_sse_lines<R: BufRead, A: StreamAccumulator>(
             break;
         }
         if let Ok(value) = serde_json::from_str::<Value>(data) {
-            accumulator.push_json(value, &mut events);
+            accumulator.push_json(value, tx);
         }
     }
-    accumulator.finish(&mut events);
-    Ok(events)
+    accumulator.finish(tx);
 }
 
-fn parse_ndjson<A: StreamAccumulator>(
-    response: Response,
-    accumulator: A,
-) -> Result<Vec<ChatEvent>, ProviderTransportError> {
-    parse_ndjson_lines(BufReader::new(response), accumulator)
-}
-
-fn parse_ndjson_lines<R: BufRead, A: StreamAccumulator>(
+fn parse_ndjson_streaming<R: BufRead, A: StreamAccumulator>(
     reader: R,
     mut accumulator: A,
-) -> Result<Vec<ChatEvent>, ProviderTransportError> {
-    let mut events = Vec::new();
+    tx: &UnboundedSender<ChatEvent>,
+) {
     for line in reader.lines() {
-        if let Ok(value) = serde_json::from_str::<Value>(&line?) {
-            accumulator.push_json(value, &mut events);
+        let Ok(line) = line else { break };
+        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+            accumulator.push_json(value, tx);
         }
     }
-    accumulator.finish(&mut events);
-    Ok(events)
+    accumulator.finish(tx);
+}
+
+fn send_error_event(tx: &UnboundedSender<ChatEvent>, error: impl std::fmt::Display) {
+    let _ = tx.unbounded_send(ChatEvent::Error(error.to_string()));
 }
 
 #[derive(Default)]
@@ -498,13 +581,13 @@ struct OpenAiAccumulator {
 }
 
 impl StreamAccumulator for OpenAiAccumulator {
-    fn push_json(&mut self, value: Value, events: &mut Vec<ChatEvent>) {
+    fn push_json(&mut self, value: Value, tx: &UnboundedSender<ChatEvent>) {
         let Some(delta) = value.pointer("/choices/0/delta") else {
             return;
         };
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             self.text.push_str(text);
-            events.push(ChatEvent::TextDelta(text.to_owned()));
+            let _ = tx.unbounded_send(ChatEvent::TextDelta(text.to_owned()));
         }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
@@ -530,11 +613,11 @@ impl StreamAccumulator for OpenAiAccumulator {
         }
     }
 
-    fn finish(self, events: &mut Vec<ChatEvent>) {
+    fn finish(self, tx: &UnboundedSender<ChatEvent>) {
         for call in &self.tools {
-            events.push(ChatEvent::ToolCall(call.clone()));
+            let _ = tx.unbounded_send(ChatEvent::ToolCall(call.clone()));
         }
-        events.push(ChatEvent::Done(Message {
+        let _ = tx.unbounded_send(ChatEvent::Done(Message {
             role: Role::Assistant,
             content: self.text,
             tool_calls: self.tools,
@@ -551,7 +634,7 @@ struct AnthropicAccumulator {
 }
 
 impl StreamAccumulator for AnthropicAccumulator {
-    fn push_json(&mut self, value: Value, events: &mut Vec<ChatEvent>) {
+    fn push_json(&mut self, value: Value, tx: &UnboundedSender<ChatEvent>) {
         match value.get("type").and_then(Value::as_str) {
             Some("content_block_start")
                 if value.pointer("/content_block/type").and_then(Value::as_str)
@@ -575,7 +658,7 @@ impl StreamAccumulator for AnthropicAccumulator {
             Some("content_block_delta") => {
                 if let Some(text) = value.pointer("/delta/text").and_then(Value::as_str) {
                     self.text.push_str(text);
-                    events.push(ChatEvent::TextDelta(text.to_owned()));
+                    let _ = tx.unbounded_send(ChatEvent::TextDelta(text.to_owned()));
                 }
                 if let (Some(index), Some(partial)) = (
                     self.active_tool,
@@ -585,16 +668,18 @@ impl StreamAccumulator for AnthropicAccumulator {
                 }
             }
             Some("content_block_stop") => self.active_tool = None,
-            Some("error") => events.push(ChatEvent::Error(value.to_string())),
+            Some("error") => {
+                let _ = tx.unbounded_send(ChatEvent::Error(value.to_string()));
+            }
             _ => {}
         }
     }
 
-    fn finish(self, events: &mut Vec<ChatEvent>) {
+    fn finish(self, tx: &UnboundedSender<ChatEvent>) {
         for call in &self.tools {
-            events.push(ChatEvent::ToolCall(call.clone()));
+            let _ = tx.unbounded_send(ChatEvent::ToolCall(call.clone()));
         }
-        events.push(ChatEvent::Done(Message {
+        let _ = tx.unbounded_send(ChatEvent::Done(Message {
             role: Role::Assistant,
             content: self.text,
             tool_calls: self.tools,
@@ -610,7 +695,7 @@ struct GoogleAccumulator {
 }
 
 impl StreamAccumulator for GoogleAccumulator {
-    fn push_json(&mut self, value: Value, events: &mut Vec<ChatEvent>) {
+    fn push_json(&mut self, value: Value, tx: &UnboundedSender<ChatEvent>) {
         let Some(parts) = value
             .pointer("/candidates/0/content/parts")
             .and_then(Value::as_array)
@@ -620,7 +705,7 @@ impl StreamAccumulator for GoogleAccumulator {
         for part in parts {
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 self.text.push_str(text);
-                events.push(ChatEvent::TextDelta(text.to_owned()));
+                let _ = tx.unbounded_send(ChatEvent::TextDelta(text.to_owned()));
             }
             if let Some(call) = part.get("functionCall") {
                 self.tools.push(ToolCall {
@@ -640,11 +725,11 @@ impl StreamAccumulator for GoogleAccumulator {
         }
     }
 
-    fn finish(self, events: &mut Vec<ChatEvent>) {
+    fn finish(self, tx: &UnboundedSender<ChatEvent>) {
         for call in &self.tools {
-            events.push(ChatEvent::ToolCall(call.clone()));
+            let _ = tx.unbounded_send(ChatEvent::ToolCall(call.clone()));
         }
-        events.push(ChatEvent::Done(Message {
+        let _ = tx.unbounded_send(ChatEvent::Done(Message {
             role: Role::Assistant,
             content: self.text,
             tool_calls: self.tools,
@@ -660,10 +745,10 @@ struct OllamaAccumulator {
 }
 
 impl StreamAccumulator for OllamaAccumulator {
-    fn push_json(&mut self, value: Value, events: &mut Vec<ChatEvent>) {
+    fn push_json(&mut self, value: Value, tx: &UnboundedSender<ChatEvent>) {
         if let Some(text) = value.pointer("/message/content").and_then(Value::as_str) {
             self.text.push_str(text);
-            events.push(ChatEvent::TextDelta(text.to_owned()));
+            let _ = tx.unbounded_send(ChatEvent::TextDelta(text.to_owned()));
         }
         if let Some(calls) = value
             .pointer("/message/tool_calls")
@@ -687,11 +772,11 @@ impl StreamAccumulator for OllamaAccumulator {
         }
     }
 
-    fn finish(self, events: &mut Vec<ChatEvent>) {
+    fn finish(self, tx: &UnboundedSender<ChatEvent>) {
         for call in &self.tools {
-            events.push(ChatEvent::ToolCall(call.clone()));
+            let _ = tx.unbounded_send(ChatEvent::ToolCall(call.clone()));
         }
-        events.push(ChatEvent::Done(Message {
+        let _ = tx.unbounded_send(ChatEvent::Done(Message {
             role: Role::Assistant,
             content: self.text,
             tool_calls: self.tools,
@@ -722,7 +807,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"a\\\"}\"}}]}}]}\n\n",
             "data: [DONE]\n"
         );
-        let events = parse_sse_lines(Cursor::new(input), OpenAiAccumulator::default()).unwrap();
+        let events = accumulate_all(Cursor::new(input), OpenAiAccumulator::default());
         assert!(events
             .iter()
             .any(|event| matches!(event, ChatEvent::TextDelta(text) if text == "Hi ")));
@@ -740,7 +825,7 @@ mod tests {
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n",
             "data: {\"type\":\"content_block_stop\"}\n"
         );
-        let events = parse_sse_lines(Cursor::new(input), AnthropicAccumulator::default()).unwrap();
+        let events = accumulate_all(Cursor::new(input), AnthropicAccumulator::default());
         let ChatEvent::Done(message) = events.last().unwrap() else {
             panic!()
         };
@@ -756,13 +841,13 @@ mod tests {
         .unwrap();
         // Config was not marked local, so the guard denies it.
         assert!(provider
-            .check_endpoint("http://127.0.0.1:9999/v1/chat/completions")
+            .check_endpoint_for_ping("http://127.0.0.1:9999/v1/chat/completions")
             .is_err());
         let mut config = ProviderConfig::for_kind(ProviderKind::LmStudio, "local");
         config.base_url = "http://127.0.0.1:9999/v1".into();
         let local = HttpProvider::new(config).unwrap();
         assert!(local
-            .check_endpoint("http://127.0.0.1:9999/v1/chat/completions")
+            .check_endpoint_for_ping("http://127.0.0.1:9999/v1/chat/completions")
             .is_ok());
     }
 }
