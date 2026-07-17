@@ -39,6 +39,19 @@ fn collect_via_emulator_until<F: Fn(&str) -> bool>(
     acc
 }
 
+fn shell_is_ready(output: &str) -> bool {
+    #[cfg(windows)]
+    {
+        // PowerShell and cmd can print banners before their line editor is ready. Sending input
+        // before the first prompt risks having it discarded during startup initialization.
+        output.contains('>')
+    }
+    #[cfg(not(windows))]
+    {
+        !output.is_empty()
+    }
+}
+
 #[test]
 fn spawn_produces_output() {
     // Windows 用 cmd，Unix 用 bash——都应能 spawn 并产生初始输出。
@@ -96,12 +109,12 @@ fn default_shell_roundtrip_handles_terminal_protocol_queries() {
     let initial = collect_via_emulator_until(
         &mut rx,
         writer.clone(),
-        |output| !output.is_empty(),
-        Duration::from_secs(5),
+        shell_is_ready,
+        Duration::from_secs(15),
     );
     assert!(
-        !initial.is_empty(),
-        "default shell produced no terminal data"
+        shell_is_ready(&initial),
+        "default shell did not become interactive: {initial:?}"
     );
 
     writer
@@ -111,7 +124,7 @@ fn default_shell_roundtrip_handles_terminal_protocol_queries() {
         &mut rx,
         writer,
         |output| output.matches("termior_default_shell_alive").count() >= 2,
-        Duration::from_secs(5),
+        Duration::from_secs(10),
     );
     assert!(
         output.matches("termior_default_shell_alive").count() >= 2,
@@ -134,12 +147,12 @@ fn shell_integration_roundtrip_stays_interactive() {
     let initial = collect_via_emulator_until(
         &mut rx,
         writer.clone(),
-        |output| !output.is_empty(),
-        Duration::from_secs(5),
+        shell_is_ready,
+        Duration::from_secs(15),
     );
     assert!(
-        !initial.is_empty(),
-        "shell integration produced no terminal data"
+        shell_is_ready(&initial),
+        "shell integration did not become interactive: {initial:?}"
     );
 
     writer
@@ -149,7 +162,7 @@ fn shell_integration_roundtrip_stays_interactive() {
         &mut rx,
         writer,
         |output| output.matches("termior_integrated_shell_alive").count() >= 2,
-        Duration::from_secs(5),
+        Duration::from_secs(10),
     );
     assert!(
         output.matches("termior_integrated_shell_alive").count() >= 2,
