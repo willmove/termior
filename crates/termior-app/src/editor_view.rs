@@ -6,7 +6,7 @@ use gpui::{
     UTF16Selection, WeakEntity, Window,
 };
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use termior_editor::{
     builtin_editor_themes, EditorBuffer, EditorTheme, HighlightKind, Motion, SyntaxDocument,
     SyntaxLanguage, VimCommand, VimEngine, VimMode,
@@ -94,6 +94,21 @@ impl EditorView {
 
     pub fn path(&self) -> Option<&Path> {
         self.buffer.path()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.buffer.is_dirty()
+    }
+
+    /// Retarget an already-open editor after an Explorer rename without
+    /// discarding its buffer, selection, undo history, or syntax state.
+    pub fn set_path_after_rename(&mut self, path: PathBuf) {
+        self.title = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Editor")
+            .to_owned();
+        self.buffer.set_path(path);
     }
 
     pub fn selected_text(&self) -> Option<String> {

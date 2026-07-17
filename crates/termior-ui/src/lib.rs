@@ -61,6 +61,10 @@ pub struct WorkspaceState {
     pub active: Option<TabId>,
     pub sidebar_visible: bool,
     pub sidebar_panel: SidebarPanel,
+    /// Persisted width of the activity bar plus sidebar panel. Older workspace
+    /// files predate this field, so serde restores the product default.
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
     pub composer_visible: bool,
     pub localhost_preview: Option<String>,
     pub ai_tools_running: usize,
@@ -83,6 +87,7 @@ impl WorkspaceState {
             active: None,
             sidebar_visible: true,
             sidebar_panel: SidebarPanel::Explorer,
+            sidebar_width: default_sidebar_width(),
             composer_visible: true,
             localhost_preview: None,
             ai_tools_running: 0,
@@ -202,6 +207,10 @@ impl WorkspaceState {
     }
 }
 
+fn default_sidebar_width() -> f32 {
+    280.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +257,17 @@ mod tests {
         assert_eq!(ws.tabs.len(), 1);
         ws.close_active_pane_or_tab().unwrap();
         assert!(ws.tabs.is_empty());
+    }
+
+    #[test]
+    fn legacy_workspace_json_restores_default_sidebar_width() {
+        let mut ws = WorkspaceState::new("/workspace");
+        ws.new_tab(TabKind::Terminal, "terminal", false);
+        let mut value = serde_json::to_value(&ws).unwrap();
+        value.as_object_mut().unwrap().remove("sidebar_width");
+
+        let restored: WorkspaceState = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.sidebar_width, 280.0);
     }
 }

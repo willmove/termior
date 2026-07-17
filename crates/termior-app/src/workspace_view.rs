@@ -5,16 +5,19 @@ use crate::preview_view::PreviewView;
 use crate::settings_view::SettingsView;
 use crate::terminal_view::{TerminalView, TerminalViewEvent};
 use gpui::{
-    div, prelude::*, px, relative, size, AnyElement, AnyWindowHandle, Bounds, Context, Entity,
-    FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, SharedString, Task, Window,
-    WindowBounds,
+    anchored, canvas, div, prelude::*, px, relative, size, AnyElement, AnyWindowHandle, App,
+    Bounds, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, PromptButton, PromptLevel, SharedString, Task, UTF16Selection, Window, WindowBounds,
 };
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 use termior_ai::AttachmentSource;
 use termior_explorer::{
-    ContentMatch, ContentSearch, FileEntry, FileIndex, TreeState, WorkspaceWatcher,
+    ContentMatch, ContentSearch, FileEntry, FileIndex, IconKind, TreeState, WorkspaceWatcher,
 };
 use termior_platform::{
     AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationContext,
@@ -31,6 +34,10 @@ use termior_ui_kit::{LayoutNode, PaneId, SplitDirection};
 use termior_vcs::{
     BranchState, ChangeGroup, ChangedFile, CommitInfo, GitRepository, RemoteOperation,
 };
+
+const DEFAULT_SIDEBAR_WIDTH: f32 = 280.0;
+const MIN_SIDEBAR_WIDTH: f32 = 220.0;
+const MAX_SIDEBAR_WIDTH: f32 = 520.0;
 
 #[derive(Clone)]
 enum PaneContent {
@@ -87,6 +94,57 @@ enum CommandMode {
     GitSwitchBranch,
 }
 
+#[derive(Debug, Clone)]
+struct ExplorerContextMenu {
+    target: ExplorerContextTarget,
+    position: Point<Pixels>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExplorerContextTarget {
+    Workspace,
+    Directory(PathBuf),
+    File(PathBuf),
+}
+
+impl ExplorerContextTarget {
+    fn path(&self, root: &Path) -> PathBuf {
+        match self {
+            Self::Workspace => root.to_path_buf(),
+            Self::Directory(path) | Self::File(path) => path.clone(),
+        }
+    }
+
+    fn kind(&self) -> ExplorerContextTargetKind {
+        match self {
+            Self::Workspace => ExplorerContextTargetKind::Workspace,
+            Self::Directory(_) => ExplorerContextTargetKind::Directory,
+            Self::File(_) => ExplorerContextTargetKind::File,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplorerContextTargetKind {
+    Workspace,
+    Directory,
+    File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplorerContextAction {
+    Open,
+    CreateFile,
+    CreateDirectory,
+    Rename,
+    Delete,
+    Reveal,
+    AttachToAi,
+    FindFile,
+    SearchContent,
+    Refresh,
+}
+
 pub struct WorkspaceView {
     model: WorkspaceState,
     tabs: Vec<AppTab>,
@@ -98,12 +156,20 @@ pub struct WorkspaceView {
     explorer: Option<FileIndex>,
     explorer_tree: TreeState,
     explorer_watcher: Option<WorkspaceWatcher>,
+    explorer_requested_root: PathBuf,
+    explorer_loading: bool,
+    explorer_scan_generation: u64,
+    explorer_error: Option<String>,
     _background_task: Option<Task<()>>,
     command_mode: CommandMode,
     command_input: String,
+    command_marked_text: String,
     command_message: Option<String>,
+    pending_name_parent: Option<PathBuf>,
+    pending_rename_target: Option<PathBuf>,
+    explorer_context_menu: Option<ExplorerContextMenu>,
+    sidebar_resizing: bool,
     content_matches: Vec<ContentMatch>,
-    confirm_delete: Option<PathBuf>,
     vcs_status: Vec<ChangedFile>,
     vcs_history: Vec<CommitInfo>,
     vcs_branch: Option<BranchState>,
@@ -149,6 +215,9 @@ impl WorkspaceView {
             .and_then(|raw| serde_json::from_str::<WorkspaceState>(&raw).ok())
             .filter(|state| state.root == root)
             .unwrap_or_else(|| WorkspaceState::new(root.clone()));
+        model.sidebar_width = model
+            .sidebar_width
+            .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
         // A restored model needs runtime view owners; terminal/preview are restored asynchronously.
         let tabs = model
             .tabs
@@ -234,9 +303,7 @@ impl WorkspaceView {
             status: AgentStatus::Finished,
             tab_id: None,
         });
-        let explorer = FileIndex::build(&root, settings.show_dotfiles).ok();
         let explorer_tree = TreeState::new(root.clone());
-        let explorer_watcher = WorkspaceWatcher::watch(&root).ok();
         let (vcs_status, vcs_history, vcs_branch) = load_vcs(&root, &workspace_auth);
         Self {
             model,
@@ -246,15 +313,23 @@ impl WorkspaceView {
             palette,
             focus_handle: cx.focus_handle(),
             composer,
-            explorer,
+            explorer: None,
             explorer_tree,
-            explorer_watcher,
+            explorer_watcher: None,
+            explorer_requested_root: root,
+            explorer_loading: true,
+            explorer_scan_generation: 0,
+            explorer_error: None,
             _background_task: None,
             command_mode: CommandMode::Browse,
             command_input: String::new(),
+            command_marked_text: String::new(),
             command_message: None,
+            pending_name_parent: None,
+            pending_rename_target: None,
+            explorer_context_menu: None,
+            sidebar_resizing: false,
             content_matches: Vec::new(),
-            confirm_delete: None,
             vcs_status,
             vcs_history,
             vcs_branch,
@@ -327,6 +402,7 @@ impl WorkspaceView {
     }
 
     pub fn start_background_services(&mut self, cx: &mut Context<Self>) {
+        self.schedule_explorer_scan(self.explorer_requested_root.clone(), cx);
         self._background_task = Some(cx.spawn(async move |workspace, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
@@ -338,7 +414,9 @@ impl WorkspaceView {
                         .as_ref()
                         .is_some_and(|watcher| !watcher.try_changes().is_empty());
                     if changed {
-                        workspace.refresh_workspace_data();
+                        workspace
+                            .schedule_explorer_scan(workspace.explorer_requested_root.clone(), cx);
+                        workspace.refresh_vcs_data();
                         cx.notify();
                     }
                 })
@@ -349,12 +427,62 @@ impl WorkspaceView {
         }));
     }
 
-    fn refresh_workspace_data(&mut self) {
-        if let Some(index) = self.explorer.as_mut() {
-            if let Err(error) = index.refresh() {
-                self.command_message = Some(format!("Explorer refresh failed: {error}"));
-            }
+    fn schedule_explorer_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if !root.is_dir() {
+            self.explorer_loading = false;
+            self.explorer_error = Some(format!(
+                "Explorer root is not a directory: {}",
+                root.display()
+            ));
+            return;
         }
+
+        self.explorer_requested_root = root.clone();
+        self.explorer_tree.set_root(root.clone());
+        self.explorer_loading = true;
+        self.explorer_error = None;
+        self.explorer_scan_generation = self.explorer_scan_generation.saturating_add(1);
+        let generation = self.explorer_scan_generation;
+        let show_dotfiles = self.settings.show_dotfiles;
+        let scan = cx
+            .background_executor()
+            .spawn(async move { FileIndex::build(root, show_dotfiles) });
+        cx.spawn(async move |workspace, cx| {
+            let result = scan.await;
+            let _ = workspace.update(cx, |workspace, cx| {
+                if generation != workspace.explorer_scan_generation {
+                    return;
+                }
+                workspace.explorer_loading = false;
+                match result {
+                    Ok(index) if index.root() == workspace.explorer_requested_root => {
+                        let root_changed = workspace
+                            .explorer
+                            .as_ref()
+                            .map_or(true, |current| current.root() != index.root());
+                        if root_changed || workspace.explorer_watcher.is_none() {
+                            workspace.explorer_watcher = WorkspaceWatcher::watch(index.root()).ok();
+                        }
+                        workspace.explorer = Some(index);
+                        workspace.explorer_error = None;
+                    }
+                    Ok(_) => return,
+                    Err(error) => {
+                        workspace.explorer_error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_workspace_data(&mut self, cx: &mut Context<Self>) {
+        self.schedule_explorer_scan(self.explorer_requested_root.clone(), cx);
+        self.refresh_vcs_data();
+    }
+
+    fn refresh_vcs_data(&mut self) {
         let (status, history, branch) = load_vcs(&self.model.root, &self.workspace_auth);
         self.vcs_status = status;
         self.vcs_history = history;
@@ -549,6 +677,21 @@ impl WorkspaceView {
     }
 
     fn open_editor(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let resource = path.to_string_lossy().into_owned();
+        if let Some(id) = self
+            .model
+            .tabs
+            .iter()
+            .find(|tab| {
+                matches!(tab.kind, TabKind::Editor | TabKind::Markdown)
+                    && tab.resource.as_deref() == Some(resource.as_str())
+            })
+            .map(|tab| tab.id)
+        {
+            self.activate_runtime(id, cx);
+            cx.notify();
+            return;
+        }
         let title = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -563,7 +706,7 @@ impl WorkspaceView {
         }
         let id = self.model.new_tab(TabKind::Editor, title, false);
         if let Some(tab) = self.model.active_tab_mut() {
-            tab.resource = Some(path.to_string_lossy().into_owned());
+            tab.resource = Some(resource);
         }
         self.tabs.push(AppTab {
             id,
@@ -871,6 +1014,352 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn show_explorer_context_menu(
+        &mut self,
+        target: ExplorerContextTarget,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match &target {
+            ExplorerContextTarget::Workspace => {}
+            ExplorerContextTarget::Directory(path) | ExplorerContextTarget::File(path) => {
+                self.explorer_tree.select(path.clone());
+            }
+        }
+        self.command_mode = CommandMode::Browse;
+        self.command_marked_text.clear();
+        self.explorer_context_menu = Some(ExplorerContextMenu { target, position });
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn handle_explorer_context_action(
+        &mut self,
+        action: ExplorerContextAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.explorer_context_menu.take().map(|menu| menu.target) else {
+            return;
+        };
+        let root = self.explorer_requested_root.clone();
+        match action {
+            ExplorerContextAction::Open => {
+                if let ExplorerContextTarget::File(path) = target {
+                    self.open_editor(path, cx);
+                }
+            }
+            ExplorerContextAction::CreateFile | ExplorerContextAction::CreateDirectory => {
+                let parent = match target {
+                    ExplorerContextTarget::Directory(path) => path,
+                    ExplorerContextTarget::File(path) => {
+                        path.parent().map(Path::to_path_buf).unwrap_or(root)
+                    }
+                    ExplorerContextTarget::Workspace => root,
+                };
+                if action == ExplorerContextAction::CreateFile {
+                    self.begin_name_command(
+                        CommandMode::CreateFile,
+                        parent,
+                        None,
+                        "untitled",
+                        window,
+                        cx,
+                    );
+                } else {
+                    self.begin_name_command(
+                        CommandMode::CreateDirectory,
+                        parent,
+                        None,
+                        "New Folder",
+                        window,
+                        cx,
+                    );
+                }
+            }
+            ExplorerContextAction::Rename => {
+                let path = match target {
+                    ExplorerContextTarget::Directory(path) | ExplorerContextTarget::File(path) => {
+                        path
+                    }
+                    ExplorerContextTarget::Workspace => return,
+                };
+                let parent = path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| root.clone());
+                let prefill = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                self.begin_name_command(
+                    CommandMode::Rename,
+                    parent,
+                    Some(path),
+                    &prefill,
+                    window,
+                    cx,
+                );
+            }
+            ExplorerContextAction::Delete => self.delete_selected_with_prompt(window, cx),
+            ExplorerContextAction::Reveal => {
+                let path = target.path(&root);
+                self.command_message = reveal_in_system_file_manager(
+                    &path,
+                    target.kind() == ExplorerContextTargetKind::File,
+                )
+                .err()
+                .map(|error| format!("Could not reveal path: {error}"))
+                .or_else(|| Some(format!("Revealed {}", path.display())));
+            }
+            ExplorerContextAction::AttachToAi => {
+                if let ExplorerContextTarget::File(path) = target {
+                    self.attach_file(path, cx);
+                }
+            }
+            ExplorerContextAction::FindFile => self.begin_command(CommandMode::FindFile, cx),
+            ExplorerContextAction::SearchContent => {
+                self.begin_command(CommandMode::SearchContent, cx)
+            }
+            ExplorerContextAction::Refresh => {
+                self.refresh_workspace_data(cx);
+                self.command_message = Some("Explorer refresh scheduled".into());
+            }
+        }
+        cx.notify();
+    }
+
+    fn has_dirty_editor_under(&self, target: &Path, cx: &App) -> bool {
+        self.tabs.iter().any(|tab| {
+            tab.panes.values().any(|pane| match pane {
+                PaneContent::Editor(editor) => {
+                    let editor = editor.read(cx);
+                    editor.is_dirty()
+                        && editor
+                            .path()
+                            .is_some_and(|path| path == target || path.starts_with(target))
+                }
+                _ => false,
+            })
+        })
+    }
+
+    fn retarget_open_editors(&mut self, old_path: &Path, new_path: &Path, cx: &mut Context<Self>) {
+        let updates = self
+            .model
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                if !matches!(tab.kind, TabKind::Editor | TabKind::Markdown) {
+                    return None;
+                }
+                let resource = PathBuf::from(tab.resource.as_deref()?);
+                let updated = if resource == old_path {
+                    new_path.to_path_buf()
+                } else {
+                    let suffix = resource.strip_prefix(old_path).ok()?;
+                    new_path.join(suffix)
+                };
+                Some((tab.id, updated))
+            })
+            .collect::<Vec<_>>();
+
+        for (id, path) in updates {
+            if let Some(tab) = self.model.tabs.iter_mut().find(|tab| tab.id == id) {
+                tab.title = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Editor")
+                    .to_owned();
+                tab.resource = Some(path.to_string_lossy().into_owned());
+            }
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+                for pane in tab.panes.values_mut() {
+                    if let PaneContent::Editor(editor) = pane {
+                        editor.update(cx, |editor, _| {
+                            let Some(current) = editor.path().map(Path::to_path_buf) else {
+                                return;
+                            };
+                            let retargeted = if current == old_path {
+                                Some(new_path.to_path_buf())
+                            } else {
+                                current
+                                    .strip_prefix(old_path)
+                                    .ok()
+                                    .map(|suffix| new_path.join(suffix))
+                            };
+                            if let Some(retargeted) = retargeted {
+                                editor.set_path_after_rename(retargeted);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn delete_selected_with_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.explorer_tree.selected().map(Path::to_path_buf) else {
+            self.command_message = Some("Select a file or directory first".into());
+            cx.notify();
+            return;
+        };
+        if self.has_dirty_editor_under(&path, cx) {
+            self.command_message = Some("Save open files under this path before deleting".into());
+            cx.notify();
+            return;
+        }
+        let Ok(relative) = path
+            .strip_prefix(self.explorer_tree.root())
+            .map(Path::to_path_buf)
+        else {
+            self.command_message = Some("Selected path is outside the Explorer root".into());
+            cx.notify();
+            return;
+        };
+
+        let detail = format!("Delete {}?", path.display());
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Delete Explorer item",
+            Some(&detail),
+            &[PromptButton::ok("Delete"), PromptButton::cancel("Cancel")],
+            cx,
+        );
+        let recursive_prompt = (path.is_dir() && dir_is_non_empty(&path)).then(|| {
+            (
+                "Delete non-empty directory".to_owned(),
+                format!(
+                    "{} and all of its contents will be permanently deleted.",
+                    path.display()
+                ),
+            )
+        });
+        let window_handle = window.window_handle();
+        self.command_message = Some("Waiting for delete confirmation…".into());
+        cx.spawn(async move |workspace, cx| {
+            let first_confirmed = matches!(answer.await, Ok(0));
+            let confirmed = match (first_confirmed, recursive_prompt) {
+                (true, Some((title, detail))) => {
+                    let second = cx.update_window(window_handle, |_, window, cx| {
+                        window.prompt(
+                            PromptLevel::Warning,
+                            &title,
+                            Some(&detail),
+                            &[
+                                PromptButton::ok("Delete all"),
+                                PromptButton::cancel("Cancel"),
+                            ],
+                            cx,
+                        )
+                    });
+                    match second {
+                        Ok(second) => matches!(second.await, Ok(0)),
+                        Err(_) => false,
+                    }
+                }
+                (true, None) => true,
+                (false, _) => false,
+            };
+            let _ = workspace.update(cx, |workspace, cx| {
+                if !confirmed {
+                    workspace.command_message = Some("Delete canceled".into());
+                    cx.notify();
+                    return;
+                }
+                match workspace.explorer_tree.delete(&relative) {
+                    Ok(()) => {
+                        workspace.close_tabs_for_deleted_path(&path);
+                        workspace.explorer_tree.clear_selection();
+                        workspace.command_message = Some(format!("Deleted {}", path.display()));
+                        workspace.refresh_workspace_data(cx);
+                    }
+                    Err(error) => {
+                        workspace.command_message = Some(format!("Delete failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn close_tabs_for_deleted_path(&mut self, deleted: &Path) {
+        let removed = self
+            .model
+            .tabs
+            .iter()
+            .filter(|tab| {
+                matches!(tab.kind, TabKind::Editor | TabKind::Markdown)
+                    && tab
+                        .resource
+                        .as_deref()
+                        .map(Path::new)
+                        .is_some_and(|path| path == deleted || path.starts_with(deleted))
+            })
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            return;
+        }
+        self.model.tabs.retain(|tab| !removed.contains(&tab.id));
+        self.tabs.retain(|tab| !removed.contains(&tab.id));
+        if self.model.active.is_some_and(|id| removed.contains(&id)) {
+            self.model.active = self.model.tabs.last().map(|tab| tab.id);
+        }
+    }
+
+    fn start_sidebar_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_resizing = true;
+        self.explorer_context_menu = None;
+        if event.click_count >= 2 {
+            self.model.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn resize_sidebar(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sidebar_resizing {
+            self.model.sidebar_width =
+                f32::from(event.position.x).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+            cx.notify();
+        }
+    }
+
+    fn stop_sidebar_resize(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.sidebar_resizing {
+            self.sidebar_resizing = false;
+            self.persist_workspace();
+            cx.notify();
+        }
+    }
+
+    fn persist_workspace(&self) {
+        if let Some(dir) = &self.data_dir {
+            if let Ok(raw) = serde_json::to_string_pretty(&self.model) {
+                let _ = atomic_write(&dir.join("Termior-workspaces.json"), &raw);
+            }
+        }
+    }
+
     fn cycle_theme(
         &mut self,
         _event: &MouseDownEvent,
@@ -941,9 +1430,7 @@ impl WorkspaceView {
             },
             true,
         );
-        if let Some(index) = self.explorer.as_mut() {
-            let _ = index.set_show_dotfiles(self.settings.show_dotfiles);
-        }
+        self.schedule_explorer_scan(self.explorer_requested_root.clone(), cx);
         for tab in &self.tabs {
             for pane in tab.panes.values() {
                 if let PaneContent::Editor(editor) = pane {
@@ -972,7 +1459,39 @@ impl WorkspaceView {
     fn begin_command(&mut self, mode: CommandMode, cx: &mut Context<Self>) {
         self.command_mode = mode;
         self.command_input.clear();
+        self.command_marked_text.clear();
         self.command_message = None;
+        if mode == CommandMode::SearchContent {
+            self.content_matches.clear();
+        }
+        self.pending_name_parent = None;
+        self.pending_rename_target = None;
+        self.explorer_context_menu = None;
+        cx.notify();
+    }
+
+    fn begin_name_command(
+        &mut self,
+        mode: CommandMode,
+        parent: PathBuf,
+        target: Option<PathBuf>,
+        prefill: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.command_mode = mode;
+        self.command_input = prefill.to_owned();
+        self.command_marked_text.clear();
+        self.command_message = Some(match mode {
+            CommandMode::CreateFile => "Type a file name, then press Enter".into(),
+            CommandMode::CreateDirectory => "Type a directory name, then press Enter".into(),
+            CommandMode::Rename => "Edit the name, then press Enter".into(),
+            _ => String::new(),
+        });
+        self.pending_name_parent = Some(parent);
+        self.pending_rename_target = target;
+        self.explorer_context_menu = None;
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -985,20 +1504,20 @@ impl WorkspaceView {
             "escape" => {
                 self.command_mode = CommandMode::Browse;
                 self.command_input.clear();
+                self.command_marked_text.clear();
+                self.content_matches.clear();
+                self.pending_name_parent = None;
+                self.pending_rename_target = None;
             }
             "backspace" => {
+                self.command_marked_text.clear();
                 self.command_input.pop();
-            }
-            "enter" | "return" => self.execute_command(cx),
-            _ if !event.keystroke.modifiers.control
-                && !event.keystroke.modifiers.platform
-                && !event.keystroke.modifiers.alt =>
-            {
-                if let Some(text) = &event.keystroke.key_char {
-                    self.command_input.push_str(text);
+                if self.command_mode == CommandMode::SearchContent {
+                    self.content_matches.clear();
                 }
             }
-            _ => {}
+            "enter" | "return" => self.execute_command(cx),
+            _ => return false,
         }
         cx.notify();
         true
@@ -1009,6 +1528,7 @@ impl WorkspaceView {
         if input.is_empty() {
             return;
         }
+        let completed_mode = self.command_mode;
         let result = match self.command_mode {
             CommandMode::FindFile => {
                 let path = self.explorer.as_ref().and_then(|index| {
@@ -1046,28 +1566,67 @@ impl WorkspaceView {
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             }
-            CommandMode::CreateFile => self
-                .explorer_tree
-                .create_file(&input)
-                .map(|path| self.open_editor(path, cx))
-                .map_err(|error| error.to_string()),
-            CommandMode::CreateDirectory => self
-                .explorer_tree
-                .create_directory(&input)
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
+            CommandMode::CreateFile => {
+                let result = if let Some(parent) = self.pending_name_parent.as_ref() {
+                    parent
+                        .strip_prefix(self.explorer_tree.root())
+                        .map_err(|error| error.to_string())
+                        .and_then(|relative| {
+                            self.explorer_tree
+                                .create_file_in(relative, &input)
+                                .map_err(|error| error.to_string())
+                        })
+                } else {
+                    self.explorer_tree
+                        .create_file(&input)
+                        .map_err(|error| error.to_string())
+                };
+                result.map(|path| {
+                    self.explorer_tree.select(path.clone());
+                    self.open_editor(path, cx);
+                })
+            }
+            CommandMode::CreateDirectory => {
+                let result = if let Some(parent) = self.pending_name_parent.as_ref() {
+                    parent
+                        .strip_prefix(self.explorer_tree.root())
+                        .map_err(|error| error.to_string())
+                        .and_then(|relative| {
+                            self.explorer_tree
+                                .create_directory_in(relative, &input)
+                                .map_err(|error| error.to_string())
+                        })
+                } else {
+                    self.explorer_tree
+                        .create_directory(&input)
+                        .map_err(|error| error.to_string())
+                };
+                result.map(|path| self.explorer_tree.select(path))
+            }
             CommandMode::Rename => {
-                let selected = self.explorer_tree.selected().map(Path::to_path_buf);
-                match selected.and_then(|path| {
-                    path.strip_prefix(self.explorer_tree.root())
-                        .ok()
-                        .map(Path::to_path_buf)
-                }) {
-                    Some(relative) => self
-                        .explorer_tree
-                        .rename(relative, &input)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string()),
+                let selected = self
+                    .pending_rename_target
+                    .clone()
+                    .or_else(|| self.explorer_tree.selected().map(Path::to_path_buf));
+                match selected {
+                    Some(path) if self.has_dirty_editor_under(&path, cx) => {
+                        Err("Save open files under this path before renaming".to_owned())
+                    }
+                    Some(path) => {
+                        let relative = path
+                            .strip_prefix(self.explorer_tree.root())
+                            .map(Path::to_path_buf)
+                            .map_err(|error| error.to_string());
+                        relative.and_then(|relative| {
+                            self.explorer_tree
+                                .rename(relative, &input)
+                                .map_err(|error| error.to_string())
+                                .map(|renamed| {
+                                    self.retarget_open_editors(&path, &renamed, cx);
+                                    self.explorer_tree.select(renamed);
+                                })
+                        })
+                    }
                     None => Err("Select a file or directory first".to_owned()),
                 }
             }
@@ -1088,10 +1647,32 @@ impl WorkspaceView {
         };
         match result {
             Ok(()) => {
-                self.command_message = Some("Done".into());
-                self.command_mode = CommandMode::Browse;
-                self.command_input.clear();
-                self.refresh_workspace_data();
+                if completed_mode == CommandMode::SearchContent {
+                    self.command_message = Some(match self.content_matches.len() {
+                        0 => "No content matches".into(),
+                        1 => "1 content match".into(),
+                        count => format!("{count} content matches"),
+                    });
+                    self.command_marked_text.clear();
+                } else {
+                    self.command_message = Some("Done".into());
+                    self.command_mode = CommandMode::Browse;
+                    self.command_input.clear();
+                    self.command_marked_text.clear();
+                    self.pending_name_parent = None;
+                    self.pending_rename_target = None;
+                }
+                if matches!(
+                    completed_mode,
+                    CommandMode::CreateFile
+                        | CommandMode::CreateDirectory
+                        | CommandMode::Rename
+                        | CommandMode::GitCommit
+                        | CommandMode::GitCreateBranch
+                        | CommandMode::GitSwitchBranch
+                ) {
+                    self.refresh_workspace_data(cx);
+                }
             }
             Err(error) => self.command_message = Some(error),
         }
@@ -1110,7 +1691,7 @@ impl WorkspaceView {
             }
         });
         self.command_message = result.err();
-        self.refresh_workspace_data();
+        self.refresh_workspace_data(cx);
         cx.notify();
     }
 
@@ -1127,7 +1708,7 @@ impl WorkspaceView {
             Ok(())
         });
         self.command_message = result.err();
-        self.refresh_workspace_data();
+        self.refresh_workspace_data(cx);
         cx.notify();
     }
 
@@ -1146,37 +1727,11 @@ impl WorkspaceView {
                     Ok(output) => output.trim().to_owned(),
                     Err(error) => error.to_string(),
                 });
-                workspace.refresh_workspace_data();
+                workspace.refresh_workspace_data(cx);
                 cx.notify();
             });
         })
         .detach();
-    }
-
-    fn delete_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(selected) = self.explorer_tree.selected().map(Path::to_path_buf) else {
-            self.command_message = Some("Select a file or directory first".into());
-            cx.notify();
-            return;
-        };
-        if self.confirm_delete.as_ref() != Some(&selected) {
-            self.confirm_delete = Some(selected);
-            self.command_message = Some("Click Delete again to confirm".into());
-            cx.notify();
-            return;
-        }
-        self.confirm_delete = None;
-        let result = selected
-            .strip_prefix(self.explorer_tree.root())
-            .map_err(|error| error.to_string())
-            .and_then(|relative| {
-                self.explorer_tree
-                    .delete(relative)
-                    .map_err(|error| error.to_string())
-            });
-        self.command_message = result.err();
-        self.refresh_workspace_data();
-        cx.notify();
     }
 
     fn global_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1371,8 +1926,14 @@ impl WorkspaceView {
                 .border_color(gpui::rgba(0x4f8fefff))
                 .text_xs()
                 .child(SharedString::from(format!(
-                    "{:?}: {}▏",
-                    self.command_mode, self.command_input
+                    "{:?}: {}{}▏",
+                    self.command_mode,
+                    self.command_input,
+                    if self.command_marked_text.is_empty() {
+                        ""
+                    } else {
+                        "…"
+                    }
                 )))
         });
         let message = self.command_message.clone().map(|message| {
@@ -1404,12 +1965,39 @@ impl WorkspaceView {
                     .child(sidebar_button("+D", "explorer-new-dir", cx, |this, cx| {
                         this.begin_command(CommandMode::CreateDirectory, cx)
                     }))
-                    .child(sidebar_button("Ren", "explorer-rename", cx, |this, cx| {
-                        this.begin_command(CommandMode::Rename, cx)
-                    }))
-                    .child(sidebar_button("Del", "explorer-delete", cx, |this, cx| {
-                        this.delete_selected(cx)
+                    .child(sidebar_button("↻", "explorer-refresh", cx, |this, cx| {
+                        this.refresh_workspace_data(cx)
                     }));
+
+                let root_label = self
+                    .explorer_requested_root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.explorer_requested_root.display().to_string());
+                let active_path = self
+                    .model
+                    .active_tab()
+                    .and_then(|tab| tab.resource.as_deref())
+                    .map(PathBuf::from);
+                let icon_surface = gpui_color(self.palette.surface[1]);
+                let icon_panel = gpui_color(self.palette.surface[2]);
+                let (visible_entries, visible_entry_count) = self
+                    .explorer
+                    .as_ref()
+                    .map(|index| {
+                        let mut entries = index
+                            .entries()
+                            .iter()
+                            .filter(|entry| explorer_entry_visible(entry, &self.explorer_tree))
+                            .collect::<Vec<_>>();
+                        entries.sort_by(|a, b| a.relative.cmp(&b.relative));
+                        let count = entries.len();
+                        let visible = entries.into_iter().take(500).cloned().collect::<Vec<_>>();
+                        (visible, count)
+                    })
+                    .unwrap_or_else(|| (Vec::new(), 0));
+                let tree_content_width = explorer_content_width(&visible_entries);
 
                 let rows = if self.command_mode == CommandMode::FindFile {
                     self.explorer
@@ -1437,9 +2025,7 @@ impl WorkspaceView {
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default()
-                } else if self.command_mode == CommandMode::SearchContent
-                    && !self.content_matches.is_empty()
-                {
+                } else if self.command_mode == CommandMode::SearchContent {
                     self.content_matches
                         .iter()
                         .map(|hit| {
@@ -1456,7 +2042,7 @@ impl WorkspaceView {
                                 .cursor_pointer()
                                 .child(SharedString::from(format!(
                                     "{}:{}  {}",
-                                    path.strip_prefix(&self.model.root)
+                                    path.strip_prefix(&self.explorer_requested_root)
                                         .unwrap_or(&path)
                                         .display(),
                                     hit.line_number,
@@ -1471,78 +2057,149 @@ impl WorkspaceView {
                         })
                         .collect()
                 } else {
-                    self.explorer
-                        .as_ref()
-                        .map(|index| {
-                            let mut entries = index.entries().to_vec();
-                            entries.sort_by(|a, b| a.relative.cmp(&b.relative));
-                            entries
-                                .into_iter()
-                                .filter(|entry| explorer_entry_visible(entry, &self.explorer_tree))
-                                .take(500)
-                                .map(|entry| {
-                                    let path = entry.path.clone();
-                                    let attach_path = path.clone();
-                                    let selected =
-                                        self.explorer_tree.selected() == Some(path.as_path());
-                                    let expanded = self.explorer_tree.is_expanded(&path);
-                                    let label = entry
-                                        .path
-                                        .file_name()
-                                        .and_then(|name| name.to_str())
-                                        .unwrap_or(&entry.relative)
-                                        .to_owned();
+                    visible_entries
+                        .into_iter()
+                        .map(|entry| {
+                            let path = entry.path.clone();
+                            let right_path = path.clone();
+                            let selected = self.explorer_tree.selected() == Some(path.as_path());
+                            let active = active_path.as_ref() == Some(&path);
+                            let expanded = self.explorer_tree.is_expanded(&path);
+                            let is_dir = entry.is_dir;
+                            let icon = entry.icon;
+                            let label = entry
+                                .path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or(&entry.relative)
+                                .to_owned();
+                            div()
+                                .id(SharedString::from(format!("file-{}", entry.relative)))
+                                .ml(px(entry.depth as f32 * 12.0))
+                                .w_full()
+                                .min_w(px(tree_content_width))
+                                .px_1()
+                                .py(px(2.0))
+                                .rounded_sm()
+                                .text_xs()
+                                .cursor_pointer()
+                                .when(selected, |row| row.bg(gpui::rgba(0x36588088)))
+                                .when(active, |row| row.bg(gpui::rgba(0x4f8fef66)))
+                                .child(
                                     div()
-                                        .id(SharedString::from(format!("file-{}", entry.relative)))
-                                        .pl(px(4.0 + entry.depth as f32 * 12.0))
-                                        .pr_1()
-                                        .py_1()
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .when(selected, |row| row.bg(gpui::rgba(0x36588088)))
-                                        .child(SharedString::from(format!(
-                                            "{}{}",
-                                            if entry.is_dir {
-                                                if expanded {
-                                                    "▾ "
-                                                } else {
-                                                    "▸ "
-                                                }
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_1()
+                                        .whitespace_nowrap()
+                                        .child(explorer_icon(
+                                            icon,
+                                            expanded,
+                                            icon_surface,
+                                            icon_panel,
+                                        ))
+                                        .child(SharedString::from(label)),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _event, window, cx| {
+                                        this.explorer_context_menu = None;
+                                        this.explorer_tree.select(path.clone());
+                                        if is_dir {
+                                            this.explorer_tree.toggle_expanded(path.clone());
+                                            window.focus(&this.focus_handle, cx);
+                                        } else {
+                                            this.open_editor(path.clone(), cx);
+                                        }
+                                        cx.notify();
+                                    }),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        this.show_explorer_context_menu(
+                                            if is_dir {
+                                                ExplorerContextTarget::Directory(right_path.clone())
                                             } else {
-                                                "  "
+                                                ExplorerContextTarget::File(right_path.clone())
                                             },
-                                            label
-                                        )))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _event, _window, cx| {
-                                                this.explorer_tree.select(path.clone());
-                                                this.confirm_delete = None;
-                                                if entry.is_dir {
-                                                    this.explorer_tree
-                                                        .toggle_expanded(path.clone());
-                                                } else {
-                                                    this.open_editor(path.clone(), cx);
-                                                }
-                                                cx.notify();
-                                            }),
-                                        )
-                                        .on_mouse_down(
-                                            MouseButton::Right,
-                                            cx.listener(move |this, _event, _window, cx| {
-                                                this.attach_file(attach_path.clone(), cx)
-                                            }),
-                                        )
-                                })
-                                .collect::<Vec<_>>()
+                                            event.position,
+                                            window,
+                                            cx,
+                                        );
+                                    }),
+                                )
                         })
-                        .unwrap_or_default()
+                        .collect::<Vec<_>>()
                 };
+                let background_target = ExplorerContextTarget::Workspace;
                 div()
                     .flex()
                     .flex_col()
+                    .size_full()
                     .child(toolbar)
-                    .children(rows)
+                    .child(
+                        div()
+                            .px_1()
+                            .pb_1()
+                            .text_xs()
+                            .text_color(gpui::rgba(0x9aa6b7ff))
+                            .child(SharedString::from(format!(
+                                "{}{}",
+                                root_label,
+                                if self.explorer_loading {
+                                    "  · indexing…"
+                                } else if visible_entry_count > 500 {
+                                    "  · showing first 500"
+                                } else {
+                                    ""
+                                }
+                            ))),
+                    )
+                    .children(self.explorer_error.clone().map(|error| {
+                        div()
+                            .px_1()
+                            .py_1()
+                            .text_xs()
+                            .text_color(gpui::rgba(0xe07a5fff))
+                            .child(SharedString::from(error))
+                    }))
+                    .child(
+                        div()
+                            .id("explorer-scroll")
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .overflow_x_scroll()
+                            .overflow_y_scroll()
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    this.show_explorer_context_menu(
+                                        background_target.clone(),
+                                        event.position,
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            )
+                            .children(rows)
+                            .children(
+                                (self.explorer.is_some()
+                                    && !self.explorer_loading
+                                    && self
+                                        .explorer
+                                        .as_ref()
+                                        .is_some_and(|index| index.entries().is_empty()))
+                                .then(|| {
+                                    div()
+                                        .p_2()
+                                        .text_xs()
+                                        .text_color(gpui::rgba(0x9aa6b7ff))
+                                        .child("This workspace has no visible files")
+                                }),
+                            ),
+                    )
                     .into_any_element()
             }
             SidebarPanel::SourceControl => {
@@ -1661,15 +2318,8 @@ impl WorkspaceView {
         if let Some(cwd) = &cwd {
             self.model.set_active_cwd(cwd);
             let path = Path::new(cwd);
-            if path.is_dir()
-                && self
-                    .explorer
-                    .as_ref()
-                    .map_or(true, |index| index.root() != path)
-            {
-                self.explorer = FileIndex::build(path, self.settings.show_dotfiles).ok();
-                self.explorer_tree.set_root(path.to_path_buf());
-                self.explorer_watcher = WorkspaceWatcher::watch(path).ok();
+            if path.is_dir() && self.explorer_requested_root != path {
+                self.schedule_explorer_scan(path.to_path_buf(), cx);
             }
         }
         let resolved_cwd = cwd.unwrap_or_else(|| self.model.root.to_string_lossy().into_owned());
@@ -1683,6 +2333,154 @@ impl WorkspaceView {
 impl Focusable for WorkspaceView {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+impl EntityInputHandler for WorkspaceView {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        if self.command_mode == CommandMode::Browse {
+            return None;
+        }
+        let start = utf16_to_byte(&self.command_input, range_utf16.start);
+        let end = utf16_to_byte(&self.command_input, range_utf16.end);
+        actual_range.replace(range_utf16);
+        self.command_input.get(start..end).map(str::to_owned)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        (self.command_mode != CommandMode::Browse).then(|| {
+            let position = self.command_input.encode_utf16().count();
+            UTF16Selection {
+                range: position..position,
+                reversed: false,
+            }
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let prefix_len = self
+            .command_input
+            .len()
+            .saturating_sub(self.command_marked_text.len());
+        let start = self.command_input[..prefix_len].encode_utf16().count();
+        let len = self.command_marked_text.encode_utf16().count();
+        (len > 0).then_some(start..start + len)
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.command_marked_text.clear();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.command_mode == CommandMode::Browse {
+            return;
+        }
+        if let Some(range) = range_utf16 {
+            let start = utf16_to_byte(&self.command_input, range.start);
+            let end = utf16_to_byte(&self.command_input, range.end);
+            if start <= end && end <= self.command_input.len() {
+                self.command_input.replace_range(start..end, text);
+            } else {
+                self.command_input.push_str(text);
+            }
+        } else {
+            let keep = self
+                .command_input
+                .len()
+                .saturating_sub(self.command_marked_text.len());
+            self.command_input.truncate(keep);
+            self.command_input.push_str(text);
+        }
+        self.command_marked_text.clear();
+        if self.command_mode == CommandMode::SearchContent {
+            self.content_matches.clear();
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.command_mode != CommandMode::Browse {
+            let range = range_utf16
+                .map(|range| {
+                    utf16_to_byte(&self.command_input, range.start)
+                        ..utf16_to_byte(&self.command_input, range.end)
+                })
+                .unwrap_or_else(|| {
+                    self.command_input
+                        .len()
+                        .saturating_sub(self.command_marked_text.len())
+                        ..self.command_input.len()
+                });
+            self.command_input.replace_range(range, new_text);
+            self.command_marked_text = new_text.to_owned();
+            if self.command_mode == CommandMode::SearchContent {
+                self.content_matches.clear();
+            }
+            cx.notify();
+        }
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(Bounds::new(
+            Point::new(element_bounds.left(), element_bounds.top()),
+            size(px(1.0), px(18.0)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.command_input.encode_utf16().count())
+    }
+
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        (self.command_mode != CommandMode::Browse)
+            .then(|| self.command_input.encode_utf16().count())
+    }
+
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        self.command_mode != CommandMode::Browse
     }
 }
 
@@ -1741,10 +2539,8 @@ impl gpui::Render for WorkspaceView {
             div()
                 .flex()
                 .flex_row()
-                .w(px(260.0))
+                .w(px(self.model.sidebar_width))
                 .h_full()
-                .border_r_1()
-                .border_color(gpui_color(p.surface[1]))
                 .child(
                     div()
                         .flex()
@@ -1755,12 +2551,13 @@ impl gpui::Render for WorkspaceView {
                         .pt_2()
                         .children(
                             [
-                                ("E", SidebarPanel::Explorer),
-                                ("G", SidebarPanel::SourceControl),
-                                ("H", SidebarPanel::GitHistory),
+                                ("▱", SidebarPanel::Explorer),
+                                ("⑂", SidebarPanel::SourceControl),
+                                ("◷", SidebarPanel::GitHistory),
                             ]
                             .into_iter()
                             .map(|(label, panel)| {
+                                let selected = self.model.sidebar_panel == panel;
                                 div()
                                     .id(SharedString::from(format!("sidebar-{panel:?}")))
                                     .w(px(32.0))
@@ -1770,6 +2567,11 @@ impl gpui::Render for WorkspaceView {
                                     .justify_center()
                                     .rounded_md()
                                     .cursor_pointer()
+                                    .when(selected, |button| {
+                                        button
+                                            .bg(gpui_color(p.surface[1]))
+                                            .text_color(gpui::rgba(0x75a7ffff))
+                                    })
                                     .child(label)
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -1785,9 +2587,21 @@ impl gpui::Render for WorkspaceView {
                 .child(
                     div()
                         .flex_1()
+                        .min_w(px(0.0))
                         .overflow_hidden()
                         .p_2()
                         .child(self.sidebar_content(cx)),
+                )
+                .child(
+                    div()
+                        .id("sidebar-resize-handle")
+                        .w(px(5.0))
+                        .h_full()
+                        .flex_shrink_0()
+                        .border_r_1()
+                        .border_color(gpui_color(p.surface[1]))
+                        .cursor(CursorStyle::ResizeColumn)
+                        .on_mouse_down(MouseButton::Left, cx.listener(Self::start_sidebar_resize)),
                 )
                 .into_any_element()
         } else {
@@ -1915,16 +2729,76 @@ impl gpui::Render for WorkspaceView {
                     )
             })
             .collect::<Vec<_>>();
+        let explorer_context_menu = self.explorer_context_menu.clone().map(|menu| {
+            let target_kind = menu.target.kind();
+            anchored().position(menu.position).child(
+                div()
+                    .id("explorer-context-menu")
+                    .w(px(220.0))
+                    .occlude()
+                    .p_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(gpui_color(p.surface[1]))
+                    .bg(gpui_color(p.surface[2]))
+                    .shadow_md()
+                    .children(explorer_context_actions(target_kind).iter().copied().map(
+                        |action| {
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(gpui::rgba(0x36588088)))
+                                .child(explorer_context_action_label(action))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _event, window, cx| {
+                                        cx.stop_propagation();
+                                        this.handle_explorer_context_action(action, window, cx);
+                                    }),
+                                )
+                        },
+                    )),
+            )
+        });
+        let input_focus = self.focus_handle.clone();
+        let input_entity = cx.entity();
         div()
             .id("workspace-root")
             .relative()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::global_key))
+            .on_mouse_move(cx.listener(Self::resize_sidebar))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::stop_sidebar_resize))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    if this.explorer_context_menu.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .flex()
             .flex_col()
             .size_full()
             .bg(gpui_color(p.background))
             .text_color(gpui_color(p.foreground))
+            .child(
+                canvas(
+                    |bounds, _, _| bounds,
+                    move |bounds, _, window, cx| {
+                        window.handle_input(
+                            &input_focus,
+                            ElementInputHandler::new(bounds, input_entity.clone()),
+                            cx,
+                        );
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             .when_some(background_image, |root, (path, opacity)| {
                 root.child(
                     gpui::img(path)
@@ -2050,6 +2924,7 @@ impl gpui::Render for WorkspaceView {
                         bar.child(SharedString::from(format!("Open in preview: {url}")))
                     }),
             )
+            .children(explorer_context_menu)
     }
 }
 
@@ -2085,6 +2960,217 @@ fn explorer_entry_visible(entry: &FileEntry, tree: &TreeState) -> bool {
     false
 }
 
+fn explorer_content_width(entries: &[FileEntry]) -> f32 {
+    entries
+        .iter()
+        .map(|entry| {
+            let name = entry
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&entry.relative);
+            entry.depth as f32 * 12.0
+                + 42.0
+                + name
+                    .chars()
+                    .map(|character| if character.is_ascii() { 7.0 } else { 12.0 })
+                    .sum::<f32>()
+        })
+        .fold(1.0, f32::max)
+}
+
+fn explorer_icon(
+    icon: IconKind,
+    expanded: bool,
+    surface_bg: gpui::Rgba,
+    panel_bg: gpui::Rgba,
+) -> gpui::Div {
+    if icon == IconKind::Folder {
+        let color = gpui::rgba(0xe5c07bff);
+        let folder = div()
+            .relative()
+            .w(px(18.0))
+            .h(px(16.0))
+            .flex_shrink_0()
+            .child(
+                div()
+                    .absolute()
+                    .top(px(2.0))
+                    .left(px(2.0))
+                    .w(px(7.0))
+                    .h(px(5.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(color)
+                    .bg(panel_bg),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(5.0))
+                    .left(px(1.0))
+                    .w(px(15.0))
+                    .h(px(10.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(color)
+                    .bg(panel_bg),
+            );
+        return if expanded {
+            folder.child(
+                div()
+                    .absolute()
+                    .top(px(8.0))
+                    .left(px(0.0))
+                    .w(px(17.0))
+                    .h(px(7.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(color)
+                    .bg(surface_bg),
+            )
+        } else {
+            folder
+        };
+    }
+
+    let (label, color) = match icon {
+        IconKind::Rust => ("R", gpui::rgba(0xd08770ff)),
+        IconKind::JavaScript => ("J", gpui::rgba(0xebcb8bff)),
+        IconKind::TypeScript => ("T", gpui::rgba(0x5e81acff)),
+        IconKind::Python => ("P", gpui::rgba(0x81a1c1ff)),
+        IconKind::Go => ("G", gpui::rgba(0x88c0d0ff)),
+        IconKind::Java => ("J", gpui::rgba(0xbf616aff)),
+        IconKind::Html => ("H", gpui::rgba(0xd08770ff)),
+        IconKind::Css => ("C", gpui::rgba(0xb48eadff)),
+        IconKind::Json => ("{", gpui::rgba(0xa3be8cff)),
+        IconKind::Markdown => ("M", gpui::rgba(0x81a1c1ff)),
+        IconKind::Image => ("I", gpui::rgba(0xb48eadff)),
+        IconKind::Config => ("C", gpui::rgba(0x8fbcbbff)),
+        IconKind::File | IconKind::Folder => ("", gpui::rgba(0x9aa6b7ff)),
+    };
+    div()
+        .relative()
+        .w(px(18.0))
+        .h(px(16.0))
+        .flex_shrink_0()
+        .child(
+            div()
+                .absolute()
+                .top(px(1.0))
+                .left(px(1.0))
+                .w(px(12.0))
+                .h(px(14.0))
+                .rounded_sm()
+                .border_1()
+                .border_color(color)
+                .bg(surface_bg),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(5.0))
+                .left(px(4.0))
+                .text_size(px(7.0))
+                .line_height(px(7.0))
+                .text_color(color)
+                .child(label),
+        )
+}
+
+fn explorer_context_actions(kind: ExplorerContextTargetKind) -> &'static [ExplorerContextAction] {
+    match kind {
+        ExplorerContextTargetKind::File => &[
+            ExplorerContextAction::Open,
+            ExplorerContextAction::Rename,
+            ExplorerContextAction::Delete,
+            ExplorerContextAction::Reveal,
+            ExplorerContextAction::AttachToAi,
+            ExplorerContextAction::Refresh,
+        ],
+        ExplorerContextTargetKind::Directory => &[
+            ExplorerContextAction::CreateFile,
+            ExplorerContextAction::CreateDirectory,
+            ExplorerContextAction::Rename,
+            ExplorerContextAction::Delete,
+            ExplorerContextAction::Reveal,
+            ExplorerContextAction::Refresh,
+        ],
+        ExplorerContextTargetKind::Workspace => &[
+            ExplorerContextAction::CreateFile,
+            ExplorerContextAction::CreateDirectory,
+            ExplorerContextAction::FindFile,
+            ExplorerContextAction::SearchContent,
+            ExplorerContextAction::Reveal,
+            ExplorerContextAction::Refresh,
+        ],
+    }
+}
+
+fn explorer_context_action_label(action: ExplorerContextAction) -> &'static str {
+    match action {
+        ExplorerContextAction::Open => "Open",
+        ExplorerContextAction::CreateFile => "New File…",
+        ExplorerContextAction::CreateDirectory => "New Folder…",
+        ExplorerContextAction::Rename => "Rename…",
+        ExplorerContextAction::Delete => "Delete…",
+        ExplorerContextAction::Reveal => "Show in File Manager",
+        ExplorerContextAction::AttachToAi => "Attach to AI",
+        ExplorerContextAction::FindFile => "Find File…",
+        ExplorerContextAction::SearchContent => "Search in Files…",
+        ExplorerContextAction::Refresh => "Refresh",
+    }
+}
+
+fn dir_is_non_empty(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+fn reveal_in_system_file_manager(path: &Path, select_file: bool) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut command = Command::new("explorer");
+        if select_file {
+            command.arg(format!("/select,{}", path.display()));
+        } else {
+            command.arg(path);
+        }
+        command.spawn().map(|_| ())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("open");
+        if select_file {
+            command.arg("-R").arg(path);
+        } else {
+            command.arg(path);
+        }
+        command.spawn().map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let target = if select_file {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        Command::new("xdg-open").arg(target).spawn().map(|_| ())
+    }
+}
+
+fn utf16_to_byte(text: &str, utf16_offset: usize) -> usize {
+    let mut utf16_count = 0;
+    for (byte, character) in text.char_indices() {
+        if utf16_count >= utf16_offset {
+            return byte;
+        }
+        utf16_count += character.len_utf16();
+    }
+    text.len()
+}
+
 fn sidebar_button(
     label: &'static str,
     id: &'static str,
@@ -2102,7 +3188,10 @@ fn sidebar_button(
         .child(label)
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |workspace, _event, _window, cx| listener(workspace, cx)),
+            cx.listener(move |workspace, _event, window, cx| {
+                window.focus(&workspace.focus_handle, cx);
+                listener(workspace, cx);
+            }),
         )
 }
 
@@ -2202,5 +3291,33 @@ fn load_vcs(
             repo.branch_state().ok(),
         ),
         Err(_) => (Vec::new(), Vec::new(), None),
+    }
+}
+
+#[cfg(test)]
+mod explorer_ui_tests {
+    use super::*;
+
+    #[test]
+    fn utf16_offsets_never_split_a_code_point() {
+        let text = "a😀中";
+        assert_eq!(utf16_to_byte(text, 0), 0);
+        assert_eq!(utf16_to_byte(text, 1), 1);
+        assert_eq!(utf16_to_byte(text, 2), 5);
+        assert_eq!(utf16_to_byte(text, 3), 5);
+        assert_eq!(utf16_to_byte(text, 4), text.len());
+    }
+
+    #[test]
+    fn explorer_context_actions_are_target_specific() {
+        let file = explorer_context_actions(ExplorerContextTargetKind::File);
+        assert!(file.contains(&ExplorerContextAction::Open));
+        assert!(file.contains(&ExplorerContextAction::AttachToAi));
+        assert!(!file.contains(&ExplorerContextAction::CreateDirectory));
+
+        let workspace = explorer_context_actions(ExplorerContextTargetKind::Workspace);
+        assert!(workspace.contains(&ExplorerContextAction::CreateFile));
+        assert!(workspace.contains(&ExplorerContextAction::SearchContent));
+        assert!(!workspace.contains(&ExplorerContextAction::Delete));
     }
 }

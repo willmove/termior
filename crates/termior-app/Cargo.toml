@@ -51,6 +51,7 @@ icon = [
     "../../assets/icons/termior.icns",
     "../../assets/icons/termior.ico",
 ]
+resources = ["../../NOTICE"]
 category = "Developer Tool"
 short_description = "A terminal-first, AI-native development environment"
 long_description = "Termior combines a native terminal, editor, Git, preview, and a locally controlled coding agent."
