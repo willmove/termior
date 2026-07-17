@@ -29,7 +29,29 @@ futures = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"
 serde_json = { workspace = true }
+rfd = "0.17.2"
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 gpui-wry = "0.5"
 wry = "0.53.3"
+
+[build-dependencies]
+winresource = "0.1"
+
+[package.metadata.bundle]
+name = "Termior"
+identifier = "app.termior.Termior"
+icon = [
+    "../../assets/icons/png/32x32.png",
+    "../../assets/icons/png/128x128.png",
+    "../../assets/icons/png/256x256.png",
+    "../../assets/icons/termior.icns",
+    "../../assets/icons/termior.ico",
+]
+category = "Developer Tool"
+short_description = "A terminal-first, AI-native development environment"
+long_description = "Termior combines a native terminal, editor, Git, preview, and a locally controlled coding agent."
+osx_minimum_system_version = "13.0"

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Termior
+GenericName=AI Development Environment
+Comment=Terminal-first, AI-native development environment
+Exec=termior-app %F
+Icon=app.termior.Termior
+Terminal=false
+Categories=Development;IDE;
+Keywords=terminal;editor;git;ai;development;
+StartupNotify=true
+StartupWMClass=app.termior.Termior

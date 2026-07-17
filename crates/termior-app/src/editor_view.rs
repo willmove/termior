@@ -100,6 +100,24 @@ impl EditorView {
         self.buffer.selected_text()
     }
 
+    pub fn open_search(&mut self, cx: &mut Context<Self>) {
+        self.search.open();
+        self.update_search();
+        cx.notify();
+    }
+
+    pub fn undo(&mut self, cx: &mut Context<Self>) {
+        self.buffer.undo();
+        self.reparse();
+        cx.notify();
+    }
+
+    pub fn redo(&mut self, cx: &mut Context<Self>) {
+        self.buffer.redo();
+        self.reparse();
+        cx.notify();
+    }
+
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
@@ -114,28 +132,10 @@ impl EditorView {
             modifiers.control
         };
         if primary {
-            match key {
-                "f" => {
-                    self.search.open();
-                    self.update_search();
-                    cx.notify();
+            if key == "s" {
+                if let Err(error) = self.buffer.save() {
+                    log::warn!("save failed: {error}");
                 }
-                "z" => {
-                    self.buffer.undo();
-                    self.reparse();
-                    cx.notify();
-                }
-                "y" => {
-                    self.buffer.redo();
-                    self.reparse();
-                    cx.notify();
-                }
-                "s" => {
-                    if let Err(error) = self.buffer.save() {
-                        log::warn!("save failed: {error}");
-                    }
-                }
-                _ => {}
             }
             return;
         }
@@ -537,11 +537,10 @@ impl Render for EditorView {
             .text_sm()
             .child(
                 canvas(
-                    move |bounds, window, cx| {
-                        window.handle_input(&input_focus, handler.clone(), cx);
-                        bounds
+                    |bounds, _, _| bounds,
+                    move |_, _, window, cx| {
+                        window.handle_input(&input_focus, handler, cx);
                     },
-                    |_, _, _, _| {},
                 )
                 .absolute()
                 .size_full(),

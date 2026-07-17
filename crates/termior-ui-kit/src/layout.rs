@@ -94,13 +94,14 @@ impl PaneLayout {
         if self.panes().len() == 1 {
             return Err(LayoutError::FinalPane);
         }
+        let removed = self.focused;
         self.root = self
             .root
             .clone()
             .remove(self.focused)
             .expect("more than one pane leaves a root");
         self.focused = self.panes()[0];
-        Ok(self.focused)
+        Ok(removed)
     }
 
     pub fn resize_split(&mut self, path: &[usize], ratio: f32) -> Result<(), LayoutError> {

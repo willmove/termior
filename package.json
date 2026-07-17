@@ -1,0 +1,12 @@
+{
+  "name": "termior-assets",
+  "private": true,
+  "scripts": {
+    "icons": "node scripts/generate-icons.mjs --write",
+    "icons:check": "node scripts/generate-icons.mjs --check"
+  },
+  "devDependencies": {
+    "png2icons": "2.0.1",
+    "sharp": "0.35.3"
+  }
+}

@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use termior_ui_kit::{LayoutError, PaneLayout, SplitDirection};
+use termior_ui_kit::{LayoutError, PaneId, PaneLayout, SplitDirection};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TabId(pub u64);
@@ -28,6 +28,9 @@ pub struct TabState {
     pub kind: TabKind,
     pub title: String,
     pub cwd: PathBuf,
+    /// File or URL represented by this tab, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
     pub layout: PaneLayout,
     /// View owners increment this for meaningful state changes; tab switching never does.
     pub state_generation: u64,
@@ -112,6 +115,7 @@ impl WorkspaceState {
             kind,
             title: title.into(),
             cwd,
+            resource: None,
             layout: PaneLayout::new(),
             state_generation: 0,
         });
@@ -150,12 +154,11 @@ impl WorkspaceState {
         self.active = Some(self.tabs[(current + delta) % self.tabs.len()].id);
     }
 
-    pub fn close_active_pane_or_tab(&mut self) -> Result<(), WorkspaceError> {
+    pub fn close_active_pane_or_tab(&mut self) -> Result<Option<PaneId>, WorkspaceError> {
         let id = self.active.ok_or(WorkspaceError::TabNotFound(TabId(0)))?;
         let tab = self.active_tab_mut().expect("active tab exists");
         if tab.layout.panes().len() > 1 {
-            tab.layout.close_focused()?;
-            return Ok(());
+            return Ok(Some(tab.layout.close_focused()?));
         }
         let index = self.tabs.iter().position(|tab| tab.id == id).unwrap();
         self.tabs.remove(index);
@@ -164,15 +167,14 @@ impl WorkspaceState {
         } else {
             Some(self.tabs[index.min(self.tabs.len() - 1)].id)
         };
-        Ok(())
+        Ok(None)
     }
 
-    pub fn split_active(&mut self, direction: SplitDirection) -> Result<(), WorkspaceError> {
+    pub fn split_active(&mut self, direction: SplitDirection) -> Result<PaneId, WorkspaceError> {
         let tab = self
             .active_tab_mut()
             .ok_or(WorkspaceError::TabNotFound(TabId(0)))?;
-        tab.layout.split_focused(direction);
-        Ok(())
+        Ok(tab.layout.split_focused(direction))
     }
 
     pub fn set_active_cwd(&mut self, cwd: impl Into<PathBuf>) {

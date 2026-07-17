@@ -318,6 +318,12 @@ impl Settings {
                 value: self.terminal.scrollback_lines.to_string(),
             });
         }
+        if !(0.8..=3.0).contains(&self.terminal.line_height) {
+            return Err(SettingsError::OutOfRange {
+                field: "line_height".into(),
+                value: self.terminal.line_height.to_string(),
+            });
+        }
         if !(0.0..=1.0).contains(&self.background.opacity) {
             return Err(SettingsError::OutOfRange {
                 field: "background.opacity".into(),
@@ -422,6 +428,9 @@ mod tests {
         assert!(s.validate().is_err());
         s.background.opacity = 0.5;
         s.terminal.letter_spacing = 9.0;
+        assert!(s.validate().is_err());
+        s.terminal.letter_spacing = 0.0;
+        s.terminal.line_height = 0.5;
         assert!(s.validate().is_err());
     }
 }

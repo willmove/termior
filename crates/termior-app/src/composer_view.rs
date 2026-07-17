@@ -8,10 +8,10 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use termior_ai::{
-    Agent, AgentOutcome, ApprovalDecision, ApprovalRequest, AttachmentSource, ComposerDraft,
-    EditProposalSummary, HttpProvider, KeyringSecretStore, Message, ProjectMemory, ProviderConfig,
-    Role, SecretStore, SessionStore, SnippetStore, TerminalContext, TerminalContextProvider,
-    ToolExecutor, ToolRegistry,
+    Agent, AgentDefinition, AgentDefinitionStore, AgentOutcome, ApprovalDecision, ApprovalRequest,
+    AttachmentSource, ComposerDraft, EditProposalSummary, HttpProvider, KeyringSecretStore,
+    Message, ProjectMemory, ProviderConfig, Role, SecretStore, SessionStore, SnippetStore,
+    TerminalContext, TerminalContextProvider, ToolExecutor, ToolRegistry,
 };
 use termior_platform::AgentStatus;
 use termior_security::workspace::WorkspaceAuthRegistry;
@@ -61,6 +61,10 @@ pub struct ComposerView {
     pending_edit: Option<PendingEdit>,
     sessions: SessionStore,
     snippets: SnippetStore,
+    custom_agents: Vec<AgentDefinition>,
+    active_custom_agent: Option<usize>,
+    base_system_prompt: String,
+    full_tools: Option<ToolRegistry>,
     data_dir: Option<PathBuf>,
     terminal_context: Arc<LiveTerminalContext>,
 }
@@ -83,6 +87,10 @@ impl ComposerView {
             pending_edit: None,
             sessions: SessionStore::default(),
             snippets: SnippetStore::default(),
+            custom_agents: Vec::new(),
+            active_custom_agent: None,
+            base_system_prompt: String::new(),
+            full_tools: None,
             data_dir: None,
             terminal_context: Arc::new(LiveTerminalContext {
                 snapshot: Mutex::new(TerminalContext {
@@ -107,6 +115,17 @@ impl ComposerView {
             let files = DataFiles::new(dir.clone());
             self.sessions = files.sessions::<SessionStore>().load().unwrap_or_default();
             self.snippets = files.snippets::<SnippetStore>().load().unwrap_or_default();
+            self.custom_agents = files
+                .agents::<AgentDefinitionStore>()
+                .load()
+                .unwrap_or_default()
+                .agents;
+            if self
+                .active_custom_agent
+                .is_some_and(|index| index >= self.custom_agents.len())
+            {
+                self.active_custom_agent = None;
+            }
         }
         if self.sessions.sessions.is_empty() {
             self.sessions.create(new_session_id());
@@ -158,8 +177,8 @@ impl ComposerView {
                 return;
             }
         };
-        let tools = ToolRegistry::new(workspace_auth);
-        let executor = match ToolExecutor::new(root, tools.clone()) {
+        let full_tools = ToolRegistry::new(workspace_auth);
+        let executor = match ToolExecutor::new(root, full_tools.clone()) {
             Ok(executor) => Arc::new(executor.with_terminal_context(self.terminal_context.clone())),
             Err(error) => {
                 self.runtime = None;
@@ -176,7 +195,7 @@ impl ComposerView {
                 )
             })
             .unwrap_or_default();
-        let system_prompt = format!(
+        let base_system_prompt = format!(
             "You are Termior's coding agent. Work only inside the authorized workspace. Read before editing, use tools when needed, and never claim an action succeeded without its tool result.{}{}",
             if settings.custom_instructions.trim().is_empty() {
                 String::new()
@@ -185,13 +204,86 @@ impl ComposerView {
             },
             memory
         );
+        let (tools, system_prompt) =
+            match self.selected_agent_runtime(&full_tools, &base_system_prompt) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    self.runtime = None;
+                    self.status = error;
+                    cx.notify();
+                    return;
+                }
+            };
+        self.full_tools = Some(full_tools);
+        self.base_system_prompt = base_system_prompt;
         self.runtime = Some(AgentRuntime {
             config,
             tools,
             executor,
             system_prompt,
         });
-        self.status = format!("Ready · {} / {}", profile.display_name, profile.model);
+        self.status = format!(
+            "Ready · {} / {} · {}",
+            profile.display_name,
+            profile.model,
+            self.active_agent_name()
+        );
+        cx.notify();
+    }
+
+    fn selected_agent_runtime(
+        &self,
+        full_tools: &ToolRegistry,
+        base_prompt: &str,
+    ) -> Result<(ToolRegistry, String), String> {
+        let Some(index) = self.active_custom_agent else {
+            return Ok((full_tools.clone(), base_prompt.to_owned()));
+        };
+        let definition = self
+            .custom_agents
+            .get(index)
+            .ok_or_else(|| "Selected custom agent no longer exists".to_owned())?;
+        let tools = full_tools
+            .clone()
+            .subset(definition.tools.clone())
+            .map_err(|error| format!("Custom agent tools are invalid: {error}"))?;
+        Ok((
+            tools,
+            format!(
+                "{base_prompt}\n\nActive custom agent ({}):\n{}",
+                definition.name, definition.system_prompt
+            ),
+        ))
+    }
+
+    fn active_agent_name(&self) -> &str {
+        self.active_custom_agent
+            .and_then(|index| self.custom_agents.get(index))
+            .map(|agent| agent.name.as_str())
+            .unwrap_or("Built-in Agent")
+    }
+
+    fn cycle_custom_agent(&mut self, cx: &mut Context<Self>) {
+        if self.busy || self.custom_agents.is_empty() {
+            return;
+        }
+        self.active_custom_agent = match self.active_custom_agent {
+            None => Some(0),
+            Some(index) if index + 1 < self.custom_agents.len() => Some(index + 1),
+            Some(_) => None,
+        };
+        if let Some(full_tools) = self.full_tools.clone() {
+            match self.selected_agent_runtime(&full_tools, &self.base_system_prompt) {
+                Ok((tools, prompt)) => {
+                    if let Some(runtime) = self.runtime.as_mut() {
+                        runtime.tools = tools;
+                        runtime.system_prompt = prompt;
+                    }
+                    self.status = format!("Active agent: {}", self.active_agent_name());
+                }
+                Err(error) => self.status = error,
+            }
+        }
         cx.notify();
     }
 
@@ -594,6 +686,7 @@ impl gpui::Render for ComposerView {
         let handler = ComposerInputHandler {
             view: cx.entity().downgrade(),
         };
+        let agent_label = format!("Agent: {}", self.active_agent_name());
         let messages = self
             .history
             .iter()
@@ -828,11 +921,10 @@ impl gpui::Render for ComposerView {
             .on_key_down(cx.listener(Self::handle_key_down))
             .child(
                 canvas(
-                    move |bounds, window, cx| {
-                        window.handle_input(&input_focus, handler.clone(), cx);
-                        bounds
+                    |bounds, _, _| bounds,
+                    move |_, _, window, cx| {
+                        window.handle_input(&input_focus, handler, cx);
                     },
-                    |_, _, _, _| {},
                 )
                 .absolute()
                 .size_full(),
@@ -867,6 +959,21 @@ impl gpui::Render for ComposerView {
                             .flex_1()
                             .text_sm()
                             .child(SharedString::from(self.display_input())),
+                    )
+                    .child(
+                        div()
+                            .id("composer-agent")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(gpui::rgba(0x293241ff))
+                            .cursor_pointer()
+                            .text_xs()
+                            .child(SharedString::from(agent_label))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.cycle_custom_agent(cx)),
+                            ),
                     )
                     .child(
                         div()

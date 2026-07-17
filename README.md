@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/termior-logo.svg" width="128" height="128" alt="Termior logo">
+</p>
+
 # Termior
 
 > 开源、跨平台、终端优先的 AI 原生开发工作台（ADE）。BYOK、本地优先、无账号、无遥测。
@@ -62,6 +66,15 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 cargo build --workspace --release
+```
+
+应用图标以 `assets/termior-logo.svg` 为唯一源文件。修改 SVG 后，使用 Node.js 22+
+重新生成 Windows ICO、macOS ICNS、通用 PNG 与 Linux hicolor 资源：
+
+```bash
+npm ci
+npm run icons
+npm run icons:check
 ```
 
 运行桌面应用：

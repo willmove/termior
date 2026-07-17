@@ -16,6 +16,19 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  icons:
+    name: Generated icons
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run icons:check
+
   core:
     name: Core (${{ matrix.os }})
     strategy:
@@ -65,3 +78,16 @@ jobs:
         run: cargo check -p termior-app
       - name: Clippy desktop application
         run: cargo clippy -p termior-app --all-targets -- -D warnings
+      - name: Build desktop application
+        run: cargo build -p termior-app
+      - name: Launch and render desktop smoke frames
+        shell: pwsh
+        run: |
+          $env:TERMIOR_SMOKE_TEST = "1"
+          $output = cargo run -p termior-app -- --workspace . 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | Write-Host
+          $outputText = $output | Out-String
+          if ($exitCode -ne 0 -or $outputText -notmatch "TERMIOR_SMOKE_OK") {
+            throw "Termior desktop smoke launch did not complete successfully"
+          }

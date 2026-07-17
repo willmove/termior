@@ -1,28 +1,33 @@
+use crate::app_identity;
 use crate::composer_view::ComposerView;
 use crate::editor_view::EditorView;
 use crate::preview_view::PreviewView;
 use crate::settings_view::SettingsView;
 use crate::terminal_view::TerminalView;
 use gpui::{
-    div, prelude::*, px, size, AnyElement, Bounds, Context, Entity, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, MouseDownEvent, SharedString, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, relative, size, AnyElement, Bounds, Context, Entity, FocusHandle,
+    Focusable, KeyDownEvent, MouseButton, MouseDownEvent, SharedString, Task, Window, WindowBounds,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use termior_ai::AttachmentSource;
-use termior_explorer::FileIndex;
+use termior_explorer::{
+    ContentMatch, ContentSearch, FileEntry, FileIndex, TreeState, WorkspaceWatcher,
+};
 use termior_platform::{
     AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationContext,
     NotificationDecision, NotificationRouter, NotificationTarget, SystemNotifier,
 };
 use termior_security::workspace::WorkspaceAuthRegistry;
-use termior_store::{app_data_dir, atomic_write, default_settings, migrate, Settings};
+use termior_store::{app_data_dir, atomic_write, default_settings, migrate, KeyAction, Settings};
 use termior_terminal_core::osc::AgentState;
-use termior_theme::{builtin_themes, Appearance, ResolvedPalette, Theme};
+use termior_theme::{Appearance, ResolvedPalette, Theme, ThemeLibrary};
 use termior_ui::{SidebarPanel, TabId, TabKind, WorkspaceState};
-use termior_ui_kit::{LayoutNode, SplitDirection};
-use termior_vcs::{ChangedFile, CommitInfo, GitRepository};
+use termior_ui_kit::{LayoutNode, PaneId, SplitDirection};
+use termior_vcs::{
+    BranchState, ChangeGroup, ChangedFile, CommitInfo, GitRepository, RemoteOperation,
+};
 
 #[derive(Clone)]
 enum PaneContent {
@@ -51,7 +56,7 @@ impl PaneContent {
 
 struct AppTab {
     id: TabId,
-    panes: Vec<PaneContent>,
+    panes: HashMap<PaneId, PaneContent>,
 }
 
 #[derive(Clone)]
@@ -66,6 +71,19 @@ struct InAppToast {
     notification: Notification,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandMode {
+    Browse,
+    FindFile,
+    SearchContent,
+    CreateFile,
+    CreateDirectory,
+    Rename,
+    GitCommit,
+    GitCreateBranch,
+    GitSwitchBranch,
+}
+
 pub struct WorkspaceView {
     model: WorkspaceState,
     tabs: Vec<AppTab>,
@@ -75,8 +93,17 @@ pub struct WorkspaceView {
     focus_handle: FocusHandle,
     composer: Entity<ComposerView>,
     explorer: Option<FileIndex>,
+    explorer_tree: TreeState,
+    explorer_watcher: Option<WorkspaceWatcher>,
+    _background_task: Option<Task<()>>,
+    command_mode: CommandMode,
+    command_input: String,
+    command_message: Option<String>,
+    content_matches: Vec<ContentMatch>,
+    confirm_delete: Option<PathBuf>,
     vcs_status: Vec<ChangedFile>,
     vcs_history: Vec<CommitInfo>,
+    vcs_branch: Option<BranchState>,
     settings: Settings,
     data_dir: Option<PathBuf>,
     migration_error: Option<String>,
@@ -91,7 +118,16 @@ pub struct WorkspaceView {
 impl WorkspaceView {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let (settings, data_dir, migration_error) = load_settings();
-        let themes = builtin_themes();
+        let themes = data_dir
+            .as_ref()
+            .and_then(|dir| {
+                termior_store::DataFiles::new(dir)
+                    .themes::<ThemeLibrary>()
+                    .load()
+                    .ok()
+            })
+            .unwrap_or_default()
+            .all();
         let theme_index = themes
             .iter()
             .position(|theme| theme.id == settings.theme_id)
@@ -116,16 +152,46 @@ impl WorkspaceView {
             .iter()
             .map(|tab| AppTab {
                 id: tab.id,
-                panes: vec![match tab.kind {
-                    TabKind::Editor => {
-                        let editor = cx.new(EditorView::untitled);
-                        editor.update(cx, |editor, _| {
-                            editor.set_preferences(&settings.editor_theme_id, settings.vim_mode)
-                        });
-                        PaneContent::Editor(editor)
-                    }
-                    _ => PaneContent::Placeholder(format!("Restoring {}…", tab.title)),
-                }],
+                panes: tab
+                    .layout
+                    .panes()
+                    .into_iter()
+                    .map(|pane_id| {
+                        (
+                            pane_id,
+                            match tab.kind {
+                                TabKind::Editor | TabKind::Markdown => {
+                                    let editor = tab
+                                        .resource
+                                        .as_ref()
+                                        .map(PathBuf::from)
+                                        .map(|path| cx.new(|cx| EditorView::open(&path, cx)))
+                                        .unwrap_or_else(|| cx.new(EditorView::untitled));
+                                    editor.update(cx, |editor, _| {
+                                        editor.set_preferences(
+                                            &settings.editor_theme_id,
+                                            settings.vim_mode,
+                                        )
+                                    });
+                                    PaneContent::Editor(editor)
+                                }
+                                TabKind::Terminal | TabKind::Preview => {
+                                    PaneContent::Placeholder(format!("Restoring {}…", tab.title))
+                                }
+                                TabKind::AiDiff | TabKind::GitDiff | TabKind::GitCommitFile => {
+                                    PaneContent::Placeholder(format!(
+                                        "{} · reopen the source item to refresh this diff",
+                                        tab.title
+                                    ))
+                                }
+                                TabKind::GitHistory => PaneContent::Placeholder(format!(
+                                    "{} · history is available in the sidebar",
+                                    tab.title
+                                )),
+                            },
+                        )
+                    })
+                    .collect(),
             })
             .collect();
         if model.tabs.is_empty() {
@@ -166,7 +232,9 @@ impl WorkspaceView {
             tab_id: None,
         });
         let explorer = FileIndex::build(&root, settings.show_dotfiles).ok();
-        let (vcs_status, vcs_history) = load_vcs(&root, &workspace_auth);
+        let explorer_tree = TreeState::new(root.clone());
+        let explorer_watcher = WorkspaceWatcher::watch(&root).ok();
+        let (vcs_status, vcs_history, vcs_branch) = load_vcs(&root, &workspace_auth);
         Self {
             model,
             tabs,
@@ -176,8 +244,17 @@ impl WorkspaceView {
             focus_handle: cx.focus_handle(),
             composer,
             explorer,
+            explorer_tree,
+            explorer_watcher,
+            _background_task: None,
+            command_mode: CommandMode::Browse,
+            command_input: String::new(),
+            command_message: None,
+            content_matches: Vec::new(),
+            confirm_delete: None,
             vcs_status,
             vcs_history,
+            vcs_branch,
             settings,
             data_dir,
             migration_error,
@@ -190,27 +267,116 @@ impl WorkspaceView {
         }
     }
 
-    pub fn restore_or_create_terminal(&mut self, cx: &mut Context<Self>) {
-        let terminal_ids: Vec<TabId> = self
+    pub fn restore_or_create_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let terminal_panes: Vec<(TabId, PaneId, Option<PathBuf>)> = self
             .model
             .tabs
             .iter()
             .filter(|tab| tab.kind == TabKind::Terminal)
-            .map(|tab| tab.id)
+            .flat_map(|tab| {
+                tab.layout
+                    .panes()
+                    .into_iter()
+                    .map(|pane_id| (tab.id, pane_id, Some(tab.cwd.clone())))
+                    .collect::<Vec<_>>()
+            })
             .collect();
-        if terminal_ids.is_empty() && self.model.tabs.is_empty() {
+        if terminal_panes.is_empty() && self.model.tabs.is_empty() {
             self.create_terminal(false, cx);
         } else {
-            for id in terminal_ids {
-                let cwd = self
+            for (id, pane_id, cwd) in terminal_panes {
+                self.spawn_terminal_into(id, pane_id, cwd, cx);
+            }
+            let previews = self
+                .model
+                .tabs
+                .iter()
+                .filter(|tab| tab.kind == TabKind::Preview)
+                .map(|tab| {
+                    (
+                        tab.id,
+                        tab.resource
+                            .clone()
+                            .unwrap_or_else(|| "http://localhost:3000".into()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (id, url) in previews {
+                let pane_ids = self
                     .model
                     .tabs
                     .iter()
                     .find(|tab| tab.id == id)
-                    .map(|tab| tab.cwd.clone());
-                self.spawn_terminal_into(id, 0, cwd, cx);
+                    .map(|tab| tab.layout.panes())
+                    .unwrap_or_default();
+                if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+                    for pane_id in pane_ids {
+                        tab.panes.insert(
+                            pane_id,
+                            PaneContent::Preview(
+                                cx.new(|cx| PreviewView::new(url.clone(), window, cx)),
+                            ),
+                        );
+                    }
+                }
             }
         }
+    }
+
+    pub fn start_background_services(&mut self, cx: &mut Context<Self>) {
+        self._background_task = Some(cx.spawn(async move |workspace, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            if workspace
+                .update(cx, |workspace, cx| {
+                    let changed = workspace
+                        .explorer_watcher
+                        .as_ref()
+                        .is_some_and(|watcher| !watcher.try_changes().is_empty());
+                    if changed {
+                        workspace.refresh_workspace_data();
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+        }));
+    }
+
+    fn refresh_workspace_data(&mut self) {
+        if let Some(index) = self.explorer.as_mut() {
+            if let Err(error) = index.refresh() {
+                self.command_message = Some(format!("Explorer refresh failed: {error}"));
+            }
+        }
+        let (status, history, branch) = load_vcs(&self.model.root, &self.workspace_auth);
+        self.vcs_status = status;
+        self.vcs_history = history;
+        self.vcs_branch = branch;
+    }
+
+    fn open_workspace_picker(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = rfd::FileDialog::new()
+            .set_title("Open a Termior workspace")
+            .pick_folder()
+        else {
+            return;
+        };
+        if !root.is_dir() || root == self.model.root {
+            return;
+        }
+        *self = Self::new(root, cx);
+        self.restore_or_create_runtime(window, cx);
+        self.start_background_services(cx);
+        cx.notify();
     }
 
     fn create_terminal(&mut self, private: bool, cx: &mut Context<Self>) {
@@ -226,21 +392,23 @@ impl WorkspaceView {
         let cwd = self.model.active_tab().map(|tab| tab.cwd.clone());
         self.tabs.push(AppTab {
             id,
-            panes: vec![PaneContent::Placeholder("Starting terminal…".into())],
+            panes: single_pane(PaneContent::Placeholder("Starting terminal…".into())),
         });
         self.activate_runtime(id, cx);
-        self.spawn_terminal_into(id, 0, cwd, cx);
+        self.spawn_terminal_into(id, PaneId(1), cwd, cx);
         cx.notify();
     }
 
     fn spawn_terminal_into(
         &mut self,
         tab_id: TabId,
-        pane_index: usize,
+        pane_id: PaneId,
         cwd: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
         let palette = self.palette.clone();
+        let terminal_settings = self.settings.terminal.clone();
+        let keymap = self.settings.keymap.clone();
         let workspace_auth = self.workspace_auth.clone();
         cx.spawn(async move |workspace, cx| {
             let config = termior_terminal::PtySessionConfig {
@@ -253,7 +421,7 @@ impl WorkspaceView {
                 Err(error) => {
                     let _ = workspace.update(cx, |workspace, cx| {
                         if let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-                            if let Some(pane) = tab.panes.get_mut(pane_index) {
+                            if let Some(pane) = tab.panes.get_mut(&pane_id) {
                                 *pane =
                                     PaneContent::Placeholder(format!("Terminal failed: {error}"));
                             }
@@ -264,8 +432,10 @@ impl WorkspaceView {
                 }
             };
             let _ = workspace.update(cx, |workspace, cx| {
-                let entity = cx.new(|cx| TerminalView::from_bridge(bridge, palette, cx));
-                let agent_id = format!("terminal-agent-{}-{pane_index}", tab_id.0);
+                let entity = cx.new(|cx| {
+                    TerminalView::from_bridge(bridge, palette, terminal_settings, keymap, cx)
+                });
+                let agent_id = format!("terminal-agent-{}-{}", tab_id.0, pane_id.0);
                 let agent_title = workspace
                     .model
                     .tabs
@@ -288,7 +458,7 @@ impl WorkspaceView {
                 )
                 .detach();
                 if let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-                    if let Some(pane) = tab.panes.get_mut(pane_index) {
+                    if let Some(pane) = tab.panes.get_mut(&pane_id) {
                         *pane = PaneContent::Terminal(entity);
                     }
                 }
@@ -306,7 +476,7 @@ impl WorkspaceView {
         });
         self.tabs.push(AppTab {
             id,
-            panes: vec![PaneContent::Editor(editor)],
+            panes: single_pane(PaneContent::Editor(editor)),
         });
         self.activate_runtime(id, cx);
         cx.notify();
@@ -326,9 +496,12 @@ impl WorkspaceView {
             log::warn!("could not open editor file: {}", path.display());
         }
         let id = self.model.new_tab(TabKind::Editor, title, false);
+        if let Some(tab) = self.model.active_tab_mut() {
+            tab.resource = Some(path.to_string_lossy().into_owned());
+        }
         self.tabs.push(AppTab {
             id,
-            panes: vec![PaneContent::Editor(entity)],
+            panes: single_pane(PaneContent::Editor(entity)),
         });
         self.activate_runtime(id, cx);
         cx.notify();
@@ -340,10 +513,13 @@ impl WorkspaceView {
             .and_then(|terminal| terminal.read(cx).localhost_urls().last().cloned())
             .unwrap_or_else(|| "http://localhost:3000".into());
         let id = self.model.new_tab(TabKind::Preview, "Preview", false);
+        if let Some(tab) = self.model.active_tab_mut() {
+            tab.resource = Some(url.clone());
+        }
         let preview = cx.new(|cx| PreviewView::new(url, window, cx));
         self.tabs.push(AppTab {
             id,
-            panes: vec![PaneContent::Preview(preview)],
+            panes: single_pane(PaneContent::Preview(preview)),
         });
         self.activate_runtime(id, cx);
         cx.notify();
@@ -353,9 +529,9 @@ impl WorkspaceView {
         let Some(active) = self.model.active else {
             return;
         };
-        if self.model.split_active(direction).is_err() {
+        let Ok(pane_id) = self.model.split_active(direction) else {
             return;
-        }
+        };
         let kind = self.model.active_tab().map(|tab| tab.kind);
         let pane = match kind {
             Some(TabKind::Editor) => {
@@ -368,36 +544,35 @@ impl WorkspaceView {
             Some(TabKind::Terminal) => PaneContent::Placeholder("Starting split terminal…".into()),
             _ => PaneContent::Placeholder("Split view".into()),
         };
-        let pane_index = if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active) {
-            tab.panes.push(pane);
-            tab.panes.len() - 1
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active) {
+            tab.panes.insert(pane_id, pane);
         } else {
             return;
-        };
+        }
         if kind == Some(TabKind::Terminal) {
             let cwd = self.model.active_tab().map(|tab| tab.cwd.clone());
-            self.spawn_terminal_into(active, pane_index, cwd, cx);
+            self.spawn_terminal_into(active, pane_id, cwd, cx);
         }
         cx.notify();
     }
 
     fn close_active(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.model.active else { return };
-        let pane_count = self
+        let pane_ids = self
             .tabs
             .iter()
             .find(|tab| tab.id == id)
-            .map(|tab| tab.panes.len())
-            .unwrap_or(0);
-        if self.model.close_active_pane_or_tab().is_ok() {
-            if pane_count > 1 {
-                self.remove_terminal_agent(id, pane_count - 1);
+            .map(|tab| tab.panes.keys().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if let Ok(removed_pane) = self.model.close_active_pane_or_tab() {
+            if let Some(pane_id) = removed_pane {
+                self.remove_terminal_agent(id, pane_id);
                 if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
-                    tab.panes.pop();
+                    tab.panes.remove(&pane_id);
                 }
             } else {
-                for pane_index in 0..pane_count {
-                    self.remove_terminal_agent(id, pane_index);
+                for pane_id in pane_ids {
+                    self.remove_terminal_agent(id, pane_id);
                 }
                 self.tabs.retain(|tab| tab.id != id);
             }
@@ -411,7 +586,7 @@ impl WorkspaceView {
     fn activate_runtime(&mut self, id: TabId, cx: &mut Context<Self>) {
         let _ = self.model.switch_to(id);
         for tab in &self.tabs {
-            for pane in &tab.panes {
+            for pane in tab.panes.values() {
                 if let PaneContent::Preview(preview) = pane {
                     preview.update(cx, |preview, cx| preview.set_active(tab.id == id, cx));
                 }
@@ -421,27 +596,37 @@ impl WorkspaceView {
 
     fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
         let active = self.model.active?;
-        self.tabs
-            .iter()
-            .find(|tab| tab.id == active)?
-            .panes
-            .iter()
-            .find_map(|pane| match pane {
+        let tab = self.tabs.iter().find(|tab| tab.id == active)?;
+        let focused = self.model.active_tab()?.layout.focused;
+        tab.panes
+            .get(&focused)
+            .and_then(|pane| match pane {
                 PaneContent::Terminal(entity) => Some(entity),
                 _ => None,
+            })
+            .or_else(|| {
+                tab.panes.values().find_map(|pane| match pane {
+                    PaneContent::Terminal(entity) => Some(entity),
+                    _ => None,
+                })
             })
     }
 
     fn active_editor(&self) -> Option<&Entity<EditorView>> {
         let active = self.model.active?;
-        self.tabs
-            .iter()
-            .find(|tab| tab.id == active)?
-            .panes
-            .iter()
-            .find_map(|pane| match pane {
+        let tab = self.tabs.iter().find(|tab| tab.id == active)?;
+        let focused = self.model.active_tab()?.layout.focused;
+        tab.panes
+            .get(&focused)
+            .and_then(|pane| match pane {
                 PaneContent::Editor(entity) => Some(entity),
                 _ => None,
+            })
+            .or_else(|| {
+                tab.panes.values().find_map(|pane| match pane {
+                    PaneContent::Editor(entity) => Some(entity),
+                    _ => None,
+                })
             })
     }
 
@@ -474,8 +659,8 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn remove_terminal_agent(&mut self, tab_id: TabId, pane_index: usize) {
-        let id = format!("terminal-agent-{}-{pane_index}", tab_id.0);
+    fn remove_terminal_agent(&mut self, tab_id: TabId, pane_id: PaneId) {
+        let id = format!("terminal-agent-{}-{}", tab_id.0, pane_id.0);
         self.pending_agent_updates.remove(&id);
         self.notification_router.remove_agent(&id);
     }
@@ -623,10 +808,7 @@ impl WorkspaceView {
         });
         let bounds = Bounds::centered(None, size(px(760.0), px(520.0)), cx);
         let _ = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
+            app_identity::window_options(WindowBounds::Windowed(bounds)),
             |_window, cx| {
                 cx.new(|cx| {
                     SettingsView::new(settings, migration_error, data_dir, Some(on_save), cx)
@@ -637,6 +819,14 @@ impl WorkspaceView {
 
     fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         self.settings = settings;
+        if let Some(library) = self.data_dir.as_ref().and_then(|dir| {
+            termior_store::DataFiles::new(dir)
+                .themes::<ThemeLibrary>()
+                .load()
+                .ok()
+        }) {
+            self.themes = library.all();
+        }
         self.notification_router
             .set_enabled(self.settings.agent_notifications);
         self.theme_index = self
@@ -656,11 +846,15 @@ impl WorkspaceView {
             let _ = index.set_show_dotfiles(self.settings.show_dotfiles);
         }
         for tab in &self.tabs {
-            for pane in &tab.panes {
+            for pane in tab.panes.values() {
                 if let PaneContent::Editor(editor) = pane {
                     editor.update(cx, |editor, _| {
                         editor
                             .set_preferences(&self.settings.editor_theme_id, self.settings.vim_mode)
+                    });
+                } else if let PaneContent::Terminal(terminal) = pane {
+                    terminal.update(cx, |terminal, cx| {
+                        terminal.set_settings(&self.settings.terminal, &self.settings.keymap, cx)
                     });
                 }
             }
@@ -676,120 +870,64 @@ impl WorkspaceView {
         });
     }
 
-    fn global_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let key = event.keystroke.key.to_ascii_lowercase();
-        let modifiers = event.keystroke.modifiers;
-        let primary = if cfg!(target_os = "macos") {
-            modifiers.platform
-        } else {
-            modifiers.control
-        };
-        if modifiers.control && key == "tab" {
-            self.model.cycle_tab(modifiers.shift);
-            if let Some(active) = self.model.active {
-                self.activate_runtime(active, cx);
-            }
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        if !primary {
-            return;
-        }
-        let handled = match (key.as_str(), modifiers.shift) {
-            ("t", false) => {
-                self.create_terminal(false, cx);
-                true
-            }
-            ("r", false) => {
-                self.create_terminal(true, cx);
-                true
-            }
-            ("e", false) => {
-                self.create_editor(cx);
-                true
-            }
-            ("e", true) => {
-                self.model.sidebar_panel = SidebarPanel::Explorer;
-                self.model.sidebar_visible = true;
-                cx.notify();
-                true
-            }
-            ("p", false) => {
-                self.create_preview(window, cx);
-                true
-            }
-            ("w", false) => {
-                self.close_active(cx);
-                true
-            }
-            ("b", false) => {
-                self.model.sidebar_visible = !self.model.sidebar_visible;
-                cx.notify();
-                true
-            }
-            ("i", false) => {
-                self.model.composer_visible = !self.model.composer_visible;
-                cx.notify();
-                true
-            }
-            ("l", false) => {
-                self.attach_active_selection(cx);
-                true
-            }
-            ("g", false) => {
-                self.model.sidebar_panel = SidebarPanel::SourceControl;
-                self.model.sidebar_visible = true;
-                cx.notify();
-                true
-            }
-            ("d", false) => {
-                self.split_active(SplitDirection::Right, cx);
-                true
-            }
-            ("d", true) => {
-                self.split_active(SplitDirection::Down, cx);
-                true
-            }
-            ("[", false) => {
-                if let Some(tab) = self.model.active_tab_mut() {
-                    tab.layout.focus_relative(-1);
-                }
-                cx.notify();
-                true
-            }
-            ("]", false) => {
-                if let Some(tab) = self.model.active_tab_mut() {
-                    tab.layout.focus_relative(1);
-                }
-                cx.notify();
-                true
-            }
-            (",", false) => {
-                self.open_settings_window(cx);
-                true
-            }
-            (digit, false)
-                if digit.len() == 1 && digit.as_bytes()[0].is_ascii_digit() && digit != "0" =>
-            {
-                let _ = self.model.switch_index(digit.parse().unwrap_or(1));
-                if let Some(active) = self.model.active {
-                    self.activate_runtime(active, cx);
-                }
-                cx.notify();
-                true
-            }
-            _ => false,
-        };
-        if handled {
-            cx.stop_propagation();
-        }
+    fn begin_command(&mut self, mode: CommandMode, cx: &mut Context<Self>) {
+        self.command_mode = mode;
+        self.command_input.clear();
+        self.command_message = None;
+        cx.notify();
     }
 
-    fn sidebar_content(&self, cx: &mut Context<Self>) -> AnyElement {
-        match self.model.sidebar_panel {
-            SidebarPanel::Explorer => {
-                let rows = self
+    fn handle_command_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.command_mode == CommandMode::Browse {
+            return false;
+        }
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" => {
+                self.command_mode = CommandMode::Browse;
+                self.command_input.clear();
+            }
+            "backspace" => {
+                self.command_input.pop();
+            }
+            "enter" | "return" => self.execute_command(cx),
+            _ if !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.platform
+                && !event.keystroke.modifiers.alt =>
+            {
+                if let Some(text) = &event.keystroke.key_char {
+                    self.command_input.push_str(text);
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+        true
+    }
+
+    fn execute_command(&mut self, cx: &mut Context<Self>) {
+        let input = self.command_input.trim().to_owned();
+        if input.is_empty() {
+            return;
+        }
+        let result = match self.command_mode {
+            CommandMode::FindFile => {
+                let path = self.explorer.as_ref().and_then(|index| {
+                    index
+                        .fuzzy(&input, 1)
+                        .first()
+                        .map(|hit| index.root().join(&hit.path))
+                });
+                if let Some(path) = path {
+                    self.open_editor(path, cx);
+                    Ok(())
+                } else {
+                    Err("No matching file".to_owned())
+                }
+            }
+            CommandMode::SearchContent => {
+                self.content_matches.clear();
+                let paths = self
                     .explorer
                     .as_ref()
                     .map(|index| {
@@ -797,54 +935,584 @@ impl WorkspaceView {
                             .entries()
                             .iter()
                             .filter(|entry| !entry.is_dir)
-                            .take(80)
-                            .map(|entry| {
-                                let path = entry.path.clone();
-                                div()
-                                    .id(SharedString::from(format!("file-{}", entry.relative)))
-                                    .px_2()
-                                    .py_1()
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .child(SharedString::from(entry.relative.clone()))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener({
-                                            let path = path.clone();
-                                            move |this, _event, _window, cx| {
-                                                this.open_editor(path.clone(), cx)
-                                            }
-                                        }),
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Right,
-                                        cx.listener(move |this, _event, _window, cx| {
-                                            this.attach_file(path.clone(), cx)
-                                        }),
-                                    )
-                            })
+                            .map(|entry| entry.path.clone())
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                div().flex().flex_col().children(rows).into_any_element()
+                ContentSearch::default()
+                    .search_paths(&input, paths, |hit| {
+                        self.content_matches.push(hit);
+                        self.content_matches.len() < 200
+                    })
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+            CommandMode::CreateFile => self
+                .explorer_tree
+                .create_file(&input)
+                .map(|path| self.open_editor(path, cx))
+                .map_err(|error| error.to_string()),
+            CommandMode::CreateDirectory => self
+                .explorer_tree
+                .create_directory(&input)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            CommandMode::Rename => {
+                let selected = self.explorer_tree.selected().map(Path::to_path_buf);
+                match selected.and_then(|path| {
+                    path.strip_prefix(self.explorer_tree.root())
+                        .ok()
+                        .map(Path::to_path_buf)
+                }) {
+                    Some(relative) => self
+                        .explorer_tree
+                        .rename(relative, &input)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    None => Err("Select a file or directory first".to_owned()),
+                }
+            }
+            CommandMode::GitCommit => self.git_repository().and_then(|repo| {
+                repo.commit(&input)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }),
+            CommandMode::GitCreateBranch => self.git_repository().and_then(|repo| {
+                repo.create_branch(&input, true)
+                    .map_err(|error| error.to_string())
+            }),
+            CommandMode::GitSwitchBranch => self.git_repository().and_then(|repo| {
+                repo.switch_branch(&input)
+                    .map_err(|error| error.to_string())
+            }),
+            CommandMode::Browse => Ok(()),
+        };
+        match result {
+            Ok(()) => {
+                self.command_message = Some("Done".into());
+                self.command_mode = CommandMode::Browse;
+                self.command_input.clear();
+                self.refresh_workspace_data();
+            }
+            Err(error) => self.command_message = Some(error),
+        }
+    }
+
+    fn git_repository(&self) -> Result<GitRepository, String> {
+        GitRepository::open(&self.model.root, &self.workspace_auth)
+            .map_err(|error| error.to_string())
+    }
+
+    fn toggle_git_file(&mut self, path: &str, group: ChangeGroup, cx: &mut Context<Self>) {
+        let result = self.git_repository().and_then(|repo| match group {
+            ChangeGroup::Staged => repo.unstage_file(path).map_err(|error| error.to_string()),
+            ChangeGroup::Unstaged | ChangeGroup::Untracked => {
+                repo.stage_file(path).map_err(|error| error.to_string())
+            }
+        });
+        self.command_message = result.err();
+        self.refresh_workspace_data();
+        cx.notify();
+    }
+
+    fn stage_all(&mut self, cx: &mut Context<Self>) {
+        let result = self.git_repository().and_then(|repo| {
+            for file in self
+                .vcs_status
+                .iter()
+                .filter(|file| file.group != ChangeGroup::Staged)
+            {
+                repo.stage_file(&file.path)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        });
+        self.command_message = result.err();
+        self.refresh_workspace_data();
+        cx.notify();
+    }
+
+    fn run_remote(&mut self, operation: RemoteOperation, cx: &mut Context<Self>) {
+        let root = self.model.root.clone();
+        let auth = self.workspace_auth.clone();
+        let task = cx.background_executor().spawn(async move {
+            GitRepository::open(root, &auth).and_then(|repo| repo.remote(operation))
+        });
+        self.command_message = Some(format!("Running {operation:?}…"));
+        cx.spawn(async move |workspace, cx| {
+            let result = task.await;
+            let _ = workspace.update(cx, |workspace, cx| {
+                workspace.command_message = Some(match result {
+                    Ok(output) if output.trim().is_empty() => format!("{operation:?} completed"),
+                    Ok(output) => output.trim().to_owned(),
+                    Err(error) => error.to_string(),
+                });
+                workspace.refresh_workspace_data();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(selected) = self.explorer_tree.selected().map(Path::to_path_buf) else {
+            self.command_message = Some("Select a file or directory first".into());
+            cx.notify();
+            return;
+        };
+        if self.confirm_delete.as_ref() != Some(&selected) {
+            self.confirm_delete = Some(selected);
+            self.command_message = Some("Click Delete again to confirm".into());
+            cx.notify();
+            return;
+        }
+        self.confirm_delete = None;
+        let result = selected
+            .strip_prefix(self.explorer_tree.root())
+            .map_err(|error| error.to_string())
+            .and_then(|relative| {
+                self.explorer_tree
+                    .delete(relative)
+                    .map_err(|error| error.to_string())
+            });
+        self.command_message = result.err();
+        self.refresh_workspace_data();
+        cx.notify();
+    }
+
+    fn global_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.handle_command_key(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        let Some(action) = self.configured_action(event) else {
+            return;
+        };
+        match action {
+            KeyAction::NewTerminalTab => self.create_terminal(false, cx),
+            KeyAction::NewPrivateTerminal => self.create_terminal(true, cx),
+            KeyAction::NewEditorTab => self.create_editor(cx),
+            KeyAction::NewPreviewTab => self.create_preview(window, cx),
+            KeyAction::ClosePaneOrTab => self.close_active(cx),
+            KeyAction::GotoTab1 => {
+                let _ = self.model.switch_index(1);
+                if let Some(active) = self.model.active {
+                    self.activate_runtime(active, cx);
+                }
+            }
+            KeyAction::CycleTabs | KeyAction::CycleTabsReverse => {
+                self.model.cycle_tab(action == KeyAction::CycleTabsReverse);
+                if let Some(active) = self.model.active {
+                    self.activate_runtime(active, cx);
+                }
+            }
+            KeyAction::SplitRight => self.split_active(SplitDirection::Right, cx),
+            KeyAction::SplitDown => self.split_active(SplitDirection::Down, cx),
+            KeyAction::FocusPanePrev | KeyAction::FocusPaneNext => {
+                if let Some(tab) = self.model.active_tab_mut() {
+                    tab.layout
+                        .focus_relative(if action == KeyAction::FocusPanePrev {
+                            -1
+                        } else {
+                            1
+                        });
+                }
+            }
+            KeyAction::InlineSearch => {
+                if let Some(editor) = self.active_editor().cloned() {
+                    editor.update(cx, EditorView::open_search);
+                } else if let Some(terminal) = self.active_terminal().cloned() {
+                    terminal.update(cx, TerminalView::open_search);
+                }
+            }
+            KeyAction::ToggleSidebar => {
+                self.model.sidebar_visible = !self.model.sidebar_visible;
+            }
+            KeyAction::FocusExplorer => {
+                self.model.sidebar_panel = SidebarPanel::Explorer;
+                self.model.sidebar_visible = true;
+            }
+            KeyAction::FileFinder => {
+                self.model.sidebar_panel = SidebarPanel::Explorer;
+                self.model.sidebar_visible = true;
+                self.begin_command(CommandMode::FindFile, cx);
+            }
+            KeyAction::SourceControlPanel => {
+                self.model.sidebar_panel = SidebarPanel::SourceControl;
+                self.model.sidebar_visible = true;
+            }
+            KeyAction::ToggleComposer => {
+                self.model.composer_visible = !self.model.composer_visible;
+            }
+            KeyAction::AskAiAboutSelection => self.attach_active_selection(cx),
+            KeyAction::CommitStaged => {
+                self.model.sidebar_panel = SidebarPanel::SourceControl;
+                self.model.sidebar_visible = true;
+                self.begin_command(CommandMode::GitCommit, cx);
+            }
+            KeyAction::OpenSettings => self.open_settings_window(cx),
+            KeyAction::Undo | KeyAction::Redo => {
+                if let Some(editor) = self.active_editor().cloned() {
+                    if action == KeyAction::Undo {
+                        editor.update(cx, EditorView::undo);
+                    } else {
+                        editor.update(cx, EditorView::redo);
+                    }
+                }
+            }
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn configured_action(&self, event: &KeyDownEvent) -> Option<KeyAction> {
+        let modifiers = event.keystroke.modifiers;
+        self.settings
+            .keymap
+            .bindings
+            .iter()
+            .find_map(|(action, binding)| {
+                let primary_matches = if binding.primary {
+                    if cfg!(target_os = "macos") {
+                        modifiers.platform && !modifiers.control
+                    } else {
+                        modifiers.control
+                    }
+                } else {
+                    modifiers.control && !modifiers.platform
+                };
+                (primary_matches
+                    && modifiers.shift == binding.shift
+                    && modifiers.alt == binding.alt
+                    && event.keystroke.key.eq_ignore_ascii_case(&binding.key))
+                .then_some(*action)
+            })
+    }
+
+    fn layout_element(
+        &self,
+        node: &LayoutNode,
+        panes: &HashMap<PaneId, PaneContent>,
+        focused: PaneId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match node {
+            LayoutNode::Pane { id } => {
+                let pane_id = *id;
+                let content = panes.get(id).map(PaneContent::element).unwrap_or_else(|| {
+                    div()
+                        .flex()
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .child("Pane unavailable")
+                        .into_any_element()
+                });
+                div()
+                    .id(SharedString::from(format!("pane-{}", id.0)))
+                    .relative()
+                    .size_full()
+                    .overflow_hidden()
+                    .when(*id == focused, |pane| {
+                        pane.border_1().border_color(gpui::rgba(0x4f8fefff))
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |workspace, _event, _window, cx| {
+                            if let Some(tab) = workspace.model.active_tab_mut() {
+                                let _ = tab.layout.focus(pane_id);
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .child(content)
+                    .into_any_element()
+            }
+            LayoutNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                let first = self.layout_element(first, panes, focused, cx);
+                let second = self.layout_element(second, panes, focused, cx);
+                let ratio = ratio.clamp(0.1, 0.9);
+                match direction {
+                    SplitDirection::Right => div()
+                        .flex()
+                        .flex_row()
+                        .size_full()
+                        .child(div().h_full().w(relative(ratio)).child(first))
+                        .child(div().h_full().flex_1().child(second))
+                        .into_any_element(),
+                    SplitDirection::Down => div()
+                        .flex()
+                        .flex_col()
+                        .size_full()
+                        .child(div().w_full().h(relative(ratio)).child(first))
+                        .child(div().w_full().flex_1().child(second))
+                        .into_any_element(),
+                }
+            }
+        }
+    }
+
+    fn sidebar_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        let command_bar = (self.command_mode != CommandMode::Browse).then(|| {
+            div()
+                .px_2()
+                .py_1()
+                .mb_1()
+                .rounded_md()
+                .border_1()
+                .border_color(gpui::rgba(0x4f8fefff))
+                .text_xs()
+                .child(SharedString::from(format!(
+                    "{:?}: {}▏",
+                    self.command_mode, self.command_input
+                )))
+        });
+        let message = self.command_message.clone().map(|message| {
+            div()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .child(SharedString::from(message))
+        });
+        let content = match self.model.sidebar_panel {
+            SidebarPanel::Explorer => {
+                let toolbar = div()
+                    .flex()
+                    .flex_row()
+                    .gap_1()
+                    .mb_1()
+                    .child(sidebar_button("Find", "explorer-find", cx, |this, cx| {
+                        this.begin_command(CommandMode::FindFile, cx)
+                    }))
+                    .child(sidebar_button(
+                        "Search",
+                        "explorer-search",
+                        cx,
+                        |this, cx| this.begin_command(CommandMode::SearchContent, cx),
+                    ))
+                    .child(sidebar_button("+F", "explorer-new-file", cx, |this, cx| {
+                        this.begin_command(CommandMode::CreateFile, cx)
+                    }))
+                    .child(sidebar_button("+D", "explorer-new-dir", cx, |this, cx| {
+                        this.begin_command(CommandMode::CreateDirectory, cx)
+                    }))
+                    .child(sidebar_button("Ren", "explorer-rename", cx, |this, cx| {
+                        this.begin_command(CommandMode::Rename, cx)
+                    }))
+                    .child(sidebar_button("Del", "explorer-delete", cx, |this, cx| {
+                        this.delete_selected(cx)
+                    }));
+
+                let rows = if self.command_mode == CommandMode::FindFile {
+                    self.explorer
+                        .as_ref()
+                        .map(|index| {
+                            index
+                                .fuzzy(&self.command_input, 80)
+                                .into_iter()
+                                .map(|hit| {
+                                    let path = index.root().join(&hit.path);
+                                    div()
+                                        .id(SharedString::from(format!("find-{}", hit.path)))
+                                        .px_2()
+                                        .py_1()
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .child(SharedString::from(hit.path))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.open_editor(path.clone(), cx)
+                                            }),
+                                        )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else if self.command_mode == CommandMode::SearchContent
+                    && !self.content_matches.is_empty()
+                {
+                    self.content_matches
+                        .iter()
+                        .map(|hit| {
+                            let path = hit.path.clone();
+                            div()
+                                .id(SharedString::from(format!(
+                                    "search-{}-{}",
+                                    path.display(),
+                                    hit.line_number
+                                )))
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .cursor_pointer()
+                                .child(SharedString::from(format!(
+                                    "{}:{}  {}",
+                                    path.strip_prefix(&self.model.root)
+                                        .unwrap_or(&path)
+                                        .display(),
+                                    hit.line_number,
+                                    hit.line
+                                )))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.open_editor(path.clone(), cx)
+                                    }),
+                                )
+                        })
+                        .collect()
+                } else {
+                    self.explorer
+                        .as_ref()
+                        .map(|index| {
+                            let mut entries = index.entries().to_vec();
+                            entries.sort_by(|a, b| a.relative.cmp(&b.relative));
+                            entries
+                                .into_iter()
+                                .filter(|entry| explorer_entry_visible(entry, &self.explorer_tree))
+                                .take(500)
+                                .map(|entry| {
+                                    let path = entry.path.clone();
+                                    let attach_path = path.clone();
+                                    let selected =
+                                        self.explorer_tree.selected() == Some(path.as_path());
+                                    let expanded = self.explorer_tree.is_expanded(&path);
+                                    let label = entry
+                                        .path
+                                        .file_name()
+                                        .and_then(|name| name.to_str())
+                                        .unwrap_or(&entry.relative)
+                                        .to_owned();
+                                    div()
+                                        .id(SharedString::from(format!("file-{}", entry.relative)))
+                                        .pl(px(4.0 + entry.depth as f32 * 12.0))
+                                        .pr_1()
+                                        .py_1()
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .when(selected, |row| row.bg(gpui::rgba(0x36588088)))
+                                        .child(SharedString::from(format!(
+                                            "{}{}",
+                                            if entry.is_dir {
+                                                if expanded {
+                                                    "▾ "
+                                                } else {
+                                                    "▸ "
+                                                }
+                                            } else {
+                                                "  "
+                                            },
+                                            label
+                                        )))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                this.explorer_tree.select(path.clone());
+                                                this.confirm_delete = None;
+                                                if entry.is_dir {
+                                                    this.explorer_tree
+                                                        .toggle_expanded(path.clone());
+                                                } else {
+                                                    this.open_editor(path.clone(), cx);
+                                                }
+                                                cx.notify();
+                                            }),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            cx.listener(move |this, _event, _window, cx| {
+                                                this.attach_file(attach_path.clone(), cx)
+                                            }),
+                                        )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(toolbar)
+                    .children(rows)
+                    .into_any_element()
             }
             SidebarPanel::SourceControl => {
+                let branch = self
+                    .vcs_branch
+                    .as_ref()
+                    .and_then(|state| state.name.clone())
+                    .unwrap_or_else(|| "No repository".into());
+                let toolbar = div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_1()
+                    .mb_1()
+                    .child(sidebar_button("All+", "git-stage-all", cx, |this, cx| {
+                        this.stage_all(cx)
+                    }))
+                    .child(sidebar_button("Commit", "git-commit", cx, |this, cx| {
+                        this.begin_command(CommandMode::GitCommit, cx)
+                    }))
+                    .child(sidebar_button("Fetch", "git-fetch", cx, |this, cx| {
+                        this.run_remote(RemoteOperation::Fetch, cx)
+                    }))
+                    .child(sidebar_button("Pull", "git-pull", cx, |this, cx| {
+                        this.run_remote(RemoteOperation::PullFfOnly, cx)
+                    }))
+                    .child(sidebar_button("Push", "git-push", cx, |this, cx| {
+                        this.run_remote(RemoteOperation::Push, cx)
+                    }))
+                    .child(sidebar_button(
+                        "+Branch",
+                        "git-new-branch",
+                        cx,
+                        |this, cx| this.begin_command(CommandMode::GitCreateBranch, cx),
+                    ))
+                    .child(sidebar_button(
+                        "Switch",
+                        "git-switch-branch",
+                        cx,
+                        |this, cx| this.begin_command(CommandMode::GitSwitchBranch, cx),
+                    ));
                 let rows = self
                     .vcs_status
                     .iter()
                     .take(80)
                     .map(|file| {
+                        let path = file.path.clone();
+                        let group = file.group;
                         div()
+                            .id(SharedString::from(format!("git-{group:?}-{path}")))
                             .px_2()
                             .py_1()
                             .text_xs()
+                            .cursor_pointer()
                             .child(SharedString::from(format!(
                                 "{:?}  {}",
                                 file.group, file.path
                             )))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.toggle_git_file(&path, group, cx)
+                                }),
+                            )
                     })
                     .collect::<Vec<_>>();
-                div().flex().flex_col().children(rows).into_any_element()
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(SharedString::from(format!("Branch: {branch}")))
+                    .child(toolbar)
+                    .children(rows)
+                    .into_any_element()
             }
             SidebarPanel::GitHistory => {
                 let rows = self
@@ -865,7 +1533,14 @@ impl WorkspaceView {
                     .collect::<Vec<_>>();
                 div().flex().flex_col().children(rows).into_any_element()
             }
-        }
+        };
+        div()
+            .flex()
+            .flex_col()
+            .children(command_bar)
+            .children(message)
+            .child(content)
+            .into_any_element()
     }
 
     fn sync_terminal_context(&mut self, cx: &mut Context<Self>) -> (String, Option<String>) {
@@ -890,6 +1565,8 @@ impl WorkspaceView {
                     .map_or(true, |index| index.root() != path)
             {
                 self.explorer = FileIndex::build(path, self.settings.show_dotfiles).ok();
+                self.explorer_tree.set_root(path.to_path_buf());
+                self.explorer_watcher = WorkspaceWatcher::watch(path).ok();
             }
         }
         let resolved_cwd = cwd.unwrap_or_else(|| self.model.root.to_string_lossy().into_owned());
@@ -943,24 +1620,8 @@ impl gpui::Render for WorkspaceView {
         let active_content = active
             .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
             .map(|tab| {
-                let direction = self
-                    .model
-                    .active_tab()
-                    .and_then(|tab| match &tab.layout.root {
-                        LayoutNode::Split { direction, .. } => Some(*direction),
-                        _ => None,
-                    });
-                let panes = tab
-                    .panes
-                    .iter()
-                    .map(PaneContent::element)
-                    .collect::<Vec<_>>();
-                let mut row = div().flex().size_full();
-                row = match direction {
-                    Some(SplitDirection::Down) => row.flex_col(),
-                    _ => row.flex_row(),
-                };
-                row.children(panes)
+                let layout = &self.model.active_tab().expect("active tab exists").layout;
+                self.layout_element(&layout.root, &tab.panes, layout.focused, cx)
             })
             .unwrap_or_else(|| {
                 div()
@@ -969,6 +1630,7 @@ impl gpui::Render for WorkspaceView {
                     .items_center()
                     .justify_center()
                     .child("No tabs. Press Ctrl/Cmd+T for a terminal.")
+                    .into_any_element()
             });
 
         let sidebar = if self.model.sidebar_visible {
@@ -1029,6 +1691,21 @@ impl gpui::Render for WorkspaceView {
         };
 
         let theme_name = self.themes[self.theme_index].name.clone();
+        let background_image = self
+            .settings
+            .background
+            .image_path
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+            .map(|path| (path, self.settings.background.opacity.clamp(0.0, 1.0)));
+        let workspace_name = self
+            .model
+            .root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Workspace")
+            .to_owned();
         let agent_indicators = self
             .notification_router
             .bell_items()
@@ -1136,6 +1813,7 @@ impl gpui::Render for WorkspaceView {
             .collect::<Vec<_>>();
         div()
             .id("workspace-root")
+            .relative()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::global_key))
             .flex()
@@ -1143,6 +1821,15 @@ impl gpui::Render for WorkspaceView {
             .size_full()
             .bg(gpui_color(p.background))
             .text_color(gpui_color(p.foreground))
+            .when_some(background_image, |root, (path, opacity)| {
+                root.child(
+                    gpui::img(path)
+                        .absolute()
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::Cover)
+                        .opacity(opacity),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -1157,6 +1844,20 @@ impl gpui::Render for WorkspaceView {
                             .flex_1()
                             .h_full()
                             .children(tab_buttons),
+                    )
+                    .child(
+                        div()
+                            .id("open-workspace")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_xs()
+                            .child(SharedString::from(workspace_name))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::open_workspace_picker),
+                            ),
                     )
                     .child(header_button("+T", "new-terminal", cx, |this, _, _, cx| {
                         this.create_terminal(false, cx)
@@ -1258,6 +1959,46 @@ impl Drop for WorkspaceView {
     }
 }
 
+fn single_pane(content: PaneContent) -> HashMap<PaneId, PaneContent> {
+    HashMap::from([(PaneId(1), content)])
+}
+
+fn explorer_entry_visible(entry: &FileEntry, tree: &TreeState) -> bool {
+    let root = tree.root();
+    let mut parent = entry.path.parent();
+    while let Some(path) = parent {
+        if path == root {
+            return true;
+        }
+        if !path.starts_with(root) || !tree.is_expanded(path) {
+            return false;
+        }
+        parent = path.parent();
+    }
+    false
+}
+
+fn sidebar_button(
+    label: &'static str,
+    id: &'static str,
+    cx: &mut Context<WorkspaceView>,
+    listener: impl Fn(&mut WorkspaceView, &mut Context<WorkspaceView>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_1()
+        .py_1()
+        .rounded_sm()
+        .bg(gpui::rgba(0x293241dd))
+        .text_xs()
+        .cursor_pointer()
+        .child(label)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |workspace, _event, _window, cx| listener(workspace, cx)),
+        )
+}
+
 fn header_button(
     label: &'static str,
     id: &'static str,
@@ -1346,12 +2087,13 @@ fn load_settings() -> (Settings, Option<PathBuf>, Option<String>) {
 fn load_vcs(
     root: &Path,
     workspace_auth: &WorkspaceAuthRegistry,
-) -> (Vec<ChangedFile>, Vec<CommitInfo>) {
+) -> (Vec<ChangedFile>, Vec<CommitInfo>, Option<BranchState>) {
     match GitRepository::open(root, workspace_auth) {
         Ok(repo) => (
             repo.status().unwrap_or_default(),
             repo.history(100, None).unwrap_or_default(),
+            repo.branch_state().ok(),
         ),
-        Err(_) => (Vec::new(), Vec::new()),
+        Err(_) => (Vec::new(), Vec::new(), None),
     }
 }

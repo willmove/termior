@@ -20,6 +20,7 @@ use gpui::{
     ScrollWheelEvent, SharedString, Styled, Task, TextAlign, TextRun, UTF16Selection, WeakEntity,
     Window,
 };
+use termior_store::{TerminalSettings, UserKeymap};
 use termior_terminal::{PtySessionConfig, TerminalBridge};
 use termior_terminal_core::osc::{AgentState, OscEvent};
 use termior_terminal_core::{find_hyperlinks, TerminalSearch};
@@ -27,10 +28,6 @@ use termior_theme::{Color as ThemeColor, ResolvedPalette, TerminalPalette};
 use termior_ui_kit::SearchOverlay;
 
 use crate::keystroke::keystroke_to_pty_bytes;
-
-/// 默认等宽字体族与字号。
-const FONT_FAMILY: &str = "monospace";
-const FONT_SIZE: f32 = 14.0;
 
 /// GPUI 终端视图。
 pub struct TerminalView {
@@ -50,6 +47,10 @@ pub struct TerminalView {
     search_overlay: SearchOverlay,
     search: TerminalSearch,
     snapshot_text: String,
+    text_style: TerminalTextStyle,
+    cell_width: f32,
+    line_height_px: f32,
+    keymap: UserKeymap,
 }
 
 impl TerminalView {
@@ -57,9 +58,14 @@ impl TerminalView {
     /// 生产路径用 `from_bridge`（在 GPUI borrow 周期外 spawn，避免 RefCell 重入）；
     /// 本构造函数保留给测试/未来单测场景。
     #[allow(dead_code)]
-    pub fn new(palette: ResolvedPalette, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        palette: ResolvedPalette,
+        settings: TerminalSettings,
+        keymap: UserKeymap,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let bridge = TerminalBridge::spawn(&PtySessionConfig::default()).expect("PTY spawn failed");
-        Self::from_bridge(bridge, palette, cx)
+        Self::from_bridge(bridge, palette, settings, keymap, cx)
     }
 
     /// 用已 spawn 的 bridge 创建视图。
@@ -67,6 +73,8 @@ impl TerminalView {
     pub fn from_bridge(
         mut bridge: TerminalBridge,
         palette: ResolvedPalette,
+        settings: TerminalSettings,
+        keymap: UserKeymap,
         cx: &mut Context<Self>,
     ) -> Self {
         let cols = PtySessionConfig::default().cols as usize;
@@ -74,8 +82,12 @@ impl TerminalView {
         let output_rx = bridge.take_output().expect("output channel");
         log::info!("PTY attached: cols={cols} rows={rows}");
 
+        let term_config = TermConfig {
+            scrolling_history: settings.scrollback_lines as usize,
+            ..Default::default()
+        };
         let term = Term::new(
-            TermConfig::default(),
+            term_config,
             &TermSize {
                 columns: cols,
                 screen_lines: rows,
@@ -135,6 +147,8 @@ impl TerminalView {
             log::info!("PTY output stream ended");
         });
 
+        let text_style = TerminalTextStyle::from_settings(&settings);
+        let line_height_px = text_style.font_size * text_style.line_height;
         Self {
             bridge,
             term,
@@ -151,6 +165,10 @@ impl TerminalView {
             search_overlay: SearchOverlay::default(),
             search: TerminalSearch::default(),
             snapshot_text: String::new(),
+            cell_width: text_style.font_size * 0.6 + text_style.letter_spacing,
+            line_height_px,
+            text_style,
+            keymap,
         }
     }
 
@@ -166,19 +184,60 @@ impl TerminalView {
         termior_ai::context::tail_lines(&self.snapshot_text, 300)
     }
 
-    /// resize 终端网格与 PTY（窗口尺寸变化时调用；M1 预留，后续接布局事件）。
-    #[allow(dead_code)]
-    pub fn resize(&mut self, cols: usize, rows: usize, cx: &mut Context<Self>) {
-        if cols == 0 || rows == 0 || (cols == self.cols && rows == self.rows) {
+    /// Resize the terminal grid and PTY to the actual GPUI canvas dimensions.
+    pub fn resize(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        cell_width: f32,
+        line_height_px: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if cols == 0 || rows == 0 {
             return;
         }
-        self.term.resize(TermSize {
-            columns: cols,
-            screen_lines: rows,
-        });
-        let _ = self.bridge.resize(rows as u16, cols as u16);
-        self.cols = cols;
-        self.rows = rows;
+        let dimensions_changed = cols != self.cols || rows != self.rows;
+        let metrics_changed = (self.cell_width - cell_width).abs() > f32::EPSILON
+            || (self.line_height_px - line_height_px).abs() > f32::EPSILON;
+        if dimensions_changed {
+            self.term.resize(TermSize {
+                columns: cols,
+                screen_lines: rows,
+            });
+            if let Err(error) = self.bridge.resize(rows as u16, cols as u16) {
+                log::warn!("PTY resize failed: {error}");
+            }
+            self.cols = cols;
+            self.rows = rows;
+        }
+        if metrics_changed {
+            self.cell_width = cell_width;
+            self.line_height_px = line_height_px;
+        }
+        if dimensions_changed || metrics_changed {
+            cx.notify();
+        }
+    }
+
+    pub fn set_settings(
+        &mut self,
+        settings: &TerminalSettings,
+        keymap: &UserKeymap,
+        cx: &mut Context<Self>,
+    ) {
+        self.text_style = TerminalTextStyle::from_settings(settings);
+        self.keymap = keymap.clone();
+        let config = TermConfig {
+            scrolling_history: settings.scrollback_lines as usize,
+            ..Default::default()
+        };
+        self.term.set_options(config);
+        cx.notify();
+    }
+
+    pub fn open_search(&mut self, cx: &mut Context<Self>) {
+        self.search_overlay.open();
+        self.update_search();
         cx.notify();
     }
 
@@ -186,15 +245,21 @@ impl TerminalView {
     fn handle_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let modifiers = ev.keystroke.modifiers;
         let key = ev.keystroke.key.as_str();
-        let primary = if cfg!(target_os = "macos") {
-            modifiers.platform
-        } else {
-            modifiers.control
-        };
-        if primary && key == "f" {
-            self.search_overlay.open();
-            self.update_search();
-            cx.notify();
+        if self.keymap.bindings.values().any(|binding| {
+            let primary_matches = if binding.primary {
+                if cfg!(target_os = "macos") {
+                    modifiers.platform && !modifiers.control
+                } else {
+                    modifiers.control
+                }
+            } else {
+                modifiers.control && !modifiers.platform
+            };
+            primary_matches
+                && modifiers.shift == binding.shift
+                && modifiers.alt == binding.alt
+                && key.eq_ignore_ascii_case(&binding.key)
+        }) {
             return;
         }
         if self.search_overlay.visible {
@@ -286,6 +351,13 @@ impl Render for TerminalView {
         let palette = self.palette.clone();
         let cols = self.cols;
         let rows = self.rows;
+        let text_style = self.text_style.clone();
+        let paint_style = text_style.clone();
+        let view = cx.entity().downgrade();
+        let marked_cell_width = self.cell_width;
+        let marked_line_height = self.line_height_px;
+        let current_cell_width = self.cell_width;
+        let current_line_height = self.line_height_px;
 
         div()
             .id("terminal-view")
@@ -296,28 +368,63 @@ impl Render for TerminalView {
             .bg(bg)
             .text_color(fg)
             .child(canvas(
-                move |bounds, window, cx| {
-                    window.handle_input(&input_focus, input_handler.clone(), cx);
-                    let line_height = window.line_height();
-                    let cell_width = cell_advance_width(window);
+                move |bounds, window, _cx| {
+                    let line_height = px(text_style.font_size * text_style.line_height);
+                    let cell_width = cell_advance_width(window, &text_style);
+                    let measured_cols =
+                        (bounds.size.width.as_f32() / cell_width.max(1.0)).floor() as usize;
+                    let measured_rows = (bounds.size.height.as_f32()
+                        / line_height.as_f32().max(1.0))
+                    .floor() as usize;
+                    if measured_cols > 0
+                        && measured_rows > 0
+                        && (measured_cols != cols
+                            || measured_rows != rows
+                            || (current_cell_width - cell_width).abs() > f32::EPSILON
+                            || (current_line_height - line_height.as_f32()).abs() > f32::EPSILON)
+                    {
+                        let view = view.clone();
+                        window.on_next_frame(move |_, cx| {
+                            if let Some(view) = view.upgrade() {
+                                view.update(cx, |view, cx| {
+                                    view.resize(
+                                        measured_cols,
+                                        measured_rows,
+                                        cell_width,
+                                        line_height.as_f32(),
+                                        cx,
+                                    );
+                                });
+                            }
+                        });
+                    }
                     LayoutInfo {
                         origin: bounds.origin,
                         line_height,
                         cell_width,
-                        cols,
-                        rows,
+                        cols: measured_cols.max(1),
+                        rows: measured_rows.max(1),
                     }
                 },
                 move |_bounds, layout: LayoutInfo, window, cx| {
-                    paint_terminal(&layout, &snapshot, &palette, &search, window, cx);
+                    window.handle_input(&input_focus, input_handler, cx);
+                    paint_terminal(
+                        &layout,
+                        &snapshot,
+                        &palette,
+                        &search,
+                        &paint_style,
+                        window,
+                        cx,
+                    );
                 },
             ))
             .when(!marked_text.is_empty(), |element| {
                 element.child(
                     div()
                         .absolute()
-                        .left(px(marked_col as f32 * 8.4 + 2.0))
-                        .top(px(marked_row as f32 * 18.0 + 1.0))
+                        .left(px(marked_col as f32 * marked_cell_width + 2.0))
+                        .top(px(marked_row as f32 * marked_line_height + 1.0))
                         .px_1()
                         .bg(gpui::rgba(0x365880ff))
                         .child(SharedString::from(marked_text)),
@@ -589,11 +696,30 @@ fn current_cursor(term: &Term<VoidListener>) -> (u16, u16) {
 }
 
 /// 等宽字体的单字 advance 宽度（cell 宽）。
-fn cell_advance_width(window: &Window) -> f32 {
+#[derive(Debug, Clone)]
+struct TerminalTextStyle {
+    font_family: SharedString,
+    font_size: f32,
+    line_height: f32,
+    letter_spacing: f32,
+}
+
+impl TerminalTextStyle {
+    fn from_settings(settings: &TerminalSettings) -> Self {
+        Self {
+            font_family: settings.font_family.clone().into(),
+            font_size: settings.font_size.max(6) as f32,
+            line_height: settings.line_height.max(0.8),
+            letter_spacing: settings.letter_spacing,
+        }
+    }
+}
+
+fn cell_advance_width(window: &Window, style: &TerminalTextStyle) -> f32 {
     let run = TextRun {
         len: 1,
         font: Font {
-            family: FONT_FAMILY.into(),
+            family: style.font_family.clone(),
             weight: FontWeight::NORMAL,
             style: FontStyle::Normal,
             features: FontFeatures::default(),
@@ -607,8 +733,8 @@ fn cell_advance_width(window: &Window) -> f32 {
     let line =
         window
             .text_system()
-            .shape_line(SharedString::from("M"), px(FONT_SIZE), &[run], None);
-    line.width().as_f32()
+            .shape_line(SharedString::from("M"), px(style.font_size), &[run], None);
+    (line.width().as_f32() + style.letter_spacing).max(1.0)
 }
 
 /// 布局计算结果，prepaint → paint 之间传递。
@@ -626,6 +752,7 @@ fn paint_terminal(
     snapshot: &RenderSnapshot,
     palette: &ResolvedPalette,
     search: &TerminalSearch,
+    text_style: &TerminalTextStyle,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -667,6 +794,7 @@ fn paint_terminal(
                 origin,
                 lh,
                 cw,
+                text_style,
                 window,
                 cx,
             );
@@ -719,6 +847,7 @@ fn paint_terminal(
                 origin,
                 lh,
                 cw,
+                text_style,
                 window,
                 cx,
             );
@@ -736,6 +865,7 @@ fn paint_terminal(
         origin,
         lh,
         cw,
+        text_style,
         window,
         cx,
     );
@@ -754,6 +884,7 @@ fn flush_run(
     origin: Point<Pixels>,
     lh: Pixels,
     cw: f32,
+    text_style: &TerminalTextStyle,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -770,7 +901,7 @@ fn flush_run(
     let run = TextRun {
         len,
         font: Font {
-            family: FONT_FAMILY.into(),
+            family: text_style.font_family.clone(),
             weight: FontWeight::NORMAL,
             style: FontStyle::Normal,
             features: FontFeatures::default(),
@@ -783,7 +914,7 @@ fn flush_run(
     };
     let line = window
         .text_system()
-        .shape_line(shared, px(FONT_SIZE), &[run], None);
+        .shape_line(shared, px(text_style.font_size), &[run], None);
     let line_x = origin.x + px(start_col as f32 * cw);
     let baseline_y = origin.y + lh * row as f32;
     let _ = line.paint(

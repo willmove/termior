@@ -5,21 +5,34 @@ use gpui::{
 };
 use std::ops::Range;
 use std::path::PathBuf;
-use termior_ai::{HttpProvider, KeyringSecretStore, ProviderConfig, SecretStore};
+use termior_ai::{
+    AgentDefinition, AgentDefinitionStore, HttpProvider, KeyringSecretStore, ProviderConfig,
+    SecretStore,
+};
 use termior_store::settings::Appearance;
-use termior_store::{atomic_write, default_keymap, Platform, Settings};
+use termior_store::{
+    atomic_write, default_keymap, DataFiles, KeyAction, Platform, Settings, UserKeyBinding,
+};
+use termior_theme::ThemeLibrary;
 use termior_ui::SettingsPage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditField {
     FontFamily,
     FontSize,
+    LineHeight,
     LetterSpacing,
     Scrollback,
     Instructions,
     Model,
     BaseUrl,
     ApiKey,
+    BackgroundOpacity,
+    AgentName,
+    AgentPrompt,
+    AgentTools,
+    AgentIcon,
+    AgentColor,
 }
 
 type SaveCallback = Box<dyn Fn(&Settings, &mut App)>;
@@ -36,6 +49,10 @@ pub struct SettingsView {
     cursor: usize,
     marked_text: String,
     credential_present: bool,
+    capture_shortcut: Option<KeyAction>,
+    themes: ThemeLibrary,
+    agents: AgentDefinitionStore,
+    agent_index: usize,
     status: String,
     on_save: Option<SaveCallback>,
 }
@@ -48,6 +65,14 @@ impl SettingsView {
         on_save: Option<SaveCallback>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let themes = data_dir
+            .as_ref()
+            .and_then(|dir| DataFiles::new(dir).themes().load().ok())
+            .unwrap_or_default();
+        let agents = data_dir
+            .as_ref()
+            .and_then(|dir| DataFiles::new(dir).agents().load().ok())
+            .unwrap_or_default();
         let mut view = Self {
             page: SettingsPage::General,
             settings,
@@ -60,6 +85,10 @@ impl SettingsView {
             cursor: 0,
             marked_text: String::new(),
             credential_present: false,
+            capture_shortcut: None,
+            themes,
+            agents,
+            agent_index: 0,
             status: String::new(),
             on_save,
         };
@@ -79,6 +108,14 @@ impl SettingsView {
 
     fn profile_mut(&mut self) -> Option<&mut termior_store::ModelProviderSettings> {
         self.settings.models.profiles.get_mut(self.profile_index)
+    }
+
+    fn agent(&self) -> Option<&AgentDefinition> {
+        self.agents.agents.get(self.agent_index)
+    }
+
+    fn agent_mut(&mut self) -> Option<&mut AgentDefinition> {
+        self.agents.agents.get_mut(self.agent_index)
     }
 
     fn profile_key(&self) -> Option<String> {
@@ -109,6 +146,7 @@ impl SettingsView {
         match field {
             EditField::FontFamily => self.settings.terminal.font_family.clone(),
             EditField::FontSize => self.settings.terminal.font_size.to_string(),
+            EditField::LineHeight => self.settings.terminal.line_height.to_string(),
             EditField::LetterSpacing => self.settings.terminal.letter_spacing.to_string(),
             EditField::Scrollback => self.settings.terminal.scrollback_lines.to_string(),
             EditField::Instructions => self.settings.custom_instructions.clone(),
@@ -124,6 +162,15 @@ impl SettingsView {
                     "Click to add a key".into()
                 }
             }
+            EditField::BackgroundOpacity => self.settings.background.opacity.to_string(),
+            EditField::AgentName => self.agent().map(|a| a.name.clone()).unwrap_or_default(),
+            EditField::AgentPrompt => self
+                .agent()
+                .map(|a| a.system_prompt.clone())
+                .unwrap_or_default(),
+            EditField::AgentTools => self.agent().map(|a| a.tools.join(", ")).unwrap_or_default(),
+            EditField::AgentIcon => self.agent().map(|a| a.icon.clone()).unwrap_or_default(),
+            EditField::AgentColor => self.agent().map(|a| a.color.clone()).unwrap_or_default(),
         }
     }
 
@@ -142,6 +189,10 @@ impl SettingsView {
             EditField::FontSize => value
                 .parse::<u8>()
                 .map(|value| self.settings.terminal.font_size = value)
+                .map_err(|error| error.to_string()),
+            EditField::LineHeight => value
+                .parse::<f32>()
+                .map(|value| self.settings.terminal.line_height = value)
                 .map_err(|error| error.to_string()),
             EditField::LetterSpacing => value
                 .parse::<f32>()
@@ -181,6 +232,45 @@ impl SettingsView {
                     Ok(())
                 }
             }
+            EditField::BackgroundOpacity => value
+                .parse::<f32>()
+                .map(|value| self.settings.background.opacity = value)
+                .map_err(|error| error.to_string()),
+            EditField::AgentName => {
+                if let Some(agent) = self.agent_mut() {
+                    agent.name = value;
+                }
+                Ok(())
+            }
+            EditField::AgentPrompt => {
+                if let Some(agent) = self.agent_mut() {
+                    agent.system_prompt = value;
+                }
+                Ok(())
+            }
+            EditField::AgentTools => {
+                if let Some(agent) = self.agent_mut() {
+                    agent.tools = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|tool| !tool.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                }
+                Ok(())
+            }
+            EditField::AgentIcon => {
+                if let Some(agent) = self.agent_mut() {
+                    agent.icon = value;
+                }
+                Ok(())
+            }
+            EditField::AgentColor => {
+                if let Some(agent) = self.agent_mut() {
+                    agent.color = value;
+                }
+                Ok(())
+            }
         };
         if let Err(error) = result {
             self.status = format!("Invalid value: {error}");
@@ -197,21 +287,39 @@ impl SettingsView {
             cx.notify();
             return;
         }
-        let result = self.data_dir.as_ref().map_or_else(
-            || Err("application data directory is unavailable".to_owned()),
-            |dir| {
-                std::fs::create_dir_all(dir)
+        let result = self
+            .data_dir
+            .as_ref()
+            .map_or_else(
+                || Err("application data directory is unavailable".to_owned()),
+                |dir| {
+                    std::fs::create_dir_all(dir)
+                        .map_err(|error| error.to_string())
+                        .and_then(|()| {
+                            serde_json::to_string_pretty(&self.settings)
+                                .map_err(|error| error.to_string())
+                        })
+                        .and_then(|json| {
+                            atomic_write(&dir.join("Termior-settings.json"), &json)
+                                .map_err(|error| error.to_string())
+                        })
+                },
+            )
+            .and_then(|()| {
+                let dir = self
+                    .data_dir
+                    .as_ref()
+                    .ok_or_else(|| "application data directory is unavailable".to_owned())?;
+                let files = DataFiles::new(dir);
+                files
+                    .themes()
+                    .save(&self.themes)
+                    .map_err(|error| error.to_string())?;
+                files
+                    .agents()
+                    .save(&self.agents)
                     .map_err(|error| error.to_string())
-                    .and_then(|()| {
-                        serde_json::to_string_pretty(&self.settings)
-                            .map_err(|error| error.to_string())
-                    })
-                    .and_then(|json| {
-                        atomic_write(&dir.join("Termior-settings.json"), &json)
-                            .map_err(|error| error.to_string())
-                    })
-            },
-        );
+            });
         match result {
             Ok(()) => {
                 self.status = "Settings saved".into();
@@ -284,12 +392,117 @@ impl SettingsView {
     }
 
     fn cycle_app_theme(&mut self, cx: &mut Context<Self>) {
-        let themes = termior_theme::builtin_themes();
+        let themes = self.themes.all();
         let index = themes
             .iter()
             .position(|theme| theme.id == self.settings.theme_id)
             .unwrap_or(0);
         self.settings.theme_id = themes[(index + 1) % themes.len()].id.clone();
+        cx.notify();
+    }
+
+    fn import_theme(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Theme JSON", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.status = match std::fs::read_to_string(path)
+            .map_err(|error| error.to_string())
+            .and_then(|json| self.themes.import(&json).map_err(|error| error.to_string()))
+        {
+            Ok(theme) => {
+                self.settings.theme_id = theme.id;
+                "Theme imported; save settings to apply it".into()
+            }
+            Err(error) => format!("Theme import failed: {error}"),
+        };
+        cx.notify();
+    }
+
+    fn export_theme(&mut self, cx: &mut Context<Self>) {
+        let Some(theme) = self
+            .themes
+            .all()
+            .into_iter()
+            .find(|theme| theme.id == self.settings.theme_id)
+        else {
+            self.status = "Selected theme was not found".into();
+            cx.notify();
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("{}.json", theme.id))
+            .save_file()
+        else {
+            return;
+        };
+        self.status = match ThemeLibrary::export(&theme)
+            .map_err(|error| error.to_string())
+            .and_then(|json| atomic_write(&path, &json).map_err(|error| error.to_string()))
+        {
+            Ok(()) => format!("Theme exported to {}", path.display()),
+            Err(error) => format!("Theme export failed: {error}"),
+        };
+        cx.notify();
+    }
+
+    fn select_background(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"])
+            .pick_file()
+        {
+            self.settings.background.image_path = Some(path.to_string_lossy().into_owned());
+            cx.notify();
+        }
+    }
+
+    fn clear_background(&mut self, cx: &mut Context<Self>) {
+        self.settings.background.image_path = None;
+        cx.notify();
+    }
+
+    fn new_agent(&mut self, cx: &mut Context<Self>) {
+        let next = (1..)
+            .find(|index| {
+                !self
+                    .agents
+                    .agents
+                    .iter()
+                    .any(|agent| agent.id == format!("custom-agent-{index}"))
+            })
+            .unwrap_or(1);
+        self.agents.agents.push(AgentDefinition {
+            id: format!("custom-agent-{next}"),
+            name: format!("Custom Agent {next}"),
+            system_prompt: "You are a focused coding assistant.".into(),
+            tools: Vec::new(),
+            icon: "agent".into(),
+            color: "#4f8fef".into(),
+        });
+        self.agent_index = self.agents.agents.len() - 1;
+        cx.notify();
+    }
+
+    fn cycle_agent(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.commit_edit();
+        let len = self.agents.agents.len();
+        if len > 0 {
+            self.agent_index =
+                (self.agent_index as isize + delta).rem_euclid(len as isize) as usize;
+        }
+        cx.notify();
+    }
+
+    fn remove_agent(&mut self, cx: &mut Context<Self>) {
+        self.commit_edit();
+        if self.agent_index < self.agents.agents.len() {
+            self.agents.agents.remove(self.agent_index);
+            self.agent_index = self
+                .agent_index
+                .min(self.agents.agents.len().saturating_sub(1));
+        }
         cx.notify();
     }
 
@@ -334,6 +547,61 @@ impl SettingsView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(action) = self.capture_shortcut {
+            let key = event.keystroke.key.as_str();
+            if key == "escape" {
+                self.capture_shortcut = None;
+                self.status = "Shortcut capture cancelled".into();
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if matches!(key, "control" | "shift" | "alt" | "meta" | "command") {
+                return;
+            }
+            let modifiers = event.keystroke.modifiers;
+            let has_required_modifier = if cfg!(target_os = "macos") {
+                modifiers.platform || modifiers.control
+            } else {
+                modifiers.control
+            };
+            if !has_required_modifier {
+                self.status = "Shortcuts must include Cmd/Ctrl".into();
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if key.eq_ignore_ascii_case("s")
+                && !modifiers.shift
+                && !modifiers.alt
+                && (modifiers.control || modifiers.platform)
+            {
+                self.status = "Cmd/Ctrl+S is reserved for saving editor files".into();
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            let binding = UserKeyBinding {
+                primary: if cfg!(target_os = "macos") {
+                    modifiers.platform
+                } else {
+                    true
+                },
+                shift: modifiers.shift,
+                alt: modifiers.alt,
+                key: event.keystroke.key.clone(),
+            };
+            self.status = match self.settings.keymap.rebind(action, binding) {
+                Ok(()) => {
+                    self.capture_shortcut = None;
+                    format!("Updated {action:?}")
+                }
+                Err(error) => error.to_string(),
+            };
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.edit_field.is_none() {
             return;
         }
@@ -383,6 +651,14 @@ impl SettingsView {
         } else {
             self.value_for(field)
         }
+    }
+
+    fn capture_shortcut(&mut self, action: KeyAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_edit();
+        self.capture_shortcut = Some(action);
+        self.status = format!("Press the new Cmd/Ctrl shortcut for {action:?}");
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
     }
 
     fn edit_row(
@@ -450,6 +726,7 @@ impl SettingsView {
             .children([
                 self.edit_row("Terminal font family", EditField::FontFamily, cx),
                 self.edit_row("Font size (8–32)", EditField::FontSize, cx),
+                self.edit_row("Line height (0.8–3)", EditField::LineHeight, cx),
                 self.edit_row("Letter spacing (-2–8)", EditField::LetterSpacing, cx),
                 self.edit_row("Scrollback rows (200–50,000)", EditField::Scrollback, cx),
                 self.edit_row("Global custom instructions", EditField::Instructions, cx),
@@ -585,28 +862,85 @@ impl SettingsView {
     }
 
     fn themes_page(&self, cx: &mut Context<Self>) -> AnyElement {
+        let background = self
+            .settings
+            .background
+            .image_path
+            .as_deref()
+            .unwrap_or("None")
+            .to_owned();
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .child(Self::button(
-                format!("Application theme: {}", self.settings.theme_id),
-                "app-theme",
-            ).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.cycle_app_theme(cx))))
-            .child(Self::button(
-                format!("Editor theme: {}", self.settings.editor_theme_id),
-                "editor-theme",
-            ).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.cycle_editor_theme(cx))))
-            .child(Self::button(
-                format!("Appearance: {:?}", self.settings.appearance),
-                "appearance",
-            ).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.cycle_appearance(cx))))
-            .child("Custom themes can be imported/exported as JSON; background image opacity and blur are persisted in the theme settings.")
+            .child(
+                Self::button(
+                    format!("Application theme: {}", self.settings.theme_id),
+                    "app-theme",
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.cycle_app_theme(cx)),
+                ),
+            )
+            .child(
+                Self::button(
+                    format!("Editor theme: {}", self.settings.editor_theme_id),
+                    "editor-theme",
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.cycle_editor_theme(cx)),
+                ),
+            )
+            .child(
+                Self::button(
+                    format!("Appearance: {:?}", self.settings.appearance),
+                    "appearance",
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.cycle_appearance(cx)),
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(Self::button("Import theme", "import-theme").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.import_theme(cx)),
+                    ))
+                    .child(Self::button("Export theme", "export-theme").on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.export_theme(cx)),
+                    )),
+            )
+            .child(SharedString::from(format!("Background: {background}")))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Self::button("Choose image", "background-image").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.select_background(cx)),
+                        ),
+                    )
+                    .child(
+                        Self::button("Clear image", "background-clear").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.clear_background(cx)),
+                        ),
+                    ),
+            )
+            .child(self.edit_row("Background opacity (0–1)", EditField::BackgroundOpacity, cx))
             .into_any_element()
     }
 
-    fn shortcuts_page(&self) -> AnyElement {
+    fn shortcuts_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let rows = default_keymap().into_iter().map(|entry| {
+            let action = entry.action;
             let current = self.settings.keymap.bindings.get(&entry.action);
             let label = current
                 .map(|binding| {
@@ -629,11 +963,24 @@ impl SettingsView {
                 })
                 .unwrap_or_else(|| entry.binding.display(Platform::current()));
             div()
+                .id(SharedString::from(format!("shortcut-{action:?}")))
                 .flex()
                 .justify_between()
+                .px_2()
                 .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .when(self.capture_shortcut == Some(action), |row| {
+                    row.bg(gpui::rgba(0x36588088))
+                })
                 .child(SharedString::from(format!("{:?}", entry.action)))
                 .child(SharedString::from(label))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        this.capture_shortcut(action, window, cx)
+                    }),
+                )
         });
         div()
             .flex()
@@ -658,13 +1005,92 @@ impl SettingsView {
                 }
             })
             .unwrap_or("unavailable");
-        div().flex().flex_col().gap_3()
-            .child(SharedString::from(format!("Claude Code hooks: {hook_status}")))
-            .child(div().flex().gap_2()
-                .child(Self::button("Install hooks", "install-hooks").on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.install_hooks(cx))))
-                .child(Self::button("Uninstall hooks", "uninstall-hooks").on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.uninstall_hooks(cx)))))
-            .child(Self::button(format!("Agent notifications: {}", on_off(self.settings.agent_notifications)), "agent-notifications").on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| { this.settings.agent_notifications = !this.settings.agent_notifications; cx.notify(); })))
-            .child("Custom agents persist an independent system prompt, icon color, and explicit tool subset in Termior-ai-agents.json.")
+        let agent_controls = if self.agents.agents.is_empty() {
+            div().child("No custom agents yet").into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(SharedString::from(format!(
+                    "Custom agent {}/{} · {}",
+                    self.agent_index + 1,
+                    self.agents.agents.len(),
+                    self.agent()
+                        .map(|agent| agent.id.as_str())
+                        .unwrap_or_default()
+                )))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(Self::button("‹", "previous-agent").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.cycle_agent(-1, cx)),
+                        ))
+                        .child(Self::button("›", "next-agent").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.cycle_agent(1, cx)),
+                        ))
+                        .child(Self::button("Remove", "remove-agent").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.remove_agent(cx)),
+                        )),
+                )
+                .children([
+                    self.edit_row("Name", EditField::AgentName, cx),
+                    self.edit_row("System prompt", EditField::AgentPrompt, cx),
+                    self.edit_row("Tools (comma separated)", EditField::AgentTools, cx),
+                    self.edit_row("Icon", EditField::AgentIcon, cx),
+                    self.edit_row("Color", EditField::AgentColor, cx),
+                ])
+                .into_any_element()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(SharedString::from(format!(
+                "Claude Code hooks: {hook_status}"
+            )))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Self::button("Install hooks", "install-hooks").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.install_hooks(cx)),
+                        ),
+                    )
+                    .child(
+                        Self::button("Uninstall hooks", "uninstall-hooks").on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.uninstall_hooks(cx)),
+                        ),
+                    ),
+            )
+            .child(
+                Self::button(
+                    format!(
+                        "Agent notifications: {}",
+                        on_off(self.settings.agent_notifications)
+                    ),
+                    "agent-notifications",
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.settings.agent_notifications = !this.settings.agent_notifications;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(Self::button("New custom agent", "new-agent").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.new_agent(cx)),
+            ))
+            .child(agent_controls)
             .into_any_element()
     }
 
@@ -673,7 +1099,7 @@ impl SettingsView {
             SettingsPage::General => self.general_page(cx),
             SettingsPage::Models => self.models_page(cx),
             SettingsPage::Themes => self.themes_page(cx),
-            SettingsPage::Shortcuts => self.shortcuts_page(),
+            SettingsPage::Shortcuts => self.shortcuts_page(cx),
             SettingsPage::Agents => self.agents_page(cx),
             SettingsPage::About => div()
                 .flex()
@@ -741,11 +1167,10 @@ impl gpui::Render for SettingsView {
             .text_color(gpui::white())
             .child(
                 canvas(
-                    move |bounds, window, cx| {
-                        window.handle_input(&input_focus, handler.clone(), cx);
-                        bounds
+                    |bounds, _, _| bounds,
+                    move |_, _, window, cx| {
+                        window.handle_input(&input_focus, handler, cx);
                     },
-                    |_, _, _, _| {},
                 )
                 .absolute()
                 .size_full(),

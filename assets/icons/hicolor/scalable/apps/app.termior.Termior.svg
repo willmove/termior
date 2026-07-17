@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="512"
+     height="512"
+     viewBox="0 0 512 512"
+     fill="none"
+     role="img"
+     aria-labelledby="title description">
+  <title id="title">Termior logo</title>
+  <desc id="description">A terminal prompt beside a stylized letter T in a rounded workspace tile.</desc>
+
+  <!-- The tile uses Termior's default dark theme background. -->
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="#0D1117"/>
+  <rect x="26" y="26" width="460" height="460" rx="110" stroke="#30363D" stroke-width="4"/>
+
+  <!-- Terminal-first prompt. -->
+  <path d="M124 164L208 256L124 348"
+        stroke="#58A6FF"
+        stroke-width="44"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+
+  <!-- Termior initial, also reading as the active terminal input. -->
+  <path d="M244 174H388M316 174V338"
+        stroke="#F0F6FC"
+        stroke-width="44"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+
+  <!-- Small ready-state indicator for the local AI agent. -->
+  <circle cx="388" cy="342" r="18" fill="#3FB950"/>
+</svg>

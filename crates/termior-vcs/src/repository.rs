@@ -138,7 +138,11 @@ impl GitRepository {
     pub fn stage_file(&self, relative: impl AsRef<Path>) -> Result<(), GitError> {
         let relative = self.checked_relative(relative)?;
         let mut index = self.repo.index()?;
-        index.add_path(&relative)?;
+        if self.root.join(&relative).exists() {
+            index.add_path(&relative)?;
+        } else {
+            index.remove_path(&relative)?;
+        }
         index.write()?;
         Ok(())
     }
@@ -252,6 +256,32 @@ impl GitRepository {
             ahead,
             behind,
         })
+    }
+
+    pub fn branches(&self) -> Result<Vec<String>, GitError> {
+        let mut names = self
+            .repo
+            .branches(Some(git2::BranchType::Local))?
+            .filter_map(Result::ok)
+            .filter_map(|(branch, _)| branch.name().ok().flatten().map(str::to_owned))
+            .collect::<Vec<_>>();
+        names.sort();
+        Ok(names)
+    }
+
+    pub fn create_branch(&self, name: &str, switch: bool) -> Result<(), GitError> {
+        validate_branch_name(name)?;
+        let head = self.repo.head()?.peel_to_commit()?;
+        self.repo.branch(name, &head, false)?;
+        if switch {
+            self.switch_branch(name)?;
+        }
+        Ok(())
+    }
+
+    pub fn switch_branch(&self, name: &str) -> Result<(), GitError> {
+        validate_branch_name(name)?;
+        self.run_git(["switch", name], None).map(|_| ())
     }
 
     pub fn remote(&self, operation: RemoteOperation) -> Result<String, GitError> {
@@ -389,6 +419,14 @@ fn changed(path: &str, group: ChangeGroup, status: &str) -> ChangedFile {
     }
 }
 
+fn validate_branch_name(name: &str) -> Result<(), GitError> {
+    let reference = format!("refs/heads/{name}");
+    if name.trim().is_empty() || !git2::Reference::is_valid_name(&reference) {
+        return Err(GitError::Command(format!("invalid branch name: {name}")));
+    }
+    Ok(())
+}
+
 fn status_name(status: Status, index: bool) -> &'static str {
     if status.intersects(if index {
         Status::INDEX_DELETED
@@ -487,6 +525,33 @@ mod tests {
         assert_eq!(
             repo.remote_commit_url("abc").as_deref(),
             Some("https://github.com/acme/demo/commit/abc")
+        );
+    }
+
+    #[test]
+    fn deleted_files_and_branches_are_writable() {
+        let (dir, _auth, repo) = repo();
+        fs::remove_file(dir.path().join("a.txt")).unwrap();
+        repo.stage_file("a.txt").unwrap();
+        assert!(repo.status().unwrap().iter().any(|file| {
+            file.path == "a.txt" && file.group == ChangeGroup::Staged && file.status == "deleted"
+        }));
+
+        let initial_branch = repo.branch_state().unwrap().name.unwrap();
+        repo.create_branch("feature/test", true).unwrap();
+        assert_eq!(
+            repo.branch_state().unwrap().name.as_deref(),
+            Some("feature/test")
+        );
+        assert!(repo
+            .branches()
+            .unwrap()
+            .iter()
+            .any(|name| name == "feature/test"));
+        repo.switch_branch(&initial_branch).unwrap();
+        assert_eq!(
+            repo.branch_state().unwrap().name.as_deref(),
+            Some(initial_branch.as_str())
         );
     }
 }
