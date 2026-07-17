@@ -5,39 +5,53 @@
 //! OSC 7/133/777 经 `OscParser` 旁路嗅探，并同步 cwd、shell integration 与代理状态。
 
 use alacritty_terminal::{
-    event::VoidListener,
+    event::{Event as AlacrittyEvent, WindowSize as TerminalWindowSize},
     grid::{Dimensions, Scroll},
-    term::{Config as TermConfig, RenderableContent, Term},
+    index::{Column, Line, Point as TerminalPoint, Side},
+    selection::{Selection, SelectionType},
+    term::{cell::Flags, ClipboardType, Config as TermConfig, RenderableContent, Term, TermMode},
     vte::ansi::{
         Color as VteColor, CursorShape, NamedColor, Processor as VteProcessor, Rgb, StdSyncHandler,
     },
 };
 use futures::StreamExt;
 use gpui::{
-    canvas, div, fill, point, prelude::FluentBuilder, px, App, Bounds, Context, EventEmitter,
-    FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight, Hsla, InputHandler,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Point, Render,
-    ScrollWheelEvent, SharedString, Styled, Task, TextAlign, TextRun, UTF16Selection, WeakEntity,
-    Window,
+    canvas, div, fill, point, prelude::FluentBuilder, px, App, Bounds, ClipboardItem, Context,
+    EventEmitter, FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight, Hsla,
+    InputHandler, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+    ScrollWheelEvent, SharedString, StrikethroughStyle, Styled, Subscription, Task, TextAlign,
+    TextRun, UTF16Selection, UnderlineStyle, WeakEntity, Window,
 };
 use termior_store::{TerminalSettings, UserKeymap};
-use termior_terminal::{PtySessionConfig, TerminalBridge};
+use termior_terminal::{PtySessionConfig, TerminalBridge, TerminalEventProxy};
 use termior_terminal_core::osc::{AgentState, OscEvent};
 use termior_terminal_core::{find_hyperlinks, TerminalSearch};
 use termior_theme::{Color as ThemeColor, ResolvedPalette, TerminalPalette};
 use termior_ui_kit::SearchOverlay;
 
-use crate::keystroke::keystroke_to_pty_bytes;
+use crate::keystroke::{encode_paste, keystroke_to_pty_bytes};
+
+const MAX_PTY_BATCH_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalViewEvent {
+    TitleChanged(Option<String>),
+    Bell,
+    Exited(Option<i32>),
+}
 
 /// GPUI 终端视图。
 pub struct TerminalView {
     bridge: TerminalBridge,
-    term: Term<VoidListener>,
+    term: Term<TerminalEventProxy>,
     vte_processor: VteProcessor<StdSyncHandler>,
     palette: ResolvedPalette,
     focus_handle: FocusHandle,
     /// PTY 字节消费任务（持有以避免被取消）。
     _consumer: Task<()>,
+    focus_in_subscription: Option<Subscription>,
+    focus_out_subscription: Option<Subscription>,
     cols: usize,
     rows: usize,
     latest_cwd: Option<String>,
@@ -47,9 +61,13 @@ pub struct TerminalView {
     search_overlay: SearchOverlay,
     search: TerminalSearch,
     snapshot_text: String,
+    buffer_text: String,
     text_style: TerminalTextStyle,
     cell_width: f32,
     line_height_px: f32,
+    viewport_origin: Point<Pixels>,
+    scroll_px: f32,
+    last_mouse_cell: Option<(i32, usize, Option<MouseButton>)>,
     keymap: UserKeymap,
 }
 
@@ -80,6 +98,7 @@ impl TerminalView {
         let cols = PtySessionConfig::default().cols as usize;
         let rows = PtySessionConfig::default().rows as usize;
         let output_rx = bridge.take_output().expect("output channel");
+        let (event_proxy, mut event_rx) = TerminalEventProxy::new(bridge.writer());
         log::info!("PTY attached: cols={cols} rows={rows}");
 
         let term_config = TermConfig {
@@ -92,17 +111,27 @@ impl TerminalView {
                 columns: cols,
                 screen_lines: rows,
             },
-            VoidListener,
+            event_proxy,
         );
 
         let focus_handle = cx.focus_handle();
+        let frame_executor = cx.background_executor().clone();
 
         // 消费循环：PTY 字节 → vte 解析更新 Term + OscParser 旁路 → cx.notify 重绘。
         // Term 非 Send，只能在主线程访问，故字节通过 channel 送回主线程处理。
         let consumer = cx.spawn(async move |this, cx| {
             let mut rx = output_rx;
             let mut first_byte_seen = false;
-            while let Some(data) = rx.next().await {
+            while let Some(mut data) = rx.next().await {
+                while data.bytes.len() < MAX_PTY_BATCH_BYTES {
+                    let Ok(next) = rx.try_recv() else {
+                        break;
+                    };
+                    data.bytes.extend(next.bytes);
+                    data.events.extend(next.events);
+                    data.localhost_urls.extend(next.localhost_urls);
+                }
+                let backlog_likely = data.bytes.len() >= MAX_PTY_BATCH_BYTES;
                 let bytes = data.bytes;
                 let events = data.events;
                 let localhost_urls = data.localhost_urls;
@@ -114,16 +143,10 @@ impl TerminalView {
                             bytes.len()
                         );
                     }
-                    // 先检测光标位置查询（CPR, CSI 6n / CSI ? 6n）——shell/ConPTY 启动时
-                    // 会问终端光标在哪，不回复则很多 shell（pwsh）卡住不发提示符。
-                    // 必须在 advance 之前检测（advance 后序列已被消费），并按当前光标位回复。
-                    if contains_cpr(&bytes) {
-                        let (row, col) = current_cursor(&view.term);
-                        let reply = format!("\x1b[{row};{col}R");
-                        log::debug!("CPR query detected, replying {reply:?}");
-                        let _ = view.bridge.writer().write_all(reply.as_bytes());
-                    }
                     view.vte_processor.advance(&mut view.term, &bytes);
+                    while let Ok(event) = event_rx.try_recv() {
+                        view.handle_terminal_event(event, cx);
+                    }
                     for ev in events {
                         log::info!("OSC event: {ev:?}");
                         match ev {
@@ -143,8 +166,19 @@ impl TerminalView {
                     }
                     cx.notify();
                 });
+                if backlog_likely {
+                    // Force a scheduler yield between large batches so continuous output cannot
+                    // monopolize the GPUI executor.
+                    frame_executor
+                        .timer(std::time::Duration::from_millis(1))
+                        .await;
+                }
             }
             log::info!("PTY output stream ended");
+            let _ = this.update(cx, |_view, cx| {
+                cx.emit(TerminalViewEvent::Exited(None));
+                cx.notify();
+            });
         });
 
         let text_style = TerminalTextStyle::from_settings(&settings);
@@ -156,6 +190,8 @@ impl TerminalView {
             palette,
             focus_handle,
             _consumer: consumer,
+            focus_in_subscription: None,
+            focus_out_subscription: None,
             cols,
             rows,
             latest_cwd: None,
@@ -165,8 +201,12 @@ impl TerminalView {
             search_overlay: SearchOverlay::default(),
             search: TerminalSearch::default(),
             snapshot_text: String::new(),
+            buffer_text: String::new(),
             cell_width: text_style.font_size * 0.6 + text_style.letter_spacing,
             line_height_px,
+            viewport_origin: Point::default(),
+            scroll_px: 0.0,
+            last_mouse_cell: None,
             text_style,
             keymap,
         }
@@ -181,7 +221,89 @@ impl TerminalView {
     }
 
     pub fn recent_text(&self) -> String {
-        termior_ai::context::tail_lines(&self.snapshot_text, 300)
+        termior_ai::context::tail_lines(&self.buffer_text, 300)
+    }
+
+    pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.bridge.writer().write_all(bytes)
+    }
+
+    fn handle_terminal_event(&mut self, event: AlacrittyEvent, cx: &mut Context<Self>) {
+        match event {
+            AlacrittyEvent::MouseCursorDirty
+            | AlacrittyEvent::CursorBlinkingChange
+            | AlacrittyEvent::Wakeup => cx.notify(),
+            AlacrittyEvent::Title(title) => {
+                cx.emit(TerminalViewEvent::TitleChanged(clean_terminal_title(title)));
+                cx.notify();
+            }
+            AlacrittyEvent::ResetTitle => {
+                cx.emit(TerminalViewEvent::TitleChanged(None));
+                cx.notify();
+            }
+            AlacrittyEvent::ClipboardStore(kind, text) => {
+                let item = ClipboardItem::new_string(text);
+                match kind {
+                    // GPUI's view context exposes the system clipboard everywhere.
+                    // Primary selection is not portable (notably on Windows), so use
+                    // the system clipboard as its fallback here.
+                    ClipboardType::Clipboard | ClipboardType::Selection => {
+                        cx.write_to_clipboard(item)
+                    }
+                }
+            }
+            AlacrittyEvent::ClipboardLoad(kind, formatter) => {
+                let text = match kind {
+                    ClipboardType::Clipboard | ClipboardType::Selection => cx.read_from_clipboard(),
+                }
+                .and_then(|item| item.text())
+                .unwrap_or_default();
+                let reply = formatter(&text);
+                if let Err(error) = self.write_input(reply.as_bytes()) {
+                    log::warn!("terminal clipboard reply failed: {error}");
+                }
+            }
+            AlacrittyEvent::ColorRequest(index, formatter) => {
+                let color = self.term.colors()[index]
+                    .unwrap_or_else(|| terminal_rgb_for_index(index, &self.palette));
+                let reply = formatter(color);
+                if let Err(error) = self.write_input(reply.as_bytes()) {
+                    log::warn!("terminal color reply failed: {error}");
+                }
+            }
+            AlacrittyEvent::TextAreaSizeRequest(formatter) => {
+                let size = TerminalWindowSize {
+                    num_lines: self.rows.min(u16::MAX as usize) as u16,
+                    num_cols: self.cols.min(u16::MAX as usize) as u16,
+                    cell_width: self.cell_width.round().clamp(1.0, u16::MAX as f32) as u16,
+                    cell_height: self.line_height_px.round().clamp(1.0, u16::MAX as f32) as u16,
+                };
+                let reply = formatter(size);
+                if let Err(error) = self.write_input(reply.as_bytes()) {
+                    log::warn!("terminal size reply failed: {error}");
+                }
+            }
+            AlacrittyEvent::Bell => {
+                cx.emit(TerminalViewEvent::Bell);
+                cx.notify();
+            }
+            AlacrittyEvent::Exit => {
+                cx.emit(TerminalViewEvent::Exited(None));
+                cx.notify();
+            }
+            AlacrittyEvent::ChildExit(status) => {
+                log::info!("terminal child exited: {status:?}");
+                cx.emit(TerminalViewEvent::Exited(status.code()));
+                cx.notify();
+            }
+            AlacrittyEvent::PtyWrite(text) => {
+                // `TerminalEventProxy` handles this synchronously; keep this branch defensive in
+                // case an alternate proxy forwards it in the future.
+                if let Err(error) = self.write_input(text.as_bytes()) {
+                    log::warn!("terminal protocol reply failed: {error}");
+                }
+            }
+        }
     }
 
     /// Resize the terminal grid and PTY to the actual GPUI canvas dimensions.
@@ -191,6 +313,7 @@ impl TerminalView {
         rows: usize,
         cell_width: f32,
         line_height_px: f32,
+        viewport_origin: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         if cols == 0 || rows == 0 {
@@ -199,12 +322,15 @@ impl TerminalView {
         let dimensions_changed = cols != self.cols || rows != self.rows;
         let metrics_changed = (self.cell_width - cell_width).abs() > f32::EPSILON
             || (self.line_height_px - line_height_px).abs() > f32::EPSILON;
+        let origin_changed = self.viewport_origin != viewport_origin;
         if dimensions_changed {
+            let pty_rows = rows.min(u16::MAX as usize) as u16;
+            let pty_cols = cols.min(u16::MAX as usize) as u16;
             self.term.resize(TermSize {
                 columns: cols,
                 screen_lines: rows,
             });
-            if let Err(error) = self.bridge.resize(rows as u16, cols as u16) {
+            if let Err(error) = self.bridge.resize(pty_rows, pty_cols) {
                 log::warn!("PTY resize failed: {error}");
             }
             self.cols = cols;
@@ -214,7 +340,10 @@ impl TerminalView {
             self.cell_width = cell_width;
             self.line_height_px = line_height_px;
         }
-        if dimensions_changed || metrics_changed {
+        if origin_changed {
+            self.viewport_origin = viewport_origin;
+        }
+        if dimensions_changed || metrics_changed || origin_changed {
             cx.notify();
         }
     }
@@ -283,7 +412,22 @@ impl TerminalView {
             cx.notify();
             return;
         }
-        let bytes = keystroke_to_pty_bytes(&ev.keystroke);
+        if is_copy_shortcut(&ev.keystroke) {
+            if let Some(text) = self.term.selection_to_string() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return;
+        }
+        if is_paste_shortcut(&ev.keystroke) {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let bytes = encode_paste(&text, *self.term.mode());
+                if let Err(error) = self.write_input(&bytes) {
+                    log::warn!("PTY paste error: {error}");
+                }
+            }
+            return;
+        }
+        let bytes = keystroke_to_pty_bytes(&ev.keystroke, *self.term.mode());
         if ev.keystroke.key_char.is_some()
             && !modifiers.control
             && !modifiers.alt
@@ -310,27 +454,176 @@ impl TerminalView {
     fn handle_scroll(
         &mut self,
         event: &ScrollWheelEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let pixels = event.delta.pixel_delta(window.line_height()).y.as_f32();
-        let line_height = window.line_height().as_f32().max(1.0);
-        let lines = (pixels / line_height).round() as i32;
-        if lines != 0 {
+        let pixels = event
+            .delta
+            .pixel_delta(px(self.line_height_px.max(1.0)))
+            .y
+            .as_f32();
+        if self.scroll_px != 0.0 && self.scroll_px.signum() != pixels.signum() {
+            self.scroll_px = 0.0;
+        }
+        self.scroll_px += pixels;
+        let lines = (self.scroll_px / self.line_height_px.max(1.0)).trunc() as i32;
+        if lines == 0 {
+            return;
+        }
+        self.scroll_px -= lines as f32 * self.line_height_px.max(1.0);
+
+        let (point, _) = self.terminal_point_for_position(event.position);
+        let mode = *self.term.mode();
+        if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
+            let button = if lines > 0 { 64 } else { 65 };
+            if let Some(report) = mouse_report(point, button, true, event.modifiers, mode) {
+                for _ in 0..lines.unsigned_abs() {
+                    let _ = self.write_input(&report);
+                }
+            }
+        } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
+            && !event.modifiers.shift
+        {
+            let bytes = alternate_scroll(lines);
+            let _ = self.write_input(&bytes);
+        } else {
             self.term.scroll_display(Scroll::Delta(lines));
             cx.notify();
         }
     }
+
+    fn handle_focus_in(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.term.mode().contains(TermMode::FOCUS_IN_OUT) {
+            let _ = self.write_input(b"\x1b[I");
+        }
+        cx.notify();
+    }
+
+    fn handle_focus_out(&mut self, cx: &mut Context<Self>) {
+        if self.term.mode().contains(TermMode::FOCUS_IN_OUT) {
+            let _ = self.write_input(b"\x1b[O");
+        }
+        cx.notify();
+    }
+
+    fn handle_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        let (point, side) = self.terminal_point_for_position(event.position);
+        let mode = *self.term.mode();
+        if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
+            if let Some(button) = mouse_button_code(event.button, false) {
+                if let Some(report) = mouse_report(point, button, true, event.modifiers, mode) {
+                    let _ = self.write_input(&report);
+                }
+            }
+        } else if event.button == MouseButton::Left {
+            let selection_type = match event.click_count {
+                2 => SelectionType::Semantic,
+                3.. => SelectionType::Lines,
+                _ => SelectionType::Simple,
+            };
+            self.term.selection = Some(Selection::new(selection_type, point, side));
+            cx.notify();
+        }
+    }
+
+    fn handle_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (point, side) = self.terminal_point_for_position(event.position);
+        let mode = *self.term.mode();
+        if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
+            let current = (point.line.0, point.column.0, event.pressed_button);
+            if self.last_mouse_cell == Some(current) {
+                return;
+            }
+            self.last_mouse_cell = Some(current);
+            let should_report = mode.contains(TermMode::MOUSE_MOTION)
+                || (mode.contains(TermMode::MOUSE_DRAG) && event.pressed_button.is_some());
+            if should_report {
+                if let Some(button) = mouse_motion_button_code(event.pressed_button) {
+                    if let Some(report) = mouse_report(point, button, true, event.modifiers, mode) {
+                        let _ = self.write_input(&report);
+                    }
+                }
+            }
+        } else if event.pressed_button == Some(MouseButton::Left) {
+            if let Some(selection) = self.term.selection.as_mut() {
+                selection.update(point, side);
+                cx.notify();
+            }
+        }
+    }
+
+    fn handle_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.last_mouse_cell = None;
+        let (point, _) = self.terminal_point_for_position(event.position);
+        let mode = *self.term.mode();
+        if mode.intersects(TermMode::MOUSE_MODE) && !event.modifiers.shift {
+            if let Some(button) = mouse_button_code(event.button, false) {
+                if let Some(report) = mouse_report(point, button, false, event.modifiers, mode) {
+                    let _ = self.write_input(&report);
+                }
+            }
+        } else if event.button == MouseButton::Left {
+            cx.notify();
+        }
+    }
+
+    fn terminal_point_for_position(&self, position: Point<Pixels>) -> (TerminalPoint, Side) {
+        let relative_x = (position.x - self.viewport_origin.x).as_f32();
+        let relative_y = (position.y - self.viewport_origin.y).as_f32();
+        let raw_column = (relative_x.max(0.0) / self.cell_width.max(1.0)).floor() as usize;
+        let column = raw_column.min(self.cols.saturating_sub(1));
+        let cell_x = relative_x.max(0.0) % self.cell_width.max(1.0);
+        let side = if cell_x >= self.cell_width.max(1.0) / 2.0 {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        let viewport_line = (relative_y.max(0.0) / self.line_height_px.max(1.0)).floor() as i32;
+        let viewport_line = viewport_line.min(self.rows.saturating_sub(1) as i32);
+        let display_offset = self.term.grid().display_offset().min(i32::MAX as usize) as i32;
+        (
+            TerminalPoint::new(Line(viewport_line - display_offset), Column(column)),
+            side,
+        )
+    }
 }
 
 impl EventEmitter<AgentState> for TerminalView {}
+impl EventEmitter<TerminalViewEvent> for TerminalView {}
 
 impl Render for TerminalView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let bg = theme_color_to_hsla(self.palette.background);
         let fg = theme_color_to_hsla(self.palette.foreground);
         let focus = self.focus_handle.clone();
         let input_focus = focus.clone();
+        if self.focus_in_subscription.is_none() {
+            self.focus_in_subscription =
+                Some(cx.on_focus_in(&focus, window, Self::handle_focus_in));
+        }
+        if self.focus_out_subscription.is_none() {
+            self.focus_out_subscription = Some(cx.on_focus_out(
+                &focus,
+                window,
+                |view, _event, _window, cx| view.handle_focus_out(cx),
+            ));
+        }
         let input_handler = TerminalInputHandler {
             view: cx.entity().downgrade(),
         };
@@ -339,6 +632,7 @@ impl Render for TerminalView {
         let content = self.term.renderable_content();
         let snapshot: RenderSnapshot = collect_snapshot(content);
         self.snapshot_text = snapshot_to_text(&snapshot);
+        self.buffer_text = terminal_buffer_tail_to_text(&self.term, 300);
         self.update_search();
         let search = self.search.clone();
         let links = find_hyperlinks(&self.snapshot_text)
@@ -358,10 +652,18 @@ impl Render for TerminalView {
         let marked_line_height = self.line_height_px;
         let current_cell_width = self.cell_width;
         let current_line_height = self.line_height_px;
+        let current_origin = self.viewport_origin;
 
         div()
             .id("terminal-view")
             .track_focus(&focus)
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::handle_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::handle_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::handle_mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::handle_mouse_up))
+            .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_scroll_wheel(cx.listener(Self::handle_scroll))
             .size_full()
@@ -381,7 +683,8 @@ impl Render for TerminalView {
                         && (measured_cols != cols
                             || measured_rows != rows
                             || (current_cell_width - cell_width).abs() > f32::EPSILON
-                            || (current_line_height - line_height.as_f32()).abs() > f32::EPSILON)
+                            || (current_line_height - line_height.as_f32()).abs() > f32::EPSILON
+                            || current_origin != bounds.origin)
                     {
                         let view = view.clone();
                         window.on_next_frame(move |_, cx| {
@@ -392,6 +695,7 @@ impl Render for TerminalView {
                                         measured_rows,
                                         cell_width,
                                         line_height.as_f32(),
+                                        bounds.origin,
                                         cx,
                                     );
                                 });
@@ -603,13 +907,17 @@ struct RenderSnapshot {
     /// (row:i32, col:usize, cell) —— 每个可见 cell。
     cells: Vec<(i32, usize, CellSnapshot)>,
     cursor: CursorSnapshot,
+    colors: Vec<Option<Rgb>>,
 }
 
-/// cell 的 owned 快照（Cell 含 Arc，但 c/fg/bg/flags 足够渲染）。
+/// Cell 的 owned 快照；保留组合字符和样式标志，避免把 VTE 网格降级为纯字符矩阵。
 struct CellSnapshot {
-    c: char,
+    text: String,
     fg: VteColor,
     bg: VteColor,
+    underline_color: Option<VteColor>,
+    flags: Flags,
+    selected: bool,
 }
 
 /// 光标快照。
@@ -623,76 +931,112 @@ struct CursorSnapshot {
 fn collect_snapshot(content: RenderableContent<'_>) -> RenderSnapshot {
     let RenderableContent {
         display_iter,
+        selection,
         cursor,
+        display_offset,
+        colors,
         ..
     } = content;
+    let dynamic_colors = (0..alacritty_terminal::term::color::COUNT)
+        .map(|index| colors[index])
+        .collect();
+    let cursor_point = cursor.point;
+    let cursor_shape = cursor.shape;
     let cells = display_iter
         .map(|indexed| {
-            let cell = &indexed.cell;
+            let cell = indexed.cell;
+            let mut text = String::from(cell.c);
+            if let Some(zerowidth) = cell.zerowidth() {
+                text.extend(zerowidth);
+            }
+            let selected = selection.as_ref().is_some_and(|selection| {
+                selection.contains_cell(&indexed, cursor_point, cursor_shape)
+            });
             (
-                indexed.point.line.0,
+                indexed.point.line.0 + display_offset.min(i32::MAX as usize) as i32,
                 indexed.point.column.0,
                 CellSnapshot {
-                    c: cell.c,
+                    text,
                     fg: cell.fg,
                     bg: cell.bg,
+                    underline_color: cell.underline_color(),
+                    flags: cell.flags,
+                    selected,
                 },
             )
         })
         .collect();
     let cursor = CursorSnapshot {
-        shape: cursor.shape,
-        col: cursor.point.column.0,
-        row: cursor.point.line.0,
+        shape: if display_offset == 0 {
+            cursor_shape
+        } else {
+            CursorShape::Hidden
+        },
+        col: cursor_point.column.0,
+        row: cursor_point.line.0,
     };
-    RenderSnapshot { cells, cursor }
+    RenderSnapshot {
+        cells,
+        cursor,
+        colors: dynamic_colors,
+    }
 }
 
 fn snapshot_to_text(snapshot: &RenderSnapshot) -> String {
-    let mut rows = std::collections::BTreeMap::<i32, Vec<char>>::new();
+    let mut rows = std::collections::BTreeMap::<i32, Vec<String>>::new();
     for (row, column, cell) in &snapshot.cells {
         let line = rows.entry(*row).or_default();
         if line.len() <= *column {
-            line.resize(*column + 1, ' ');
+            line.resize(*column + 1, " ".to_owned());
         }
-        line[*column] = cell.c;
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            line[*column].clear();
+        } else {
+            line[*column].clone_from(&cell.text);
+        }
     }
     rows.into_values()
-        .map(|line| line.into_iter().collect::<String>().trim_end().to_owned())
+        .map(|line| line.concat().trim_end().to_owned())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn terminal_buffer_tail_to_text<T>(term: &Term<T>, max_lines: usize) -> String {
+    if max_lines == 0 {
+        return String::new();
+    }
+    let bottom = term.bottommost_line().0;
+    let requested_top = bottom.saturating_sub(max_lines.saturating_sub(1) as i32);
+    let top = requested_top.max(term.topmost_line().0);
+    let mut rows = Vec::with_capacity((bottom - top + 1).max(0) as usize);
+    for line_index in top..=bottom {
+        let line = &term.grid()[Line(line_index)];
+        let mut text = String::new();
+        for column in 0..term.columns() {
+            let cell = &line[Column(column)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            text.push(cell.c);
+            if let Some(zerowidth) = cell.zerowidth() {
+                text.extend(zerowidth);
+            }
+        }
+        rows.push(text.trim_end().to_owned());
+    }
+    rows.join("\n")
 }
 
 impl Focusable for TerminalView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
-}
-
-/// 检测字节流是否包含光标位置查询（CPR: `CSI 6 n` 或带私有的 `CSI ? 6 n`）。
-/// shell/ConPTY 启动时常发此查询，不回复则部分 shell（pwsh）卡住不发提示符。
-fn contains_cpr(bytes: &[u8]) -> bool {
-    // 简化匹配：查找 ESC [ ? 6 n 或 ESC [ 6 n（允许中间有 ;0 等参数）
-    // 用子串搜索避免手写状态机；CPR 在正常输出里极罕见，误检代价低。
-    for w in bytes.windows(4) {
-        if w == b"\x1b[6n" {
-            return true;
-        }
-    }
-    for w in bytes.windows(5) {
-        if w == b"\x1b[?6n" {
-            return true;
-        }
-    }
-    false
-}
-
-/// 取 Term 当前光标位置（1-based row/col，CPR 回复格式）。
-fn current_cursor(term: &Term<VoidListener>) -> (u16, u16) {
-    let p = &term.grid().cursor.point;
-    let row = (p.line.0 + 1).max(1) as u16;
-    let col = (p.column.0 + 1).max(1) as u16;
-    (row, col)
 }
 
 /// 等宽字体的单字 advance 宽度（cell 宽）。
@@ -756,14 +1100,11 @@ fn paint_terminal(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let default_fg = theme_color_to_hsla(palette.foreground);
     let default_bg = theme_color_to_hsla(palette.background);
 
     let lh = layout.line_height;
     let cw = layout.cell_width;
     let origin = layout.origin;
-    let first_row = snapshot.cells.first().map(|cell| cell.0).unwrap_or(0);
-
     // 1) 整体刷背景
     let total_bounds = Bounds {
         origin,
@@ -771,41 +1112,53 @@ fn paint_terminal(
     };
     window.paint_quad(fill(total_bounds, default_bg));
 
-    // 2) 逐 cell：背景非默认的画 quad，前景按「连续相同 fg+bg」分段 shape+paint。
+    // 2) 逐 cell：背景单独绘制；文本按连续同样式 run 合并。宽字符占两格，但它的
+    // spacer 不进入文本 run，组合字符则跟随主字符一起交给 shaping。
     let mut cur_row: i32 = if let Some(first) = snapshot.cells.first() {
         first.0
     } else {
         paint_cursor(&snapshot.cursor, palette, origin, lh, cw, window);
         return;
     };
-    let mut run_chars: Vec<char> = Vec::new();
-    let mut run_fg: Hsla = default_fg;
-    let mut run_bg: Hsla = default_bg;
+    let mut run_text = String::new();
+    let mut run_style: Option<CellTextStyle> = None;
     let mut run_start_col: usize = 0;
+    let mut run_next_col: usize = 0;
 
     for (row, col, cell) in &snapshot.cells {
         // 换行：flush 上一段
         if *row != cur_row {
-            flush_run(
-                &mut run_chars,
-                run_fg,
-                run_start_col,
-                cur_row,
-                origin,
-                lh,
-                cw,
-                text_style,
-                window,
-                cx,
-            );
+            if let Some(style) = run_style.as_ref() {
+                flush_run(
+                    &mut run_text,
+                    style,
+                    run_start_col,
+                    cur_row,
+                    origin,
+                    lh,
+                    cw,
+                    text_style,
+                    window,
+                    cx,
+                );
+            }
             cur_row = *row;
             run_start_col = *col;
-            run_fg = default_fg;
-            run_bg = default_bg;
+            run_next_col = *col;
+            run_style = None;
         }
 
-        let cell_bg = resolve_color_simple(cell.bg, palette);
-        let cell_fg = resolve_color_simple(cell.fg, palette);
+        let mut cell_bg = resolve_color(cell.bg, palette, &snapshot.colors);
+        let mut cell_fg = resolve_color(cell.fg, palette, &snapshot.colors);
+        if cell.flags.contains(Flags::INVERSE) {
+            std::mem::swap(&mut cell_fg, &mut cell_bg);
+        }
+        if cell.selected {
+            std::mem::swap(&mut cell_fg, &mut cell_bg);
+        }
+        if cell.flags.contains(Flags::DIM) {
+            cell_fg = cell_fg.opacity(0.7);
+        }
 
         // 非默认背景：画 cell 背景块
         if cell_bg != default_bg {
@@ -816,7 +1169,7 @@ fn paint_terminal(
             window.paint_quad(fill(cb, cell_bg));
         }
 
-        let search_line = (*row - first_row).max(0) as usize;
+        let search_line = (*row).max(0) as usize;
         if let Some((hit_index, _)) = search
             .hits
             .iter()
@@ -835,50 +1188,110 @@ fn paint_terminal(
             window.paint_quad(fill(bounds, color));
         }
 
-        // 分段：fg/bg 变化时 flush
-        if cell_fg == run_fg && cell_bg == run_bg {
-            run_chars.push(cell.c);
-        } else {
-            flush_run(
-                &mut run_chars,
-                run_fg,
-                run_start_col,
-                cur_row,
-                origin,
-                lh,
-                cw,
-                text_style,
-                window,
-                cx,
-            );
-            run_fg = cell_fg;
-            run_bg = cell_bg;
-            run_start_col = *col;
-            run_chars.push(cell.c);
+        if cell
+            .flags
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
         }
+
+        let hidden = cell.flags.contains(Flags::HIDDEN);
+        let underline = cell
+            .flags
+            .intersects(Flags::ALL_UNDERLINES)
+            .then(|| UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(
+                    cell.underline_color
+                        .map(|color| resolve_color(color, palette, &snapshot.colors))
+                        .unwrap_or(cell_fg),
+                ),
+                wavy: cell.flags.contains(Flags::UNDERCURL),
+            });
+        let strikethrough = cell
+            .flags
+            .contains(Flags::STRIKEOUT)
+            .then(|| StrikethroughStyle {
+                thickness: px(1.0),
+                color: Some(cell_fg),
+            });
+        let style = CellTextStyle {
+            fg: cell_fg,
+            weight: if cell.flags.contains(Flags::BOLD) {
+                FontWeight::BOLD
+            } else {
+                FontWeight::NORMAL
+            },
+            font_style: if cell.flags.contains(Flags::ITALIC) {
+                FontStyle::Italic
+            } else {
+                FontStyle::Normal
+            },
+            underline,
+            strikethrough,
+        };
+        let cell_width = if cell.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        let append = !hidden && run_style.as_ref() == Some(&style) && *col == run_next_col;
+        if !append {
+            if let Some(previous_style) = run_style.as_ref() {
+                flush_run(
+                    &mut run_text,
+                    previous_style,
+                    run_start_col,
+                    cur_row,
+                    origin,
+                    lh,
+                    cw,
+                    text_style,
+                    window,
+                    cx,
+                );
+            }
+            run_start_col = *col;
+            run_style = (!hidden).then_some(style);
+        }
+        if !hidden {
+            run_text.push_str(&cell.text);
+        }
+        run_next_col = col.saturating_add(cell_width);
     }
-    flush_run(
-        &mut run_chars,
-        run_fg,
-        run_start_col,
-        cur_row,
-        origin,
-        lh,
-        cw,
-        text_style,
-        window,
-        cx,
-    );
+    if let Some(style) = run_style.as_ref() {
+        flush_run(
+            &mut run_text,
+            style,
+            run_start_col,
+            cur_row,
+            origin,
+            lh,
+            cw,
+            text_style,
+            window,
+            cx,
+        );
+    }
 
     // 3) 光标块
     paint_cursor(&snapshot.cursor, palette, origin, lh, cw, window);
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CellTextStyle {
+    fg: Hsla,
+    weight: FontWeight,
+    font_style: FontStyle,
+    underline: Option<UnderlineStyle>,
+    strikethrough: Option<StrikethroughStyle>,
+}
+
 /// flush 一段同色文本：shape 成 ShapedLine 后 paint。
 #[allow(clippy::too_many_arguments)]
 fn flush_run(
-    chars: &mut Vec<char>,
-    fg: Hsla,
+    text: &mut String,
+    style: &CellTextStyle,
     start_col: usize,
     row: i32,
     origin: Point<Pixels>,
@@ -888,29 +1301,31 @@ fn flush_run(
     window: &mut Window,
     cx: &mut App,
 ) {
-    if chars.is_empty() {
+    if text.is_empty() {
         return;
     }
-    let text: String = chars.iter().collect();
-    chars.clear();
-    if !text.chars().any(|c| !c.is_whitespace()) {
+    if text.chars().all(char::is_whitespace)
+        && style.underline.is_none()
+        && style.strikethrough.is_none()
+    {
+        text.clear();
         return;
     }
     let len = text.len();
-    let shared = SharedString::from(text);
+    let shared = SharedString::from(std::mem::take(text));
     let run = TextRun {
         len,
         font: Font {
             family: text_style.font_family.clone(),
-            weight: FontWeight::NORMAL,
-            style: FontStyle::Normal,
+            weight: style.weight,
+            style: style.font_style,
             features: FontFeatures::default(),
             fallbacks: None,
         },
-        color: fg,
+        color: style.fg,
         background_color: None,
-        underline: None,
-        strikethrough: None,
+        underline: style.underline,
+        strikethrough: style.strikethrough,
     };
     let line = window
         .text_system()
@@ -945,8 +1360,40 @@ fn paint_cursor(
     };
     let color = theme_color_to_hsla(palette.foreground);
     match cursor.shape {
-        CursorShape::Block | CursorShape::HollowBlock => {
-            window.paint_quad(fill(cell_bounds, color));
+        CursorShape::Block => {
+            // Keep the glyph legible without a second text pass by using a translucent block.
+            window.paint_quad(fill(cell_bounds, color.opacity(0.55)));
+        }
+        CursorShape::HollowBlock => {
+            let thickness = px(1.0);
+            window.paint_quad(fill(
+                Bounds {
+                    origin: cell_origin,
+                    size: gpui::size(px(cw), thickness),
+                },
+                color,
+            ));
+            window.paint_quad(fill(
+                Bounds {
+                    origin: point(cell_origin.x, cell_origin.y + lh - thickness),
+                    size: gpui::size(px(cw), thickness),
+                },
+                color,
+            ));
+            window.paint_quad(fill(
+                Bounds {
+                    origin: cell_origin,
+                    size: gpui::size(thickness, lh),
+                },
+                color,
+            ));
+            window.paint_quad(fill(
+                Bounds {
+                    origin: point(cell_origin.x + px(cw) - thickness, cell_origin.y),
+                    size: gpui::size(thickness, lh),
+                },
+                color,
+            ));
         }
         CursorShape::Underline => {
             let b = Bounds {
@@ -966,12 +1413,17 @@ fn paint_cursor(
     }
 }
 
-/// 简化颜色解析（不查 term.colors 表，仅用主题调色板；M1 足够）。
-fn resolve_color_simple(c: VteColor, palette: &ResolvedPalette) -> Hsla {
+fn resolve_color(c: VteColor, palette: &ResolvedPalette, colors: &[Option<Rgb>]) -> Hsla {
     match c {
         VteColor::Spec(Rgb { r, g, b }) => theme_color_to_hsla(ThemeColor { r, g, b }),
         VteColor::Named(named) => {
-            if matches!(named, NamedColor::Foreground) {
+            if let Some(Some(Rgb { r, g, b })) = colors.get(named as usize) {
+                theme_color_to_hsla(ThemeColor {
+                    r: *r,
+                    g: *g,
+                    b: *b,
+                })
+            } else if matches!(named, NamedColor::Foreground) {
                 theme_color_to_hsla(palette.foreground)
             } else if matches!(named, NamedColor::Background) {
                 theme_color_to_hsla(palette.background)
@@ -981,9 +1433,19 @@ fn resolve_color_simple(c: VteColor, palette: &ResolvedPalette) -> Hsla {
                     .unwrap_or_else(|| theme_color_to_hsla(palette.foreground))
             }
         }
-        VteColor::Indexed(idx) => indexed_to_theme(idx, &palette.terminal)
-            .map(theme_color_to_hsla)
-            .unwrap_or_else(|| theme_color_to_hsla(palette.foreground)),
+        VteColor::Indexed(idx) => {
+            if let Some(Some(Rgb { r, g, b })) = colors.get(idx as usize) {
+                theme_color_to_hsla(ThemeColor {
+                    r: *r,
+                    g: *g,
+                    b: *b,
+                })
+            } else {
+                indexed_to_theme(idx, &palette.terminal)
+                    .map(theme_color_to_hsla)
+                    .unwrap_or_else(|| theme_color_to_hsla(palette.foreground))
+            }
+        }
     }
 }
 
@@ -1012,9 +1474,9 @@ fn named_to_theme(named: NamedColor, pal: &TerminalPalette) -> Option<ThemeColor
 }
 
 /// 256 色索引：16-231 立方体、232-255 灰度。
-fn indexed_to_theme(idx: u8, _pal: &TerminalPalette) -> Option<ThemeColor> {
+fn indexed_to_theme(idx: u8, pal: &TerminalPalette) -> Option<ThemeColor> {
     if idx < 16 {
-        return None;
+        return Some(pal.all()[idx as usize]);
     }
     if idx >= 232 {
         let g = 8 + (idx - 232) * 10;
@@ -1026,6 +1488,151 @@ fn indexed_to_theme(idx: u8, _pal: &TerminalPalette) -> Option<ThemeColor> {
     let g = levels[((i / 6) % 6) as usize];
     let b = levels[(i % 6) as usize];
     Some(ThemeColor { r, g, b })
+}
+
+fn terminal_rgb_for_index(index: usize, palette: &ResolvedPalette) -> Rgb {
+    let ansi = palette.terminal.all();
+    let color = match index {
+        0..=15 => ansi[index],
+        16..=255 => indexed_to_theme(index as u8, &palette.terminal).unwrap_or(palette.foreground),
+        256 => palette.foreground,
+        257 => palette.background,
+        258 => palette.foreground,
+        259..=266 => dim_color(ansi[index - 259]),
+        267 => palette.foreground,
+        268 => dim_color(palette.foreground),
+        _ => palette.foreground,
+    };
+    Rgb {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+    }
+}
+
+fn is_copy_shortcut(keystroke: &gpui::Keystroke) -> bool {
+    let key = keystroke.key.to_ascii_lowercase();
+    let modifiers = keystroke.modifiers;
+    if cfg!(target_os = "macos") {
+        modifiers.platform && !modifiers.control && !modifiers.alt && key == "c"
+    } else {
+        (modifiers.control && modifiers.shift && !modifiers.alt && key == "c")
+            || (modifiers.control && !modifiers.shift && key == "insert")
+    }
+}
+
+fn is_paste_shortcut(keystroke: &gpui::Keystroke) -> bool {
+    let key = keystroke.key.to_ascii_lowercase();
+    let modifiers = keystroke.modifiers;
+    if cfg!(target_os = "macos") {
+        modifiers.platform && !modifiers.control && !modifiers.alt && key == "v"
+    } else {
+        (modifiers.control && modifiers.shift && !modifiers.alt && key == "v")
+            || (!modifiers.control && modifiers.shift && key == "insert")
+    }
+}
+
+fn mouse_button_code(button: MouseButton, motion: bool) -> Option<u8> {
+    match (button, motion) {
+        (MouseButton::Left, false) => Some(0),
+        (MouseButton::Middle, false) => Some(1),
+        (MouseButton::Right, false) => Some(2),
+        (MouseButton::Left, true) => Some(32),
+        (MouseButton::Middle, true) => Some(33),
+        (MouseButton::Right, true) => Some(34),
+        (MouseButton::Navigate(_), _) => None,
+    }
+}
+
+fn mouse_motion_button_code(button: Option<MouseButton>) -> Option<u8> {
+    match button {
+        Some(button) => mouse_button_code(button, true),
+        None => Some(35),
+    }
+}
+
+fn mouse_report(
+    point: TerminalPoint,
+    button: u8,
+    pressed: bool,
+    modifiers: Modifiers,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    if point.line.0 < 0 {
+        return None;
+    }
+    let mut modifier_bits = 0;
+    if modifiers.shift {
+        modifier_bits |= 4;
+    }
+    if modifiers.alt {
+        modifier_bits |= 8;
+    }
+    if modifiers.control {
+        modifier_bits |= 16;
+    }
+    let button = button.saturating_add(modifier_bits);
+    if mode.contains(TermMode::SGR_MOUSE) {
+        let terminator = if pressed { 'M' } else { 'm' };
+        return Some(
+            format!(
+                "\x1b[<{};{};{}{}",
+                button,
+                point.column.0 + 1,
+                point.line.0 + 1,
+                terminator
+            )
+            .into_bytes(),
+        );
+    }
+
+    let utf8 = mode.contains(TermMode::UTF8_MOUSE);
+    let max_coordinate = if utf8 { 2015 } else { 223 };
+    if point.line.0 >= max_coordinate || point.column.0 >= max_coordinate as usize {
+        return None;
+    }
+    let reported_button = if pressed { button } else { 3 + modifier_bits };
+    let mut report = vec![b'\x1b', b'[', b'M', 32 + reported_button];
+    append_mouse_coordinate(&mut report, point.column.0, utf8);
+    append_mouse_coordinate(&mut report, point.line.0 as usize, utf8);
+    Some(report)
+}
+
+fn append_mouse_coordinate(report: &mut Vec<u8>, coordinate: usize, utf8: bool) {
+    let encoded = 33 + coordinate;
+    if utf8 && coordinate >= 95 {
+        report.push((0xc0 + encoded / 64) as u8);
+        report.push((0x80 + encoded % 64) as u8);
+    } else {
+        report.push(encoded as u8);
+    }
+}
+
+fn alternate_scroll(lines: i32) -> Vec<u8> {
+    let final_character = if lines > 0 { b'A' } else { b'B' };
+    let mut bytes = Vec::with_capacity(lines.unsigned_abs() as usize * 3);
+    for _ in 0..lines.unsigned_abs() {
+        bytes.extend_from_slice(&[b'\x1b', b'O', final_character]);
+    }
+    bytes
+}
+
+fn clean_terminal_title(title: String) -> Option<String> {
+    let title: String = title
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(120)
+        .collect();
+    let title = title.trim();
+    (!title.is_empty()).then(|| title.to_owned())
+}
+
+fn dim_color(color: ThemeColor) -> ThemeColor {
+    ThemeColor {
+        r: color.r / 2,
+        g: color.g / 2,
+        b: color.b / 2,
+    }
 }
 
 /// termior Color → GPUI Hsla（打包 RGB 为 u32，不透明）。
@@ -1049,5 +1656,114 @@ impl Dimensions for TermSize {
     }
     fn columns(&self) -> usize {
         self.columns
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+
+    fn parsed_term(input: &str, columns: usize, screen_lines: usize) -> Term<VoidListener> {
+        let size = TermSize {
+            columns,
+            screen_lines,
+        };
+        let mut term = Term::new(TermConfig::default(), &size, VoidListener);
+        let mut processor = VteProcessor::<StdSyncHandler>::default();
+        processor.advance(&mut term, input.as_bytes());
+        term
+    }
+
+    #[test]
+    fn sgr_mouse_reports_are_one_based_and_preserve_release() {
+        let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        let point = TerminalPoint::new(Line(2), Column(4));
+        assert_eq!(
+            mouse_report(point, 0, true, Modifiers::none(), mode).unwrap(),
+            b"\x1b[<0;5;3M"
+        );
+        assert_eq!(
+            mouse_report(point, 0, false, Modifiers::none(), mode).unwrap(),
+            b"\x1b[<0;5;3m"
+        );
+    }
+
+    #[test]
+    fn alternate_scroll_uses_application_cursor_sequences() {
+        assert_eq!(alternate_scroll(2), b"\x1bOA\x1bOA");
+        assert_eq!(alternate_scroll(-1), b"\x1bOB");
+    }
+
+    #[test]
+    fn render_snapshot_preserves_wide_combining_and_style_cells() {
+        let term = parsed_term(
+            "\x1b[1m中\x1b[22me\u{301}\x1b[3mI\x1b[23;4mU\x1b[24;7mR",
+            12,
+            2,
+        );
+        let snapshot = collect_snapshot(term.renderable_content());
+
+        let wide = &snapshot
+            .cells
+            .iter()
+            .find(|(_, column, _)| *column == 0)
+            .expect("wide cell")
+            .2;
+        assert!(wide.flags.contains(Flags::WIDE_CHAR));
+        assert!(wide.flags.contains(Flags::BOLD));
+
+        let spacer = &snapshot
+            .cells
+            .iter()
+            .find(|(_, column, _)| *column == 1)
+            .expect("wide spacer")
+            .2;
+        assert!(spacer.flags.contains(Flags::WIDE_CHAR_SPACER));
+
+        let combining = &snapshot
+            .cells
+            .iter()
+            .find(|(_, column, _)| *column == 2)
+            .expect("combining cell")
+            .2;
+        assert_eq!(combining.text, "e\u{301}");
+        assert!(snapshot
+            .cells
+            .iter()
+            .any(|(_, _, cell)| cell.flags.contains(Flags::ITALIC)));
+        assert!(snapshot
+            .cells
+            .iter()
+            .any(|(_, _, cell)| cell.flags.contains(Flags::UNDERLINE)));
+        assert!(snapshot
+            .cells
+            .iter()
+            .any(|(_, _, cell)| cell.flags.contains(Flags::INVERSE)));
+        let text = snapshot_to_text(&snapshot);
+        assert!(text.starts_with("中e\u{301}IUR"), "snapshot text: {text:?}");
+    }
+
+    #[test]
+    fn scrolled_history_is_mapped_back_into_viewport_rows() {
+        let mut term = parsed_term("one\r\ntwo\r\nthree", 8, 2);
+        term.scroll_display(Scroll::Delta(1));
+        let snapshot = collect_snapshot(term.renderable_content());
+
+        assert_eq!(snapshot.cursor.shape, CursorShape::Hidden);
+        assert!(snapshot
+            .cells
+            .iter()
+            .all(|(row, _, _)| (0..2).contains(row)));
+        assert!(snapshot_to_text(&snapshot).starts_with("one\ntwo"));
+    }
+
+    #[test]
+    fn buffer_tail_includes_scrollback_without_wide_spacers() {
+        let term = parsed_term("一\r\ntwo\r\nthree\r\nfour", 8, 2);
+        let tail = terminal_buffer_tail_to_text(&term, 3);
+
+        assert_eq!(tail, "two\nthree\nfour");
+        assert!(!tail.contains(' '));
     }
 }

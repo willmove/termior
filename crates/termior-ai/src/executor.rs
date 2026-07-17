@@ -2,7 +2,7 @@
 
 use crate::context::TerminalContextProvider;
 use crate::tools::{ToolError, ToolRegistry};
-use futures::channel::mpsc::UnboundedReceiver;
+use futures::channel::mpsc::Receiver;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -36,7 +36,7 @@ struct EditProposal {
 
 struct PersistentShell {
     bridge: TerminalBridge,
-    output: UnboundedReceiver<PtyData>,
+    output: Receiver<PtyData>,
     kind: ShellKind,
 }
 
@@ -470,14 +470,14 @@ fn persistent_script(kind: ShellKind, command: &str, marker: &str) -> String {
             format!("{command}\r\nWrite-Output \"{marker}:$LASTEXITCODE\"\r\n")
         }
         ShellKind::Cmd => format!("{command}\r\necho {marker}:%errorlevel%\r\n"),
-        ShellKind::Bash | ShellKind::Zsh => {
+        ShellKind::Bash | ShellKind::Zsh | ShellKind::Fish => {
             format!("{command}\nprintf '\\n{marker}:%s\\n' $?\n")
         }
     }
 }
 
 fn collect_until_marker(
-    output: &mut UnboundedReceiver<PtyData>,
+    output: &mut Receiver<PtyData>,
     marker: &str,
     timeout: Duration,
 ) -> Result<String, ToolError> {
