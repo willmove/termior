@@ -1,25 +1,34 @@
 //! PTY 回环测试：验证 PTY spawn + reader 线程 + writer 通路（FR-TERM-01 验收）。
 //!
-//! 注：Windows ConPTY 启动时会发 `\x1b[6n`（光标位置查询）并期望终端回复；
-//! 本测试只验证 PTY 层 IO 通路（能 spawn、reader 能读到字节、writer 写入不报错），
-//! 不依赖 shell 提示符语义（那是 vte::Term 渲染层的事）。
+//! Windows ConPTY/Shell 可能先发终端查询序列并等待回复，因此测试把输出送进真实
+//! `alacritty_terminal::Term`，同时验证 PTY、协议回复与交互式 Shell 的完整往返。
 
 use std::time::{Duration, Instant};
 
-use termior_terminal::{PtyData, PtySessionConfig, TerminalBridge};
+use alacritty_terminal::{
+    term::{test::TermSize, Config as TermConfig, Term},
+    vte::ansi::{Processor as VteProcessor, StdSyncHandler},
+};
+use termior_terminal::{
+    PtyData, PtySessionConfig, TerminalBridge, TerminalEventProxy, WriterHandle,
+};
 
-/// 收集 channel 输出直到满足谓词或超时。
-fn collect_until<F: Fn(&str) -> bool>(
-    rx: &mut futures::channel::mpsc::UnboundedReceiver<PtyData>,
+fn collect_via_emulator_until<F: Fn(&str) -> bool>(
+    rx: &mut futures::channel::mpsc::Receiver<PtyData>,
+    writer: WriterHandle,
     pred: F,
     timeout: Duration,
 ) -> String {
+    let (event_proxy, _events) = TerminalEventProxy::new(writer);
+    let mut term = Term::new(TermConfig::default(), &TermSize::new(80, 24), event_proxy);
+    let mut processor = VteProcessor::<StdSyncHandler>::default();
     let deadline = Instant::now() + timeout;
     let mut acc = String::new();
     while Instant::now() < deadline {
         match rx.try_recv() {
             Ok(data) => {
                 acc.push_str(&String::from_utf8_lossy(&data.bytes));
+                processor.advance(&mut term, &data.bytes);
                 if pred(&acc) {
                     return acc;
                 }
@@ -28,6 +37,19 @@ fn collect_until<F: Fn(&str) -> bool>(
         }
     }
     acc
+}
+
+fn shell_is_ready(output: &str) -> bool {
+    #[cfg(windows)]
+    {
+        // PowerShell and cmd can print banners before their line editor is ready. Sending input
+        // before the first prompt risks having it discarded during startup initialization.
+        output.contains('>')
+    }
+    #[cfg(not(windows))]
+    {
+        !output.is_empty()
+    }
 }
 
 #[test]
@@ -43,30 +65,109 @@ fn spawn_produces_output() {
         config.shell = Some(termior_terminal_core::ShellKind::Bash);
     }
 
-    let mut bridge = match TerminalBridge::spawn(&config) {
-        Ok(b) => b,
-        Err(e) => {
-            // CI/headless 环境可能无可用 PTY/shell，跳过而非失败。
-            eprintln!("skip: PTY spawn unavailable: {e}");
-            return;
-        }
-    };
+    let mut bridge = TerminalBridge::spawn(&config).expect("PTY spawn");
     let writer = bridge.writer();
     let mut rx = bridge.take_output().expect("output channel");
 
-    // PTY 一旦 spawn，shell/ConPTY 至少应产生一些字节（提示符、CPR 查询等）。
-    let initial = collect_until(&mut rx, |s| !s.is_empty(), Duration::from_secs(3));
+    // PTY 一旦 spawn，shell/ConPTY 至少应产生一些字节（提示符、CPR 查询等）；
+    // 这些字节必须经过模拟器，以便 CPR/设备查询得到即时回复。
+    let initial = collect_via_emulator_until(
+        &mut rx,
+        writer.clone(),
+        |s| !s.is_empty(),
+        Duration::from_secs(3),
+    );
     assert!(
         !initial.is_empty(),
         "PTY produced no output within 3s — reader/writer 通路异常"
     );
 
-    // writer 写入应成功（即使 shell 因 ConPTY CPR 未应答而不回显，写入本身不应报错）。
+    // writer 写入后，命令应被回显并真正执行。
     let wres = writer.write_all(b"echo termior_pty_alive\r\n");
     assert!(wres.is_ok(), "writer write_all failed: {wres:?}");
 
-    // 写入后应能继续从 reader 读到更多输出（或至少不报错）。宽松断言。
-    let _after = collect_until(&mut rx, |_| false, Duration::from_millis(800));
+    let after = collect_via_emulator_until(
+        &mut rx,
+        writer,
+        |output| output.matches("termior_pty_alive").count() >= 2,
+        Duration::from_secs(3),
+    );
+    assert!(
+        after.matches("termior_pty_alive").count() >= 2,
+        "shell did not execute and echo the marker: {after:?}"
+    );
+
+    let _ = bridge.kill();
+}
+
+#[test]
+fn default_shell_roundtrip_handles_terminal_protocol_queries() {
+    let mut bridge = TerminalBridge::spawn(&PtySessionConfig::default()).expect("default PTY");
+    let writer = bridge.writer();
+    let mut rx = bridge.take_output().expect("output channel");
+
+    let initial = collect_via_emulator_until(
+        &mut rx,
+        writer.clone(),
+        shell_is_ready,
+        Duration::from_secs(15),
+    );
+    assert!(
+        shell_is_ready(&initial),
+        "default shell did not become interactive: {initial:?}"
+    );
+
+    writer
+        .write_all(b"echo termior_default_shell_alive\r\n")
+        .expect("write marker command");
+    let output = collect_via_emulator_until(
+        &mut rx,
+        writer,
+        |output| output.matches("termior_default_shell_alive").count() >= 2,
+        Duration::from_secs(10),
+    );
+    assert!(
+        output.matches("termior_default_shell_alive").count() >= 2,
+        "default shell did not stay interactive and execute the marker: {output:?}"
+    );
+
+    let _ = bridge.kill();
+}
+
+#[test]
+fn shell_integration_roundtrip_stays_interactive() {
+    let config = PtySessionConfig {
+        shell_integration: true,
+        ..Default::default()
+    };
+    let mut bridge = TerminalBridge::spawn(&config).expect("integrated default PTY");
+    let writer = bridge.writer();
+    let mut rx = bridge.take_output().expect("output channel");
+
+    let initial = collect_via_emulator_until(
+        &mut rx,
+        writer.clone(),
+        shell_is_ready,
+        Duration::from_secs(15),
+    );
+    assert!(
+        shell_is_ready(&initial),
+        "shell integration did not become interactive: {initial:?}"
+    );
+
+    writer
+        .write_all(b"echo termior_integrated_shell_alive\r\n")
+        .expect("write integration marker command");
+    let output = collect_via_emulator_until(
+        &mut rx,
+        writer,
+        |output| output.matches("termior_integrated_shell_alive").count() >= 2,
+        Duration::from_secs(10),
+    );
+    assert!(
+        output.matches("termior_integrated_shell_alive").count() >= 2,
+        "integrated shell did not remain interactive: {output:?}"
+    );
 
     let _ = bridge.kill();
 }
@@ -78,13 +179,7 @@ fn spawn_with_explicit_size() {
         cols: 120,
         ..Default::default()
     };
-    let bridge = match TerminalBridge::spawn(&config) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("skip: PTY spawn unavailable: {e}");
-            return;
-        }
-    };
+    let bridge = TerminalBridge::spawn(&config).expect("PTY spawn");
     // resize 应不报错。
     let r = bridge.resize(40, 160);
     assert!(r.is_ok(), "resize failed: {r:?}");

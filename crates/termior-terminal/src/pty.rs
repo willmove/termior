@@ -29,6 +29,11 @@ pub enum SpawnError {
 pub struct PtySessionConfig {
     /// None 时按平台探测默认 shell。
     pub shell: Option<ShellKind>,
+    /// Optional executable path/name. Manual shell settings use this field.
+    pub shell_program: Option<String>,
+    /// Keep shell integration opt-in so the plain interactive shell remains the reliability
+    /// baseline while integration evolves independently.
+    pub shell_integration: bool,
     pub rows: u16,
     pub cols: u16,
     pub cwd: Option<String>,
@@ -41,6 +46,8 @@ impl Default for PtySessionConfig {
     fn default() -> Self {
         Self {
             shell: None,
+            shell_program: None,
+            shell_integration: false,
             rows: 24,
             cols: 80,
             cwd: None,
@@ -91,15 +98,32 @@ impl PtySession {
             })
             .map_err(|e| SpawnError::Open(e.to_string()))?;
 
-        let kind = config.shell.unwrap_or_else(default_shell);
-        log::info!("PTY spawning shell: {:?} ({})", kind, shell_program(kind));
-        let (cmd, integration_dir) = build_command(kind, config)?;
+        let inferred_kind = config
+            .shell_program
+            .as_deref()
+            .and_then(shell_kind_from_program);
+        let kind = config.shell.or(inferred_kind).unwrap_or_else(default_shell);
+        let program = config
+            .shell_program
+            .clone()
+            .unwrap_or_else(|| shell_program(kind));
+        let known_integration_kind =
+            config.shell.is_some() || inferred_kind.is_some() || config.shell_program.is_none();
+        let integration_enabled = config.shell_integration && known_integration_kind;
+        log::info!(
+            "PTY spawning shell: {:?} ({program}), integration={integration_enabled}",
+            kind
+        );
+        let (cmd, integration_dir) = build_command(kind, &program, integration_enabled, config)?;
 
         // child spawn 在 slave 上（CommandBuilder 按值消费）。
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| SpawnError::Spawn(e.to_string()))?;
+
+        #[cfg(windows)]
+        let mut child = child;
 
         #[cfg(windows)]
         let job = match child
@@ -186,6 +210,7 @@ pub fn default_shell() -> ShellKind {
     } else {
         match std::env::var("SHELL").ok().as_deref() {
             Some(s) if s.contains("zsh") => ShellKind::Zsh,
+            Some(s) if s.contains("fish") => ShellKind::Fish,
             Some(s) if s.contains("bash") => ShellKind::Bash,
             _ => ShellKind::Bash,
         }
@@ -272,13 +297,19 @@ impl Drop for WindowsJob {
 /// 返回 `(CommandBuilder, Option<TempDir>)`；tempdir 由调用方持有以保持脚本存活。
 fn build_command(
     kind: ShellKind,
+    program: &str,
+    integration_enabled: bool,
     config: &PtySessionConfig,
 ) -> Result<(CommandBuilder, Option<tempfile::TempDir>), SpawnError> {
-    let program = shell_program(kind);
-    let mut cmd = CommandBuilder::new(&program);
+    let mut cmd = CommandBuilder::new(program);
     cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("TERM_PROGRAM", "Termior");
 
-    let integration_dir = match termior_terminal_core::shell_integration::snippets_for(kind) {
+    let snippets = integration_enabled
+        .then(|| termior_terminal_core::shell_integration::snippets_for(kind))
+        .flatten();
+    let integration_dir = match snippets {
         Some(snippets) => {
             let tempdir = tempfile::tempdir()
                 .map_err(|e| SpawnError::Integration(format!("shell integration tempdir: {e}")))?;
@@ -304,6 +335,7 @@ fn shell_program(kind: ShellKind) -> String {
     match kind {
         ShellKind::Zsh => "zsh".into(),
         ShellKind::Bash => "bash".into(),
+        ShellKind::Fish => "fish".into(),
         ShellKind::Pwsh => "pwsh".into(),
         ShellKind::PowerShell => "powershell".into(),
         ShellKind::Cmd => "cmd".into(),
@@ -327,27 +359,42 @@ fn apply_integration(
             cmd.env("ZDOTDIR", tempdir);
         }
         ShellKind::Bash => {
-            // bash：--rcfile <临时 rcfile>（snippets 只给了 flag，补路径）。
+            // bash：--rcfile <临时 rcfile>。
             let rcfile = tempdir.join("termior-bashrc.sh");
             cmd.arg("--rcfile");
             cmd.arg(rcfile);
         }
         ShellKind::Pwsh | ShellKind::PowerShell => {
-            // pwsh：-NoProfile -File <profile.ps1>，snippets 已给 flag，补路径。
+            // `-File` alone exits after running the wrapper. Flags must precede the script path;
+            // tokens after `-File <path>` are script arguments rather than host options.
             let profile = tempdir.join("profile.ps1");
+            cmd.arg("-NoProfile");
+            cmd.arg("-NoExit");
             cmd.arg("-File");
             cmd.arg(profile);
         }
-        ShellKind::Cmd => {
-            // cmd 无 shell integration（snippets_for 返回 None，不会到这里）。
+        ShellKind::Fish | ShellKind::Cmd => {
+            // These shells currently have no integration wrapper.
         }
     }
     for (k, v) in &snippets.env {
         cmd.env(k, v);
     }
-    // snippets.args 里剩余的非 flag 参数（目前为空）补上。
-    for a in &snippets.args {
-        cmd.arg(a);
+}
+
+fn shell_kind_from_program(program: &str) -> Option<ShellKind> {
+    let normalized = program.replace('\\', "/");
+    let file_name = normalized.rsplit('/').next()?;
+    let lowercase = file_name.to_ascii_lowercase();
+    let name = lowercase.strip_suffix(".exe").unwrap_or(&lowercase);
+    match name {
+        "zsh" => Some(ShellKind::Zsh),
+        "bash" => Some(ShellKind::Bash),
+        "fish" => Some(ShellKind::Fish),
+        "pwsh" => Some(ShellKind::Pwsh),
+        "powershell" => Some(ShellKind::PowerShell),
+        "cmd" => Some(ShellKind::Cmd),
+        _ => None,
     }
 }
 
@@ -367,4 +414,76 @@ fn which(name: &str) -> std::io::Result<std::path::PathBuf> {
         }
     }
     Err(std::io::Error::other(format!("{name} not found in PATH")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(command: &CommandBuilder) -> Vec<String> {
+        command
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn plain_shell_is_the_default_launch_path() {
+        let config = PtySessionConfig::default();
+        let (command, integration_dir) =
+            build_command(ShellKind::Pwsh, "pwsh", false, &config).unwrap();
+        assert_eq!(argv(&command), vec!["pwsh"]);
+        assert!(integration_dir.is_none());
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
+        assert_eq!(
+            command.get_env("COLORTERM"),
+            Some(std::ffi::OsStr::new("truecolor"))
+        );
+    }
+
+    #[test]
+    fn powershell_integration_keeps_the_shell_interactive() {
+        let config = PtySessionConfig::default();
+        let (command, integration_dir) =
+            build_command(ShellKind::Pwsh, "pwsh", true, &config).unwrap();
+        let args = argv(&command);
+        assert_eq!(&args[..4], ["pwsh", "-NoProfile", "-NoExit", "-File"]);
+        assert_eq!(
+            args.len(),
+            5,
+            "PowerShell host flags must not be duplicated"
+        );
+        assert!(args[4].ends_with("profile.ps1"));
+        assert!(integration_dir.is_some());
+    }
+
+    #[test]
+    fn bash_rcfile_flag_is_not_duplicated() {
+        let config = PtySessionConfig::default();
+        let (command, integration_dir) =
+            build_command(ShellKind::Bash, "bash", true, &config).unwrap();
+        let args = argv(&command);
+        assert_eq!(args[0], "bash");
+        assert_eq!(args.iter().filter(|arg| *arg == "--rcfile").count(), 1);
+        assert_eq!(args.len(), 3);
+        assert!(args[2].ends_with("termior-bashrc.sh"));
+        assert!(integration_dir.is_some());
+    }
+
+    #[test]
+    fn manual_shell_kind_is_inferred_from_executable_path() {
+        assert_eq!(
+            shell_kind_from_program(r"C:\Program Files\PowerShell\7\PWSH.EXE"),
+            Some(ShellKind::Pwsh)
+        );
+        assert_eq!(
+            shell_kind_from_program("/usr/bin/fish"),
+            Some(ShellKind::Fish)
+        );
+        assert_eq!(shell_kind_from_program("nu"), None);
+    }
 }

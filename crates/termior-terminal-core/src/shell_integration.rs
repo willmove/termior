@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 pub enum ShellKind {
     Zsh,
     Bash,
+    Fish,
     Pwsh,
     PowerShell,
     Cmd,
@@ -28,6 +29,7 @@ impl ShellKind {
         match self {
             ShellKind::Zsh => "zsh",
             ShellKind::Bash => "bash",
+            ShellKind::Fish => "fish",
             ShellKind::Pwsh => "pwsh",
             ShellKind::PowerShell => "powershell",
             ShellKind::Cmd => "cmd",
@@ -210,7 +212,7 @@ if (Get-Module -ListAvailable PSReadLine) {
 ";
     ShellIntegrationSnippets {
         kind: ShellKind::Pwsh,
-        args: vec!["-NoProfile".into(), "-File".into()],
+        args: vec!["-NoProfile".into(), "-NoExit".into(), "-File".into()],
         files: vec![("profile.ps1".into(), profile.into())],
         env: vec![],
     }
@@ -221,6 +223,7 @@ pub fn snippets_for(kind: ShellKind) -> Option<ShellIntegrationSnippets> {
     match kind {
         ShellKind::Zsh => Some(zsh_snippets()),
         ShellKind::Bash => Some(bash_snippets()),
+        ShellKind::Fish => None,
         ShellKind::Pwsh | ShellKind::PowerShell => Some(pwsh_snippets()),
         ShellKind::Cmd => None, // cmd 不支持 shell integration
     }
@@ -307,6 +310,7 @@ mod tests {
     #[test]
     fn shellkind_name() {
         assert_eq!(ShellKind::Zsh.name(), "zsh");
+        assert_eq!(ShellKind::Fish.name(), "fish");
         assert_eq!(ShellKind::Pwsh.name(), "pwsh");
         assert_eq!(ShellKind::Cmd.name(), "cmd");
     }

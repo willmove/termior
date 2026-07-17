@@ -28,7 +28,7 @@ pub use migrate::{migrate, MigrationError, SCHEMA_VERSION};
 pub use paths::{app_data_dir, AppDataError};
 pub use settings::{
     default_settings, BackgroundSettings, ModelProviderSettings, ModelSettings, Settings,
-    TerminalSettings,
+    ShellDetection, TerminalSettings,
 };
 
 /// FR-SEC-06 / INV-5：扫描待落盘文本是否含形似密钥的明文。命中返回错误。

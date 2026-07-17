@@ -3,10 +3,11 @@ use crate::composer_view::ComposerView;
 use crate::editor_view::EditorView;
 use crate::preview_view::PreviewView;
 use crate::settings_view::SettingsView;
-use crate::terminal_view::TerminalView;
+use crate::terminal_view::{TerminalView, TerminalViewEvent};
 use gpui::{
-    div, prelude::*, px, relative, size, AnyElement, Bounds, Context, Entity, FocusHandle,
-    Focusable, KeyDownEvent, MouseButton, MouseDownEvent, SharedString, Task, Window, WindowBounds,
+    div, prelude::*, px, relative, size, AnyElement, AnyWindowHandle, Bounds, Context, Entity,
+    FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, SharedString, Task, Window,
+    WindowBounds,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -20,7 +21,9 @@ use termior_platform::{
     NotificationDecision, NotificationRouter, NotificationTarget, SystemNotifier,
 };
 use termior_security::workspace::WorkspaceAuthRegistry;
-use termior_store::{app_data_dir, atomic_write, default_settings, migrate, KeyAction, Settings};
+use termior_store::{
+    app_data_dir, atomic_write, default_settings, migrate, KeyAction, Settings, ShellDetection,
+};
 use termior_terminal_core::osc::AgentState;
 use termior_theme::{Appearance, ResolvedPalette, Theme, ThemeLibrary};
 use termior_ui::{SidebarPanel, TabId, TabKind, WorkspaceState};
@@ -282,10 +285,10 @@ impl WorkspaceView {
             })
             .collect();
         if terminal_panes.is_empty() && self.model.tabs.is_empty() {
-            self.create_terminal(false, cx);
+            self.create_terminal(false, window, cx);
         } else {
             for (id, pane_id, cwd) in terminal_panes {
-                self.spawn_terminal_into(id, pane_id, cwd, cx);
+                self.spawn_terminal_into(id, pane_id, cwd, Some(window.window_handle()), cx);
             }
             let previews = self
                 .model
@@ -379,7 +382,7 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn create_terminal(&mut self, private: bool, cx: &mut Context<Self>) {
+    fn create_terminal(&mut self, private: bool, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.model.new_tab(
             TabKind::Terminal,
             if private {
@@ -395,7 +398,7 @@ impl WorkspaceView {
             panes: single_pane(PaneContent::Placeholder("Starting terminal…".into())),
         });
         self.activate_runtime(id, cx);
-        self.spawn_terminal_into(id, PaneId(1), cwd, cx);
+        self.spawn_terminal_into(id, PaneId(1), cwd, Some(window.window_handle()), cx);
         cx.notify();
     }
 
@@ -404,19 +407,30 @@ impl WorkspaceView {
         tab_id: TabId,
         pane_id: PaneId,
         cwd: Option<PathBuf>,
+        window_handle: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) {
         let palette = self.palette.clone();
         let terminal_settings = self.settings.terminal.clone();
         let keymap = self.settings.keymap.clone();
         let workspace_auth = self.workspace_auth.clone();
+        let shell_program = match &terminal_settings.shell_detection {
+            ShellDetection::Auto => None,
+            ShellDetection::Manual { path } if !path.trim().is_empty() => Some(path.clone()),
+            ShellDetection::Manual { .. } => None,
+        };
+        let config = termior_terminal::PtySessionConfig {
+            shell_program,
+            shell_integration: false,
+            cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
+            workspace_auth: Some(workspace_auth),
+            ..Default::default()
+        };
+        let spawn_task = cx
+            .background_executor()
+            .spawn(async move { termior_terminal::TerminalBridge::spawn(&config) });
         cx.spawn(async move |workspace, cx| {
-            let config = termior_terminal::PtySessionConfig {
-                cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
-                workspace_auth: Some(workspace_auth),
-                ..Default::default()
-            };
-            let bridge = match termior_terminal::TerminalBridge::spawn(&config) {
+            let bridge = match spawn_task.await {
                 Ok(bridge) => bridge,
                 Err(error) => {
                     let _ = workspace.update(cx, |workspace, cx| {
@@ -435,6 +449,7 @@ impl WorkspaceView {
                 let entity = cx.new(|cx| {
                     TerminalView::from_bridge(bridge, palette, terminal_settings, keymap, cx)
                 });
+                let terminal_focus = entity.read(cx).focus_handle(cx);
                 let agent_id = format!("terminal-agent-{}-{}", tab_id.0, pane_id.0);
                 let agent_title = workspace
                     .model
@@ -457,9 +472,60 @@ impl WorkspaceView {
                     },
                 )
                 .detach();
+                cx.subscribe(
+                    &entity,
+                    move |workspace, _terminal, event: &TerminalViewEvent, cx| {
+                        let focused = workspace
+                            .model
+                            .tabs
+                            .iter()
+                            .find(|tab| tab.id == tab_id)
+                            .is_some_and(|tab| tab.layout.focused == pane_id);
+                        if focused {
+                            if let Some(tab) =
+                                workspace.model.tabs.iter_mut().find(|tab| tab.id == tab_id)
+                            {
+                                match event {
+                                    TerminalViewEvent::TitleChanged(title) => {
+                                        tab.title =
+                                            title.clone().unwrap_or_else(|| "Terminal".to_owned());
+                                    }
+                                    TerminalViewEvent::Exited(code) => {
+                                        if !tab.title.ends_with(" (exited)") {
+                                            tab.title.push_str(" (exited)");
+                                        }
+                                        if let Some(code) = code {
+                                            log::info!(
+                                                "terminal tab {} exited with code {code}",
+                                                tab_id.0
+                                            );
+                                        }
+                                    }
+                                    TerminalViewEvent::Bell => {
+                                        log::debug!("terminal bell in tab {}", tab_id.0);
+                                    }
+                                }
+                            }
+                        }
+                        cx.notify();
+                    },
+                )
+                .detach();
                 if let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                     if let Some(pane) = tab.panes.get_mut(&pane_id) {
                         *pane = PaneContent::Terminal(entity);
+                    }
+                }
+                let should_focus = workspace.model.active == Some(tab_id)
+                    && workspace
+                        .model
+                        .active_tab()
+                        .is_some_and(|tab| tab.layout.focused == pane_id);
+                if should_focus {
+                    if let Some(window_handle) = window_handle {
+                        let _ = cx.update_window(window_handle, |_, window, cx| {
+                            window.focus(&terminal_focus, cx);
+                        });
                     }
                 }
                 cx.notify();
@@ -525,7 +591,12 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn split_active(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
+    fn split_active(
+        &mut self,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(active) = self.model.active else {
             return;
         };
@@ -551,7 +622,9 @@ impl WorkspaceView {
         }
         if kind == Some(TabKind::Terminal) {
             let cwd = self.model.active_tab().map(|tab| tab.cwd.clone());
-            self.spawn_terminal_into(active, pane_id, cwd, cx);
+            self.spawn_terminal_into(active, pane_id, cwd, Some(window.window_handle()), cx);
+        } else {
+            self.focus_active_pane(window, cx);
         }
         cx.notify();
     }
@@ -591,6 +664,32 @@ impl WorkspaceView {
                     preview.update(cx, |preview, cx| preview.set_active(tab.id == id, cx));
                 }
             }
+        }
+    }
+
+    fn focus_active_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active) = self.model.active else {
+            return;
+        };
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == active) else {
+            return;
+        };
+        let Some(model_tab) = self.model.active_tab() else {
+            return;
+        };
+        let Some(pane) = tab.panes.get(&model_tab.layout.focused) else {
+            return;
+        };
+        match pane {
+            PaneContent::Terminal(terminal) => {
+                let focus = terminal.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
+            PaneContent::Editor(editor) => {
+                let focus = editor.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
+            PaneContent::Preview(_) | PaneContent::Placeholder(_) => {}
         }
     }
 
@@ -1089,8 +1188,8 @@ impl WorkspaceView {
             return;
         };
         match action {
-            KeyAction::NewTerminalTab => self.create_terminal(false, cx),
-            KeyAction::NewPrivateTerminal => self.create_terminal(true, cx),
+            KeyAction::NewTerminalTab => self.create_terminal(false, window, cx),
+            KeyAction::NewPrivateTerminal => self.create_terminal(true, window, cx),
             KeyAction::NewEditorTab => self.create_editor(cx),
             KeyAction::NewPreviewTab => self.create_preview(window, cx),
             KeyAction::ClosePaneOrTab => self.close_active(cx),
@@ -1098,16 +1197,18 @@ impl WorkspaceView {
                 let _ = self.model.switch_index(1);
                 if let Some(active) = self.model.active {
                     self.activate_runtime(active, cx);
+                    self.focus_active_pane(window, cx);
                 }
             }
             KeyAction::CycleTabs | KeyAction::CycleTabsReverse => {
                 self.model.cycle_tab(action == KeyAction::CycleTabsReverse);
                 if let Some(active) = self.model.active {
                     self.activate_runtime(active, cx);
+                    self.focus_active_pane(window, cx);
                 }
             }
-            KeyAction::SplitRight => self.split_active(SplitDirection::Right, cx),
-            KeyAction::SplitDown => self.split_active(SplitDirection::Down, cx),
+            KeyAction::SplitRight => self.split_active(SplitDirection::Right, window, cx),
+            KeyAction::SplitDown => self.split_active(SplitDirection::Down, window, cx),
             KeyAction::FocusPanePrev | KeyAction::FocusPaneNext => {
                 if let Some(tab) = self.model.active_tab_mut() {
                     tab.layout
@@ -1117,6 +1218,7 @@ impl WorkspaceView {
                             1
                         });
                 }
+                self.focus_active_pane(window, cx);
             }
             KeyAction::InlineSearch => {
                 if let Some(editor) = self.active_editor().cloned() {
@@ -1218,10 +1320,11 @@ impl WorkspaceView {
                     })
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |workspace, _event, _window, cx| {
+                        cx.listener(move |workspace, _event, window, cx| {
                             if let Some(tab) = workspace.model.active_tab_mut() {
                                 let _ = tab.layout.focus(pane_id);
                             }
+                            workspace.focus_active_pane(window, cx);
                             cx.notify();
                         }),
                     )
@@ -1609,8 +1712,9 @@ impl gpui::Render for WorkspaceView {
                     .child(SharedString::from(tab.title.clone()))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _event, _window, cx| {
+                        cx.listener(move |this, _event, window, cx| {
                             this.activate_runtime(id, cx);
+                            this.focus_active_pane(window, cx);
                             cx.notify();
                         }),
                     )
@@ -1859,9 +1963,12 @@ impl gpui::Render for WorkspaceView {
                                 cx.listener(Self::open_workspace_picker),
                             ),
                     )
-                    .child(header_button("+T", "new-terminal", cx, |this, _, _, cx| {
-                        this.create_terminal(false, cx)
-                    }))
+                    .child(header_button(
+                        "+T",
+                        "new-terminal",
+                        cx,
+                        |this, _, window, cx| this.create_terminal(false, window, cx),
+                    ))
                     .child(header_button("+E", "new-editor", cx, |this, _, _, cx| {
                         this.create_editor(cx)
                     }))
@@ -1875,7 +1982,7 @@ impl gpui::Render for WorkspaceView {
                         "Split",
                         "split-right",
                         cx,
-                        |this, _, _, cx| this.split_active(SplitDirection::Right, cx),
+                        |this, _, window, cx| this.split_active(SplitDirection::Right, window, cx),
                     ))
                     .child(
                         div()

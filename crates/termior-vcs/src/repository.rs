@@ -476,9 +476,12 @@ mod tests {
         let sig = Signature::now("Test", "test@example.com").unwrap();
         raw.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
             .unwrap();
+        // Authorize the same libgit2-normalized workdir representation that `open` validates.
+        // This avoids platform aliases such as `/var` → `/private/var` and Windows temp paths.
+        let root_path = raw.workdir().unwrap_or_else(|| raw.path()).to_path_buf();
         drop(tree);
         drop(raw);
-        let root = dir.path().to_string_lossy().replace('\\', "/");
+        let root = root_path.to_string_lossy().replace('\\', "/");
         let auth = WorkspaceAuthRegistry::with_roots([root]);
         let repo = GitRepository::open(dir.path(), &auth).unwrap();
         (dir, auth, repo)
