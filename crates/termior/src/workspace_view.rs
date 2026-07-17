@@ -1,9 +1,12 @@
+use crate::ai_diff_view::{AiDiffAction, AiDiffView};
 use crate::app_identity;
-use crate::composer_view::ComposerView;
+use crate::composer_view::{ComposerView, EditReviewRequested};
 use crate::editor_view::EditorView;
+use crate::git_views::{GitDiffAction, GitDiffView, GitHistoryAction, GitHistoryView};
 use crate::preview_view::PreviewView;
 use crate::settings_view::SettingsView;
 use crate::terminal_view::{TerminalView, TerminalViewEvent};
+use futures::StreamExt;
 use gpui::{
     anchored, canvas, div, prelude::*, px, relative, size, AnyElement, AnyWindowHandle, App,
     Bounds, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
@@ -44,6 +47,9 @@ enum PaneContent {
     Terminal(Entity<TerminalView>),
     Editor(Entity<EditorView>),
     Preview(Entity<PreviewView>),
+    AiDiff(Entity<AiDiffView>),
+    GitDiff(Entity<GitDiffView>),
+    GitHistory(Entity<GitHistoryView>),
     Placeholder(String),
 }
 
@@ -53,6 +59,9 @@ impl PaneContent {
             Self::Terminal(entity) => div().size_full().child(entity.clone()).into_any_element(),
             Self::Editor(entity) => div().size_full().child(entity.clone()).into_any_element(),
             Self::Preview(entity) => div().size_full().child(entity.clone()).into_any_element(),
+            Self::AiDiff(entity) => div().size_full().child(entity.clone()).into_any_element(),
+            Self::GitDiff(entity) => div().size_full().child(entity.clone()).into_any_element(),
+            Self::GitHistory(entity) => div().size_full().child(entity.clone()).into_any_element(),
             Self::Placeholder(message) => div()
                 .flex()
                 .size_full()
@@ -98,6 +107,15 @@ enum CommandMode {
 struct ExplorerContextMenu {
     target: ExplorerContextTarget,
     position: Point<Pixels>,
+}
+
+#[derive(Debug, Clone)]
+struct PaneResizeState {
+    path: Vec<usize>,
+    direction: SplitDirection,
+    start_position: Point<Pixels>,
+    start_ratio: f32,
+    extent: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,7 +187,10 @@ pub struct WorkspaceView {
     pending_rename_target: Option<PathBuf>,
     explorer_context_menu: Option<ExplorerContextMenu>,
     sidebar_resizing: bool,
+    pane_resizing: Option<PaneResizeState>,
     content_matches: Vec<ContentMatch>,
+    content_search_generation: u64,
+    content_searching: bool,
     vcs_status: Vec<ChangedFile>,
     vcs_history: Vec<CommitInfo>,
     vcs_branch: Option<BranchState>,
@@ -295,6 +316,13 @@ impl WorkspaceView {
             },
         )
         .detach();
+        cx.subscribe(
+            &composer,
+            |workspace, _composer, request: &EditReviewRequested, cx| {
+                workspace.open_ai_diff(request.0.clone(), cx);
+            },
+        )
+        .detach();
         let mut notification_router = NotificationRouter::default();
         notification_router.set_enabled(settings.agent_notifications);
         notification_router.update_agent(AgentIndicator {
@@ -329,7 +357,10 @@ impl WorkspaceView {
             pending_rename_target: None,
             explorer_context_menu: None,
             sidebar_resizing: false,
+            pane_resizing: None,
             content_matches: Vec::new(),
+            content_search_generation: 0,
+            content_searching: false,
             vcs_status,
             vcs_history,
             vcs_branch,
@@ -346,7 +377,7 @@ impl WorkspaceView {
     }
 
     pub fn restore_or_create_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let terminal_panes: Vec<(TabId, PaneId, Option<PathBuf>)> = self
+        let terminal_panes: Vec<(TabId, PaneId, Option<PathBuf>, bool)> = self
             .model
             .tabs
             .iter()
@@ -355,15 +386,22 @@ impl WorkspaceView {
                 tab.layout
                     .panes()
                     .into_iter()
-                    .map(|pane_id| (tab.id, pane_id, Some(tab.cwd.clone())))
+                    .map(|pane_id| (tab.id, pane_id, Some(tab.cwd.clone()), tab.private_terminal))
                     .collect::<Vec<_>>()
             })
             .collect();
         if terminal_panes.is_empty() && self.model.tabs.is_empty() {
             self.create_terminal(false, window, cx);
         } else {
-            for (id, pane_id, cwd) in terminal_panes {
-                self.spawn_terminal_into(id, pane_id, cwd, Some(window.window_handle()), cx);
+            for (id, pane_id, cwd, private) in terminal_panes {
+                self.spawn_terminal_into(
+                    id,
+                    pane_id,
+                    cwd,
+                    private,
+                    Some(window.window_handle()),
+                    cx,
+                );
             }
             let previews = self
                 .model
@@ -463,6 +501,15 @@ impl WorkspaceView {
                         if root_changed || workspace.explorer_watcher.is_none() {
                             workspace.explorer_watcher = WorkspaceWatcher::watch(index.root()).ok();
                         }
+                        let paths = index
+                            .entries()
+                            .iter()
+                            .filter(|entry| !entry.is_dir)
+                            .map(|entry| entry.relative.clone())
+                            .collect();
+                        workspace
+                            .composer
+                            .update(cx, |composer, _| composer.set_workspace_paths(paths));
                         workspace.explorer = Some(index);
                         workspace.explorer_error = None;
                     }
@@ -526,7 +573,14 @@ impl WorkspaceView {
             panes: single_pane(PaneContent::Placeholder("Starting terminal…".into())),
         });
         self.activate_runtime(id, cx);
-        self.spawn_terminal_into(id, PaneId(1), cwd, Some(window.window_handle()), cx);
+        self.spawn_terminal_into(
+            id,
+            PaneId(1),
+            cwd,
+            private,
+            Some(window.window_handle()),
+            cx,
+        );
         cx.notify();
     }
 
@@ -535,6 +589,7 @@ impl WorkspaceView {
         tab_id: TabId,
         pane_id: PaneId,
         cwd: Option<PathBuf>,
+        private: bool,
         window_handle: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) {
@@ -549,7 +604,8 @@ impl WorkspaceView {
         };
         let config = termior_terminal::PtySessionConfig {
             shell_program,
-            shell_integration: false,
+            shell_integration: true,
+            inherit_environment: !private,
             cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
             workspace_auth: Some(workspace_auth),
             ..Default::default()
@@ -734,6 +790,272 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn open_ai_diff(&mut self, summary: termior_ai::EditProposalSummary, cx: &mut Context<Self>) {
+        if let Some(id) = self
+            .model
+            .tabs
+            .iter()
+            .find(|tab| {
+                tab.kind == TabKind::AiDiff && tab.resource.as_deref() == Some(summary.id.as_str())
+            })
+            .map(|tab| tab.id)
+        {
+            self.activate_runtime(id, cx);
+            cx.notify();
+            return;
+        }
+        let title = Path::new(&summary.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("AI Diff · {name}"))
+            .unwrap_or_else(|| "AI Diff".into());
+        let proposal_id = summary.id.clone();
+        let entity = cx.new(|_| AiDiffView::new(summary));
+        cx.subscribe(&entity, |workspace, diff, action: &AiDiffAction, cx| {
+            let result = match action {
+                AiDiffAction::Apply {
+                    proposal_id,
+                    accepted_hunks,
+                } => workspace.composer.update(cx, |composer, cx| {
+                    composer.apply_reviewed_edit(proposal_id, accepted_hunks, cx)
+                }),
+                AiDiffAction::RejectAll { proposal_id } => {
+                    workspace.composer.update(cx, |composer, cx| {
+                        composer.reject_reviewed_edit(proposal_id, cx)
+                    })
+                }
+            };
+            diff.update(cx, |diff, cx| diff.set_result(result, cx));
+            workspace.refresh_workspace_data(cx);
+            cx.notify();
+        })
+        .detach();
+        let id = self.model.new_tab(TabKind::AiDiff, title, false);
+        if let Some(tab) = self.model.active_tab_mut() {
+            tab.resource = Some(proposal_id);
+        }
+        self.tabs.push(AppTab {
+            id,
+            panes: single_pane(PaneContent::AiDiff(entity)),
+        });
+        self.activate_runtime(id, cx);
+        cx.notify();
+    }
+
+    fn open_git_diff(&mut self, path: String, group: ChangeGroup, cx: &mut Context<Self>) {
+        let resource = format!("{group:?}:{path}");
+        if let Some(id) = self
+            .model
+            .tabs
+            .iter()
+            .find(|tab| {
+                tab.kind == TabKind::GitDiff && tab.resource.as_deref() == Some(resource.as_str())
+            })
+            .map(|tab| tab.id)
+        {
+            self.activate_runtime(id, cx);
+            cx.notify();
+            return;
+        }
+        let patch = self
+            .git_repository()
+            .and_then(|repo| {
+                repo.diff_file(&path, group == ChangeGroup::Staged)
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap_or_else(|error| format!("Could not load diff: {error}"));
+        let title = Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("Git Diff · {name}"))
+            .unwrap_or_else(|| "Git Diff".into());
+        let entity = cx.new(|_| GitDiffView::working(path.clone(), group, patch));
+        cx.subscribe(&entity, |workspace, diff, action: &GitDiffAction, cx| {
+            workspace.handle_git_diff_action(&diff, action.clone(), cx)
+        })
+        .detach();
+        let id = self.model.new_tab(TabKind::GitDiff, title, false);
+        if let Some(tab) = self.model.active_tab_mut() {
+            tab.resource = Some(resource);
+        }
+        self.tabs.push(AppTab {
+            id,
+            panes: single_pane(PaneContent::GitDiff(entity)),
+        });
+        self.activate_runtime(id, cx);
+        cx.notify();
+    }
+
+    fn handle_git_diff_action(
+        &mut self,
+        view: &Entity<GitDiffView>,
+        action: GitDiffAction,
+        cx: &mut Context<Self>,
+    ) {
+        let (path, preferred_group, result) = match self.git_repository() {
+            Ok(repo) => match action {
+                GitDiffAction::StageHunk { path, patch } => (
+                    path,
+                    ChangeGroup::Unstaged,
+                    repo.stage_hunk(&patch)
+                        .map(|_| "Hunk staged".to_owned())
+                        .map_err(|error| error.to_string()),
+                ),
+                GitDiffAction::UnstageHunk { path, patch } => (
+                    path,
+                    ChangeGroup::Staged,
+                    repo.unstage_hunk(&patch)
+                        .map(|_| "Hunk unstaged".to_owned())
+                        .map_err(|error| error.to_string()),
+                ),
+                GitDiffAction::StageFile(path) => {
+                    let result = repo
+                        .stage_file(&path)
+                        .map(|_| "File staged".to_owned())
+                        .map_err(|error| error.to_string());
+                    (path, ChangeGroup::Staged, result)
+                }
+                GitDiffAction::UnstageFile(path) => {
+                    let result = repo
+                        .unstage_file(&path)
+                        .map(|_| "File unstaged".to_owned())
+                        .map_err(|error| error.to_string());
+                    (path, ChangeGroup::Unstaged, result)
+                }
+                GitDiffAction::DiscardFile(path) => {
+                    let result = repo
+                        .discard_file(&path)
+                        .map(|_| "Working-tree changes discarded".to_owned())
+                        .map_err(|error| error.to_string());
+                    (path, ChangeGroup::Unstaged, result)
+                }
+            },
+            Err(error) => (String::new(), ChangeGroup::Unstaged, Err(error)),
+        };
+        self.refresh_vcs_data();
+        let group = self
+            .vcs_status
+            .iter()
+            .find(|file| file.path == path && file.group == preferred_group)
+            .or_else(|| self.vcs_status.iter().find(|file| file.path == path))
+            .map(|file| file.group);
+        let patch = group.and_then(|group| {
+            self.git_repository()
+                .ok()
+                .and_then(|repo| repo.diff_file(&path, group == ChangeGroup::Staged).ok())
+        });
+        view.update(cx, |view, cx| {
+            view.update_after_action(result, patch, group, cx)
+        });
+        cx.notify();
+    }
+
+    fn open_git_history(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self
+            .model
+            .tabs
+            .iter()
+            .find(|tab| tab.kind == TabKind::GitHistory)
+            .map(|tab| tab.id)
+        {
+            self.activate_runtime(id, cx);
+            cx.notify();
+            return;
+        }
+        self.refresh_vcs_data();
+        let commits = self.vcs_history.clone();
+        let files = commits
+            .first()
+            .and_then(|commit| {
+                self.git_repository()
+                    .ok()
+                    .and_then(|repo| repo.commit_files(&commit.id).ok())
+            })
+            .unwrap_or_default();
+        let entity = cx.new(|cx| GitHistoryView::new(commits, files, cx));
+        cx.subscribe(
+            &entity,
+            |workspace, history, action: &GitHistoryAction, cx| match action {
+                GitHistoryAction::SelectCommit(commit) => {
+                    let files = workspace
+                        .git_repository()
+                        .ok()
+                        .and_then(|repo| repo.commit_files(commit).ok())
+                        .unwrap_or_default();
+                    history.update(cx, |history, cx| {
+                        history.set_commit_files(commit.clone(), files, cx)
+                    });
+                }
+                GitHistoryAction::OpenFile { commit, path } => {
+                    workspace.open_git_commit_file(commit.clone(), path.clone(), cx)
+                }
+                GitHistoryAction::OpenRemote(commit) => {
+                    if let Some(url) = workspace
+                        .git_repository()
+                        .ok()
+                        .and_then(|repo| repo.remote_commit_url(commit))
+                    {
+                        cx.open_url(&url);
+                    } else {
+                        workspace.command_message =
+                            Some("No supported origin URL for this commit".into());
+                    }
+                }
+            },
+        )
+        .detach();
+        let id = self
+            .model
+            .new_tab(TabKind::GitHistory, "Git History", false);
+        self.tabs.push(AppTab {
+            id,
+            panes: single_pane(PaneContent::GitHistory(entity)),
+        });
+        self.activate_runtime(id, cx);
+        cx.notify();
+    }
+
+    fn open_git_commit_file(&mut self, commit: String, path: String, cx: &mut Context<Self>) {
+        let resource = format!("{commit}:{path}");
+        if let Some(id) = self
+            .model
+            .tabs
+            .iter()
+            .find(|tab| {
+                tab.kind == TabKind::GitCommitFile
+                    && tab.resource.as_deref() == Some(resource.as_str())
+            })
+            .map(|tab| tab.id)
+        {
+            self.activate_runtime(id, cx);
+            cx.notify();
+            return;
+        }
+        let patch = self
+            .git_repository()
+            .and_then(|repo| {
+                repo.diff_commit_file(&commit, &path)
+                    .map_err(|error| error.to_string())
+            })
+            .unwrap_or_else(|error| format!("Could not load commit diff: {error}"));
+        let title = Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("Commit · {name}"))
+            .unwrap_or_else(|| "Commit File".into());
+        let entity = cx.new(|_| GitDiffView::commit_file(path, patch));
+        let id = self.model.new_tab(TabKind::GitCommitFile, title, false);
+        if let Some(tab) = self.model.active_tab_mut() {
+            tab.resource = Some(resource);
+        }
+        self.tabs.push(AppTab {
+            id,
+            panes: single_pane(PaneContent::GitDiff(entity)),
+        });
+        self.activate_runtime(id, cx);
+        cx.notify();
+    }
+
     fn split_active(
         &mut self,
         direction: SplitDirection,
@@ -765,7 +1087,18 @@ impl WorkspaceView {
         }
         if kind == Some(TabKind::Terminal) {
             let cwd = self.model.active_tab().map(|tab| tab.cwd.clone());
-            self.spawn_terminal_into(active, pane_id, cwd, Some(window.window_handle()), cx);
+            let private = self
+                .model
+                .active_tab()
+                .is_some_and(|tab| tab.private_terminal);
+            self.spawn_terminal_into(
+                active,
+                pane_id,
+                cwd,
+                private,
+                Some(window.window_handle()),
+                cx,
+            );
         } else {
             self.focus_active_pane(window, cx);
         }
@@ -832,7 +1165,14 @@ impl WorkspaceView {
                 let focus = editor.read(cx).focus_handle(cx);
                 window.focus(&focus, cx);
             }
-            PaneContent::Preview(_) | PaneContent::Placeholder(_) => {}
+            PaneContent::GitHistory(history) => {
+                let focus = history.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
+            PaneContent::Preview(_)
+            | PaneContent::AiDiff(_)
+            | PaneContent::GitDiff(_)
+            | PaneContent::Placeholder(_) => {}
         }
     }
 
@@ -1337,6 +1677,44 @@ impl WorkspaceView {
                 f32::from(event.position.x).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
             cx.notify();
         }
+        if let Some(resize) = self.pane_resizing.clone() {
+            let delta = match resize.direction {
+                SplitDirection::Right => f32::from(event.position.x - resize.start_position.x),
+                SplitDirection::Down => f32::from(event.position.y - resize.start_position.y),
+            };
+            let ratio = (resize.start_ratio + delta / resize.extent).clamp(0.1, 0.9);
+            if let Some(tab) = self.model.active_tab_mut() {
+                let _ = tab.layout.resize_split(&resize.path, ratio);
+                tab.state_generation = tab.state_generation.saturating_add(1);
+            }
+            cx.notify();
+        }
+    }
+
+    fn start_pane_resize(
+        &mut self,
+        path: Vec<usize>,
+        direction: SplitDirection,
+        ratio: f32,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport = window.viewport_size();
+        let extent = match direction {
+            SplitDirection::Right => f32::from(viewport.width),
+            SplitDirection::Down => f32::from(viewport.height),
+        }
+        .max(1.0);
+        self.pane_resizing = Some(PaneResizeState {
+            path,
+            direction,
+            start_position: event.position,
+            start_ratio: ratio,
+            extent,
+        });
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn stop_sidebar_resize(
@@ -1345,8 +1723,9 @@ impl WorkspaceView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.sidebar_resizing {
+        if self.sidebar_resizing || self.pane_resizing.is_some() {
             self.sidebar_resizing = false;
+            self.pane_resizing = None;
             self.persist_workspace();
             cx.notify();
         }
@@ -1463,6 +1842,8 @@ impl WorkspaceView {
         self.command_message = None;
         if mode == CommandMode::SearchContent {
             self.content_matches.clear();
+            self.content_search_generation = self.content_search_generation.saturating_add(1);
+            self.content_searching = false;
         }
         self.pending_name_parent = None;
         self.pending_rename_target = None;
@@ -1506,6 +1887,8 @@ impl WorkspaceView {
                 self.command_input.clear();
                 self.command_marked_text.clear();
                 self.content_matches.clear();
+                self.content_search_generation = self.content_search_generation.saturating_add(1);
+                self.content_searching = false;
                 self.pending_name_parent = None;
                 self.pending_rename_target = None;
             }
@@ -1528,6 +1911,10 @@ impl WorkspaceView {
         if input.is_empty() {
             return;
         }
+        if self.command_mode == CommandMode::SearchContent {
+            self.start_content_search(input, cx);
+            return;
+        }
         let completed_mode = self.command_mode;
         let result = match self.command_mode {
             CommandMode::FindFile => {
@@ -1545,26 +1932,7 @@ impl WorkspaceView {
                 }
             }
             CommandMode::SearchContent => {
-                self.content_matches.clear();
-                let paths = self
-                    .explorer
-                    .as_ref()
-                    .map(|index| {
-                        index
-                            .entries()
-                            .iter()
-                            .filter(|entry| !entry.is_dir)
-                            .map(|entry| entry.path.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                ContentSearch::default()
-                    .search_paths(&input, paths, |hit| {
-                        self.content_matches.push(hit);
-                        self.content_matches.len() < 200
-                    })
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
+                unreachable!("content search starts before command dispatch")
             }
             CommandMode::CreateFile => {
                 let result = if let Some(parent) = self.pending_name_parent.as_ref() {
@@ -1678,21 +2046,81 @@ impl WorkspaceView {
         }
     }
 
+    fn start_content_search(&mut self, query: String, cx: &mut Context<Self>) {
+        self.content_search_generation = self.content_search_generation.saturating_add(1);
+        let generation = self.content_search_generation;
+        self.content_matches.clear();
+        self.content_searching = true;
+        self.command_message = Some("Searching workspace…".into());
+        let paths = self
+            .explorer
+            .as_ref()
+            .map(|index| {
+                index
+                    .entries()
+                    .iter()
+                    .filter(|entry| !entry.is_dir)
+                    .map(|entry| entry.path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded::<ContentMatch>();
+        let search = cx.background_executor().spawn(async move {
+            let mut sent = 0usize;
+            ContentSearch::default()
+                .search_paths(&query, paths, |hit| {
+                    sent += 1;
+                    sender.unbounded_send(hit).is_ok() && sent < 200
+                })
+                .map_err(|error| error.to_string())
+        });
+        cx.spawn(async move |workspace, cx| {
+            while let Some(hit) = receiver.next().await {
+                let accepted = workspace
+                    .update(cx, |workspace, cx| {
+                        if generation != workspace.content_search_generation {
+                            return false;
+                        }
+                        workspace.content_matches.push(hit);
+                        workspace.command_message = Some(format!(
+                            "Searching… {} match{}",
+                            workspace.content_matches.len(),
+                            if workspace.content_matches.len() == 1 {
+                                ""
+                            } else {
+                                "es"
+                            }
+                        ));
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !accepted {
+                    break;
+                }
+            }
+            let result = search.await;
+            let _ = workspace.update(cx, |workspace, cx| {
+                if generation != workspace.content_search_generation {
+                    return;
+                }
+                workspace.content_searching = false;
+                workspace.command_message = Some(match result {
+                    Ok(_) if workspace.content_matches.is_empty() => "No content matches".into(),
+                    Ok(_) if workspace.content_matches.len() == 1 => "1 content match".into(),
+                    Ok(_) => format!("{} content matches", workspace.content_matches.len()),
+                    Err(error) => error,
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn git_repository(&self) -> Result<GitRepository, String> {
         GitRepository::open(&self.model.root, &self.workspace_auth)
             .map_err(|error| error.to_string())
-    }
-
-    fn toggle_git_file(&mut self, path: &str, group: ChangeGroup, cx: &mut Context<Self>) {
-        let result = self.git_repository().and_then(|repo| match group {
-            ChangeGroup::Staged => repo.unstage_file(path).map_err(|error| error.to_string()),
-            ChangeGroup::Unstaged | ChangeGroup::Untracked => {
-                repo.stage_file(path).map_err(|error| error.to_string())
-            }
-        });
-        self.command_message = result.err();
-        self.refresh_workspace_data(cx);
-        cx.notify();
     }
 
     fn stage_all(&mut self, cx: &mut Context<Self>) {
@@ -1734,8 +2162,95 @@ impl WorkspaceView {
         .detach();
     }
 
+    fn handle_explorer_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.command_mode != CommandMode::Browse
+            || self.model.sidebar_panel != SidebarPanel::Explorer
+            || !self.model.sidebar_visible
+            || !self.focus_handle.is_focused(window)
+        {
+            return false;
+        }
+        let mut entries = self
+            .explorer
+            .as_ref()
+            .map(|index| {
+                index
+                    .entries()
+                    .iter()
+                    .filter(|entry| explorer_entry_visible(entry, &self.explorer_tree))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        entries.sort_by(|a, b| a.relative.cmp(&b.relative));
+        if entries.is_empty() {
+            return false;
+        }
+        let selected = self
+            .explorer_tree
+            .selected()
+            .and_then(|path| entries.iter().position(|entry| entry.path == path))
+            .unwrap_or(0);
+        match event.keystroke.key.as_str() {
+            "up" => self
+                .explorer_tree
+                .select(entries[selected.saturating_sub(1)].path.clone()),
+            "down" => self
+                .explorer_tree
+                .select(entries[(selected + 1).min(entries.len() - 1)].path.clone()),
+            "home" => self.explorer_tree.select(entries[0].path.clone()),
+            "end" => self
+                .explorer_tree
+                .select(entries.last().expect("entries is non-empty").path.clone()),
+            "right" => {
+                let entry = &entries[selected];
+                if entry.is_dir && !self.explorer_tree.is_expanded(&entry.path) {
+                    self.explorer_tree.toggle_expanded(entry.path.clone());
+                } else if entry.is_dir {
+                    if let Some(child) = entries
+                        .iter()
+                        .skip(selected + 1)
+                        .find(|child| child.path.parent() == Some(entry.path.as_path()))
+                    {
+                        self.explorer_tree.select(child.path.clone());
+                    }
+                }
+            }
+            "left" => {
+                let entry = &entries[selected];
+                if entry.is_dir && self.explorer_tree.is_expanded(&entry.path) {
+                    self.explorer_tree.toggle_expanded(entry.path.clone());
+                } else if let Some(parent) = entry.path.parent() {
+                    if let Some(parent_entry) = entries.iter().find(|item| item.path == parent) {
+                        self.explorer_tree.select(parent_entry.path.clone());
+                    }
+                }
+            }
+            "enter" | "return" | "space" => {
+                let entry = entries[selected].clone();
+                if entry.is_dir {
+                    self.explorer_tree.toggle_expanded(entry.path);
+                } else {
+                    self.open_editor(entry.path, cx);
+                }
+            }
+            _ => return false,
+        }
+        cx.notify();
+        true
+    }
+
     fn global_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.handle_command_key(event, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.handle_explorer_key(event, window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -1788,6 +2303,7 @@ impl WorkspaceView {
             KeyAction::FocusExplorer => {
                 self.model.sidebar_panel = SidebarPanel::Explorer;
                 self.model.sidebar_visible = true;
+                window.focus(&self.focus_handle, cx);
             }
             KeyAction::FileFinder => {
                 self.model.sidebar_panel = SidebarPanel::Explorer;
@@ -1853,6 +2369,17 @@ impl WorkspaceView {
         focused: PaneId,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.layout_element_at(node, panes, focused, Vec::new(), cx)
+    }
+
+    fn layout_element_at(
+        &self,
+        node: &LayoutNode,
+        panes: &HashMap<PaneId, PaneContent>,
+        focused: PaneId,
+        path: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match node {
             LayoutNode::Pane { id } => {
                 let pane_id = *id;
@@ -1892,22 +2419,76 @@ impl WorkspaceView {
                 first,
                 second,
             } => {
-                let first = self.layout_element(first, panes, focused, cx);
-                let second = self.layout_element(second, panes, focused, cx);
+                let mut first_path = path.clone();
+                first_path.push(0);
+                let mut second_path = path.clone();
+                second_path.push(1);
+                let first = self.layout_element_at(first, panes, focused, first_path, cx);
+                let second = self.layout_element_at(second, panes, focused, second_path, cx);
                 let ratio = ratio.clamp(0.1, 0.9);
+                let resize_path = path.clone();
+                let resize_direction = *direction;
+                let resize_handle = div()
+                    .id(SharedString::from(format!(
+                        "pane-divider-{}",
+                        path.iter()
+                            .map(usize::to_string)
+                            .collect::<Vec<_>>()
+                            .join("-")
+                    )))
+                    .flex_shrink_0()
+                    .bg(gpui::rgba(0x344052ff))
+                    .hover(|style| style.bg(gpui::rgba(0x4f8fefff)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |workspace, event, window, cx| {
+                            workspace.start_pane_resize(
+                                resize_path.clone(),
+                                resize_direction,
+                                ratio,
+                                event,
+                                window,
+                                cx,
+                            )
+                        }),
+                    );
                 match direction {
                     SplitDirection::Right => div()
                         .flex()
                         .flex_row()
                         .size_full()
-                        .child(div().h_full().w(relative(ratio)).child(first))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(ratio))
+                                .flex_shrink_0()
+                                .child(first),
+                        )
+                        .child(
+                            resize_handle
+                                .w(px(5.0))
+                                .h_full()
+                                .cursor(CursorStyle::ResizeColumn),
+                        )
                         .child(div().h_full().flex_1().child(second))
                         .into_any_element(),
                     SplitDirection::Down => div()
                         .flex()
                         .flex_col()
                         .size_full()
-                        .child(div().w_full().h(relative(ratio)).child(first))
+                        .child(
+                            div()
+                                .w_full()
+                                .h(relative(ratio))
+                                .flex_shrink_0()
+                                .child(first),
+                        )
+                        .child(
+                            resize_handle
+                                .w_full()
+                                .h(px(5.0))
+                                .cursor(CursorStyle::ResizeRow),
+                        )
                         .child(div().w_full().flex_1().child(second))
                         .into_any_element(),
                 }
@@ -2261,7 +2842,7 @@ impl WorkspaceView {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
-                                    this.toggle_git_file(&path, group, cx)
+                                    this.open_git_diff(path.clone(), group, cx)
                                 }),
                             )
                     })
@@ -2291,7 +2872,17 @@ impl WorkspaceView {
                             )))
                     })
                     .collect::<Vec<_>>();
-                div().flex().flex_col().children(rows).into_any_element()
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(sidebar_button(
+                        "Open full history",
+                        "git-open-history",
+                        cx,
+                        |this, cx| this.open_git_history(cx),
+                    ))
+                    .children(rows)
+                    .into_any_element()
             }
         };
         div()

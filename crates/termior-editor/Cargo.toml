@@ -25,3 +25,8 @@ tree-sitter-md = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "large_file"
+harness = false

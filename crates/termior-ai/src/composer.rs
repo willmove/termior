@@ -76,6 +76,10 @@ pub enum ComposerError {
 }
 
 impl ComposerDraft {
+    pub fn attach_image(&mut self, name: impl Into<String>, mime: impl Into<String>, bytes: &[u8]) {
+        self.attachments.push(Attachment::image(name, mime, bytes));
+    }
+
     pub fn attach_file(&mut self, path: impl Into<PathBuf>) {
         let path = path.into();
         if !self

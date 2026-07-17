@@ -1,4 +1,3 @@
-# CI — domain/runtime crates on three platforms plus a Windows desktop compile gate.
 name: CI
 
 on:
@@ -6,7 +5,9 @@ on:
     branches: [main]
   pull_request:
 
-# 同分支新 run 取消旧 run，省额度。
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -36,38 +37,45 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Cache cargo registry + target
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
-
       - name: rustfmt
         run: cargo fmt --all -- --check
-
       - name: Clippy
         run: cargo clippy --workspace --all-targets --exclude termior -- -D warnings
-
       - name: Build
         run: cargo build --workspace --exclude termior --all-targets
-
       - name: Test
         run: cargo test --workspace --exclude termior --all-targets
 
-  desktop-check:
-    name: GPUI desktop (Windows)
-    runs-on: windows-latest
-    timeout-minutes: 30
+  desktop:
+    name: Desktop (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux desktop dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libfontconfig-dev libfreetype-dev libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev libudev-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -78,16 +86,61 @@ jobs:
         run: cargo check -p termior
       - name: Clippy desktop application
         run: cargo clippy -p termior --all-targets -- -D warnings
-      - name: Build desktop application
-        run: cargo build -p termior
-      - name: Launch and render desktop smoke frames
+      - name: Build release desktop application
+        run: cargo build -p termior --release
+      - name: Enforce binary size and record dependency tree
+        shell: pwsh
+        run: ./scripts/check-release-binary.ps1 -Platform ${{ matrix.platform }} -MaxBinaryMiB 60
+      - name: Upload dependency report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-tree-${{ matrix.platform }}
+          path: target/release-dependency-tree.txt
+      - name: Launch and render Windows smoke frames
+        if: matrix.platform == 'windows'
         shell: pwsh
         run: |
           $env:TERMIOR_SMOKE_TEST = "1"
-          $output = cargo run -p termior -- --workspace . 2>&1
+          $output = & ./target/release/termior.exe 2>&1
           $exitCode = $LASTEXITCODE
           $output | Write-Host
-          $outputText = $output | Out-String
-          if ($exitCode -ne 0 -or $outputText -notmatch "TERMIOR_SMOKE_OK") {
+          if ($exitCode -ne 0 -or ($output | Out-String) -notmatch "TERMIOR_SMOKE_OK") {
             throw "Termior desktop smoke launch did not complete successfully"
           }
+
+  coverage:
+    name: Core coverage ≥ 80%
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - name: Measure line coverage
+        run: cargo llvm-cov --workspace --exclude termior --tests --lcov --output-path target/lcov.info --fail-under-lines 80
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: target/lcov.info
+
+  benchmark:
+    name: 5 MiB editor benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - name: Run quick benchmark gate
+        run: cargo bench -p termior-editor --bench large_file -- --quick
+      - uses: actions/upload-artifact@v4
+        with:
+          name: editor-benchmark-report
+          path: target/criterion

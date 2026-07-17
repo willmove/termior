@@ -31,6 +31,9 @@ pub struct TabState {
     /// File or URL represented by this tab, when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
+    /// Private terminal tabs do not inherit the active tab's cwd or application environment.
+    #[serde(default)]
+    pub private_terminal: bool,
     pub layout: PaneLayout,
     /// View owners increment this for meaningful state changes; tab switching never does.
     pub state_generation: u64,
@@ -121,6 +124,7 @@ impl WorkspaceState {
             title: title.into(),
             cwd,
             resource: None,
+            private_terminal: kind == TabKind::Terminal && private,
             layout: PaneLayout::new(),
             state_generation: 0,
         });
@@ -246,6 +250,21 @@ mod tests {
         ws.switch_to(first).unwrap();
         assert_eq!(ws.active_tab().unwrap().state_generation, 9);
         ws.switch_to(second).unwrap();
+    }
+
+    #[test]
+    fn private_terminal_uses_workspace_root_and_persists_privacy() {
+        let mut ws = WorkspaceState::new("/workspace");
+        ws.new_tab(TabKind::Terminal, "terminal", false);
+        ws.set_active_cwd("/workspace/app");
+        ws.new_tab(TabKind::Terminal, "private", true);
+        let private = ws.active_tab().unwrap();
+        assert_eq!(private.cwd, Path::new("/workspace"));
+        assert!(private.private_terminal);
+
+        let restored: WorkspaceState =
+            serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        assert!(restored.active_tab().unwrap().private_terminal);
     }
 
     #[test]

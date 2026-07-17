@@ -7,5 +7,6 @@ mod repository;
 
 pub use graph::{allocate_lanes, CommitNode, LaneCommit};
 pub use repository::{
-    BranchState, ChangeGroup, ChangedFile, CommitInfo, GitError, GitRepository, RemoteOperation,
+    parse_diff_hunks, BranchState, ChangeGroup, ChangedFile, CommitInfo, GitDiffHunk, GitError,
+    GitRepository, RemoteOperation,
 };

@@ -1,9 +1,9 @@
 //! GPUI viewport for the rope/tree-sitter editor core, including IME preedit.
 
 use gpui::{
-    canvas, div, prelude::*, px, AnyElement, App, Bounds, Context, FocusHandle, Focusable,
-    InputHandler, KeyDownEvent, Pixels, Point, SharedString, StatefulInteractiveElement,
-    UTF16Selection, WeakEntity, Window,
+    canvas, div, prelude::*, px, uniform_list, AnyElement, App, Bounds, Context, FocusHandle,
+    Focusable, InputHandler, KeyDownEvent, Pixels, Point, ScrollStrategy, SharedString,
+    UTF16Selection, UniformListScrollHandle, WeakEntity, Window,
 };
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ pub struct EditorView {
     vim_enabled: bool,
     vim: VimEngine,
     visual_anchor: Option<usize>,
+    scroll_handle: UniformListScrollHandle,
 }
 
 impl EditorView {
@@ -42,6 +43,7 @@ impl EditorView {
             vim_enabled: false,
             vim: VimEngine::default(),
             visual_anchor: None,
+            scroll_handle: UniformListScrollHandle::default(),
         }
     }
 
@@ -71,6 +73,7 @@ impl EditorView {
             vim_enabled: false,
             vim: VimEngine::default(),
             visual_anchor: None,
+            scroll_handle: UniformListScrollHandle::default(),
         }
     }
 
@@ -124,12 +127,14 @@ impl EditorView {
     pub fn undo(&mut self, cx: &mut Context<Self>) {
         self.buffer.undo();
         self.reparse();
+        self.scroll_cursor_into_view();
         cx.notify();
     }
 
     pub fn redo(&mut self, cx: &mut Context<Self>) {
         self.buffer.redo();
         self.reparse();
+        self.scroll_cursor_into_view();
         cx.notify();
     }
 
@@ -183,6 +188,7 @@ impl EditorView {
             if let Some(command) = self.vim.feed(&vim_key) {
                 self.execute_vim(command);
             }
+            self.scroll_cursor_into_view();
             cx.notify();
             return;
         }
@@ -190,6 +196,7 @@ impl EditorView {
             if let Some(command) = self.vim.feed("esc") {
                 self.execute_vim(command);
             }
+            self.scroll_cursor_into_view();
             cx.notify();
             return;
         }
@@ -232,12 +239,26 @@ impl EditorView {
             }
             _ => return,
         }
+        self.scroll_cursor_into_view();
         cx.notify();
     }
 
     fn reparse(&mut self) {
-        self.syntax.reparse(&self.buffer.text());
+        let edits = self.buffer.take_pending_edits();
+        if !edits.is_empty() {
+            self.syntax.reparse_incremental(&self.buffer.text(), &edits);
+        }
         self.update_search();
+    }
+
+    fn scroll_cursor_into_view(&self) {
+        if let Ok((line, _)) = self
+            .buffer
+            .line_col_for_char(self.buffer.cursor().char_index)
+        {
+            self.scroll_handle
+                .scroll_to_item(line, ScrollStrategy::Nearest);
+        }
     }
 
     fn update_search(&mut self) {
@@ -249,10 +270,97 @@ impl EditorView {
 
     fn select_current_search(&mut self) {
         if let Some(found) = self.search_matches.get(self.search.current) {
-            let _ = self
-                .buffer
-                .set_selection(found.char_range.start, found.char_range.end);
+            let range = found.char_range.clone();
+            let line = found.line;
+            let _ = self.buffer.set_selection(range.start, range.end);
+            self.scroll_handle
+                .scroll_to_item(line, ScrollStrategy::Center);
         }
+    }
+
+    fn render_visible_lines(&mut self, range: Range<usize>) -> Vec<AnyElement> {
+        let requested_lines = range.len();
+        let viewport = self.buffer.text_for_lines(range.clone());
+        let global_end = viewport.start_byte + viewport.text.len();
+        let spans = self
+            .syntax
+            .highlight_spans(viewport.start_byte..global_end)
+            .into_iter()
+            .map(|mut span| {
+                span.byte_range = span.byte_range.start.saturating_sub(viewport.start_byte)
+                    ..span.byte_range.end.saturating_sub(viewport.start_byte);
+                span
+            })
+            .collect::<Vec<_>>();
+        let cursor_byte = self
+            .buffer
+            .byte_for_char(self.buffer.cursor().char_index)
+            .ok()
+            .filter(|byte| *byte >= viewport.start_byte && *byte <= global_end)
+            .map(|byte| byte - viewport.start_byte)
+            .unwrap_or(usize::MAX);
+        let marked_text = self.marked_text.clone();
+        let theme = self.theme.clone();
+        let selected_lines = self.buffer.selection().map(|selection| {
+            let selection = selection.range();
+            let start = self
+                .buffer
+                .line_col_for_char(selection.start)
+                .map(|value| value.0)
+                .unwrap_or(0);
+            let end = self
+                .buffer
+                .line_col_for_char(selection.end)
+                .map(|value| value.0)
+                .unwrap_or(start);
+            start..=end
+        });
+
+        line_ranges(&viewport.text)
+            .into_iter()
+            .take(requested_lines)
+            .enumerate()
+            .map(|(offset, line_range)| {
+                let line_index = viewport.start_line + offset;
+                let segments = highlighted_segments(
+                    &viewport.text,
+                    line_range,
+                    &spans,
+                    cursor_byte,
+                    &marked_text,
+                    &theme,
+                );
+                let is_match = self
+                    .search_matches
+                    .iter()
+                    .any(|found| found.line == line_index);
+                let is_selected = selected_lines
+                    .as_ref()
+                    .is_some_and(|lines| lines.contains(&line_index));
+                div()
+                    .flex()
+                    .flex_row()
+                    .w_full()
+                    .px_3()
+                    .bg(if is_selected {
+                        parse_hex(&theme.selection)
+                    } else if is_match {
+                        gpui::rgba(0x5f4b2488)
+                    } else {
+                        gpui::rgba(0x00000000)
+                    })
+                    .child(
+                        div()
+                            .w(px(52.0))
+                            .pr_3()
+                            .text_right()
+                            .text_color(gpui::rgba(0x738091ff))
+                            .child(SharedString::from(format!("{}", line_index + 1))),
+                    )
+                    .child(div().flex().flex_1().children(segments))
+                    .into_any_element()
+            })
+            .collect()
     }
 
     fn execute_vim(&mut self, command: VimCommand) {
@@ -433,64 +541,16 @@ impl Render for EditorView {
         let handler = EditorInputHandler {
             view: cx.entity().downgrade(),
         };
-        let source = self.buffer.text();
-        let spans = self.syntax.highlight_spans(0..source.len());
-        let cursor_byte = char_to_byte(&source, self.buffer.cursor().char_index);
-        let marked_text = self.marked_text.clone();
-        let theme = self.theme.clone();
-        let selected_lines = self.buffer.selection().map(|selection| {
-            let range = selection.range();
-            let start = self
-                .buffer
-                .line_col_for_char(range.start)
-                .map(|value| value.0)
-                .unwrap_or(0);
-            let end = self
-                .buffer
-                .line_col_for_char(range.end)
-                .map(|value| value.0)
-                .unwrap_or(start);
-            start..=end
-        });
-        let lines = line_ranges(&source)
-            .into_iter()
-            .take(500)
-            .enumerate()
-            .map(|(index, range)| {
-                let segments = highlighted_segments(
-                    &source,
-                    range.clone(),
-                    &spans,
-                    cursor_byte,
-                    &marked_text,
-                    &theme,
-                );
-                let is_match = self.search_matches.iter().any(|found| found.line == index);
-                let is_selected = selected_lines
-                    .as_ref()
-                    .is_some_and(|lines| lines.contains(&index));
-                div()
-                    .flex()
-                    .flex_row()
-                    .w_full()
-                    .bg(if is_selected {
-                        parse_hex(&theme.selection)
-                    } else if is_match {
-                        gpui::rgba(0x5f4b2488)
-                    } else {
-                        gpui::rgba(0x00000000)
-                    })
-                    .child(
-                        div()
-                            .w(px(52.0))
-                            .pr_3()
-                            .text_right()
-                            .text_color(gpui::rgba(0x738091ff))
-                            .child(SharedString::from(format!("{}", index + 1))),
-                    )
-                    .child(div().flex().flex_1().children(segments))
-            })
-            .collect::<Vec<_>>();
+        let line_count = self.buffer.len_lines();
+        let lines = uniform_list(
+            "editor-lines",
+            line_count,
+            cx.processor(|this, range: Range<usize>, _window, _cx| {
+                this.render_visible_lines(range)
+            }),
+        )
+        .track_scroll(&self.scroll_handle)
+        .size_full();
 
         let search_overlay = self.search.visible.then(|| {
             div()
@@ -545,7 +605,6 @@ impl Render for EditorView {
             .track_focus(&focus)
             .on_key_down(cx.listener(Self::handle_key_down))
             .size_full()
-            .overflow_y_scroll()
             .bg(parse_hex(&self.theme.background))
             .text_color(parse_hex(&self.theme.foreground))
             .font_family("monospace")
@@ -560,7 +619,7 @@ impl Render for EditorView {
                 .absolute()
                 .size_full(),
             )
-            .child(div().flex().flex_col().p_3().children(lines))
+            .child(lines)
             .children(search_overlay)
             .children(vim_status)
     }
@@ -645,6 +704,7 @@ impl InputHandler for EditorInputHandler {
             let _ = view.buffer.replace(range, text);
             view.marked_text.clear();
             view.reparse();
+            view.scroll_cursor_into_view();
             cx.notify();
         });
     }
@@ -815,11 +875,4 @@ fn parse_hex(value: &str) -> gpui::Rgba {
         .ok()
         .map(|rgb| gpui::rgba((rgb << 8) | 0xff))
         .unwrap_or_else(|| gpui::rgba(0xffffffff))
-}
-
-fn char_to_byte(text: &str, index: usize) -> usize {
-    text.char_indices()
-        .nth(index)
-        .map(|(byte, _)| byte)
-        .unwrap_or(text.len())
 }

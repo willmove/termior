@@ -11,7 +11,9 @@ pub mod syntax;
 pub mod theme;
 pub mod vim;
 
-pub use buffer::{Cursor, EditError, EditorBuffer, SearchMatch, Selection};
+pub use buffer::{
+    BufferEdit, Cursor, EditError, EditorBuffer, SearchMatch, Selection, TextPoint, ViewportText,
+};
 pub use completion::{CompletionController, CompletionState};
 pub use syntax::{HighlightKind, HighlightSpan, SyntaxDocument, SyntaxLanguage};
 pub use theme::{builtin_editor_themes, EditorTheme};

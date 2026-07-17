@@ -15,6 +15,7 @@ termior-terminal = { workspace = true }
 termior-terminal-core = { workspace = true }
 termior-editor = { workspace = true }
 termior-explorer = { workspace = true }
+termior-explorer-core = { workspace = true }
 termior-vcs = { workspace = true }
 termior-preview = { workspace = true }
 termior-platform = { workspace = true }

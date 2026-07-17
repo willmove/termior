@@ -34,6 +34,9 @@ pub struct PtySessionConfig {
     /// Keep shell integration opt-in so the plain interactive shell remains the reliability
     /// baseline while integration evolves independently.
     pub shell_integration: bool,
+    /// Whether the child receives the full application environment. Private terminals retain
+    /// only the small set of variables required to locate and start the user's shell.
+    pub inherit_environment: bool,
     pub rows: u16,
     pub cols: u16,
     pub cwd: Option<String>,
@@ -48,6 +51,7 @@ impl Default for PtySessionConfig {
             shell: None,
             shell_program: None,
             shell_integration: false,
+            inherit_environment: true,
             rows: 24,
             cols: 80,
             cwd: None,
@@ -302,6 +306,13 @@ fn build_command(
     config: &PtySessionConfig,
 ) -> Result<(CommandBuilder, Option<tempfile::TempDir>), SpawnError> {
     let mut cmd = CommandBuilder::new(program);
+    if !config.inherit_environment {
+        let retained = private_environment();
+        cmd.env_clear();
+        for (key, value) in retained {
+            cmd.env(key, value);
+        }
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TERM_PROGRAM", "Termior");
@@ -328,6 +339,34 @@ fn build_command(
     }
 
     Ok((cmd, integration_dir))
+}
+
+/// Keep the platform variables required to resolve executables, home directories and temporary
+/// files without leaking arbitrary application/session variables into a private terminal.
+fn private_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(key, _)| private_environment_key(key))
+        .collect()
+}
+
+fn private_environment_key(key: &std::ffi::OsStr) -> bool {
+    let key = key.to_string_lossy();
+    [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LC_ALL",
+        "SHELL",
+    ]
+    .iter()
+    .any(|allowed| key.eq_ignore_ascii_case(allowed))
 }
 
 /// shell 可执行名。
@@ -443,6 +482,30 @@ mod tests {
             command.get_env("COLORTERM"),
             Some(std::ffi::OsStr::new("truecolor"))
         );
+    }
+
+    #[test]
+    fn private_terminal_keeps_only_required_environment() {
+        assert!(private_environment_key(std::ffi::OsStr::new("PATH")));
+        assert!(private_environment_key(std::ffi::OsStr::new("SystemRoot")));
+        assert!(!private_environment_key(std::ffi::OsStr::new(
+            "TERMIOR_PARENT_SESSION_SECRET"
+        )));
+
+        let config = PtySessionConfig {
+            inherit_environment: false,
+            ..PtySessionConfig::default()
+        };
+        let (command, _) = build_command(ShellKind::Cmd, "cmd", false, &config).unwrap();
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
+        if let Some((key, _)) =
+            std::env::vars_os().find(|(key, _)| !private_environment_key(key) && key != "TERM")
+        {
+            assert_eq!(command.get_env(key), None);
+        }
     }
 
     #[test]

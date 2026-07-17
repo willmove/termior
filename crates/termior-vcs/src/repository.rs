@@ -41,6 +41,45 @@ pub struct CommitInfo {
     pub lane: Option<LaneCommit>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitDiffHunk {
+    pub header: String,
+    /// A complete, apply-ready patch containing the file header and this hunk only.
+    pub patch: String,
+}
+
+/// Split a git patch into independently applicable hunks while retaining its file header.
+pub fn parse_diff_hunks(patch: &str) -> Vec<GitDiffHunk> {
+    let mut file_header = String::new();
+    let mut current_header = None::<String>;
+    let mut current_body = String::new();
+    let mut hunks = Vec::new();
+    for line in patch.split_inclusive('\n') {
+        if line.starts_with("@@") {
+            if let Some(header) = current_header.take() {
+                hunks.push(GitDiffHunk {
+                    header,
+                    patch: format!("{file_header}{current_body}"),
+                });
+                current_body.clear();
+            }
+            current_header = Some(line.trim_end().to_owned());
+            current_body.push_str(line);
+        } else if current_header.is_some() {
+            current_body.push_str(line);
+        } else {
+            file_header.push_str(line);
+        }
+    }
+    if let Some(header) = current_header {
+        hunks.push(GitDiffHunk {
+            header,
+            patch: format!("{file_header}{current_body}"),
+        });
+    }
+    hunks
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteOperation {
     Fetch,
@@ -173,6 +212,13 @@ impl GitRepository {
 
     pub fn discard_file(&self, relative: impl AsRef<Path>) -> Result<(), GitError> {
         let relative = self.checked_relative(relative)?;
+        if self.repo.status_file(&relative)?.contains(Status::WT_NEW) {
+            let path = self.root.join(&relative);
+            if path.is_file() || path.is_symlink() {
+                std::fs::remove_file(path)?;
+                return Ok(());
+            }
+        }
         self.run_git(["checkout", "--", &relative.to_string_lossy()], None)
             .map(|_| ())
     }
@@ -361,6 +407,36 @@ impl GitRepository {
         Ok(commits)
     }
 
+    pub fn commit_files(&self, commit: &str) -> Result<Vec<String>, GitError> {
+        let commit = self.repo.find_commit(Oid::from_str(commit)?)?;
+        let tree = commit.tree()?;
+        let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok());
+        let diff = self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        let mut files = diff
+            .deltas()
+            .filter_map(|delta| delta.new_file().path().or_else(|| delta.old_file().path()))
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect::<Vec<_>>();
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
+
+    pub fn diff_commit_file(&self, commit: &str, relative: &str) -> Result<String, GitError> {
+        let relative = self.checked_relative(relative)?;
+        let commit = self.repo.find_commit(Oid::from_str(commit)?)?;
+        let tree = commit.tree()?;
+        let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok());
+        let mut options = DiffOptions::new();
+        options.pathspec(&relative);
+        let diff =
+            self.repo
+                .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut options))?;
+        render_patch(&diff)
+    }
+
     pub fn remote_commit_url(&self, commit: &str) -> Option<String> {
         let remote = self.repo.find_remote("origin").ok()?;
         let url = remote.url().ok()?;
@@ -409,6 +485,18 @@ impl GitRepository {
             ))
         }
     }
+}
+
+fn render_patch(diff: &git2::Diff<'_>) -> Result<String, GitError> {
+    let mut bytes = Vec::new();
+    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        if matches!(line.origin(), '+' | '-' | ' ') {
+            bytes.push(line.origin() as u8);
+        }
+        bytes.extend_from_slice(line.content());
+        true
+    })?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn changed(path: &str, group: ChangeGroup, status: &str) -> ChangedFile {
@@ -517,6 +605,59 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].summary, "second");
         assert!(history.iter().all(|commit| commit.lane.is_some()));
+        let files = repo.commit_files(&history[0].id).unwrap();
+        assert_eq!(files, vec!["a.txt"]);
+        assert!(repo
+            .diff_commit_file(&history[0].id, "a.txt")
+            .unwrap()
+            .contains("+two"));
+    }
+
+    #[test]
+    fn patch_parser_keeps_file_header_on_each_hunk() {
+        let patch = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n@@ -4,0 +5 @@\n+tail\n";
+        let hunks = parse_diff_hunks(patch);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].header, "@@ -1 +1 @@");
+        assert!(hunks
+            .iter()
+            .all(|hunk| hunk.patch.starts_with("diff --git")));
+        assert!(hunks[1].patch.contains("@@ -4,0 +5 @@"));
+        assert!(!hunks[1].patch.contains("@@ -1 +1 @@"));
+    }
+
+    #[test]
+    fn individual_worktree_hunk_can_be_staged() {
+        let (dir, _auth, repo) = repo();
+        let original = (0..20)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(dir.path().join("a.txt"), &original).unwrap();
+        repo.stage_file("a.txt").unwrap();
+        repo.commit("lines").unwrap();
+        let changed = original
+            .replace("line 1\n", "line one\n")
+            .replace("line 18\n", "line eighteen\n");
+        fs::write(dir.path().join("a.txt"), changed).unwrap();
+        let hunks = parse_diff_hunks(&repo.diff_file("a.txt", false).unwrap());
+        assert_eq!(hunks.len(), 2);
+        repo.stage_hunk(&hunks[0].patch).unwrap();
+        let status = repo.status().unwrap();
+        assert!(status
+            .iter()
+            .any(|file| file.path == "a.txt" && file.group == ChangeGroup::Staged));
+        assert!(status
+            .iter()
+            .any(|file| file.path == "a.txt" && file.group == ChangeGroup::Unstaged));
+    }
+
+    #[test]
+    fn confirmed_discard_removes_an_untracked_file() {
+        let (dir, _auth, repo) = repo();
+        let path = dir.path().join("scratch.txt");
+        fs::write(&path, "temporary").unwrap();
+        repo.discard_file("scratch.txt").unwrap();
+        assert!(!path.exists());
     }
 
     #[test]
