@@ -243,25 +243,35 @@ impl TerminalView {
             }
             AlacrittyEvent::ClipboardStore(kind, text) => {
                 let item = ClipboardItem::new_string(text);
-                match kind {
-                    // GPUI's view context exposes the system clipboard everywhere.
+                // Defer the clipboard access out of the current entity update: on
+                // Windows, opening the clipboard can dispatch sent messages back into
+                // our wndproc while this entity's RefCell is still borrowed.
+                cx.defer(move |cx| match kind {
+                    // GPUI's app context exposes the system clipboard everywhere.
                     // Primary selection is not portable (notably on Windows), so use
                     // the system clipboard as its fallback here.
                     ClipboardType::Clipboard | ClipboardType::Selection => {
                         cx.write_to_clipboard(item)
                     }
-                }
+                });
             }
             AlacrittyEvent::ClipboardLoad(kind, formatter) => {
-                let text = match kind {
-                    ClipboardType::Clipboard | ClipboardType::Selection => cx.read_from_clipboard(),
-                }
-                .and_then(|item| item.text())
-                .unwrap_or_default();
-                let reply = formatter(&text);
-                if let Err(error) = self.write_input(reply.as_bytes()) {
-                    log::warn!("terminal clipboard reply failed: {error}");
-                }
+                // Same re-entrancy hazard as ClipboardStore above: read the clipboard
+                // and reply to the PTY after the current update cycle completes.
+                let writer = self.bridge.writer();
+                cx.defer(move |cx| {
+                    let text = match kind {
+                        ClipboardType::Clipboard | ClipboardType::Selection => {
+                            cx.read_from_clipboard()
+                        }
+                    }
+                    .and_then(|item| item.text())
+                    .unwrap_or_default();
+                    let reply = formatter(&text);
+                    if let Err(error) = writer.write_all(reply.as_bytes()) {
+                        log::warn!("terminal clipboard reply failed: {error}");
+                    }
+                });
             }
             AlacrittyEvent::ColorRequest(index, formatter) => {
                 let color = self.term.colors()[index]
@@ -414,17 +424,25 @@ impl TerminalView {
         }
         if is_copy_shortcut(&ev.keystroke) {
             if let Some(text) = self.term.selection_to_string() {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                // Key listeners run inside this entity's update; defer the clipboard
+                // access so Windows clipboard message pumping cannot re-enter while
+                // the RefCell is borrowed (same hazard as in handle_terminal_event).
+                cx.defer(move |cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
             }
             return;
         }
         if is_paste_shortcut(&ev.keystroke) {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                let bytes = encode_paste(&text, *self.term.mode());
-                if let Err(error) = self.write_input(&bytes) {
-                    log::warn!("PTY paste error: {error}");
+            let mode = *self.term.mode();
+            let writer = self.bridge.writer();
+            // Same deferral as the copy path above.
+            cx.defer(move |cx| {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    let bytes = encode_paste(&text, mode);
+                    if let Err(error) = writer.write_all(&bytes) {
+                        log::warn!("PTY paste error: {error}");
+                    }
                 }
-            }
+            });
             return;
         }
         let bytes = keystroke_to_pty_bytes(&ev.keystroke, *self.term.mode());
@@ -711,7 +729,14 @@ impl Render for TerminalView {
                     }
                 },
                 move |_bounds, layout: LayoutInfo, window, cx| {
-                    window.handle_input(&input_focus, input_handler, cx);
+                    // Register the IME input handler only for the focused pane. With split
+                    // panes, unconditional per-frame registrations from every pane fight
+                    // each other, and on Windows each registration can trigger re-entrant
+                    // IME/TSF (COM) message traffic. Zed's terminal element gates the same
+                    // way (gpui's handle_input also checks focus internally on this rev).
+                    if input_focus.is_focused(window) {
+                        window.handle_input(&input_focus, input_handler, cx);
+                    }
                     paint_terminal(
                         &layout,
                         &snapshot,

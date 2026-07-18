@@ -59,8 +59,8 @@ impl WorkspaceAuthRegistry {
     /// 判定目标路径是否落在某个已授权工作区内（含等价或子路径）。
     pub fn is_authorized(&self, target: &str) -> bool {
         let t = canonicalize_logical(target);
-        // 去掉末尾分隔符以规范化比较
-        let t = t.trim_end_matches('/').to_string();
+        // 去掉末尾分隔符以规范化比较；盘符路径折叠大小写（Windows 语义）
+        let t = fold_drive_path_case(t.trim_end_matches('/'));
         for r in &self.roots {
             if t == *r {
                 return true;
@@ -84,7 +84,20 @@ impl WorkspaceAuthRegistry {
 
 fn normalize_root(root: &str) -> String {
     let c = canonicalize_logical(root);
-    c.trim_end_matches('/').to_string()
+    fold_drive_path_case(c.trim_end_matches('/'))
+}
+
+/// Windows 盘符路径（规范化后以 `X:` 开头）按不区分大小写比较：存储与比较前
+/// 统一折叠为小写。为保证测试在任意宿主 OS 上行为一致，此规则**不依赖**
+/// 编译目标平台——盘符前缀本身即代表 Windows 文件系统语义（NTFS 不区分大小写）。
+/// Unix 风格绝对路径（`/...`）保持大小写敏感。
+fn fold_drive_path_case(path: &str) -> String {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        path.to_ascii_lowercase()
+    } else {
+        path.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +197,25 @@ mod tests {
         let reg = WorkspaceAuthRegistry::with_roots([r"C:\proj".to_string()]);
         // 穿到 C:\Windows
         assert!(!reg.is_authorized(r"C:\proj\..\Windows\System32"));
+    }
+
+    #[test]
+    fn windows_drive_paths_compare_case_insensitively() {
+        // NTFS 不区分大小写：`c:/users/...` 必须命中授权根 `C:/Users/...`
+        let reg = WorkspaceAuthRegistry::with_roots(["C:/Users/Willmove/Proj".to_string()]);
+        assert!(reg.is_authorized("c:/users/willmove/proj/sub"));
+        assert!(reg.is_authorized("C:/Users/Willmove/Proj"));
+        assert!(reg.is_authorized(r"c:\Users\WILLMOVE\proj\sub\file.rs"));
+        // 大小写折叠不放宽子路径边界
+        assert!(!reg.is_authorized("c:/users/willmove/proj-evil"));
+    }
+
+    #[test]
+    fn unix_paths_stay_case_sensitive() {
+        let reg = WorkspaceAuthRegistry::with_roots(["/home/u".to_string()]);
+        assert!(reg.is_authorized("/home/u/x"));
+        assert!(!reg.is_authorized("/home/U"));
+        assert!(!reg.is_authorized("/home/U/x"));
     }
 
     #[test]

@@ -542,19 +542,30 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(root) = rfd::FileDialog::new()
-            .set_title("Open a Termior workspace")
-            .pick_folder()
-        else {
-            return;
-        };
-        if !root.is_dir() || root == self.model.root {
-            return;
-        }
-        *self = Self::new(root, cx);
-        self.restore_or_create_runtime(window, cx);
-        self.start_background_services(cx);
-        cx.notify();
+        // The blocking `rfd::FileDialog` must never run inside a GPUI event
+        // handler: on Windows its modal message loop re-enters the foreground
+        // executor while the `App` RefCell is still borrowed, aborting the
+        // process. Await the async dialog instead and hop back into the view.
+        cx.spawn_in(window, async move |workspace, cx| {
+            let Some(folder) = rfd::AsyncFileDialog::new()
+                .set_title("Open a Termior workspace")
+                .pick_folder()
+                .await
+            else {
+                return;
+            };
+            let root = folder.path().to_path_buf();
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                if !root.is_dir() || root == workspace.model.root {
+                    return;
+                }
+                *workspace = Self::new(root, cx);
+                workspace.restore_or_create_runtime(window, cx);
+                workspace.start_background_services(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn create_terminal(&mut self, private: bool, window: &mut Window, cx: &mut Context<Self>) {

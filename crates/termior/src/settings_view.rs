@@ -402,23 +402,33 @@ impl SettingsView {
     }
 
     fn import_theme(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Theme JSON", &["json"])
-            .pick_file()
-        else {
-            return;
-        };
-        self.status = match std::fs::read_to_string(path)
-            .map_err(|error| error.to_string())
-            .and_then(|json| self.themes.import(&json).map_err(|error| error.to_string()))
-        {
-            Ok(theme) => {
-                self.settings.theme_id = theme.id;
-                "Theme imported; save settings to apply it".into()
-            }
-            Err(error) => format!("Theme import failed: {error}"),
-        };
-        cx.notify();
+        // Blocking dialogs inside GPUI handlers deadlock/panic on Windows
+        // (re-entrant dispatch while the `App` RefCell is borrowed), so the
+        // async dialog is awaited before touching the view again.
+        cx.spawn(async move |view, cx| {
+            let Some(handle) = rfd::AsyncFileDialog::new()
+                .add_filter("Theme JSON", &["json"])
+                .pick_file()
+                .await
+            else {
+                return;
+            };
+            let path = handle.path().to_path_buf();
+            let _ = view.update(cx, |view, cx| {
+                view.status = match std::fs::read_to_string(path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|json| view.themes.import(&json).map_err(|error| error.to_string()))
+                {
+                    Ok(theme) => {
+                        view.settings.theme_id = theme.id;
+                        "Theme imported; save settings to apply it".into()
+                    }
+                    Err(error) => format!("Theme import failed: {error}"),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn export_theme(&mut self, cx: &mut Context<Self>) {
@@ -432,30 +442,46 @@ impl SettingsView {
             cx.notify();
             return;
         };
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name(format!("{}.json", theme.id))
-            .save_file()
-        else {
-            return;
-        };
-        self.status = match ThemeLibrary::export(&theme)
-            .map_err(|error| error.to_string())
-            .and_then(|json| atomic_write(&path, &json).map_err(|error| error.to_string()))
-        {
-            Ok(()) => format!("Theme exported to {}", path.display()),
-            Err(error) => format!("Theme export failed: {error}"),
-        };
-        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let Some(handle) = rfd::AsyncFileDialog::new()
+                .set_file_name(format!("{}.json", theme.id))
+                .save_file()
+                .await
+            else {
+                return;
+            };
+            let path = handle.path().to_path_buf();
+            let status = match ThemeLibrary::export(&theme)
+                .map_err(|error| error.to_string())
+                .and_then(|json| atomic_write(&path, &json).map_err(|error| error.to_string()))
+            {
+                Ok(()) => format!("Theme exported to {}", path.display()),
+                Err(error) => format!("Theme export failed: {error}"),
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.status = status;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn select_background(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"])
-            .pick_file()
-        {
-            self.settings.background.image_path = Some(path.to_string_lossy().into_owned());
-            cx.notify();
-        }
+        cx.spawn(async move |view, cx| {
+            let Some(handle) = rfd::AsyncFileDialog::new()
+                .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"])
+                .pick_file()
+                .await
+            else {
+                return;
+            };
+            let path = handle.path().to_path_buf();
+            let _ = view.update(cx, |view, cx| {
+                view.settings.background.image_path = Some(path.to_string_lossy().into_owned());
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn clear_background(&mut self, cx: &mut Context<Self>) {

@@ -178,8 +178,24 @@ fn parse_osc7(rest: &str) -> Option<OscEvent> {
         if authority.is_empty() {
             (String::new(), after_scheme.to_string())
         } else if authority.contains(':') || authority.contains('\\') {
-            // 看起来是路径片段（如 Windows C:），不当作 host
-            (String::new(), after_scheme.to_string())
+            // 防御：畸形遗留形式 `file://<host><drive>:/...`（hostname 与盘符粘连，
+            // 如 `file://DESKTOP-ABCC:/Users/x`）。若 authority 尾部形如
+            // `<单个 ASCII 字母>:`（盘符），把 hostname 拆出，路径从盘符开始。
+            let bytes = authority.as_bytes();
+            let n = bytes.len();
+            let ends_with_drive = n >= 2
+                && bytes[n - 1] == b':'
+                && bytes[n - 2].is_ascii_alphabetic()
+                && !authority.contains('\\');
+            if ends_with_drive {
+                (
+                    authority[..n - 2].to_string(),
+                    after_scheme[slash_idx - 2..].to_string(),
+                )
+            } else {
+                // 其他含 `:`/`\` 的形式当作路径片段，不当作 host
+                (String::new(), after_scheme.to_string())
+            }
         } else {
             (authority.to_string(), after_scheme[slash_idx..].to_string())
         }
@@ -315,6 +331,66 @@ mod tests {
             vec![OscEvent::Cwd {
                 host: "host".into(),
                 path: "C:/Users/u".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn osc7_malformed_hostname_glued_to_drive_recovered() {
+        // 畸形遗留形式：hostname 与盘符粘连（旧 pwsh 注入产生）。
+        // `file://HOSTC:/Users/x` → host `HOST`，path `C:/Users/x`。
+        let ev = feed_one("\x1b]7;file://HOSTC:/Users/x\x07");
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "HOST".into(),
+                path: "C:/Users/x".into()
+            }]
+        );
+        // 真实机器名样例
+        let ev = feed_one("\x1b]7;file://DESKTOP-ABCC:/Users/willmove/proj\x07");
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "DESKTOP-ABC".into(),
+                path: "C:/Users/willmove/proj".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn osc7_wellformed_windows_url_with_host() {
+        // 修复后的 pwsh 注入产生 `file://HOST/C:/Users/x`
+        let ev = feed_one("\x1b]7;file://HOST/C:/Users/x\x07");
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "HOST".into(),
+                path: "C:/Users/x".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn osc7_windows_url_without_host() {
+        let ev = feed_one("\x1b]7;file:///C:/Users/x\x07");
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "".into(),
+                path: "C:/Users/x".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn osc7_plain_unix_with_host() {
+        let ev = feed_one("\x1b]7;file://host/home/u\x07");
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "host".into(),
+                path: "/home/u".into()
             }]
         );
     }

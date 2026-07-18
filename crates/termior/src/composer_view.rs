@@ -372,7 +372,7 @@ impl ComposerView {
     }
 
     fn pick_attachment(&mut self, image_only: bool, cx: &mut Context<Self>) {
-        let mut dialog = rfd::FileDialog::new().set_title(if image_only {
+        let mut dialog = rfd::AsyncFileDialog::new().set_title(if image_only {
             "Attach an image to Composer"
         } else {
             "Attach a file to Composer"
@@ -388,28 +388,37 @@ impl ComposerView {
                 ],
             );
         }
-        let Some(path) = dialog.pick_file() else {
-            return;
-        };
-        if image_only {
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    let mime = image_mime(&path);
-                    let name = path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("image")
-                        .to_owned();
-                    self.draft.attach_image(name, mime, &bytes);
-                    self.status = "Image attached".into();
+        // Never run a blocking file dialog inside a GPUI event handler: on
+        // Windows its modal message loop re-enters the foreground executor
+        // while the `App` RefCell is borrowed. Await the async dialog instead.
+        cx.spawn(async move |view, cx| {
+            let Some(handle) = dialog.pick_file().await else {
+                return;
+            };
+            let path = handle.path().to_path_buf();
+            let _ = view.update(cx, |view, cx| {
+                if image_only {
+                    match std::fs::read(&path) {
+                        Ok(bytes) => {
+                            let mime = image_mime(&path);
+                            let name = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("image")
+                                .to_owned();
+                            view.draft.attach_image(name, mime, &bytes);
+                            view.status = "Image attached".into();
+                        }
+                        Err(error) => view.status = format!("Could not attach image: {error}"),
+                    }
+                } else {
+                    view.draft.attach_file(path);
+                    view.status = "File attached".into();
                 }
-                Err(error) => self.status = format!("Could not attach image: {error}"),
-            }
-        } else {
-            self.draft.attach_file(path);
-            self.status = "File attached".into();
-        }
-        cx.notify();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn update_path_suggestions(&mut self) {
