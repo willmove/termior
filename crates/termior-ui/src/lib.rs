@@ -179,11 +179,47 @@ impl WorkspaceState {
         Ok(None)
     }
 
-    pub fn split_active(&mut self, direction: SplitDirection) -> Result<PaneId, WorkspaceError> {
-        let tab = self
+    /// Close a specific pane in a specific tab (e.g. its terminal process exited).
+    ///
+    /// Like [`Self::close_active_pane_or_tab`], but targets any tab/pane pair:
+    /// closing one of several panes returns `Ok(Some(pane))`; closing the tab's
+    /// final pane removes the whole tab and returns `Ok(None)`, moving `active`
+    /// to a neighbouring tab when the removed tab was active.
+    pub fn close_pane(
+        &mut self,
+        tab_id: TabId,
+        pane_id: PaneId,
+    ) -> Result<Option<PaneId>, WorkspaceError> {
+        let index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == tab_id)
+            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+        if self.tabs[index].layout.panes().len() > 1 {
+            return Ok(Some(self.tabs[index].layout.close_pane(pane_id)?));
+        }
+        self.tabs.remove(index);
+        if self.active == Some(tab_id) {
+            self.active = if self.tabs.is_empty() {
+                None
+            } else {
+                Some(self.tabs[index.min(self.tabs.len() - 1)].id)
+            };
+        }
+        Ok(None)
+    }
+
+    pub fn split_active(&mut self, direction: SplitDirection) -> Result<PaneId, WorkspaceError> {        let tab = self
             .active_tab_mut()
             .ok_or(WorkspaceError::TabNotFound(TabId(0)))?;
         Ok(tab.layout.split_focused(direction))
+    }
+
+    pub fn close_other_panes(&mut self) -> Result<Vec<PaneId>, WorkspaceError> {
+        let tab = self
+            .active_tab_mut()
+            .ok_or(WorkspaceError::TabNotFound(TabId(0)))?;
+        Ok(tab.layout.close_other_panes())
     }
 
     pub fn set_active_cwd(&mut self, cwd: impl Into<PathBuf>) {
@@ -276,6 +312,50 @@ mod tests {
         assert_eq!(ws.tabs.len(), 1);
         ws.close_active_pane_or_tab().unwrap();
         assert!(ws.tabs.is_empty());
+    }
+
+    #[test]
+    fn close_specific_pane_in_inactive_tab() {
+        let mut ws = WorkspaceState::new("/workspace");
+        let first = ws.new_tab(TabKind::Terminal, "one", false);
+        let first_pane = ws.active_tab().unwrap().layout.focused;
+        let second_pane = ws.split_active(SplitDirection::Right).unwrap();
+        let second = ws.new_tab(TabKind::Terminal, "two", false);
+
+        // Closing an unfocused pane of a background tab keeps that tab and its focus.
+        assert_eq!(
+            ws.close_pane(first, second_pane).unwrap(),
+            Some(second_pane)
+        );
+        let first_tab = ws.tabs.iter().find(|tab| tab.id == first).unwrap();
+        assert_eq!(first_tab.layout.panes(), vec![first_pane]);
+        assert_eq!(first_tab.layout.focused, first_pane);
+        assert_eq!(ws.active, Some(second));
+
+        // Closing a background tab's final pane removes the tab, active stays.
+        assert_eq!(ws.close_pane(first, first_pane).unwrap(), None);
+        assert!(ws.tabs.iter().all(|tab| tab.id != first));
+        assert_eq!(ws.active, Some(second));
+
+        // Closing the active tab's final pane moves active to a neighbour.
+        let last_pane = ws.active_tab().unwrap().layout.focused;
+        assert_eq!(ws.close_pane(second, last_pane).unwrap(), None);
+        assert!(ws.tabs.is_empty());
+        assert_eq!(ws.active, None);
+    }
+
+    #[test]
+    fn close_other_panes_keeps_the_focused_pane() {
+        let mut ws = WorkspaceState::new("/workspace");
+        ws.new_tab(TabKind::Editor, "editor", false);
+        let second = ws.split_active(SplitDirection::Right).unwrap();
+        ws.split_active(SplitDirection::Down).unwrap();
+        ws.active_tab_mut().unwrap().layout.focus(second).unwrap();
+
+        let removed = ws.close_other_panes().unwrap();
+
+        assert_eq!(removed.len(), 2);
+        assert_eq!(ws.active_tab().unwrap().layout.panes(), vec![second]);
     }
 
     #[test]

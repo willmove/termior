@@ -184,11 +184,19 @@ $env:TERMior_HOSTNAME = if ($env:TERMior_HOSTNAME) { $env:TERMior_HOSTNAME } els
 
 function script:__termior_Osc7 {
     # Build a well-formed file URL: authority and path must be separated by '/'.
-    # Windows paths (`C:\\Users\\...`) do not start with '/', so prefix one —
-    # `file://host/C:/Users/...` — otherwise the hostname glues onto the drive.
-    $p = $PWD.Path -replace '\\\\','/'
-    if (-not $p.StartsWith('/')) { $p = '/' + $p }
-    $raw = \"file://$($env:TERMior_HOSTNAME)$p\"
+    # Use ProviderPath and strip extended-length prefixes so the emitted path is
+    # always a plain drive/UNC path — otherwise the hostname glues onto the drive
+    # or the provider qualifier leaks into the URL. Skip non-FileSystem providers.
+    if (-not $PWD.Provider -or $PWD.Provider.Name -ne 'FileSystem') { return }
+    $path = $PWD.ProviderPath
+    if ($path.StartsWith('\\\\?\\UNC\\')) {
+        $path = '\\\\' + $path.Substring(8)
+    } elseif ($path.StartsWith('\\\\?\\')) {
+        $path = $path.Substring(4)
+    }
+    $path = $path -replace '\\\\','/'
+    if ($path -match '^[A-Za-z]:/') { $path = '/' + $path }
+    $raw = \"file://$($env:TERMior_HOSTNAME)$path\"
     [Console]::Write([char]27 + \"]7;\" + $raw + [char]7)
 }
 function script:__termior_MarkPrompt { [Console]::Write([char]27 + \"]133;A\" + [char]7) }
@@ -282,12 +290,14 @@ mod tests {
             .1
             .as_str();
         assert!(prof.contains("TERMior_REAL_PROFILE") || prof.contains("$PROFILE"));
+        assert!(prof.contains("$PWD.ProviderPath"));
+        assert!(prof.contains("FileSystem"));
         assert!(prof.contains("133"));
     }
 
     #[test]
     fn pwsh_osc7_url_separates_authority_and_path() {
-        // Windows `$PWD.Path` is `C:\Users\...` → after `\`→`/` replace it does NOT
+        // Windows `$PWD.ProviderPath` is `C:\Users\...` → after `\`→`/` replace it does NOT
         // start with `/`. Without an explicit separator the hostname glues onto the
         // drive letter (`file://HOSTC:/Users/...`). The snippet must prefix `/` so
         // the emitted URL is `file://host/C:/Users/...`.
@@ -300,11 +310,11 @@ mod tests {
             .1
             .as_str();
         assert!(
-            prof.contains(r"if (-not $p.StartsWith('/')) { $p = '/' + $p }"),
+            prof.contains(r"if ($path -match '^[A-Za-z]:/') { $path = '/' + $path }"),
             "pwsh OSC 7 must ensure a '/' separates authority and path"
         );
         assert!(
-            prof.contains(r#"$raw = "file://$($env:TERMior_HOSTNAME)$p""#),
+            prof.contains(r#"$raw = "file://$($env:TERMior_HOSTNAME)$path""#),
             "pwsh OSC 7 must build the URL from the slash-prefixed path"
         );
         // The old broken form (path glued directly onto the hostname) must be gone.

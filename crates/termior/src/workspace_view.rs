@@ -11,7 +11,8 @@ use gpui::{
     anchored, canvas, div, prelude::*, px, relative, size, AnyElement, AnyWindowHandle, App,
     Bounds, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
     Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, PromptButton, PromptLevel, SharedString, Task, UTF16Selection, Window, WindowBounds,
+    Point, PromptButton, PromptLevel, Role, SharedString, Task, UTF16Selection, Window,
+    WindowBounds,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
@@ -41,6 +42,13 @@ use termior_vcs::{
 const DEFAULT_SIDEBAR_WIDTH: f32 = 280.0;
 const MIN_SIDEBAR_WIDTH: f32 = 220.0;
 const MAX_SIDEBAR_WIDTH: f32 = 520.0;
+const WORKSPACE_HEADER_HEIGHT: f32 = 40.0;
+const STATUS_BAR_HEIGHT: f32 = 24.0;
+const COMPOSER_MAX_HEIGHT: f32 = 330.0;
+const PANE_DIVIDER_SIZE: f32 = 5.0;
+const MIN_PANE_WIDTH: f32 = 320.0;
+const MIN_PANE_HEIGHT: f32 = 180.0;
+const MAX_PANES_PER_TAB: usize = 8;
 
 #[derive(Clone)]
 enum PaneContent {
@@ -163,6 +171,15 @@ enum ExplorerContextAction {
     Refresh,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitMenuAction {
+    Smart,
+    Right,
+    Down,
+    CloseActive,
+    CloseOthers,
+}
+
 pub struct WorkspaceView {
     model: WorkspaceState,
     tabs: Vec<AppTab>,
@@ -186,6 +203,7 @@ pub struct WorkspaceView {
     pending_name_parent: Option<PathBuf>,
     pending_rename_target: Option<PathBuf>,
     explorer_context_menu: Option<ExplorerContextMenu>,
+    split_menu_open: bool,
     sidebar_resizing: bool,
     pane_resizing: Option<PaneResizeState>,
     content_matches: Vec<ContentMatch>,
@@ -356,6 +374,7 @@ impl WorkspaceView {
             pending_name_parent: None,
             pending_rename_target: None,
             explorer_context_menu: None,
+            split_menu_open: false,
             sidebar_resizing: false,
             pane_resizing: None,
             content_matches: Vec::new(),
@@ -670,6 +689,20 @@ impl WorkspaceView {
                 cx.subscribe(
                     &entity,
                     move |workspace, _terminal, event: &TerminalViewEvent, cx| {
+                        // A shell that exits (e.g. via `exit`) closes its pane — and the
+                        // whole tab when it was the tab's final pane — regardless of
+                        // which pane is focused.
+                        if let TerminalViewEvent::Exited(code) = event {
+                            workspace.handle_terminal_exited(
+                                tab_id,
+                                pane_id,
+                                *code,
+                                window_handle,
+                                cx,
+                            );
+                            cx.notify();
+                            return;
+                        }
                         let focused = workspace
                             .model
                             .tabs
@@ -685,20 +718,10 @@ impl WorkspaceView {
                                         tab.title =
                                             title.clone().unwrap_or_else(|| "Terminal".to_owned());
                                     }
-                                    TerminalViewEvent::Exited(code) => {
-                                        if !tab.title.ends_with(" (exited)") {
-                                            tab.title.push_str(" (exited)");
-                                        }
-                                        if let Some(code) = code {
-                                            log::info!(
-                                                "terminal tab {} exited with code {code}",
-                                                tab_id.0
-                                            );
-                                        }
-                                    }
                                     TerminalViewEvent::Bell => {
                                         log::debug!("terminal bell in tab {}", tab_id.0);
                                     }
+                                    TerminalViewEvent::Exited(_) => {}
                                 }
                             }
                         }
@@ -1067,12 +1090,130 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn pane_area_size(&self, window: &Window) -> (f32, f32) {
+        let viewport = window.viewport_size();
+        let sidebar_width = if self.model.sidebar_visible {
+            self.model.sidebar_width
+        } else {
+            0.0
+        };
+        let composer_height = if self.model.composer_visible {
+            COMPOSER_MAX_HEIGHT
+        } else {
+            0.0
+        };
+        (
+            (f32::from(viewport.width) - sidebar_width).max(0.0),
+            (f32::from(viewport.height)
+                - WORKSPACE_HEADER_HEIGHT
+                - STATUS_BAR_HEIGHT
+                - composer_height)
+                .max(0.0),
+        )
+    }
+
+    fn active_pane_count(&self) -> usize {
+        self.model
+            .active_tab()
+            .map(|tab| tab.layout.panes().len())
+            .unwrap_or(0)
+    }
+
+    fn can_split_active(&self, direction: SplitDirection, window: &Window) -> bool {
+        let Some(tab) = self.model.active_tab() else {
+            return false;
+        };
+        let (width, height) = self.pane_area_size(window);
+        tab.layout.can_split_focused(
+            direction,
+            width,
+            height,
+            PANE_DIVIDER_SIZE,
+            MIN_PANE_WIDTH,
+            MIN_PANE_HEIGHT,
+            MAX_PANES_PER_TAB,
+        )
+    }
+
+    fn preferred_split_direction(&self, window: &Window) -> Option<SplitDirection> {
+        let can_right = self.can_split_active(SplitDirection::Right, window);
+        let can_down = self.can_split_active(SplitDirection::Down, window);
+        match (can_right, can_down) {
+            (true, false) => Some(SplitDirection::Right),
+            (false, true) => Some(SplitDirection::Down),
+            (false, false) => None,
+            (true, true) => {
+                let tab = self.model.active_tab()?;
+                let (width, height) = self.pane_area_size(window);
+                let extent = tab
+                    .layout
+                    .focused_extent(width, height, PANE_DIVIDER_SIZE)?;
+                if extent.width >= extent.height {
+                    Some(SplitDirection::Right)
+                } else {
+                    Some(SplitDirection::Down)
+                }
+            }
+        }
+    }
+
+    fn split_unavailable_message(&self, direction: Option<SplitDirection>) -> String {
+        if self.model.active_tab().is_none() {
+            return "Open a tab before splitting a pane.".into();
+        }
+        if self.active_pane_count() >= MAX_PANES_PER_TAB {
+            return format!("This tab has reached the limit of {MAX_PANES_PER_TAB} panes.");
+        }
+        match direction {
+            Some(SplitDirection::Right) => {
+                "The focused pane is too narrow to split right. Resize the window or close another pane."
+                    .into()
+            }
+            Some(SplitDirection::Down) => {
+                "The focused pane is too short to split down. Resize the window or close another pane."
+                    .into()
+            }
+            None => "The focused pane is too small to split. Resize the window or close another pane."
+                .into(),
+        }
+    }
+
+    fn show_split_unavailable(
+        &mut self,
+        direction: Option<SplitDirection>,
+        cx: &mut Context<Self>,
+    ) {
+        self.enqueue_toast(
+            Notification {
+                title: "Cannot split pane".into(),
+                body: self.split_unavailable_message(direction),
+                target: NotificationTarget::Global,
+                status: AgentStatus::Attention,
+            },
+            cx,
+        );
+    }
+
+    fn smart_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_menu_open = false;
+        if let Some(direction) = self.preferred_split_direction(window) {
+            self.split_active(direction, window, cx);
+        } else {
+            self.show_split_unavailable(None, cx);
+        }
+    }
+
     fn split_active(
         &mut self,
         direction: SplitDirection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.split_menu_open = false;
+        if !self.can_split_active(direction, window) {
+            self.show_split_unavailable(Some(direction), cx);
+            return;
+        }
         let Some(active) = self.model.active else {
             return;
         };
@@ -1116,6 +1257,69 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn close_active_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_menu_open = false;
+        if self.active_pane_count() <= 1 {
+            self.enqueue_toast(
+                Notification {
+                    title: "Cannot close pane".into(),
+                    body: "This is the only pane in the tab.".into(),
+                    target: NotificationTarget::Global,
+                    status: AgentStatus::Attention,
+                },
+                cx,
+            );
+            return;
+        }
+        let Some(tab_id) = self.model.active else {
+            return;
+        };
+        let Ok(Some(pane_id)) = self.model.close_active_pane_or_tab() else {
+            return;
+        };
+        self.remove_terminal_agent(tab_id, pane_id);
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.panes.remove(&pane_id);
+        }
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    fn close_other_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_menu_open = false;
+        let Some(tab_id) = self.model.active else {
+            return;
+        };
+        let Ok(removed) = self.model.close_other_panes() else {
+            return;
+        };
+        for pane_id in &removed {
+            self.remove_terminal_agent(tab_id, *pane_id);
+        }
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            for pane_id in removed {
+                tab.panes.remove(&pane_id);
+            }
+        }
+        self.focus_active_pane(window, cx);
+        cx.notify();
+    }
+
+    fn handle_split_menu_action(
+        &mut self,
+        action: SplitMenuAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            SplitMenuAction::Smart => self.smart_split(window, cx),
+            SplitMenuAction::Right => self.split_active(SplitDirection::Right, window, cx),
+            SplitMenuAction::Down => self.split_active(SplitDirection::Down, window, cx),
+            SplitMenuAction::CloseActive => self.close_active_pane(window, cx),
+            SplitMenuAction::CloseOthers => self.close_other_panes(window, cx),
+        }
+    }
+
     fn close_active(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.model.active else { return };
         let pane_ids = self
@@ -1154,36 +1358,81 @@ impl WorkspaceView {
         }
     }
 
-    fn focus_active_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(active) = self.model.active else {
-            return;
-        };
-        let Some(tab) = self.tabs.iter().find(|tab| tab.id == active) else {
-            return;
-        };
-        let Some(model_tab) = self.model.active_tab() else {
-            return;
-        };
-        let Some(pane) = tab.panes.get(&model_tab.layout.focused) else {
-            return;
-        };
-        match pane {
-            PaneContent::Terminal(terminal) => {
-                let focus = terminal.read(cx).focus_handle(cx);
-                window.focus(&focus, cx);
+    /// A terminal's shell exited: close its pane, and the whole tab when the pane
+    /// was the tab's last one. Runs regardless of which pane is focused — the shell
+    /// may have exited in a split (`exit`) or in a background tab on its own.
+    fn handle_terminal_exited(
+        &mut self,
+        tab_id: TabId,
+        pane_id: PaneId,
+        exit_code: Option<i32>,
+        window_handle: Option<AnyWindowHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(code) = exit_code {
+            log::info!(
+                "terminal pane {} in tab {} exited with code {code}",
+                pane_id.0,
+                tab_id.0
+            );
+        }
+        let had_focus = self.model.active == Some(tab_id)
+            && self
+                .model
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .is_some_and(|tab| tab.layout.focused == pane_id);
+        let closed = match self.model.close_pane(tab_id, pane_id) {
+            Ok(closed) => closed,
+            Err(error) => {
+                log::warn!("could not close exited terminal pane: {error}");
+                return;
             }
-            PaneContent::Editor(editor) => {
-                let focus = editor.read(cx).focus_handle(cx);
-                window.focus(&focus, cx);
+        };
+        self.remove_terminal_agent(tab_id, pane_id);
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            tab.panes.remove(&pane_id);
+        }
+        match closed {
+            Some(_) => {
+                // The exited pane had keyboard focus: hand it to the surviving pane.
+                if had_focus {
+                    let focus = self.active_pane_focus_handle(cx);
+                    if let (Some(handle), Some(focus)) = (window_handle, focus) {
+                        let _ = cx.update_window(handle, |_, window, cx| {
+                            window.focus(&focus, cx);
+                        });
+                    }
+                }
             }
-            PaneContent::GitHistory(history) => {
-                let focus = history.read(cx).focus_handle(cx);
-                window.focus(&focus, cx);
+            None => {
+                self.tabs.retain(|tab| tab.id != tab_id);
+                if let Some(active) = self.model.active {
+                    self.activate_runtime(active, cx);
+                }
             }
+        }
+    }
+
+    fn active_pane_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+        let active = self.model.active?;
+        let tab = self.tabs.iter().find(|tab| tab.id == active)?;
+        let model_tab = self.model.active_tab()?;
+        match tab.panes.get(&model_tab.layout.focused)? {
+            PaneContent::Terminal(terminal) => Some(terminal.read(cx).focus_handle(cx)),
+            PaneContent::Editor(editor) => Some(editor.read(cx).focus_handle(cx)),
+            PaneContent::GitHistory(history) => Some(history.read(cx).focus_handle(cx)),
             PaneContent::Preview(_)
             | PaneContent::AiDiff(_)
             | PaneContent::GitDiff(_)
-            | PaneContent::Placeholder(_) => {}
+            | PaneContent::Placeholder(_) => None,
+        }
+    }
+
+    fn focus_active_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(focus) = self.active_pane_focus_handle(cx) {
+            window.focus(&focus, cx);
         }
     }
 
@@ -3101,14 +3350,47 @@ impl gpui::Render for WorkspaceView {
                 let selected = active == Some(id);
                 div()
                     .id(SharedString::from(format!("tab-{}", id.0)))
+                    .relative()
+                    .h_full()
                     .px_3()
-                    .py_2()
+                    .flex()
+                    .items_center()
                     .cursor_pointer()
+                    // 激活 tab 与下方内容区同色（连成一体），非激活 tab 沉入标题栏底色。
                     .bg(if selected {
-                        gpui_color(p.surface[1])
+                        gpui_color(p.background)
                     } else {
                         gpui_color(p.surface[2])
                     })
+                    .text_color(if selected {
+                        gpui_color(p.foreground)
+                    } else {
+                        gpui_color_alpha(p.foreground, 0.55)
+                    })
+                    .when(!selected, |d| {
+                        d.hover(move |style| style.bg(gpui_color(p.surface[1])))
+                    })
+                    // 激活 tab 顶部 accent 条 + tab 间细分隔线，划清每个 tab 的边界。
+                    .when(selected, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .h(px(2.0))
+                                .bg(gpui_color(p.accent)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .absolute()
+                            .right_0()
+                            .top(px(10.0))
+                            .bottom(px(10.0))
+                            .w(px(1.0))
+                            .bg(gpui_color_alpha(p.foreground, 0.12)),
+                    )
                     .child(SharedString::from(tab.title.clone()))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -3365,6 +3647,139 @@ impl gpui::Render for WorkspaceView {
                     )),
             )
         });
+        let can_split_right = self.can_split_active(SplitDirection::Right, window);
+        let can_split_down = self.can_split_active(SplitDirection::Down, window);
+        let can_smart_split = can_split_right || can_split_down;
+        let has_multiple_panes = self.active_pane_count() > 1;
+        let split_description = if can_smart_split {
+            "Split the focused pane using the best available direction".to_owned()
+        } else {
+            self.split_unavailable_message(None)
+        };
+        let split_button = div()
+            .id("split-smart")
+            .px_2()
+            .py_1()
+            .rounded_lg()
+            .text_xs()
+            .opacity(if can_smart_split { 1.0 } else { 0.45 })
+            .focusable()
+            .tab_stop(can_smart_split)
+            .role(Role::Button)
+            .aria_label("Split focused pane")
+            .aria_description(SharedString::from(split_description))
+            .focus_visible(|style| style.border_1().border_color(gpui::rgba(0x5b8defee)))
+            .child("Split")
+            .when(can_smart_split, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(|style| style.bg(gpui::rgba(0x36588088)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, window, cx| {
+                            cx.stop_propagation();
+                            this.smart_split(window, cx);
+                        }),
+                    )
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "return" | "space") {
+                            cx.stop_propagation();
+                            this.smart_split(window, cx);
+                        }
+                    }))
+            });
+        let split_menu_toggle = div()
+            .id("split-menu-toggle")
+            .px_1()
+            .py_1()
+            .rounded_r_lg()
+            .text_xs()
+            .cursor_pointer()
+            .focusable()
+            .tab_stop(true)
+            .role(Role::Button)
+            .aria_label("Open split pane menu")
+            .aria_expanded(self.split_menu_open)
+            .focus_visible(|style| style.border_1().border_color(gpui::rgba(0x5b8defee)))
+            .hover(|style| style.bg(gpui::rgba(0x36588088)))
+            .child("▾")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    cx.stop_propagation();
+                    this.explorer_context_menu = None;
+                    this.split_menu_open = !this.split_menu_open;
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "return" | "space") {
+                    cx.stop_propagation();
+                    this.explorer_context_menu = None;
+                    this.split_menu_open = !this.split_menu_open;
+                    cx.notify();
+                }
+            }));
+        let split_menu = self.split_menu_open.then(|| {
+            let menu_x = (f32::from(window.viewport_size().width) - 330.0).max(0.0);
+            anchored()
+                .position(Point::new(px(menu_x), px(WORKSPACE_HEADER_HEIGHT)))
+                .child(
+                    div()
+                        .id("split-pane-menu")
+                        .w(px(270.0))
+                        .occlude()
+                        .p_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(gpui_color(p.surface[1]))
+                        .bg(gpui_color(p.surface[2]))
+                        .shadow_md()
+                        .when(!can_smart_split, |menu| {
+                            menu.child(
+                                div().px_2().py_1().mb_1().text_xs().opacity(0.65).child(
+                                    SharedString::from(self.split_unavailable_message(None)),
+                                ),
+                            )
+                        })
+                        .child(split_menu_item(
+                            "Smart split",
+                            "split-menu-smart",
+                            can_smart_split,
+                            SplitMenuAction::Smart,
+                            cx,
+                        ))
+                        .child(split_menu_item(
+                            "Split right",
+                            "split-menu-right",
+                            can_split_right,
+                            SplitMenuAction::Right,
+                            cx,
+                        ))
+                        .child(split_menu_item(
+                            "Split down",
+                            "split-menu-down",
+                            can_split_down,
+                            SplitMenuAction::Down,
+                            cx,
+                        ))
+                        .child(div().h(px(1.0)).my_1().bg(gpui_color(p.surface[1])))
+                        .child(split_menu_item(
+                            "Close focused pane",
+                            "split-menu-close",
+                            has_multiple_panes,
+                            SplitMenuAction::CloseActive,
+                            cx,
+                        ))
+                        .child(split_menu_item(
+                            "Keep only focused pane",
+                            "split-menu-close-others",
+                            has_multiple_panes,
+                            SplitMenuAction::CloseOthers,
+                            cx,
+                        )),
+                )
+        });
         let input_focus = self.focus_handle.clone();
         let input_entity = cx.entity();
         div()
@@ -3377,7 +3792,9 @@ impl gpui::Render for WorkspaceView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event, _window, cx| {
-                    if this.explorer_context_menu.take().is_some() {
+                    let closed_explorer_menu = this.explorer_context_menu.take().is_some();
+                    let closed_split_menu = std::mem::take(&mut this.split_menu_open);
+                    if closed_explorer_menu || closed_split_menu {
                         cx.notify();
                     }
                 }),
@@ -3415,7 +3832,7 @@ impl gpui::Render for WorkspaceView {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .h(px(40.0))
+                    .h(px(WORKSPACE_HEADER_HEIGHT))
                     .bg(gpui_color(p.surface[2]))
                     .child(
                         div()
@@ -3454,12 +3871,15 @@ impl gpui::Render for WorkspaceView {
                         cx,
                         |this, _, window, cx| this.create_preview(window, cx),
                     ))
-                    .child(header_button(
-                        "Split",
-                        "split-right",
-                        cx,
-                        |this, _, window, cx| this.split_active(SplitDirection::Right, window, cx),
-                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .bg(gpui::rgba(0x293241dd))
+                            .child(split_button)
+                            .child(split_menu_toggle),
+                    )
                     .child(
                         div()
                             .id("theme-cycle")
@@ -3513,7 +3933,7 @@ impl gpui::Render for WorkspaceView {
                     .flex_row()
                     .items_center()
                     .justify_between()
-                    .h(px(24.0))
+                    .h(px(STATUS_BAR_HEIGHT))
                     .px_3()
                     .bg(gpui_color(p.surface[2]))
                     .text_xs()
@@ -3527,6 +3947,7 @@ impl gpui::Render for WorkspaceView {
                     }),
             )
             .children(explorer_context_menu)
+            .children(split_menu)
     }
 }
 
@@ -3814,6 +4235,50 @@ fn header_button(
         .on_mouse_down(MouseButton::Left, cx.listener(listener))
 }
 
+fn split_menu_item(
+    label: &'static str,
+    id: &'static str,
+    enabled: bool,
+    action: SplitMenuAction,
+    cx: &mut Context<WorkspaceView>,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .text_xs()
+        .opacity(if enabled { 1.0 } else { 0.45 })
+        .focusable()
+        .tab_stop(enabled)
+        .role(Role::Button)
+        .aria_label(label)
+        .aria_description(if enabled {
+            "Activate this split pane command"
+        } else {
+            "Unavailable for the focused pane"
+        })
+        .focus_visible(|style| style.border_1().border_color(gpui::rgba(0x5b8defee)))
+        .child(label)
+        .when(enabled, |item| {
+            item.cursor_pointer()
+                .hover(|style| style.bg(gpui::rgba(0x36588088)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, window, cx| {
+                        cx.stop_propagation();
+                        this.handle_split_menu_action(action, window, cx);
+                    }),
+                )
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "return" | "space") {
+                        cx.stop_propagation();
+                        this.handle_split_menu_action(action, window, cx);
+                    }
+                }))
+        })
+}
+
 fn terminal_agent_status(state: AgentState) -> AgentStatus {
     match state {
         AgentState::Started => AgentStatus::Started,
@@ -3858,6 +4323,12 @@ fn status_color(palette: &ResolvedPalette, status: AgentStatus) -> termior_theme
 
 fn gpui_color(color: termior_theme::Color) -> gpui::Rgba {
     gpui::rgba(((color.r as u32) << 24) | ((color.g as u32) << 16) | ((color.b as u32) << 8) | 0xff)
+}
+
+/// 带透明度的主题色（tab 非激活文字、分隔线等弱化元素用）。
+fn gpui_color_alpha(color: termior_theme::Color, alpha: f32) -> gpui::Rgba {
+    let alpha = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
+    gpui::rgba(((color.r as u32) << 24) | ((color.g as u32) << 16) | ((color.b as u32) << 8) | alpha)
 }
 
 fn load_settings() -> (Settings, Option<PathBuf>, Option<String>) {

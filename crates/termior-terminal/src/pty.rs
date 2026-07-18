@@ -65,10 +65,13 @@ impl Default for PtySessionConfig {
 ///
 /// reader 由 [`crate::bridge::TerminalBridge`] 在独立线程里消费（`take_reader`），
 /// 故此处不持有 reader。`integration_dir` 让注入脚本在会话存活期间不被清理。
+/// child 句柄可由 [`PtySession::take_child`] 取走交给退出监听线程（阻塞 `wait`），
+/// 会话侧保留 `clone_killer` 得到的 killer，kill 能力不受影响。
 pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     /// 保持 shell integration 脚本文件存活；drop 时随会话清理。
     _integration_dir: Option<tempfile::TempDir>,
     #[cfg(windows)]
@@ -108,7 +111,7 @@ impl PtySession {
             "PTY spawning shell: {:?} ({program}), integration={integration_enabled}",
             kind
         );
-        let (cmd, integration_dir) = build_command(kind, &program, integration_enabled, config)?;
+        let (cmd, integration_dir) = build_command(kind, &program, integration_enabled, &config)?;
 
         // child spawn 在 slave 上（CommandBuilder 按值消费）。
         let child = pair
@@ -140,10 +143,13 @@ impl PtySession {
             .take_writer()
             .map_err(|e| SpawnError::Open(format!("take_writer: {e}")))?;
 
+        let killer = child.clone_killer();
+
         Ok(Self {
             master: pair.master,
             writer: Arc::new(Mutex::new(writer)),
-            child,
+            killer,
+            child: Some(child),
             _integration_dir: integration_dir,
             #[cfg(windows)]
             _job: job,
@@ -174,17 +180,15 @@ impl PtySession {
             .map_err(|e| SpawnError::Io(std::io::Error::other(e.to_string())))
     }
 
-    /// 等待子进程退出（关闭 tab 时调用）。
-    pub fn wait(mut self) -> Result<(), SpawnError> {
-        self.child
-            .wait()
-            .map_err(|e| SpawnError::Spawn(format!("wait: {e}")))?;
-        Ok(())
+    /// 取走子进程句柄（一次性）：由调用方线程阻塞 `wait()` 监听退出。
+    /// 之后 [`PtySession::kill`] 仍有效（killer 是独立克隆的句柄）。
+    pub fn take_child(&mut self) -> Option<Box<dyn portable_pty::Child + Send + Sync>> {
+        self.child.take()
     }
 
     /// 尝试 kill 子进程。
     pub fn kill(&mut self) -> Result<(), SpawnError> {
-        self.child
+        self.killer
             .kill()
             .map_err(|e| SpawnError::Spawn(format!("kill: {e}")))
     }
