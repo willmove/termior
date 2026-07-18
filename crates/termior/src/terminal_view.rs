@@ -225,6 +225,14 @@ impl TerminalView {
         self.latest_cwd.as_deref()
     }
 
+    /// 应用主题切换后同步终端色板(背景/前景/16 色即时生效)。
+    pub fn set_palette(&mut self, palette: ResolvedPalette, cx: &mut Context<Self>) {
+        if self.palette != palette {
+            self.palette = palette;
+            cx.notify();
+        }
+    }
+
     /// 重新计算标签页展示标题并在变化时 emit（OSC 7 每个 prompt 都上报，必须去重）。
     fn update_display_title(&mut self, cx: &mut Context<Self>) {
         let display = display_title(self.shell_title.as_deref(), self.latest_cwd.as_deref());
@@ -774,7 +782,7 @@ impl Render for TerminalView {
                         .left(px(marked_col as f32 * marked_cell_width + 2.0))
                         .top(px(marked_row as f32 * marked_line_height + 1.0))
                         .px_1()
-                        .bg(gpui::rgba(0x365880ff))
+                        .bg(crate::ui::alpha(self.palette.accent, 0.35))
                         .child(SharedString::from(marked_text)),
                 )
             })
@@ -790,8 +798,10 @@ impl Render for TerminalView {
                         .py_2()
                         .rounded_md()
                         .border_1()
-                        .border_color(gpui::rgba(0x4f8fefff))
-                        .bg(gpui::rgba(0x202733ff))
+                        .border_color(crate::ui::color(self.palette.accent))
+                        .bg(crate::ui::color(self.palette.surface[2]))
+                        .text_color(crate::ui::color(self.palette.foreground))
+                        .shadow_md()
                         .child(SharedString::from(format!(
                             "Find: {}▏",
                             self.search_overlay.query
@@ -827,7 +837,10 @@ impl Render for TerminalView {
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
-                                .bg(gpui::rgba(0x293241dd))
+                                .bg(crate::ui::alpha(self.palette.surface[2], 0.92))
+                                .border_1()
+                                .border_color(crate::ui::border(&self.palette))
+                                .text_color(crate::ui::color(self.palette.accent))
                                 .cursor_pointer()
                                 .text_xs()
                                 .child(SharedString::from(url))

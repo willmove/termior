@@ -9,6 +9,7 @@ mod keystroke;
 mod preview_view;
 mod settings_view;
 mod terminal_view;
+mod ui;
 mod workspace_view;
 
 use gpui::{px, size, App, AppContext, Bounds, Entity, Window, WindowBounds};

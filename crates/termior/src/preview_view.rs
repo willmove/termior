@@ -1,3 +1,4 @@
+use crate::ui::{self, ButtonKind};
 use gpui::{
     div, prelude::*, Context, Entity, MouseButton, MouseDownEvent, Render, SharedString, Window,
 };
@@ -70,6 +71,7 @@ impl Render for PreviewView {
         if let Some(webview) = self.webview.clone() {
             return div().size_full().child(webview).into_any_element();
         }
+        let p = ui::palette(cx);
         div()
             .flex()
             .flex_col()
@@ -77,17 +79,20 @@ impl Render for PreviewView {
             .items_center()
             .justify_center()
             .gap_3()
+            .bg(ui::color(p.background))
+            .text_color(ui::color(p.foreground))
             .child("Embedded preview is unavailable; using the system browser.")
-            .child(SharedString::from(self.state.url.clone()))
             .child(
                 div()
-                    .id("open-preview-browser")
+                    .text_xs()
+                    .text_color(ui::muted(&p))
+                    .child(SharedString::from(self.state.url.clone())),
+            )
+            .child(
+                ui::button("open-preview-browser", "Open in browser", ButtonKind::Primary, &p)
                     .px_4()
                     .py_2()
-                    .rounded_md()
-                    .bg(gpui::rgba(0x4f8fefff))
-                    .cursor_pointer()
-                    .child("Open in browser")
+                    .text_sm()
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::open_browser)),
             )
             .into_any_element()

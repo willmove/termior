@@ -345,7 +345,7 @@ impl EditorView {
                     .bg(if is_selected {
                         parse_hex(&theme.selection)
                     } else if is_match {
-                        gpui::rgba(0x5f4b2488)
+                        parse_hex_alpha(&theme.selection, 0x88)
                     } else {
                         gpui::rgba(0x00000000)
                     })
@@ -354,7 +354,7 @@ impl EditorView {
                             .w(px(52.0))
                             .pr_3()
                             .text_right()
-                            .text_color(gpui::rgba(0x738091ff))
+                            .text_color(parse_hex_alpha(&theme.foreground, 0x66))
                             .child(SharedString::from(format!("{}", line_index + 1))),
                     )
                     .child(div().flex().flex_1().children(segments))
@@ -552,6 +552,7 @@ impl Render for EditorView {
         .track_scroll(&self.scroll_handle)
         .size_full();
 
+        let p = crate::ui::palette(cx);
         let search_overlay = self.search.visible.then(|| {
             div()
                 .absolute()
@@ -563,8 +564,10 @@ impl Render for EditorView {
                 .py_2()
                 .rounded_md()
                 .border_1()
-                .border_color(gpui::rgba(0x4f8fefff))
-                .bg(gpui::rgba(0x202733ff))
+                .border_color(crate::ui::color(p.accent))
+                .bg(crate::ui::color(p.surface[2]))
+                .text_color(crate::ui::color(p.foreground))
+                .shadow_md()
                 .child(SharedString::from(format!("Find: {}▏", self.search.query)))
                 .child(SharedString::from(format!(
                     "{}/{} · {}",
@@ -594,8 +597,11 @@ impl Render for EditorView {
                 .px_2()
                 .py_1()
                 .rounded_md()
-                .bg(gpui::rgba(0x293241dd))
+                .bg(crate::ui::alpha(p.surface[2], 0.9))
+                .border_1()
+                .border_color(crate::ui::border(&p))
                 .text_xs()
+                .text_color(crate::ui::color(p.foreground))
                 .child(SharedString::from(command))
         });
 
@@ -875,4 +881,13 @@ fn parse_hex(value: &str) -> gpui::Rgba {
         .ok()
         .map(|rgb| gpui::rgba((rgb << 8) | 0xff))
         .unwrap_or_else(|| gpui::rgba(0xffffffff))
+}
+
+/// 编辑器主题色 + 透明度(行号弱化、搜索命中底色跟随编辑器主题而非应用主题)。
+fn parse_hex_alpha(value: &str, alpha: u32) -> gpui::Rgba {
+    let value = value.trim_start_matches('#');
+    u32::from_str_radix(value, 16)
+        .ok()
+        .map(|rgb| gpui::rgba((rgb << 8) | (alpha & 0xff)))
+        .unwrap_or_else(|| gpui::rgba(0xffffff88))
 }

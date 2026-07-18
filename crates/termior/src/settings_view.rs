@@ -55,6 +55,8 @@ pub struct SettingsView {
     agent_index: usize,
     status: String,
     on_save: Option<SaveCallback>,
+    /// 渲染期缓存的当前主题色板(每帧从全局刷新,供 edit_row 等辅助方法使用)。
+    palette: termior_theme::ResolvedPalette,
 }
 
 impl SettingsView {
@@ -91,6 +93,10 @@ impl SettingsView {
             agent_index: 0,
             status: String::new(),
             on_save,
+            palette: termior_theme::default_theme().resolve(
+                termior_theme::Appearance::Dark,
+                true,
+            ),
         };
         view.refresh_credential_state();
         view
@@ -693,6 +699,7 @@ impl SettingsView {
         field: EditField,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let p = self.palette.clone();
         div()
             .flex()
             .flex_col()
@@ -700,7 +707,7 @@ impl SettingsView {
             .child(
                 div()
                     .text_xs()
-                    .text_color(gpui::rgba(0x9aa6b7ff))
+                    .text_color(crate::ui::muted(&p))
                     .child(label),
             )
             .child(
@@ -711,10 +718,11 @@ impl SettingsView {
                     .rounded_md()
                     .border_1()
                     .border_color(if self.edit_field == Some(field) {
-                        gpui::rgba(0x4f8fefff)
+                        crate::ui::color(p.accent)
                     } else {
-                        gpui::rgba(0x3a4658ff)
+                        crate::ui::border(&p)
                     })
+                    .bg(crate::ui::color(p.surface[1]))
                     .cursor_text()
                     .child(SharedString::from(self.display_edit(field)))
                     .on_mouse_down(
@@ -730,15 +738,12 @@ impl SettingsView {
     fn button(
         label: impl Into<SharedString>,
         id: impl Into<gpui::ElementId>,
+        p: &termior_theme::ResolvedPalette,
     ) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id(id)
+        crate::ui::button(id, label, crate::ui::ButtonKind::Subtle, p)
             .px_3()
             .py_2()
-            .rounded_md()
-            .bg(gpui::rgba(0x293241ff))
-            .cursor_pointer()
-            .child(label.into())
+            .text_sm()
     }
 
     fn general_page(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -762,10 +767,7 @@ impl SettingsView {
                     .flex()
                     .gap_2()
                     .child(
-                        Self::button(
-                            format!("Autocomplete: {}", on_off(autocomplete)),
-                            "autocomplete",
-                        )
+                        Self::button(format!("Autocomplete: {}", on_off(autocomplete)), "autocomplete", &self.palette)
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
@@ -776,7 +778,7 @@ impl SettingsView {
                         ),
                     )
                     .child(
-                        Self::button(format!("Vim: {}", on_off(vim)), "vim").on_mouse_down(
+                        Self::button(format!("Vim: {}", on_off(vim)), "vim", &self.palette).on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
                                 this.settings.vim_mode = !this.settings.vim_mode;
@@ -785,7 +787,7 @@ impl SettingsView {
                         ),
                     )
                     .child(
-                        Self::button(format!("Dotfiles: {}", on_off(dotfiles)), "dotfiles")
+                        Self::button(format!("Dotfiles: {}", on_off(dotfiles)), "dotfiles", &self.palette)
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
@@ -814,7 +816,7 @@ impl SettingsView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(Self::button("‹", "previous-provider").on_mouse_down(
+                    .child(Self::button("‹", "previous-provider", &self.palette).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.cycle_profile(-1, cx)),
                     ))
@@ -824,7 +826,7 @@ impl SettingsView {
                         self.profile_index + 1,
                         self.settings.models.profiles.len()
                     ))))
-                    .child(Self::button("›", "next-provider").on_mouse_down(
+                    .child(Self::button("›", "next-provider", &self.palette).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.cycle_profile(1, cx)),
                     )),
@@ -840,45 +842,36 @@ impl SettingsView {
                     .flex_wrap()
                     .gap_2()
                     .child(
-                        Self::button(
-                            format!("Enabled: {}", on_off(profile.enabled)),
-                            "provider-enabled",
-                        )
+                        Self::button(format!("Enabled: {}", on_off(profile.enabled)), "provider-enabled", &self.palette)
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.toggle_provider(cx)),
                         ),
                     )
                     .child(
-                        Self::button(
-                            if active_chat {
+                        Self::button(if active_chat {
                                 "✓ Default chat"
                             } else {
                                 "Use for chat"
-                            },
-                            "active-chat",
-                        )
+                            }, "active-chat", &self.palette)
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.make_active_chat(cx)),
                         ),
                     )
                     .child(
-                        Self::button(
-                            if active_completion {
+                        Self::button(if active_completion {
                                 "✓ Default completion"
                             } else {
                                 "Use for completion"
-                            },
-                            "active-completion",
-                        )
+                            }, "active-completion", &self.palette)
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.make_active_completion(cx)),
                         ),
                     )
                     .child(
-                        Self::button("Test connection", "ping-provider").on_mouse_down(
+                        Self::button("Test connection", "ping-provider", &self.palette).on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.ping_provider(cx)),
                         ),
@@ -900,30 +893,21 @@ impl SettingsView {
             .flex_col()
             .gap_3()
             .child(
-                Self::button(
-                    format!("Application theme: {}", self.settings.theme_id),
-                    "app-theme",
-                )
+                Self::button(format!("Application theme: {}", self.settings.theme_id), "app-theme", &self.palette)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| this.cycle_app_theme(cx)),
                 ),
             )
             .child(
-                Self::button(
-                    format!("Editor theme: {}", self.settings.editor_theme_id),
-                    "editor-theme",
-                )
+                Self::button(format!("Editor theme: {}", self.settings.editor_theme_id), "editor-theme", &self.palette)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| this.cycle_editor_theme(cx)),
                 ),
             )
             .child(
-                Self::button(
-                    format!("Appearance: {:?}", self.settings.appearance),
-                    "appearance",
-                )
+                Self::button(format!("Appearance: {:?}", self.settings.appearance), "appearance", &self.palette)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| this.cycle_appearance(cx)),
@@ -933,11 +917,11 @@ impl SettingsView {
                 div()
                     .flex()
                     .gap_2()
-                    .child(Self::button("Import theme", "import-theme").on_mouse_down(
+                    .child(Self::button("Import theme", "import-theme", &self.palette).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.import_theme(cx)),
                     ))
-                    .child(Self::button("Export theme", "export-theme").on_mouse_down(
+                    .child(Self::button("Export theme", "export-theme", &self.palette).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.export_theme(cx)),
                     )),
@@ -948,13 +932,13 @@ impl SettingsView {
                     .flex()
                     .gap_2()
                     .child(
-                        Self::button("Choose image", "background-image").on_mouse_down(
+                        Self::button("Choose image", "background-image", &self.palette).on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.select_background(cx)),
                         ),
                     )
                     .child(
-                        Self::button("Clear image", "background-clear").on_mouse_down(
+                        Self::button("Clear image", "background-clear", &self.palette).on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.clear_background(cx)),
                         ),
@@ -997,7 +981,7 @@ impl SettingsView {
                 .rounded_md()
                 .cursor_pointer()
                 .when(self.capture_shortcut == Some(action), |row| {
-                    row.bg(gpui::rgba(0x36588088))
+                    row.bg(crate::ui::selected_wash(&self.palette))
                 })
                 .child(SharedString::from(format!("{:?}", entry.action)))
                 .child(SharedString::from(label))
@@ -1050,15 +1034,15 @@ impl SettingsView {
                     div()
                         .flex()
                         .gap_2()
-                        .child(Self::button("‹", "previous-agent").on_mouse_down(
+                        .child(Self::button("‹", "previous-agent", &self.palette).on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.cycle_agent(-1, cx)),
                         ))
-                        .child(Self::button("›", "next-agent").on_mouse_down(
+                        .child(Self::button("›", "next-agent", &self.palette).on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.cycle_agent(1, cx)),
                         ))
-                        .child(Self::button("Remove", "remove-agent").on_mouse_down(
+                        .child(Self::button("Remove", "remove-agent", &self.palette).on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.remove_agent(cx)),
                         )),
@@ -1084,26 +1068,23 @@ impl SettingsView {
                     .flex()
                     .gap_2()
                     .child(
-                        Self::button("Install hooks", "install-hooks").on_mouse_down(
+                        Self::button("Install hooks", "install-hooks", &self.palette).on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.install_hooks(cx)),
                         ),
                     )
                     .child(
-                        Self::button("Uninstall hooks", "uninstall-hooks").on_mouse_down(
+                        Self::button("Uninstall hooks", "uninstall-hooks", &self.palette).on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.uninstall_hooks(cx)),
                         ),
                     ),
             )
             .child(
-                Self::button(
-                    format!(
+                Self::button(format!(
                         "Agent notifications: {}",
                         on_off(self.settings.agent_notifications)
-                    ),
-                    "agent-notifications",
-                )
+                    ), "agent-notifications", &self.palette)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
@@ -1112,7 +1093,7 @@ impl SettingsView {
                     }),
                 ),
             )
-            .child(Self::button("New custom agent", "new-agent").on_mouse_down(
+            .child(Self::button("New custom agent", "new-agent", &self.palette).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.new_agent(cx)),
             ))
@@ -1150,6 +1131,8 @@ impl Focusable for SettingsView {
 
 impl gpui::Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.palette = crate::ui::palette(cx);
+        let p = self.palette.clone();
         let focus = self.focus_handle.clone();
         let input_focus = focus.clone();
         let handler = SettingsInputHandler {
@@ -1172,9 +1155,18 @@ impl gpui::Render for SettingsView {
                 .py_2()
                 .rounded_md()
                 .bg(if active {
-                    gpui::rgba(0x4f8fefff)
+                    crate::ui::color(p.accent)
                 } else {
-                    gpui::rgba(0x242c38ff)
+                    crate::ui::color(p.surface[1])
+                })
+                .text_color(if active {
+                    crate::ui::on_color(p.accent)
+                } else {
+                    crate::ui::muted(&p)
+                })
+                .when(!active, |tab| {
+                    let wash = crate::ui::hover_wash(&p);
+                    tab.hover(move |style| style.bg(wash))
                 })
                 .cursor_pointer()
                 .child(SharedString::from(format!("{page:?}")))
@@ -1189,8 +1181,8 @@ impl gpui::Render for SettingsView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(gpui::rgba(0x11151cff))
-            .text_color(gpui::white())
+            .bg(crate::ui::color(p.background))
+            .text_color(crate::ui::color(p.foreground))
             .child(
                 canvas(
                     |bounds, _, _| bounds,
@@ -1209,7 +1201,7 @@ impl gpui::Render for SettingsView {
                     .p_3()
                     .children(tabs)
                     .child(div().flex_1())
-                    .child(Self::button("Save", "save-settings").on_mouse_down(
+                    .child(Self::button("Save", "save-settings", &self.palette).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| this.save(cx)),
                     )),

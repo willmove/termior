@@ -975,6 +975,7 @@ impl Focusable for ComposerView {
 
 impl gpui::Render for ComposerView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = crate::ui::palette(cx);
         let focus = self.focus_handle.clone();
         let input_focus = focus.clone();
         let handler = ComposerInputHandler {
@@ -1012,7 +1013,9 @@ impl gpui::Render for ComposerView {
                     .px_2()
                     .py_1()
                     .rounded_md()
-                    .bg(gpui::rgba(0x2d3748ff))
+                    .bg(crate::ui::color(p.surface[2]))
+                    .border_1()
+                    .border_color(crate::ui::border(&p))
                     .text_xs()
                     .cursor_pointer()
                     .child(SharedString::from(format!(
@@ -1035,8 +1038,9 @@ impl gpui::Render for ComposerView {
                 .mt_1()
                 .rounded_md()
                 .border_1()
-                .border_color(gpui::rgba(0x4f8fefff))
-                .bg(gpui::rgba(0x202733ff))
+                .border_color(crate::ui::color(p.accent))
+                .bg(crate::ui::color(p.surface[2]))
+                .shadow_md()
                 .children(
                     self.path_suggestions
                         .iter()
@@ -1050,7 +1054,7 @@ impl gpui::Render for ComposerView {
                                 .py_1()
                                 .text_xs()
                                 .cursor_pointer()
-                                .when(selected, |row| row.bg(gpui::rgba(0x365880aa)))
+                                .when(selected, |row| row.bg(crate::ui::selected_wash(&p)))
                                 .child(SharedString::from(format!("@{path}")))
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -1070,7 +1074,8 @@ impl gpui::Render for ComposerView {
                 .p_2()
                 .rounded_md()
                 .border_1()
-                .border_color(gpui::rgba(0xe7a93fff))
+                .border_color(crate::ui::color(p.status[2]))
+                .bg(crate::ui::alpha(p.status[2], 0.08))
                 .child(SharedString::from(format!(
                     "Approval: {}",
                     pending.request.summary
@@ -1090,7 +1095,8 @@ impl gpui::Render for ComposerView {
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
-                                .bg(gpui::rgba(0x3a9b62ff))
+                                .bg(crate::ui::color(p.status[1]))
+                                .text_color(crate::ui::on_color(p.status[1]))
                                 .cursor_pointer()
                                 .child("Approve")
                                 .on_mouse_down(
@@ -1104,7 +1110,8 @@ impl gpui::Render for ComposerView {
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
-                                .bg(gpui::rgba(0xa64a4aff))
+                                .bg(crate::ui::color(p.status[3]))
+                                .text_color(crate::ui::on_color(p.status[3]))
                                 .cursor_pointer()
                                 .child("Reject")
                                 .on_mouse_down(
@@ -1126,9 +1133,14 @@ impl gpui::Render for ComposerView {
                         .py_1()
                         .rounded_md()
                         .bg(if decision == Some(true) {
-                            gpui::rgba(0x3a9b62ff)
+                            crate::ui::color(p.status[1])
                         } else {
-                            gpui::rgba(0x293241ff)
+                            crate::ui::color(p.surface[2])
+                        })
+                        .text_color(if decision == Some(true) {
+                            crate::ui::on_color(p.status[1])
+                        } else {
+                            crate::ui::color(p.foreground)
                         })
                         .cursor_pointer()
                         .child(SharedString::from(format!("Accept hunk {id}")))
@@ -1144,9 +1156,14 @@ impl gpui::Render for ComposerView {
                         .py_1()
                         .rounded_md()
                         .bg(if decision == Some(false) {
-                            gpui::rgba(0xa64a4aff)
+                            crate::ui::color(p.status[3])
                         } else {
-                            gpui::rgba(0x293241ff)
+                            crate::ui::color(p.surface[2])
+                        })
+                        .text_color(if decision == Some(false) {
+                            crate::ui::on_color(p.status[3])
+                        } else {
+                            crate::ui::color(p.foreground)
                         })
                         .cursor_pointer()
                         .child(SharedString::from(format!("Reject hunk {id}")))
@@ -1166,7 +1183,7 @@ impl gpui::Render for ComposerView {
                 .p_2()
                 .rounded_md()
                 .border_1()
-                .border_color(gpui::rgba(0x4f8fefff))
+                .border_color(crate::ui::color(p.accent))
                 .child(SharedString::from(format!(
                     "AI diff · {}",
                     edit.summary.path
@@ -1189,7 +1206,8 @@ impl gpui::Render for ComposerView {
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
-                                .bg(gpui::rgba(0x3a9b62ff))
+                                .bg(crate::ui::color(p.status[1]))
+                                .text_color(crate::ui::on_color(p.status[1]))
                                 .cursor_pointer()
                                 .child("Apply decisions")
                                 .on_mouse_down(
@@ -1203,7 +1221,8 @@ impl gpui::Render for ComposerView {
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
-                                .bg(gpui::rgba(0xa64a4aff))
+                                .bg(crate::ui::color(p.status[3]))
+                                .text_color(crate::ui::on_color(p.status[3]))
                                 .cursor_pointer()
                                 .child("Reject all")
                                 .on_mouse_down(
@@ -1221,7 +1240,7 @@ impl gpui::Render for ComposerView {
                 .p_2()
                 .rounded_md()
                 .border_1()
-                .border_color(gpui::rgba(0x4f8fefff))
+                .border_color(crate::ui::color(p.accent))
                 .child("Plan awaiting confirmation")
                 .child(
                     div()
@@ -1229,7 +1248,8 @@ impl gpui::Render for ComposerView {
                         .px_2()
                         .py_1()
                         .rounded_md()
-                        .bg(gpui::rgba(0x3a9b62ff))
+                        .bg(crate::ui::color(p.status[1]))
+                        .text_color(crate::ui::on_color(p.status[1]))
                         .cursor_pointer()
                         .child("Confirm plan")
                         .on_mouse_down(
@@ -1243,7 +1263,8 @@ impl gpui::Render for ComposerView {
                         .px_2()
                         .py_1()
                         .rounded_md()
-                        .bg(gpui::rgba(0xa64a4aff))
+                        .bg(crate::ui::color(p.status[3]))
+                        .text_color(crate::ui::on_color(p.status[3]))
                         .cursor_pointer()
                         .child("Reject plan")
                         .on_mouse_down(
@@ -1260,8 +1281,9 @@ impl gpui::Render for ComposerView {
             .min_h(px(165.0))
             .max_h(px(330.0))
             .border_t_1()
-            .border_color(gpui::rgba(0x344052ff))
-            .bg(gpui::rgba(0x151a22ff))
+            .border_color(crate::ui::border(&p))
+            .bg(crate::ui::color(p.surface[1]))
+            .text_color(crate::ui::color(p.foreground))
             .track_focus(&focus)
             .on_key_down(cx.listener(Self::handle_key_down))
             .child(
@@ -1299,7 +1321,8 @@ impl gpui::Render for ComposerView {
                     .py_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(gpui::rgba(0x3a4658ff))
+                    .border_color(crate::ui::border(&p))
+                    .bg(crate::ui::color(p.background))
                     .child(
                         div()
                             .flex_1()
@@ -1312,7 +1335,7 @@ impl gpui::Render for ComposerView {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(gpui::rgba(0x293241ff))
+                            .bg(crate::ui::color(p.surface[2]))
                             .cursor_pointer()
                             .text_xs()
                             .child("+ File")
@@ -1327,7 +1350,7 @@ impl gpui::Render for ComposerView {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(gpui::rgba(0x293241ff))
+                            .bg(crate::ui::color(p.surface[2]))
                             .cursor_pointer()
                             .text_xs()
                             .child("+ Image")
@@ -1342,7 +1365,7 @@ impl gpui::Render for ComposerView {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(gpui::rgba(0x293241ff))
+                            .bg(crate::ui::color(p.surface[2]))
                             .cursor_pointer()
                             .text_xs()
                             .child(SharedString::from(agent_label))
@@ -1358,9 +1381,14 @@ impl gpui::Render for ComposerView {
                             .py_1()
                             .rounded_md()
                             .bg(if self.plan_mode {
-                                gpui::rgba(0x4f8fefff)
+                                crate::ui::color(p.accent)
                             } else {
-                                gpui::rgba(0x293241ff)
+                                crate::ui::color(p.surface[2])
+                            })
+                            .text_color(if self.plan_mode {
+                                crate::ui::on_color(p.accent)
+                            } else {
+                                crate::ui::color(p.foreground)
                             })
                             .cursor_pointer()
                             .text_xs()
@@ -1374,9 +1402,14 @@ impl gpui::Render for ComposerView {
                             .py_1()
                             .rounded_md()
                             .bg(if self.busy {
-                                gpui::rgba(0x59606bff)
+                                crate::ui::alpha(p.foreground, 0.25)
                             } else {
-                                gpui::rgba(0x4f8fefff)
+                                crate::ui::color(p.accent)
+                            })
+                            .text_color(if self.busy {
+                                crate::ui::color(p.foreground)
+                            } else {
+                                crate::ui::on_color(p.accent)
                             })
                             .cursor_pointer()
                             .child(if self.busy { "Working…" } else { "Send" })
@@ -1388,7 +1421,7 @@ impl gpui::Render for ComposerView {
                     .px_3()
                     .py_1()
                     .text_xs()
-                    .text_color(gpui::rgba(0x9aa6b7ff))
+                    .text_color(crate::ui::muted(&p))
                     .child(SharedString::from(self.status.clone())),
             )
     }

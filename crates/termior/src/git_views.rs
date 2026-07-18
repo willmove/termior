@@ -3,6 +3,7 @@ use gpui::{
     Focusable, InputHandler, KeyDownEvent, MouseButton, Pixels, Point, SharedString,
     UTF16Selection, WeakEntity, Window,
 };
+use crate::ui::{self, ButtonKind};
 use std::ops::Range;
 use termior_vcs::{parse_diff_hunks, ChangeGroup, CommitInfo, GitDiffHunk};
 
@@ -91,6 +92,7 @@ impl EventEmitter<GitDiffAction> for GitDiffView {}
 
 impl gpui::Render for GitDiffView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = ui::palette(cx);
         let hunk_controls = self.hunks.iter().enumerate().map(|(index, hunk)| {
             let patch = hunk.patch.clone();
             let path = self.path.clone();
@@ -104,25 +106,23 @@ impl gpui::Render for GitDiffView {
                 .py_2()
                 .rounded_md()
                 .border_1()
-                .border_color(gpui::rgba(0x344052ff))
+                .border_color(ui::border(&p))
                 .child(SharedString::from(format!(
                     "Hunk {} · {}",
                     index + 1,
                     hunk.header
                 )))
                 .children(group.map(|group| {
-                    div()
-                        .id(SharedString::from(format!("git-hunk-{index}")))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .bg(gpui::rgba(0x293241ff))
-                        .child(if group == ChangeGroup::Staged {
+                    ui::button(
+                        SharedString::from(format!("git-hunk-{index}")),
+                        if group == ChangeGroup::Staged {
                             "Unstage hunk"
                         } else {
                             "Stage hunk"
-                        })
+                        },
+                        ButtonKind::Subtle,
+                        &p,
+                    )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |_this, _, _, cx| {
@@ -143,13 +143,13 @@ impl gpui::Render for GitDiffView {
         });
         let patch_lines = self.patch.lines().map(|line| {
             let color = if line.starts_with('+') && !line.starts_with("+++") {
-                gpui::rgba(0x8bd49cff)
+                ui::color(p.diff[0])
             } else if line.starts_with('-') && !line.starts_with("---") {
-                gpui::rgba(0xe06c75ff)
+                ui::color(p.diff[1])
             } else if line.starts_with("@@") {
-                gpui::rgba(0x75a7ffff)
+                ui::color(p.accent)
             } else {
-                gpui::rgba(0xc6d0e0ff)
+                ui::alpha(p.foreground, 0.75)
             };
             div()
                 .px_3()
@@ -165,12 +165,14 @@ impl gpui::Render for GitDiffView {
             Ok(message) => div()
                 .px_3()
                 .py_2()
-                .bg(gpui::rgba(0x244c36ff))
+                .bg(ui::alpha(p.status[1], 0.18))
+                .text_color(ui::color(p.status[1]))
                 .child(SharedString::from(message.clone())),
             Err(error) => div()
                 .px_3()
                 .py_2()
-                .bg(gpui::rgba(0x5b2929ff))
+                .bg(ui::alpha(p.status[3], 0.18))
+                .text_color(ui::color(p.status[3]))
                 .child(SharedString::from(error.clone())),
         });
 
@@ -178,8 +180,8 @@ impl gpui::Render for GitDiffView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(gpui::rgba(0x151a22ff))
-            .text_color(gpui::rgba(0xd7deebff))
+            .bg(ui::color(p.background))
+            .text_color(ui::color(p.foreground))
             .child(
                 div()
                     .flex()
@@ -188,47 +190,42 @@ impl gpui::Render for GitDiffView {
                     .px_4()
                     .py_3()
                     .border_b_1()
-                    .border_color(gpui::rgba(0x344052ff))
+                    .border_color(ui::border(&p))
                     .child(SharedString::from(self.path.clone()))
                     .children(self.group.map(|group| {
                         div()
                             .flex()
                             .gap_2()
                             .child(
-                                div()
-                                    .id("git-file-action")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .bg(gpui::rgba(0x3a6ea5ff))
-                                    .child(file_label)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.file_action(cx)),
-                                    ),
+                                ui::button(
+                                    "git-file-action",
+                                    file_label,
+                                    ButtonKind::Primary,
+                                    &p,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.file_action(cx)),
+                                ),
                             )
                             .children((group != ChangeGroup::Staged).then(|| {
-                                div()
-                                    .id("git-discard-file")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .bg(if self.confirm_discard {
-                                        gpui::rgba(0xc94f4fff)
-                                    } else {
-                                        gpui::rgba(0x6b3f3fff)
-                                    })
-                                    .child(if self.confirm_discard {
+                                ui::button(
+                                    "git-discard-file",
+                                    if self.confirm_discard {
                                         "Confirm discard"
                                     } else {
                                         "Discard…"
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.discard(cx)),
-                                    )
+                                    },
+                                    ButtonKind::Danger,
+                                    &p,
+                                )
+                                .when(!self.confirm_discard, |button| {
+                                    button.opacity(0.85)
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.discard(cx)),
+                                )
                             }))
                     })),
             )
@@ -322,6 +319,7 @@ impl EventEmitter<GitHistoryAction> for GitHistoryView {}
 
 impl gpui::Render for GitHistoryView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = ui::palette(cx);
         let focus = self.focus_handle.clone();
         let input_focus = focus.clone();
         let handler = GitHistoryInputHandler {
@@ -354,11 +352,11 @@ impl gpui::Render for GitHistoryView {
                     .px_3()
                     .py_2()
                     .cursor_pointer()
-                    .when(selected, |row| row.bg(gpui::rgba(0x365880aa)))
+                    .when(selected, |row| row.bg(ui::selected_wash(&p)))
                     .child(
                         div()
                             .font_family("monospace")
-                            .text_color(gpui::rgba(0x75a7ffff))
+                            .text_color(ui::color(p.accent))
                             .child(SharedString::from(graph)),
                     )
                     .child(
@@ -369,7 +367,7 @@ impl gpui::Render for GitHistoryView {
                                 "{}{}",
                                 commit.summary, decorations
                             )))
-                            .child(div().text_xs().text_color(gpui::rgba(0x9aa6b7ff)).child(
+                            .child(div().text_xs().text_color(ui::muted(&p)).child(
                                 SharedString::from(format!(
                                     "{} · {}",
                                     &commit.id[..7.min(commit.id.len())],
@@ -391,7 +389,10 @@ impl gpui::Render for GitHistoryView {
                 .px_3()
                 .py_2()
                 .cursor_pointer()
-                .hover(|style| style.bg(gpui::rgba(0x36588066)))
+                .hover({
+                    let wash = ui::hover_wash(&p);
+                    move |style| style.bg(wash)
+                })
                 .child(SharedString::from(path.clone()))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -412,8 +413,8 @@ impl gpui::Render for GitHistoryView {
             .size_full()
             .track_focus(&focus)
             .on_key_down(cx.listener(Self::handle_key))
-            .bg(gpui::rgba(0x151a22ff))
-            .text_color(gpui::rgba(0xd7deebff))
+            .bg(ui::color(p.background))
+            .text_color(ui::color(p.foreground))
             .child(
                 canvas(
                     |bounds, _, _| bounds,
@@ -430,7 +431,8 @@ impl gpui::Render for GitHistoryView {
                     .py_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(gpui::rgba(0x4f8fefff))
+                    .border_color(ui::color(p.accent))
+                    .bg(ui::color(p.surface[1]))
                     .child(SharedString::from(format!(
                         "Search history: {}▏",
                         self.query
@@ -448,7 +450,7 @@ impl gpui::Render for GitHistoryView {
                             .h_full()
                             .overflow_y_scroll()
                             .border_r_1()
-                            .border_color(gpui::rgba(0x344052ff))
+                            .border_color(ui::border(&p))
                             .children(commits),
                     )
                     .child(
@@ -465,14 +467,12 @@ impl gpui::Render for GitHistoryView {
                                     .py_2()
                                     .child("Changed files")
                                     .children(remote_commit.map(|commit| {
-                                        div()
-                                            .id("open-remote-commit")
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .bg(gpui::rgba(0x293241ff))
-                                            .child("Open remote")
+                                        ui::button(
+                                            "open-remote-commit",
+                                            "Open remote",
+                                            ButtonKind::Subtle,
+                                            &p,
+                                        )
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |_this, _, _, cx| {

@@ -1,3 +1,4 @@
+use crate::ui::{self, ButtonKind};
 use gpui::{div, prelude::*, px, Context, EventEmitter, MouseButton, SharedString, Window};
 use std::collections::HashMap;
 use termior_ai::EditProposalSummary;
@@ -70,6 +71,7 @@ impl EventEmitter<AiDiffAction> for AiDiffView {}
 
 impl gpui::Render for AiDiffView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = ui::palette(cx);
         let controls = self.summary.hunk_ids.iter().map(|id| {
             let accept_id = *id;
             let reject_id = *id;
@@ -82,54 +84,50 @@ impl gpui::Render for AiDiffView {
                 .py_2()
                 .rounded_md()
                 .border_1()
-                .border_color(gpui::rgba(0x344052ff))
+                .border_color(ui::border(&p))
                 .child(SharedString::from(format!("Hunk {}", id + 1)))
                 .child(
-                    div()
-                        .id(SharedString::from(format!("ai-diff-accept-{id}")))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .bg(if decision == Some(true) {
-                            gpui::rgba(0x3a9b62ff)
+                    ui::button(
+                        SharedString::from(format!("ai-diff-accept-{id}")),
+                        "Accept",
+                        if decision == Some(true) {
+                            ButtonKind::Success
                         } else {
-                            gpui::rgba(0x293241ff)
-                        })
-                        .child("Accept")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| this.decide(accept_id, true, cx)),
-                        ),
+                            ButtonKind::Subtle
+                        },
+                        &p,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.decide(accept_id, true, cx)),
+                    ),
                 )
                 .child(
-                    div()
-                        .id(SharedString::from(format!("ai-diff-reject-{id}")))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .bg(if decision == Some(false) {
-                            gpui::rgba(0xa64a4aff)
+                    ui::button(
+                        SharedString::from(format!("ai-diff-reject-{id}")),
+                        "Reject",
+                        if decision == Some(false) {
+                            ButtonKind::Danger
                         } else {
-                            gpui::rgba(0x293241ff)
-                        })
-                        .child("Reject")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| this.decide(reject_id, false, cx)),
-                        ),
+                            ButtonKind::Subtle
+                        },
+                        &p,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| this.decide(reject_id, false, cx)),
+                    ),
                 )
         });
         let patch_lines = self.summary.patch.lines().map(|line| {
             let color = if line.starts_with('+') && !line.starts_with("+++") {
-                gpui::rgba(0x8bd49cff)
+                ui::color(p.diff[0])
             } else if line.starts_with('-') && !line.starts_with("---") {
-                gpui::rgba(0xe06c75ff)
+                ui::color(p.diff[1])
             } else if line.starts_with("@@") {
-                gpui::rgba(0x75a7ffff)
+                ui::color(p.accent)
             } else {
-                gpui::rgba(0xc6d0e0ff)
+                ui::alpha(p.foreground, 0.75)
             };
             div()
                 .px_3()
@@ -142,13 +140,15 @@ impl gpui::Render for AiDiffView {
                 .px_3()
                 .py_2()
                 .rounded_md()
-                .bg(gpui::rgba(0x244c36ff))
+                .bg(ui::alpha(p.status[1], 0.18))
+                .text_color(ui::color(p.status[1]))
                 .child(SharedString::from(message.clone())),
             Err(error) => div()
                 .px_3()
                 .py_2()
                 .rounded_md()
-                .bg(gpui::rgba(0x5b2929ff))
+                .bg(ui::alpha(p.status[3], 0.18))
+                .text_color(ui::color(p.status[3]))
                 .child(SharedString::from(error.clone())),
         });
 
@@ -156,8 +156,8 @@ impl gpui::Render for AiDiffView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(gpui::rgba(0x151a22ff))
-            .text_color(gpui::rgba(0xd7deebff))
+            .bg(ui::color(p.background))
+            .text_color(ui::color(p.foreground))
             .child(
                 div()
                     .flex()
@@ -167,12 +167,12 @@ impl gpui::Render for AiDiffView {
                     .px_4()
                     .py_3()
                     .border_b_1()
-                    .border_color(gpui::rgba(0x344052ff))
+                    .border_color(ui::border(&p))
                     .child(
                         div().flex().flex_col().child("AI proposed edit").child(
                             div()
                                 .text_xs()
-                                .text_color(gpui::rgba(0x9aa6b7ff))
+                                .text_color(ui::muted(&p))
                                 .child(SharedString::from(self.summary.path.clone())),
                         ),
                     )
@@ -181,32 +181,24 @@ impl gpui::Render for AiDiffView {
                             .flex()
                             .gap_2()
                             .child(
-                                div()
-                                    .id("ai-diff-apply")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .bg(if complete {
-                                        gpui::rgba(0x3a9b62ff)
+                                ui::button(
+                                    "ai-diff-apply",
+                                    "Apply reviewed hunks",
+                                    if complete {
+                                        ButtonKind::Success
                                     } else {
-                                        gpui::rgba(0x59606bff)
-                                    })
-                                    .child("Apply reviewed hunks")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.apply(cx)),
-                                    ),
+                                        ButtonKind::Subtle
+                                    },
+                                    &p,
+                                )
+                                .when(!complete, |button| button.opacity(0.6))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.apply(cx)),
+                                ),
                             )
                             .child(
-                                div()
-                                    .id("ai-diff-reject-all")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .bg(gpui::rgba(0xa64a4aff))
-                                    .child("Reject all")
+                                ui::button("ai-diff-reject-all", "Reject all", ButtonKind::Danger, &p)
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| this.reject_all(cx)),
