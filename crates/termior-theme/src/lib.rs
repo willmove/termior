@@ -145,14 +145,62 @@ pub fn builtin_themes() -> Vec<Theme> {
     vec![
         default_theme(),
         nord_theme(),
-        styled_theme("tide", "Tide", 0x101820, 0x4fd1c5),
-        styled_theme("catppuccin", "Catppuccin", 0x1e1e2e, 0xcba6f7),
-        styled_theme("tokyo-night", "Tokyo Night", 0x1a1b26, 0x7aa2f7),
-        styled_theme("caffeine", "Caffeine", 0x201a17, 0xd08c60),
-        styled_theme("claude", "Claude", 0x26201d, 0xd97757),
-        styled_theme("gruvbox", "Gruvbox", 0x282828, 0xd79921),
-        styled_theme("sage", "Sage", 0x17201b, 0x8fb996),
-        styled_theme("rose-pine", "Rose Pine", 0x191724, 0xebbcba),
+        styled_theme(
+            "tide",
+            "Tide",
+            StyledColors::new(
+                0x101820, 0x4fd1c5, 0xff6b6b, 0x68d391, 0xf6c453, 0x9f7aea, 0x63b3ed,
+            ),
+        ),
+        styled_theme(
+            "catppuccin",
+            "Catppuccin",
+            StyledColors::new(
+                0x1e1e2e, 0xcba6f7, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0xf5c2e7, 0x89dceb,
+            ),
+        ),
+        styled_theme(
+            "tokyo-night",
+            "Tokyo Night",
+            StyledColors::new(
+                0x1a1b26, 0x7aa2f7, 0xf7768e, 0x9ece6a, 0xe0af68, 0xbb9af7, 0x7dcfff,
+            ),
+        ),
+        styled_theme(
+            "caffeine",
+            "Caffeine",
+            StyledColors::new(
+                0x201a17, 0xd08c60, 0xe05d44, 0xa3b18a, 0xd4a373, 0xb5838d, 0x84a59d,
+            ),
+        ),
+        styled_theme(
+            "claude",
+            "Claude",
+            StyledColors::new(
+                0x26201d, 0xd97757, 0xc15f3c, 0x7f9b76, 0xe0a458, 0xac7b9b, 0x6f9e99,
+            ),
+        ),
+        styled_theme(
+            "gruvbox",
+            "Gruvbox",
+            StyledColors::new(
+                0x282828, 0xd79921, 0xcc241d, 0x98971a, 0xd79921, 0xb16286, 0x689d6a,
+            ),
+        ),
+        styled_theme(
+            "sage",
+            "Sage",
+            StyledColors::new(
+                0x17201b, 0x8fb996, 0xd47766, 0x8fb996, 0xd8b26e, 0xb19ac7, 0x78aaa1,
+            ),
+        ),
+        styled_theme(
+            "rose-pine",
+            "Rose Pine",
+            StyledColors::new(
+                0x191724, 0xebbcba, 0xeb6f92, 0x9ccfd8, 0xf6c177, 0xc4a7e7, 0x9ccfd8,
+            ),
+        ),
     ]
 }
 
@@ -236,21 +284,130 @@ pub fn nord_theme() -> Theme {
     }
 }
 
-fn styled_theme(id: &str, name: &str, background: u32, accent: u32) -> Theme {
-    let mut light = base_light();
-    let mut dark = base_dark();
-    dark.background = Color::hex3(background);
-    dark.surface = [
-        Color::hex3(background),
-        blend(Color::hex3(background), Color::rgb(255, 255, 255), 0.08),
-        blend(Color::hex3(background), Color::rgb(255, 255, 255), 0.14),
-    ];
-    dark.accent = Color::hex3(accent);
-    dark.status[0] = Color::hex3(accent);
-    dark.terminal.blue = Color::hex3(accent);
-    dark.terminal.bright_blue = blend(Color::hex3(accent), Color::rgb(255, 255, 255), 0.2);
-    light.accent = Color::hex3(accent);
-    light.status[0] = Color::hex3(accent);
+#[derive(Clone, Copy)]
+struct StyledColors {
+    background: u32,
+    accent: u32,
+    red: u32,
+    green: u32,
+    yellow: u32,
+    magenta: u32,
+    cyan: u32,
+}
+
+impl StyledColors {
+    const fn new(
+        background: u32,
+        accent: u32,
+        red: u32,
+        green: u32,
+        yellow: u32,
+        magenta: u32,
+        cyan: u32,
+    ) -> Self {
+        Self {
+            background,
+            accent,
+            red,
+            green,
+            yellow,
+            magenta,
+            cyan,
+        }
+    }
+}
+
+fn styled_theme(id: &str, name: &str, colors: StyledColors) -> Theme {
+    let white = Color::rgb(255, 255, 255);
+    let black = Color::rgb(18, 18, 20);
+    let background = Color::hex3(colors.background);
+    let accent = Color::hex3(colors.accent);
+    let red = Color::hex3(colors.red);
+    let green = Color::hex3(colors.green);
+    let yellow = Color::hex3(colors.yellow);
+    let magenta = Color::hex3(colors.magenta);
+    let cyan = Color::hex3(colors.cyan);
+
+    // Keep the visual identity in both appearance modes. Previously the light
+    // variants copied `base_light()` wholesale and changed only the accent,
+    // so most themes rendered identical application chrome.
+    let light_foreground = blend(background, black, 0.10);
+    let light_accent = blend(accent, black, 0.18);
+    let light = Palette {
+        background: blend(background, white, 0.94),
+        foreground: light_foreground,
+        surface: [
+            blend(background, white, 0.89),
+            blend(background, white, 0.975),
+            blend(background, white, 0.84),
+        ],
+        accent: light_accent,
+        status: [
+            light_accent,
+            blend(green, black, 0.14),
+            blend(yellow, black, 0.16),
+            blend(red, black, 0.12),
+        ],
+        diff: [
+            blend(green, white, 0.70),
+            blend(red, white, 0.72),
+            blend(background, white, 0.76),
+        ],
+        terminal: TerminalPalette {
+            black: light_foreground,
+            red: blend(red, black, 0.12),
+            green: blend(green, black, 0.16),
+            yellow: blend(yellow, black, 0.18),
+            blue: light_accent,
+            magenta: blend(magenta, black, 0.12),
+            cyan: blend(cyan, black, 0.16),
+            white: blend(background, white, 0.88),
+            bright_black: blend(background, white, 0.42),
+            bright_red: blend(red, white, 0.14),
+            bright_green: blend(green, white, 0.10),
+            bright_yellow: blend(yellow, white, 0.10),
+            bright_blue: blend(accent, white, 0.10),
+            bright_magenta: blend(magenta, white, 0.12),
+            bright_cyan: blend(cyan, white, 0.10),
+            bright_white: blend(background, white, 0.98),
+        },
+    };
+
+    let dark_foreground = blend(background, white, 0.90);
+    let dark = Palette {
+        background,
+        foreground: dark_foreground,
+        surface: [
+            background,
+            blend(background, white, 0.08),
+            blend(background, white, 0.14),
+        ],
+        accent,
+        status: [accent, green, yellow, red],
+        diff: [
+            blend(green, background, 0.22),
+            blend(red, background, 0.22),
+            blend(dark_foreground, background, 0.58),
+        ],
+        terminal: TerminalPalette {
+            black: blend(background, white, 0.10),
+            red,
+            green,
+            yellow,
+            blue: accent,
+            magenta,
+            cyan,
+            white: blend(background, white, 0.84),
+            bright_black: blend(background, white, 0.30),
+            bright_red: blend(red, white, 0.18),
+            bright_green: blend(green, white, 0.18),
+            bright_yellow: blend(yellow, white, 0.16),
+            bright_blue: blend(accent, white, 0.20),
+            bright_magenta: blend(magenta, white, 0.18),
+            bright_cyan: blend(cyan, white, 0.18),
+            bright_white: blend(background, white, 0.96),
+        },
+    };
     Theme {
         id: id.into(),
         name: name.into(),
@@ -410,6 +567,30 @@ mod tests {
         let ids: Vec<String> = t.iter().map(|x| x.id.clone()).collect();
         assert!(ids.iter().any(|x| x == "default"));
         assert!(ids.iter().any(|x| x == "nord"));
+    }
+
+    #[test]
+    fn builtin_themes_have_distinct_chrome_palettes() {
+        let themes = builtin_themes();
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            for (index, theme) in themes.iter().enumerate() {
+                let palette = theme.resolve(appearance, false);
+                for other in themes.iter().skip(index + 1) {
+                    let other_palette = other.resolve(appearance, false);
+                    assert_ne!(
+                        (palette.background, palette.foreground, palette.surface),
+                        (
+                            other_palette.background,
+                            other_palette.foreground,
+                            other_palette.surface
+                        ),
+                        "{} and {} render the same app chrome in {appearance:?} mode",
+                        theme.id,
+                        other.id
+                    );
+                }
+            }
+        }
     }
 
     #[test]

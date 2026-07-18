@@ -13,7 +13,7 @@ use gpui::{
     Bounds, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
     Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Point, PromptButton, PromptLevel, Role, SharedString, Task, UTF16Selection, Window,
-    WindowBounds,
+    WindowAppearance, WindowBounds,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
@@ -28,6 +28,7 @@ use termior_platform::{
     AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationContext,
     NotificationDecision, NotificationRouter, NotificationTarget, SystemNotifier,
 };
+use termior_preview::normalize_preview_url;
 use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_store::{
     app_data_dir, atomic_write, default_settings, migrate, KeyAction, Settings, ShellDetection,
@@ -110,6 +111,7 @@ enum CommandMode {
     GitCommit,
     GitCreateBranch,
     GitSwitchBranch,
+    PreviewUrl,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +207,7 @@ pub struct WorkspaceView {
     pending_rename_target: Option<PathBuf>,
     explorer_context_menu: Option<ExplorerContextMenu>,
     split_menu_open: bool,
+    theme_menu_open: bool,
     sidebar_resizing: bool,
     pane_resizing: Option<PaneResizeState>,
     content_matches: Vec<ContentMatch>,
@@ -222,10 +225,11 @@ pub struct WorkspaceView {
     toasts: Vec<InAppToast>,
     next_toast_id: u64,
     bell_open: bool,
+    system_is_dark: bool,
 }
 
 impl WorkspaceView {
-    pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(root: PathBuf, system_is_dark: bool, cx: &mut Context<Self>) -> Self {
         let (settings, data_dir, migration_error) = load_settings();
         let themes = data_dir
             .as_ref()
@@ -247,7 +251,7 @@ impl WorkspaceView {
                 termior_store::settings::Appearance::Dark => Appearance::Dark,
                 termior_store::settings::Appearance::FollowSystem => Appearance::FollowSystem,
             },
-            true,
+            system_is_dark,
         );
         cx.set_global(ui::ActiveTheme(palette.clone()));
         let mut model = data_dir
@@ -377,6 +381,7 @@ impl WorkspaceView {
             pending_rename_target: None,
             explorer_context_menu: None,
             split_menu_open: false,
+            theme_menu_open: false,
             sidebar_resizing: false,
             pane_resizing: None,
             content_matches: Vec::new(),
@@ -394,6 +399,7 @@ impl WorkspaceView {
             toasts: Vec::new(),
             next_toast_id: 1,
             bell_open: false,
+            system_is_dark,
         }
     }
 
@@ -450,9 +456,7 @@ impl WorkspaceView {
                     for pane_id in pane_ids {
                         tab.panes.insert(
                             pane_id,
-                            PaneContent::Preview(
-                                cx.new(|cx| PreviewView::new(url.clone(), window, cx)),
-                            ),
+                            PaneContent::Preview(new_preview_view(url.clone(), window, cx)),
                         );
                     }
                 }
@@ -484,6 +488,65 @@ impl WorkspaceView {
                 break;
             }
         }));
+    }
+
+    /// Runs the real preview creation path and exits after the embedded WebView is ready.
+    /// Used by `scripts/preview-smoke.ps1`; normal launches never call this method.
+    pub(crate) fn start_preview_smoke(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |workspace, cx| {
+            // Let the explorer scan and watcher schedule foreground work. This is the
+            // timing that exposed the Windows WebView2/GPUI re-entrancy crash.
+            cx.background_executor()
+                .timer(Duration::from_millis(750))
+                .await;
+            if workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.create_preview_url("http://localhost:3000".into(), window, cx)
+                })
+                .is_err()
+            {
+                return;
+            }
+
+            for _ in 0..80 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let backend = workspace
+                    .update_in(cx, |workspace, _window, cx| {
+                        workspace
+                            .tabs
+                            .iter()
+                            .find(|tab| Some(tab.id) == workspace.model.active)
+                            .and_then(|tab| {
+                                tab.panes.values().find_map(|pane| match pane {
+                                    PaneContent::Preview(preview) => {
+                                        Some(preview.read(cx).backend())
+                                    }
+                                    _ => None,
+                                })
+                            })
+                    })
+                    .ok()
+                    .flatten();
+                match backend {
+                    Some(termior_preview::PreviewBackend::Embedded) => {
+                        println!("TERMIOR_PREVIEW_SMOKE_OK");
+                        let _ = cx.update(|_, cx| cx.quit());
+                        return;
+                    }
+                    Some(termior_preview::PreviewBackend::ExternalBrowser) => {
+                        eprintln!("TERMIOR_PREVIEW_SMOKE_FAILED: embedded WebView unavailable");
+                        let _ = cx.update(|_, cx| cx.quit());
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            eprintln!("TERMIOR_PREVIEW_SMOKE_FAILED: timed out waiting for WebView");
+            let _ = cx.update(|_, cx| cx.quit());
+        })
+        .detach();
     }
 
     fn schedule_explorer_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
@@ -580,7 +643,11 @@ impl WorkspaceView {
                 if !root.is_dir() || root == workspace.model.root {
                     return;
                 }
-                *workspace = Self::new(root, cx);
+                let system_is_dark = matches!(
+                    window.appearance(),
+                    WindowAppearance::Dark | WindowAppearance::VibrantDark
+                );
+                *workspace = Self::new(root, system_is_dark, cx);
                 workspace.restore_or_create_runtime(window, cx);
                 workspace.start_background_services(cx);
                 cx.notify();
@@ -808,16 +875,30 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn create_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let url = self
+    fn request_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(url) = self
             .active_terminal()
             .and_then(|terminal| terminal.read(cx).localhost_urls().last().cloned())
-            .unwrap_or_else(|| "http://localhost:3000".into());
+        {
+            self.create_preview_url(url, window, cx);
+            return;
+        }
+        self.command_mode = CommandMode::PreviewUrl;
+        self.command_input.clear();
+        self.command_marked_text.clear();
+        self.command_message =
+            Some("Enter an http(s) URL, e.g. localhost:3000, then press Enter".into());
+        self.model.sidebar_visible = true;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn create_preview_url(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.model.new_tab(TabKind::Preview, "Preview", false);
         if let Some(tab) = self.model.active_tab_mut() {
             tab.resource = Some(url.clone());
         }
-        let preview = cx.new(|cx| PreviewView::new(url, window, cx));
+        let preview = new_preview_view(url, window, cx);
         self.tabs.push(AppTab {
             id,
             panes: single_pane(PaneContent::Preview(preview)),
@@ -2030,16 +2111,56 @@ impl WorkspaceView {
         }
     }
 
-    fn cycle_theme(
+    fn select_theme(&mut self, theme_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(theme_index) = self.themes.iter().position(|theme| theme.id == theme_id) else {
+            return;
+        };
+        self.system_is_dark = matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
+        self.theme_index = theme_index;
+        self.settings.theme_id = self.themes[theme_index].id.clone();
+        self.palette =
+            self.themes[theme_index].resolve(self.resolved_appearance(), self.system_is_dark);
+        self.theme_menu_open = false;
+        self.propagate_palette(cx);
+        cx.notify();
+    }
+
+    fn apply_theme_preferences(
         &mut self,
-        _event: &MouseDownEvent,
-        _window: &mut Window,
+        theme: &Theme,
+        editor_theme_id: &str,
+        appearance: termior_store::settings::Appearance,
         cx: &mut Context<Self>,
     ) {
-        self.theme_index = (self.theme_index + 1) % self.themes.len();
-        self.palette = self.themes[self.theme_index].resolve(self.resolved_appearance(), true);
-        self.settings.theme_id = self.themes[self.theme_index].id.clone();
+        self.settings.theme_id = theme.id.clone();
+        self.settings.editor_theme_id = editor_theme_id.to_owned();
+        self.settings.appearance = appearance;
+        self.theme_index = if let Some(index) = self
+            .themes
+            .iter()
+            .position(|candidate| candidate.id == theme.id)
+        {
+            self.themes[index] = theme.clone();
+            index
+        } else {
+            self.themes.push(theme.clone());
+            self.themes.len() - 1
+        };
+        self.palette =
+            self.themes[self.theme_index].resolve(self.resolved_appearance(), self.system_is_dark);
         self.propagate_palette(cx);
+        for tab in &self.tabs {
+            for pane in tab.panes.values() {
+                if let PaneContent::Editor(editor) = pane {
+                    editor.update(cx, |editor, _| {
+                        editor.set_preferences(editor_theme_id, self.settings.vim_mode)
+                    });
+                }
+            }
+        }
         cx.notify();
     }
 
@@ -2079,6 +2200,7 @@ impl WorkspaceView {
         let migration_error = self.migration_error.clone();
         let data_dir = self.data_dir.clone();
         let workspace = cx.entity().downgrade();
+        let preview_workspace = workspace.clone();
         let on_save = Box::new(move |settings: &Settings, app: &mut gpui::App| {
             if let Some(workspace) = workspace.upgrade() {
                 workspace.update(app, |workspace, cx| {
@@ -2087,12 +2209,36 @@ impl WorkspaceView {
                 });
             }
         });
+        let on_theme_preview = Box::new(
+            move |theme: &Theme,
+                  editor_theme_id: &str,
+                  appearance: termior_store::settings::Appearance,
+                  app: &mut gpui::App| {
+                if let Some(workspace) = preview_workspace.upgrade() {
+                    workspace.update(app, |workspace, cx| {
+                        workspace.apply_theme_preferences(
+                            theme,
+                            editor_theme_id,
+                            appearance,
+                            cx,
+                        );
+                    });
+                }
+            },
+        );
         let bounds = Bounds::centered(None, size(px(760.0), px(520.0)), cx);
         let _ = cx.open_window(
             app_identity::window_options(WindowBounds::Windowed(bounds)),
             |_window, cx| {
                 cx.new(|cx| {
-                    SettingsView::new(settings, migration_error, data_dir, Some(on_save), cx)
+                    SettingsView::new(
+                        settings,
+                        migration_error,
+                        data_dir,
+                        Some(on_save),
+                        Some(on_theme_preview),
+                        cx,
+                    )
                 })
             },
         );
@@ -2115,7 +2261,8 @@ impl WorkspaceView {
             .iter()
             .position(|theme| theme.id == self.settings.theme_id)
             .unwrap_or(0);
-        self.palette = self.themes[self.theme_index].resolve(self.resolved_appearance(), true);
+        self.palette =
+            self.themes[self.theme_index].resolve(self.resolved_appearance(), self.system_is_dark);
         self.propagate_palette(cx);
         self.schedule_explorer_scan(self.explorer_requested_root.clone(), cx);
         for tab in &self.tabs {
@@ -2184,7 +2331,12 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn handle_command_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+    fn handle_command_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.command_mode == CommandMode::Browse {
             return false;
         }
@@ -2207,14 +2359,14 @@ impl WorkspaceView {
                     self.content_matches.clear();
                 }
             }
-            "enter" | "return" => self.execute_command(cx),
+            "enter" | "return" => self.execute_command(window, cx),
             _ => return false,
         }
         cx.notify();
         true
     }
 
-    fn execute_command(&mut self, cx: &mut Context<Self>) {
+    fn execute_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input = self.command_input.trim().to_owned();
         if input.is_empty() {
             return;
@@ -2319,6 +2471,9 @@ impl WorkspaceView {
                 repo.switch_branch(&input)
                     .map_err(|error| error.to_string())
             }),
+            CommandMode::PreviewUrl => normalize_preview_url(&input)
+                .map_err(|error| error.to_string())
+                .map(|url| self.create_preview_url(url, window, cx)),
             CommandMode::Browse => Ok(()),
         };
         match result {
@@ -2554,7 +2709,7 @@ impl WorkspaceView {
     }
 
     fn global_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.handle_command_key(event, cx) {
+        if self.handle_command_key(event, window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -2569,7 +2724,7 @@ impl WorkspaceView {
             KeyAction::NewTerminalTab => self.create_terminal(false, window, cx),
             KeyAction::NewPrivateTerminal => self.create_terminal(true, window, cx),
             KeyAction::NewEditorTab => self.create_editor(cx),
-            KeyAction::NewPreviewTab => self.create_preview(window, cx),
+            KeyAction::NewPreviewTab => self.request_preview(window, cx),
             KeyAction::ClosePaneOrTab => self.close_active(cx),
             KeyAction::GotoTab1 => {
                 let _ = self.model.switch_index(1);
@@ -2844,10 +2999,13 @@ impl WorkspaceView {
                     .flex_row()
                     .gap_1()
                     .mb_1()
-                    .child(sidebar_button("Find", "explorer-find", &self.palette,
-                        cx, |this, cx| {
-                        this.begin_command(CommandMode::FindFile, cx)
-                    }))
+                    .child(sidebar_button(
+                        "Find",
+                        "explorer-find",
+                        &self.palette,
+                        cx,
+                        |this, cx| this.begin_command(CommandMode::FindFile, cx),
+                    ))
                     .child(sidebar_button(
                         "Search",
                         "explorer-search",
@@ -2855,18 +3013,27 @@ impl WorkspaceView {
                         cx,
                         |this, cx| this.begin_command(CommandMode::SearchContent, cx),
                     ))
-                    .child(sidebar_button("+F", "explorer-new-file", &self.palette,
-                        cx, |this, cx| {
-                        this.begin_command(CommandMode::CreateFile, cx)
-                    }))
-                    .child(sidebar_button("+D", "explorer-new-dir", &self.palette,
-                        cx, |this, cx| {
-                        this.begin_command(CommandMode::CreateDirectory, cx)
-                    }))
-                    .child(sidebar_button("↻", "explorer-refresh", &self.palette,
-                        cx, |this, cx| {
-                        this.refresh_workspace_data(cx)
-                    }));
+                    .child(sidebar_button(
+                        "+F",
+                        "explorer-new-file",
+                        &self.palette,
+                        cx,
+                        |this, cx| this.begin_command(CommandMode::CreateFile, cx),
+                    ))
+                    .child(sidebar_button(
+                        "+D",
+                        "explorer-new-dir",
+                        &self.palette,
+                        cx,
+                        |this, cx| this.begin_command(CommandMode::CreateDirectory, cx),
+                    ))
+                    .child(sidebar_button(
+                        "↻",
+                        "explorer-refresh",
+                        &self.palette,
+                        cx,
+                        |this, cx| this.refresh_workspace_data(cx),
+                    ));
 
                 let root_label = self
                     .explorer_requested_root
@@ -3113,26 +3280,41 @@ impl WorkspaceView {
                     .flex_wrap()
                     .gap_1()
                     .mb_1()
-                    .child(sidebar_button("All+", "git-stage-all", &self.palette,
-                        cx, |this, cx| {
-                        this.stage_all(cx)
-                    }))
-                    .child(sidebar_button("Commit", "git-commit", &self.palette,
-                        cx, |this, cx| {
-                        this.begin_command(CommandMode::GitCommit, cx)
-                    }))
-                    .child(sidebar_button("Fetch", "git-fetch", &self.palette,
-                        cx, |this, cx| {
-                        this.run_remote(RemoteOperation::Fetch, cx)
-                    }))
-                    .child(sidebar_button("Pull", "git-pull", &self.palette,
-                        cx, |this, cx| {
-                        this.run_remote(RemoteOperation::PullFfOnly, cx)
-                    }))
-                    .child(sidebar_button("Push", "git-push", &self.palette,
-                        cx, |this, cx| {
-                        this.run_remote(RemoteOperation::Push, cx)
-                    }))
+                    .child(sidebar_button(
+                        "All+",
+                        "git-stage-all",
+                        &self.palette,
+                        cx,
+                        |this, cx| this.stage_all(cx),
+                    ))
+                    .child(sidebar_button(
+                        "Commit",
+                        "git-commit",
+                        &self.palette,
+                        cx,
+                        |this, cx| this.begin_command(CommandMode::GitCommit, cx),
+                    ))
+                    .child(sidebar_button(
+                        "Fetch",
+                        "git-fetch",
+                        &self.palette,
+                        cx,
+                        |this, cx| this.run_remote(RemoteOperation::Fetch, cx),
+                    ))
+                    .child(sidebar_button(
+                        "Pull",
+                        "git-pull",
+                        &self.palette,
+                        cx,
+                        |this, cx| this.run_remote(RemoteOperation::PullFfOnly, cx),
+                    ))
+                    .child(sidebar_button(
+                        "Push",
+                        "git-push",
+                        &self.palette,
+                        cx,
+                        |this, cx| this.run_remote(RemoteOperation::Push, cx),
+                    ))
                     .child(sidebar_button(
                         "+Branch",
                         "git-new-branch",
@@ -3403,6 +3585,18 @@ impl EntityInputHandler for WorkspaceView {
 
 impl gpui::Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let system_is_dark = matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        );
+        if self.system_is_dark != system_is_dark {
+            self.system_is_dark = system_is_dark;
+            if self.settings.appearance == termior_store::settings::Appearance::FollowSystem {
+                self.palette = self.themes[self.theme_index]
+                    .resolve(Appearance::FollowSystem, self.system_is_dark);
+                self.propagate_palette(cx);
+            }
+        }
         self.process_agent_updates(window, cx);
         let (cwd, preview_url) = self.sync_terminal_context(cx);
         let p = self.palette.clone();
@@ -3596,9 +3790,7 @@ impl gpui::Render for WorkspaceView {
                                     } else {
                                         ui::muted(&p)
                                     })
-                                    .when(selected, |button| {
-                                        button.bg(ui::selected_wash(&p))
-                                    })
+                                    .when(selected, |button| button.bg(ui::selected_wash(&p)))
                                     .when(!selected, |button| {
                                         let wash = ui::hover_wash(&p);
                                         button.hover(move |style| style.bg(wash))
@@ -3860,6 +4052,7 @@ impl gpui::Render for WorkspaceView {
                 cx.listener(|this, _event, _window, cx| {
                     cx.stop_propagation();
                     this.explorer_context_menu = None;
+                    this.theme_menu_open = false;
                     this.split_menu_open = !this.split_menu_open;
                     cx.notify();
                 }),
@@ -3868,6 +4061,7 @@ impl gpui::Render for WorkspaceView {
                 if matches!(event.keystroke.key.as_str(), "enter" | "return" | "space") {
                     cx.stop_propagation();
                     this.explorer_context_menu = None;
+                    this.theme_menu_open = false;
                     this.split_menu_open = !this.split_menu_open;
                     cx.notify();
                 }
@@ -3937,6 +4131,63 @@ impl gpui::Render for WorkspaceView {
                         )),
                 )
         });
+        let theme_menu = self.theme_menu_open.then(|| {
+            let menu_x = (f32::from(window.viewport_size().width) - 300.0).max(0.0);
+            anchored()
+                .position(Point::new(px(menu_x), px(WORKSPACE_HEADER_HEIGHT)))
+                .child(
+                    div()
+                        .id("application-theme-menu")
+                        .w(px(250.0))
+                        .occlude()
+                        .p_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(ui::border(&p))
+                        .bg(gpui_color(p.surface[2]))
+                        .shadow_md()
+                        .children(self.themes.iter().map(|theme| {
+                            let theme_id = theme.id.clone();
+                            let selected = theme.id == self.settings.theme_id;
+                            let option_palette =
+                                theme.resolve(self.resolved_appearance(), self.system_is_dark);
+                            div()
+                                .id(SharedString::from(format!("theme-option-{}", theme.id)))
+                                .w_full()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .text_sm()
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .when(selected, |item| item.bg(ui::selected_wash(&p)))
+                                .when(!selected, |item| {
+                                    let wash = ui::hover_wash(&p);
+                                    item.hover(move |style| style.bg(wash))
+                                })
+                                .child(
+                                    div()
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(ui::border(&option_palette))
+                                        .bg(gpui_color(option_palette.accent)),
+                                )
+                                .child(div().flex_1().child(SharedString::from(theme.name.clone())))
+                                .child(if selected { "✓" } else { "" })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.select_theme(&theme_id, window, cx);
+                                    }),
+                                )
+                        })),
+                )
+        });
         let input_focus = self.focus_handle.clone();
         let input_entity = cx.entity();
         div()
@@ -3951,7 +4202,8 @@ impl gpui::Render for WorkspaceView {
                 cx.listener(|this, _event, _window, cx| {
                     let closed_explorer_menu = this.explorer_context_menu.take().is_some();
                     let closed_split_menu = std::mem::take(&mut this.split_menu_open);
-                    if closed_explorer_menu || closed_split_menu {
+                    let closed_theme_menu = std::mem::take(&mut this.theme_menu_open);
+                    if closed_explorer_menu || closed_split_menu || closed_theme_menu {
                         cx.notify();
                     }
                 }),
@@ -4045,7 +4297,7 @@ impl gpui::Render for WorkspaceView {
                                 "new-preview",
                                 &p,
                                 cx,
-                                |this, _, window, cx| this.create_preview(window, cx),
+                                |this, _, window, cx| this.request_preview(window, cx),
                             ))
                             .child(
                                 div()
@@ -4056,23 +4308,29 @@ impl gpui::Render for WorkspaceView {
                                     .border_color(ui::border(&p))
                                     .bg(gpui_color(p.surface[2]))
                                     .child(split_button)
-                                    .child(
-                                        div()
-                                            .w(px(1.0))
-                                            .h(px(16.0))
-                                            .bg(ui::border(&p)),
-                                    )
+                                    .child(div().w(px(1.0)).h(px(16.0)).bg(ui::border(&p)))
                                     .child(split_menu_toggle),
                             )
                             .child(
                                 ui::button(
-                                    "theme-cycle",
-                                    SharedString::from(theme_name),
+                                    "theme-select",
+                                    SharedString::from(format!("{theme_name}  ▾")),
                                     ButtonKind::Ghost,
                                     &p,
                                 )
                                 .text_color(ui::muted(&p))
-                                .on_mouse_down(MouseButton::Left, cx.listener(Self::cycle_theme)),
+                                .aria_label("Select application theme")
+                                .aria_expanded(self.theme_menu_open)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.explorer_context_menu = None;
+                                        this.split_menu_open = false;
+                                        this.theme_menu_open = !this.theme_menu_open;
+                                        cx.notify();
+                                    }),
+                                ),
                             )
                             .child(
                                 ui::button(
@@ -4086,7 +4344,8 @@ impl gpui::Render for WorkspaceView {
                                     &p,
                                 )
                                 .when(bell_needs_attention, |button| {
-                                    button.bg(gpui_color(p.status[2]))
+                                    button
+                                        .bg(gpui_color(p.status[2]))
                                         .text_color(ui::on_color(p.status[2]))
                                 })
                                 .on_mouse_down(MouseButton::Left, cx.listener(Self::toggle_bell)),
@@ -4141,11 +4400,21 @@ impl gpui::Render for WorkspaceView {
                         self.model.ai_tools_running
                     )))
                     .when_some(preview_url, |bar, url| {
-                        bar.child(SharedString::from(format!("Open in preview: {url}")))
+                        let label = SharedString::from(format!("Open in preview: {url}"));
+                        bar.child(
+                            ui::button("open-detected-preview", label, ButtonKind::Subtle, &p)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |workspace, _, window, cx| {
+                                        workspace.create_preview_url(url.clone(), window, cx)
+                                    }),
+                                ),
+                        )
                     }),
             )
             .children(explorer_context_menu)
             .children(split_menu)
+            .children(theme_menu)
     }
 }
 
@@ -4164,6 +4433,16 @@ impl Drop for WorkspaceView {
 
 fn single_pane(content: PaneContent) -> HashMap<PaneId, PaneContent> {
     HashMap::from([(PaneId(1), content)])
+}
+
+fn new_preview_view(
+    url: String,
+    window: &mut Window,
+    cx: &mut Context<WorkspaceView>,
+) -> Entity<PreviewView> {
+    let preview = cx.new(|_| PreviewView::new(url));
+    preview.update(cx, |preview, cx| preview.initialize(window, cx));
+    preview
 }
 
 fn explorer_entry_visible(entry: &FileEntry, tree: &TreeState) -> bool {

@@ -12,7 +12,7 @@ mod terminal_view;
 mod ui;
 mod workspace_view;
 
-use gpui::{px, size, App, AppContext, Bounds, Entity, Window, WindowBounds};
+use gpui::{px, size, App, AppContext, Bounds, Entity, Window, WindowAppearance, WindowBounds};
 use gpui_platform::application;
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -23,19 +23,27 @@ fn main() {
     install_panic_log();
     let _ = env_logger::try_init();
     let smoke_test = std::env::var_os("TERMIOR_SMOKE_TEST").is_some();
-    let root = resolve_workspace_root(smoke_test);
+    let preview_smoke_test = std::env::var_os("TERMIOR_PREVIEW_SMOKE_TEST").is_some();
+    let root = resolve_workspace_root(smoke_test || preview_smoke_test);
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
         cx.open_window(
             app_identity::window_options(WindowBounds::Windowed(bounds)),
             |window, cx| {
+                let system_is_dark = matches!(
+                    window.appearance(),
+                    WindowAppearance::Dark | WindowAppearance::VibrantDark
+                );
                 let workspace: Entity<WorkspaceView> =
-                    cx.new(|cx| WorkspaceView::new(root.clone(), cx));
+                    cx.new(|cx| WorkspaceView::new(root.clone(), system_is_dark, cx));
                 workspace.update(cx, |workspace, cx| {
                     workspace.restore_or_create_runtime(window, cx);
                     workspace.start_background_services(cx);
+                    if preview_smoke_test {
+                        workspace.start_preview_smoke(window, cx);
+                    }
                 });
-                if smoke_test {
+                if smoke_test && !preview_smoke_test {
                     schedule_smoke_exit(window);
                 }
                 workspace

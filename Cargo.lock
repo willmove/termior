@@ -7272,6 +7272,7 @@ dependencies = [
  "gpui_platform",
  "image",
  "log",
+ "raw-window-handle",
  "rfd",
  "serde_json",
  "termior-ai",
@@ -7397,6 +7398,7 @@ version = "0.1.0"
 dependencies = [
  "regex",
  "serde",
+ "thiserror 1.0.69",
  "url",
 ]
 

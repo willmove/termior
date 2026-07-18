@@ -22,6 +22,11 @@ pub enum AppDataError {
 /// | Linux | `~/.local/share/app.termior.Termior/` |
 /// | Windows | `%APPDATA%\app.termior.Termior\` |
 pub fn app_data_dir() -> Result<PathBuf, AppDataError> {
+    // Desktop smoke tests need isolated state so they cannot overwrite a developer's
+    // real workspace/session files. Normal launches do not set this variable.
+    if let Some(path) = std::env::var_os("TERMIOR_DATA_DIR") {
+        return Ok(PathBuf::from(path));
+    }
     // 使用 dirs 的 data_dir，跨平台一致映射到上表。
     let base = dirs::data_dir().ok_or(AppDataError::NotFound)?;
     Ok(base.join(BUNDLE_ID))

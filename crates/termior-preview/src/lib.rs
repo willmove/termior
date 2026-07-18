@@ -8,6 +8,39 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use url::Url;
 
+#[derive(Debug, thiserror::Error)]
+pub enum PreviewUrlError {
+    #[error("preview URL is empty")]
+    Empty,
+    #[error("invalid preview URL: {0}")]
+    Invalid(#[from] url::ParseError),
+    #[error("preview URL must use http or https, got {0}")]
+    UnsupportedScheme(String),
+    #[error("preview URL must include a host")]
+    MissingHost,
+}
+
+/// Normalizes user-entered preview addresses while keeping the WebView boundary HTTP-only.
+pub fn normalize_preview_url(input: &str) -> Result<String, PreviewUrlError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(PreviewUrlError::Empty);
+    }
+    let candidate = if input.contains("://") {
+        input.to_owned()
+    } else {
+        format!("http://{input}")
+    };
+    let url = Url::parse(&candidate)?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(PreviewUrlError::UnsupportedScheme(url.scheme().to_owned()));
+    }
+    if url.host_str().is_none() {
+        return Err(PreviewUrlError::MissingHost);
+    }
+    Ok(url.into())
+}
+
 #[derive(Debug)]
 pub struct LocalhostDetector {
     regex: Regex,
@@ -134,5 +167,29 @@ mod tests {
         tab.fallback("webview unavailable");
         assert_eq!(tab.backend, PreviewBackend::ExternalBrowser);
         assert_eq!(tab.url, "http://localhost:3000");
+    }
+
+    #[test]
+    fn preview_url_input_accepts_localhost_without_a_scheme() {
+        assert_eq!(
+            normalize_preview_url("localhost:5173/app").unwrap(),
+            "http://localhost:5173/app"
+        );
+        assert_eq!(
+            normalize_preview_url("  https://127.0.0.1:3000  ").unwrap(),
+            "https://127.0.0.1:3000/"
+        );
+    }
+
+    #[test]
+    fn preview_url_input_rejects_non_web_schemes() {
+        assert!(matches!(
+            normalize_preview_url("file:///etc/passwd"),
+            Err(PreviewUrlError::UnsupportedScheme(scheme)) if scheme == "file"
+        ));
+        assert!(matches!(
+            normalize_preview_url("   "),
+            Err(PreviewUrlError::Empty)
+        ));
     }
 }

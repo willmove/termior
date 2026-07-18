@@ -8,4 +8,5 @@ authors.workspace = true
 [dependencies]
 regex = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
 url = { workspace = true }

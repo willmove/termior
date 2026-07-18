@@ -39,6 +39,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 gpui-wry = "0.5"
 wry = "0.53.3"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
+
 [build-dependencies]
 winresource = "0.1"
 

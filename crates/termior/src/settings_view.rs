@@ -1,5 +1,5 @@
 use gpui::{
-    canvas, div, prelude::*, AnyElement, App, Bounds, Context, FocusHandle, Focusable,
+    canvas, div, prelude::*, px, AnyElement, App, Bounds, Context, FocusHandle, Focusable,
     InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, SharedString,
     StatefulInteractiveElement, UTF16Selection, WeakEntity, Window,
 };
@@ -36,6 +36,15 @@ enum EditField {
 }
 
 type SaveCallback = Box<dyn Fn(&Settings, &mut App)>;
+type ThemePreviewCallback =
+    Box<dyn Fn(&termior_theme::Theme, &str, Appearance, &mut App)>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectMenu {
+    ApplicationTheme,
+    EditorTheme,
+    Appearance,
+}
 
 pub struct SettingsView {
     page: SettingsPage,
@@ -55,6 +64,8 @@ pub struct SettingsView {
     agent_index: usize,
     status: String,
     on_save: Option<SaveCallback>,
+    on_theme_preview: Option<ThemePreviewCallback>,
+    select_menu: Option<SelectMenu>,
     /// 渲染期缓存的当前主题色板(每帧从全局刷新,供 edit_row 等辅助方法使用)。
     palette: termior_theme::ResolvedPalette,
 }
@@ -65,6 +76,7 @@ impl SettingsView {
         migration_error: Option<String>,
         data_dir: Option<PathBuf>,
         on_save: Option<SaveCallback>,
+        on_theme_preview: Option<ThemePreviewCallback>,
         cx: &mut Context<Self>,
     ) -> Self {
         let themes = data_dir
@@ -93,6 +105,8 @@ impl SettingsView {
             agent_index: 0,
             status: String::new(),
             on_save,
+            on_theme_preview,
+            select_menu: None,
             palette: termior_theme::default_theme().resolve(
                 termior_theme::Appearance::Dark,
                 true,
@@ -397,13 +411,42 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn cycle_app_theme(&mut self, cx: &mut Context<Self>) {
-        let themes = self.themes.all();
-        let index = themes
-            .iter()
-            .position(|theme| theme.id == self.settings.theme_id)
-            .unwrap_or(0);
-        self.settings.theme_id = themes[(index + 1) % themes.len()].id.clone();
+    fn toggle_select_menu(&mut self, menu: SelectMenu, cx: &mut Context<Self>) {
+        self.select_menu = (self.select_menu != Some(menu)).then_some(menu);
+        cx.notify();
+    }
+
+    fn preview_theme_preferences(&self, cx: &mut Context<Self>) {
+        let Some(theme) = self
+            .themes
+            .all()
+            .into_iter()
+            .find(|theme| theme.id == self.settings.theme_id)
+        else {
+            return;
+        };
+        if let Some(callback) = &self.on_theme_preview {
+            callback(
+                &theme,
+                &self.settings.editor_theme_id,
+                self.settings.appearance,
+                cx,
+            );
+            return;
+        }
+
+        let appearance = match self.settings.appearance {
+            Appearance::Light => termior_theme::Appearance::Light,
+            Appearance::Dark => termior_theme::Appearance::Dark,
+            Appearance::FollowSystem => termior_theme::Appearance::FollowSystem,
+        };
+        crate::ui::set_palette(cx, theme.resolve(appearance, true));
+    }
+
+    fn select_app_theme(&mut self, theme_id: String, cx: &mut Context<Self>) {
+        self.settings.theme_id = theme_id;
+        self.select_menu = None;
+        self.preview_theme_preferences(cx);
         cx.notify();
     }
 
@@ -427,7 +470,8 @@ impl SettingsView {
                 {
                     Ok(theme) => {
                         view.settings.theme_id = theme.id;
-                        "Theme imported; save settings to apply it".into()
+                        view.preview_theme_preferences(cx);
+                        "Theme imported and previewed; save settings to keep it".into()
                     }
                     Err(error) => format!("Theme import failed: {error}"),
                 };
@@ -538,22 +582,17 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn cycle_editor_theme(&mut self, cx: &mut Context<Self>) {
-        let themes = termior_editor::builtin_editor_themes();
-        let index = themes
-            .iter()
-            .position(|theme| theme.id == self.settings.editor_theme_id)
-            .unwrap_or(0);
-        self.settings.editor_theme_id = themes[(index + 1) % themes.len()].id.clone();
+    fn select_editor_theme(&mut self, theme_id: String, cx: &mut Context<Self>) {
+        self.settings.editor_theme_id = theme_id;
+        self.select_menu = None;
+        self.preview_theme_preferences(cx);
         cx.notify();
     }
 
-    fn cycle_appearance(&mut self, cx: &mut Context<Self>) {
-        self.settings.appearance = match self.settings.appearance {
-            Appearance::Light => Appearance::Dark,
-            Appearance::Dark => Appearance::FollowSystem,
-            Appearance::FollowSystem => Appearance::Light,
-        };
+    fn select_appearance(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
+        self.settings.appearance = appearance;
+        self.select_menu = None;
+        self.preview_theme_preferences(cx);
         cx.notify();
     }
 
@@ -746,6 +785,76 @@ impl SettingsView {
             .text_sm()
     }
 
+    fn select_button(
+        label: &str,
+        value: impl Into<SharedString>,
+        id: impl Into<gpui::ElementId>,
+        open: bool,
+        p: &termior_theme::ResolvedPalette,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .w(px(360.0))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(if open {
+                crate::ui::color(p.accent)
+            } else {
+                crate::ui::border(p)
+            })
+            .bg(crate::ui::color(p.surface[1]))
+            .text_sm()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_color(crate::ui::muted(p))
+                            .child(SharedString::from(label.to_owned())),
+                    )
+                    .child(value.into()),
+            )
+            .child(if open { "▴" } else { "▾" })
+            .hover({
+                let wash = crate::ui::hover_wash(p);
+                move |style| style.bg(wash)
+            })
+    }
+
+    fn select_option(
+        label: impl Into<SharedString>,
+        id: impl Into<gpui::ElementId>,
+        selected: bool,
+        p: &termior_theme::ResolvedPalette,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .w_full()
+            .px_3()
+            .py_2()
+            .rounded_sm()
+            .text_sm()
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(selected, |option| option.bg(crate::ui::selected_wash(p)))
+            .when(!selected, |option| {
+                let wash = crate::ui::hover_wash(p);
+                option.hover(move |style| style.bg(wash))
+            })
+            .child(if selected { "✓" } else { " " })
+            .child(label.into())
+    }
+
     fn general_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let autocomplete = self.settings.autocomplete_enabled;
         let vim = self.settings.vim_mode;
@@ -888,30 +997,188 @@ impl SettingsView {
             .as_deref()
             .unwrap_or("None")
             .to_owned();
+        let app_themes = self.themes.all();
+        let app_theme_name = app_themes
+            .iter()
+            .find(|theme| theme.id == self.settings.theme_id)
+            .map(|theme| theme.name.clone())
+            .unwrap_or_else(|| self.settings.theme_id.clone());
+        let app_menu_open = self.select_menu == Some(SelectMenu::ApplicationTheme);
+        let app_theme_menu = app_menu_open.then(|| {
+            div()
+                .w(px(360.0))
+                .p_1()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&self.palette))
+                .bg(crate::ui::color(self.palette.surface[2]))
+                .shadow_md()
+                .children(app_themes.into_iter().map(|theme| {
+                    let theme_id = theme.id.clone();
+                    let selected = theme.id == self.settings.theme_id;
+                    Self::select_option(
+                        theme.name,
+                        SharedString::from(format!("app-theme-option-{}", theme.id)),
+                        selected,
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.select_app_theme(theme_id.clone(), cx);
+                        }),
+                    )
+                }))
+        });
+
+        let editor_themes = termior_editor::builtin_editor_themes();
+        let editor_theme_name = editor_themes
+            .iter()
+            .find(|theme| theme.id == self.settings.editor_theme_id)
+            .map(|theme| theme.name.clone())
+            .unwrap_or_else(|| self.settings.editor_theme_id.clone());
+        let editor_menu_open = self.select_menu == Some(SelectMenu::EditorTheme);
+        let editor_theme_menu = editor_menu_open.then(|| {
+            div()
+                .w(px(360.0))
+                .p_1()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&self.palette))
+                .bg(crate::ui::color(self.palette.surface[2]))
+                .shadow_md()
+                .children(editor_themes.into_iter().map(|theme| {
+                    let theme_id = theme.id.clone();
+                    let selected = theme.id == self.settings.editor_theme_id;
+                    Self::select_option(
+                        theme.name,
+                        SharedString::from(format!("editor-theme-option-{}", theme.id)),
+                        selected,
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.select_editor_theme(theme_id.clone(), cx);
+                        }),
+                    )
+                }))
+        });
+
+        let appearance_menu_open = self.select_menu == Some(SelectMenu::Appearance);
+        let appearance_label = match self.settings.appearance {
+            Appearance::Light => "Light",
+            Appearance::Dark => "Dark",
+            Appearance::FollowSystem => "Follow system",
+        };
+        let appearance_menu = appearance_menu_open.then(|| {
+            div()
+                .w(px(360.0))
+                .p_1()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&self.palette))
+                .bg(crate::ui::color(self.palette.surface[2]))
+                .shadow_md()
+                .children(
+                    [
+                        (Appearance::Light, "Light"),
+                        (Appearance::Dark, "Dark"),
+                        (Appearance::FollowSystem, "Follow system"),
+                    ]
+                    .into_iter()
+                    .map(|(appearance, label)| {
+                        Self::select_option(
+                            label,
+                            SharedString::from(format!("appearance-option-{appearance:?}")),
+                            appearance == self.settings.appearance,
+                            &self.palette,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.select_appearance(appearance, cx);
+                            }),
+                        )
+                    }),
+                )
+        });
+
         div()
             .flex()
             .flex_col()
             .gap_3()
             .child(
-                Self::button(format!("Application theme: {}", self.settings.theme_id), "app-theme", &self.palette)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.cycle_app_theme(cx)),
-                ),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        Self::select_button(
+                            "Application theme",
+                            app_theme_name,
+                            "app-theme-select",
+                            app_menu_open,
+                            &self.palette,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_select_menu(SelectMenu::ApplicationTheme, cx);
+                            }),
+                        ),
+                    )
+                    .when_some(app_theme_menu, |select, menu| select.child(menu)),
             )
             .child(
-                Self::button(format!("Editor theme: {}", self.settings.editor_theme_id), "editor-theme", &self.palette)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.cycle_editor_theme(cx)),
-                ),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        Self::select_button(
+                            "Editor theme",
+                            editor_theme_name,
+                            "editor-theme-select",
+                            editor_menu_open,
+                            &self.palette,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_select_menu(SelectMenu::EditorTheme, cx);
+                            }),
+                        ),
+                    )
+                    .when_some(editor_theme_menu, |select, menu| select.child(menu)),
             )
             .child(
-                Self::button(format!("Appearance: {:?}", self.settings.appearance), "appearance", &self.palette)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.cycle_appearance(cx)),
-                ),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        Self::select_button(
+                            "Appearance",
+                            appearance_label,
+                            "appearance-select",
+                            appearance_menu_open,
+                            &self.palette,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_select_menu(SelectMenu::Appearance, cx);
+                            }),
+                        ),
+                    )
+                    .when_some(appearance_menu, |select, menu| select.child(menu)),
             )
             .child(
                 div()
@@ -1178,6 +1445,14 @@ impl gpui::Render for SettingsView {
         div()
             .track_focus(&focus)
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.select_menu.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .flex()
             .flex_col()
             .size_full()
