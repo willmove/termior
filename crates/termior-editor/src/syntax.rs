@@ -2,7 +2,9 @@
 
 use std::ops::Range;
 use std::path::Path;
-use tree_sitter::{Language, Parser, Tree};
+use tree_sitter::{InputEdit, Language, Parser, Point, Tree};
+
+use crate::BufferEdit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntaxLanguage {
@@ -125,6 +127,28 @@ impl SyntaxDocument {
 
     pub fn reparse(&mut self, source: &str) {
         if let Some(parser) = &mut self.parser {
+            self.tree = parser.parse(source, None);
+        }
+    }
+
+    /// Apply rope mutation coordinates before asking tree-sitter to incrementally reparse.
+    pub fn reparse_incremental(&mut self, source: &str, edits: &[BufferEdit]) {
+        if edits.is_empty() {
+            return;
+        }
+        if let Some(tree) = &mut self.tree {
+            for edit in edits {
+                tree.edit(&InputEdit {
+                    start_byte: edit.start_byte,
+                    old_end_byte: edit.old_end_byte,
+                    new_end_byte: edit.new_end_byte,
+                    start_position: point(edit.start_position),
+                    old_end_position: point(edit.old_end_position),
+                    new_end_position: point(edit.new_end_position),
+                });
+            }
+        }
+        if let Some(parser) = &mut self.parser {
             self.tree = parser.parse(source, self.tree.as_ref());
         }
     }
@@ -146,6 +170,10 @@ impl SyntaxDocument {
         spans.sort_by_key(|span| (span.byte_range.start, span.byte_range.end));
         spans
     }
+}
+
+fn point(value: crate::TextPoint) -> Point {
+    Point::new(value.row, value.column)
 }
 
 fn collect_spans(
@@ -277,5 +305,17 @@ mod tests {
     fn plain_text_has_no_tree() {
         let doc = SyntaxDocument::new(SyntaxLanguage::PlainText, "hello");
         assert!(doc.highlight_spans(0..5).is_empty());
+    }
+
+    #[test]
+    fn applies_multiple_incremental_edits_before_reparse() {
+        let mut buffer = crate::EditorBuffer::new("fn main() {\n}\n");
+        let mut doc = SyntaxDocument::new(SyntaxLanguage::Rust, &buffer.text());
+        buffer.set_cursor(12).unwrap();
+        buffer.insert("let x = 1;\n").unwrap();
+        buffer.insert("let y = x + 1;\n").unwrap();
+        doc.reparse_incremental(&buffer.text(), &buffer.take_pending_edits());
+        assert!(!doc.has_error());
+        assert!(!doc.highlight_spans(0..buffer.text().len()).is_empty());
     }
 }

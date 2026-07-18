@@ -21,13 +21,13 @@ Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、�
 
 - 持久化工作区、8 类 tab、分栏、Explorer/Source Control/History 侧栏、状态栏、独立设置窗口；
 - portable-pty + alacritty_terminal 真终端，shell integration、OSC 7/133/777、IME、搜索、回滚滚动、URL/localhost 检测和 Windows Job Object；
-- Rope 编辑缓冲、tree-sitter 多语言高亮、搜索、撤销重做、10 套独立编辑器主题和 Vim 交互层；
-- 文件索引、gitignore、模糊查找、grep 内容搜索、文件监听与文件树状态；
-- Git 状态、文件/hunk stage、commit、branch、fetch/pull/push、历史与 commit graph 核心；
+- Rope 编辑缓冲、虚拟可视区、tree-sitter 增量高亮、搜索、撤销重做、10 套独立编辑器主题和 Vim 交互层；
+- 文件索引、gitignore、模糊查找、后台流式 grep、文件监听、键盘树导航与完整上下文菜单；
+- Git 专用 diff/history/commit-file 页签、文件/hunk stage/unstage、确认 discard、commit、branch、fetch/pull/push 与 commit graph；
 - wry 子 WebView 预览（Windows/macOS）及外部浏览器降级；
 - 10 套应用主题、自定义主题模型和全窗背景配置；
 - OpenAI、Anthropic、Gemini、Groq、xAI、Cerebras、OpenRouter、DeepSeek、Mistral、OpenAI-compatible、LM Studio、MLX、Ollama 的真实 HTTP/SSE 适配；
-- OS 钥匙串、会话/项目记忆、附件/snippets/TODO、Plan mode、子代理、自定义代理；
+- OS 钥匙串、会话/项目记忆、文件/图片/剪贴板/`@path` 附件、snippets/TODO、Plan mode、子代理、自定义代理；
 - 真实 Agent 工具执行、审批卡片、命令超时、持久 shell、后台进程，以及 `write_file → AI diff → 逐 hunk 决策 → 原子写` 安全闭环；
 - 内置/终端 Agent 统一通知路由：可见时抑制、隐藏时主题 toast、窗口失焦时系统通知，并在 header 铃铛列出当前状态；
 - Claude Code OSC hooks 的安全、幂等安装与卸载。
@@ -66,6 +66,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 cargo build --workspace --release
+cargo llvm-cov --workspace --exclude termior --tests --fail-under-lines 80
+cargo bench -p termior-editor --bench large_file -- --quick
 ```
 
 应用图标以 `assets/termior-logo.svg` 为唯一源文件。修改 SVG 后，使用 Node.js 22+
@@ -82,6 +84,10 @@ npm run icons:check
 ```bash
 cargo run -p termior
 ```
+
+发布 tag（`v<workspace-version>`）会触发三平台 release 构建，产出 portable ZIP/TAR 与 SHA-256 校验文件。流水线按 Spec NFR-05 将单二进制限制为 60 MiB，并将压缩包限制为 100 MiB；本地可用 `scripts/check-release-binary.ps1` 和 `scripts/package-release.ps1` 复现检查与打包。
+
+Release 体积主要来自 GPUI 原生渲染栈、终端/VTE、按语言引入的 tree-sitter grammar，以及 TLS、钥匙串和 Provider 客户端。Windows/macOS 还包含按需预览使用的 wry 接线，Linux 使用外部浏览器降级；PNG 解码和 tree-sitter 语言均采用显式最小 feature，新增 UI、预览或语法能力时须结合 CI 的依赖树和体积报告评估增量。
 
 Provider 的 endpoint、模型和启用状态保存在 `Termior-settings.json`；API key 只通过设置窗口写入 OS 钥匙串，绝不会序列化进设置或会话文件。
 

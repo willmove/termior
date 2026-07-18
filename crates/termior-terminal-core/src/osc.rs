@@ -178,8 +178,24 @@ fn parse_osc7(rest: &str) -> Option<OscEvent> {
         if authority.is_empty() {
             (String::new(), after_scheme.to_string())
         } else if authority.contains(':') || authority.contains('\\') {
-            // 看起来是路径片段（如 Windows C:），不当作 host
-            (String::new(), after_scheme.to_string())
+            // 防御：畸形遗留形式 `file://<host><drive>:/...`（hostname 与盘符粘连，
+            // 如 `file://DESKTOP-ABCC:/Users/x`）。若 authority 尾部形如
+            // `<单个 ASCII 字母>:`（盘符），把 hostname 拆出，路径从盘符开始。
+            let bytes = authority.as_bytes();
+            let n = bytes.len();
+            let ends_with_drive = n >= 2
+                && bytes[n - 1] == b':'
+                && bytes[n - 2].is_ascii_alphabetic()
+                && !authority.contains('\\');
+            if ends_with_drive {
+                (
+                    authority[..n - 2].to_string(),
+                    after_scheme[slash_idx - 2..].to_string(),
+                )
+            } else {
+                // 其他含 `:`/`\` 的形式当作路径片段，不当作 host
+                (String::new(), after_scheme.to_string())
+            }
         } else {
             (authority.to_string(), after_scheme[slash_idx..].to_string())
         }
@@ -192,10 +208,31 @@ fn parse_osc7(rest: &str) -> Option<OscEvent> {
     })
 }
 
-/// Windows 盘符规范化：`/C:/Users` → `C:/Users`（附录B）。
+/// cwd 规范化：统一分隔符，并处理 Windows 盘符、PowerShell provider 与长路径前缀。
 pub fn normalize_cwd(path: &str) -> String {
-    // 统一反斜杠为正斜杠
-    let p = path.replace('\\', "/");
+    // PowerShell 从 Windows 长路径启动时，PWD.Path 会带 FileSystem provider 限定符；
+    // 兼容旧版 shell integration 已经持久化的 /FileSystem:://?/C:/... 格式。
+    let mut p = path.replace('\\', "/");
+
+    for prefix in [
+        "Microsoft.PowerShell.Core/FileSystem::",
+        "/Microsoft.PowerShell.Core/FileSystem::",
+        "FileSystem::",
+        "/FileSystem::",
+    ] {
+        if let Some(rest) = p.strip_prefix(prefix) {
+            p = rest.to_owned();
+            break;
+        }
+    }
+
+    if let Some(rest) = p.strip_prefix("//?/UNC/") {
+        p = format!("//{rest}");
+    } else if let Some(rest) = p.strip_prefix("//?/") {
+        if is_windows_drive_path(rest) {
+            p = rest.to_owned();
+        }
+    }
     // 形如 `/C:/...` 或 `/C|/...`（某些 shell 用 | 代替 :）
     let bytes = p.as_bytes();
     if p.starts_with('/') && p.len() >= 3 {
@@ -211,6 +248,11 @@ pub fn normalize_cwd(path: &str) -> String {
         }
     }
     p
+}
+
+fn is_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && matches!(bytes[1], b':' | b'|')
 }
 
 /// OSC 133：`A` / `B` / `C;<cmd>` / `D;<code>`。
@@ -317,6 +359,99 @@ mod tests {
                 path: "C:/Users/u".into()
             }]
         );
+    }
+
+    #[test]
+    fn osc7_malformed_hostname_glued_to_drive_recovered() {
+        // 畸形遗留形式：hostname 与盘符粘连（旧 pwsh 注入产生）。
+        // `file://HOSTC:/Users/x` → host `HOST`，path `C:/Users/x`。
+        let ev = feed_one("\x1b]7;file://HOSTC:/Users/x\x07");
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "HOST".into(),
+                path: "C:/Users/x".into()
+            }]
+        );
+        // 真实机器名样例
+        let ev = feed_one("\x1b]7;file://DESKTOP-ABCC:/Users/willmove/proj\x07");
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "DESKTOP-ABC".into(),
+                path: "C:/Users/willmove/proj".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn powershell_provider_and_extended_drive_paths_are_normalized() {
+        assert_eq!(
+            normalize_cwd(
+                r"Microsoft.PowerShell.Core\FileSystem::\\?\D:\Coding\ToolsProjects\termior"
+            ),
+            "D:/Coding/ToolsProjects/termior"
+        );
+        assert_eq!(
+            normalize_cwd("/FileSystem:://?/D:/Coding/ToolsProjects/termior"),
+            "D:/Coding/ToolsProjects/termior"
+        );
+    }
+
+    #[test]
+    fn osc7_wellformed_windows_url_with_host() {
+        // 修复后的 pwsh 注入产生 `file://HOST/C:/Users/x`
+        let ev = feed_one("\x1b]7;file://HOST/C:/Users/x\x07");
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "HOST".into(),
+                path: "C:/Users/x".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn powershell_extended_unc_path_is_normalized() {
+        assert_eq!(
+            normalize_cwd(r"Microsoft.PowerShell.Core\FileSystem::\\?\UNC\server\share\dir"),
+            "//server/share/dir"
+        );
+    }
+
+    #[test]
+    fn osc7_windows_url_without_host() {
+        let ev = feed_one("\x1b]7;file:///C:/Users/x\x07");
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "".into(),
+                path: "C:/Users/x".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn osc7_plain_unix_with_host() {
+        let ev = feed_one("\x1b]7;file://host/home/u\x07");
+        assert_eq!(
+            ev,
+            vec![OscEvent::Cwd {
+                host: "host".into(),
+                path: "/home/u".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn malformed_legacy_powershell_osc7_still_recovers_the_drive_path() {
+        let ev = feed_one(
+            "\x1b]7;file://hostMicrosoft.PowerShell.Core/FileSystem:://?/D:/Coding/termior\x07",
+        );
+        assert!(matches!(
+            ev.as_slice(),
+            [OscEvent::Cwd { path, .. }] if path == "D:/Coding/termior"
+        ));
     }
 
     // —— OSC 133 ——

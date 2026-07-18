@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the v prefix (must match Cargo.toml)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  package:
+    name: Package (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve and validate version
+        id: version
+        shell: pwsh
+        run: |
+          $requested = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.version }}" } else { "${{ github.ref_name }}".TrimStart("v") }
+          $manifest = Get-Content Cargo.toml -Raw
+          if ($manifest -notmatch '(?ms)\[workspace\.package\].*?version\s*=\s*"([^"]+)"') { throw "workspace package version not found" }
+          if ($requested -ne $Matches[1]) { throw "Release version $requested does not match Cargo.toml version $($Matches[1])" }
+          "version=$requested" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Install Linux desktop dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libfontconfig-dev libfreetype-dev libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - name: Build optimized binary
+        run: cargo build -p termior --release --locked
+      - name: Package with binary and archive size gates
+        shell: pwsh
+        run: ./scripts/package-release.ps1 -Version ${{ steps.version.outputs.version }} -Platform ${{ matrix.platform }} -MaxBinaryMiB 60 -MaxArchiveMiB 100
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256

@@ -1,8 +1,8 @@
 use futures::StreamExt;
 use gpui::{
-    canvas, div, prelude::*, px, App, Bounds, Context, EventEmitter, FocusHandle, Focusable,
-    InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, SharedString,
-    UTF16Selection, WeakEntity, Window,
+    canvas, div, prelude::*, px, App, Bounds, ClipboardEntry, Context, EventEmitter, FocusHandle,
+    Focusable, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
+    SharedString, UTF16Selection, WeakEntity, Window,
 };
 use std::collections::HashMap;
 use std::ops::Range;
@@ -14,6 +14,7 @@ use termior_ai::{
     Message, ProjectMemory, ProviderConfig, Role, SecretStore, SessionStore, SnippetStore,
     TerminalContext, TerminalContextProvider, ToolExecutor, ToolRegistry,
 };
+use termior_explorer_core::fuzzy::fuzzy_match;
 use termior_platform::AgentStatus;
 use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_store::{DataFiles, Settings};
@@ -35,6 +36,9 @@ struct PendingEdit {
     summary: EditProposalSummary,
     decisions: HashMap<usize, bool>,
 }
+
+#[derive(Debug, Clone)]
+pub struct EditReviewRequested(pub EditProposalSummary);
 
 struct LiveTerminalContext {
     snapshot: Mutex<TerminalContext>,
@@ -68,6 +72,10 @@ pub struct ComposerView {
     full_tools: Option<ToolRegistry>,
     data_dir: Option<PathBuf>,
     terminal_context: Arc<LiveTerminalContext>,
+    workspace_root: PathBuf,
+    workspace_paths: Vec<String>,
+    path_suggestions: Vec<String>,
+    selected_path_suggestion: usize,
 }
 
 impl ComposerView {
@@ -100,6 +108,10 @@ impl ComposerView {
                     captured_at_unix_ms: 0,
                 }),
             }),
+            workspace_root: PathBuf::new(),
+            workspace_paths: Vec::new(),
+            path_suggestions: Vec::new(),
+            selected_path_suggestion: 0,
         }
     }
 
@@ -111,6 +123,7 @@ impl ComposerView {
         data_dir: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
+        self.workspace_root = root.to_path_buf();
         self.data_dir = data_dir;
         if let Some(dir) = &self.data_dir {
             let files = DataFiles::new(dir.clone());
@@ -296,6 +309,205 @@ impl ComposerView {
         self.draft.attach_file(path);
     }
 
+    pub fn set_workspace_paths(&mut self, paths: Vec<String>) {
+        self.workspace_paths = paths;
+        self.update_path_suggestions();
+    }
+
+    pub fn apply_reviewed_edit(
+        &mut self,
+        proposal_id: &str,
+        accepted: &[usize],
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        if self
+            .pending_edit
+            .as_ref()
+            .map_or(true, |edit| edit.summary.id != proposal_id)
+        {
+            return Err("This AI edit is no longer pending".into());
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Err("No active edit executor".into());
+        };
+        let result = runtime
+            .executor
+            .accept_edit(proposal_id, accepted)
+            .map_err(|error| error.to_string());
+        self.pending_edit = None;
+        match &result {
+            Ok(message) => {
+                self.status = message.clone();
+                cx.emit(AgentStatus::Finished);
+            }
+            Err(error) => {
+                self.status = format!("Edit failed: {error}");
+                cx.emit(AgentStatus::Error);
+            }
+        }
+        cx.notify();
+        result
+    }
+
+    pub fn reject_reviewed_edit(
+        &mut self,
+        proposal_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<String, String> {
+        if self
+            .pending_edit
+            .as_ref()
+            .map_or(true, |edit| edit.summary.id != proposal_id)
+        {
+            return Err("This AI edit is no longer pending".into());
+        }
+        if let Some(runtime) = &self.runtime {
+            runtime.executor.reject_edit(proposal_id);
+        }
+        self.pending_edit = None;
+        self.status = "AI edit rejected; disk was not changed".into();
+        cx.emit(AgentStatus::Finished);
+        cx.notify();
+        Ok(self.status.clone())
+    }
+
+    fn pick_attachment(&mut self, image_only: bool, cx: &mut Context<Self>) {
+        let mut dialog = rfd::AsyncFileDialog::new().set_title(if image_only {
+            "Attach an image to Composer"
+        } else {
+            "Attach a file to Composer"
+        });
+        if self.workspace_root.is_dir() {
+            dialog = dialog.set_directory(&self.workspace_root);
+        }
+        if image_only {
+            dialog = dialog.add_filter(
+                "Images",
+                &[
+                    "png", "jpg", "jpeg", "webp", "gif", "svg", "bmp", "tif", "tiff",
+                ],
+            );
+        }
+        // Never run a blocking file dialog inside a GPUI event handler: on
+        // Windows its modal message loop re-enters the foreground executor
+        // while the `App` RefCell is borrowed. Await the async dialog instead.
+        cx.spawn(async move |view, cx| {
+            let Some(handle) = dialog.pick_file().await else {
+                return;
+            };
+            let path = handle.path().to_path_buf();
+            let _ = view.update(cx, |view, cx| {
+                if image_only {
+                    match std::fs::read(&path) {
+                        Ok(bytes) => {
+                            let mime = image_mime(&path);
+                            let name = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("image")
+                                .to_owned();
+                            view.draft.attach_image(name, mime, &bytes);
+                            view.status = "Image attached".into();
+                        }
+                        Err(error) => view.status = format!("Could not attach image: {error}"),
+                    }
+                } else {
+                    view.draft.attach_file(path);
+                    view.status = "File attached".into();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn update_path_suggestions(&mut self) {
+        let Some(query) = self.active_path_query() else {
+            self.path_suggestions.clear();
+            self.selected_path_suggestion = 0;
+            return;
+        };
+        self.path_suggestions =
+            fuzzy_match(&query, self.workspace_paths.iter().map(String::as_str))
+                .into_iter()
+                .take(8)
+                .map(|hit| hit.path)
+                .collect();
+        self.selected_path_suggestion = self
+            .selected_path_suggestion
+            .min(self.path_suggestions.len().saturating_sub(1));
+    }
+
+    fn active_path_query(&self) -> Option<String> {
+        let prefix = self
+            .draft
+            .input
+            .chars()
+            .take(self.cursor)
+            .collect::<String>();
+        let token = prefix
+            .rsplit(|character: char| character.is_whitespace())
+            .next()?;
+        token.strip_prefix('@').map(str::to_owned)
+    }
+
+    fn accept_path_suggestion(&mut self, path: String, cx: &mut Context<Self>) {
+        let prefix = self
+            .draft
+            .input
+            .chars()
+            .take(self.cursor)
+            .collect::<String>();
+        let token_chars = prefix
+            .rsplit(|character: char| character.is_whitespace())
+            .next()
+            .map(|token| token.chars().count())
+            .unwrap_or(0);
+        let start_char = self.cursor.saturating_sub(token_chars);
+        let start_byte = char_to_byte(&self.draft.input, start_char);
+        let end_byte = char_to_byte(&self.draft.input, self.cursor);
+        self.draft.input.replace_range(start_byte..end_byte, "");
+        self.cursor = start_char;
+        self.draft.attach_file(self.workspace_root.join(path));
+        self.path_suggestions.clear();
+        self.selected_path_suggestion = 0;
+        cx.notify();
+    }
+
+    fn attach_clipboard_items(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(item) = cx.read_from_clipboard() else {
+            return false;
+        };
+        let mut attached = false;
+        for entry in item.into_entries() {
+            match entry {
+                ClipboardEntry::Image(image) => {
+                    let format = image.format();
+                    self.draft.attach_image(
+                        format!("pasted-image.{}", format.extension()),
+                        format.mime_type(),
+                        image.bytes(),
+                    );
+                    attached = true;
+                }
+                ClipboardEntry::ExternalPaths(paths) => {
+                    for path in paths.0 {
+                        if path.is_file() {
+                            self.draft.attach_file(path);
+                            attached = true;
+                        }
+                    }
+                }
+                ClipboardEntry::String(_) => {}
+            }
+        }
+        if attached {
+            self.status = "Clipboard attachment added".into();
+            cx.notify();
+        }
+        attached
+    }
+
     pub fn update_terminal_context(&mut self, cwd: String, recent_output: String) {
         let captured_at_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -442,12 +654,14 @@ impl ComposerView {
                     Ok((outcome, edit)) => {
                         view.apply_agent_result(Ok(outcome), cx);
                         if let Some(summary) = edit {
+                            let review_request = EditReviewRequested(summary.clone());
                             view.pending_edit = Some(PendingEdit {
                                 summary,
                                 decisions: HashMap::new(),
                             });
                             view.status = "Review every proposed hunk before writing".into();
                             cx.emit(AgentStatus::Attention);
+                            cx.emit(review_request);
                         }
                     }
                     Err(error) => {
@@ -498,12 +712,11 @@ impl ComposerView {
     }
 
     fn apply_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(edit) = self.pending_edit.take() else {
+        let Some(edit) = self.pending_edit.as_ref() else {
             return;
         };
         if edit.decisions.len() != edit.summary.hunk_ids.len() {
             self.status = "Accept or reject every hunk first".into();
-            self.pending_edit = Some(edit);
             cx.notify();
             return;
         }
@@ -514,33 +727,17 @@ impl ComposerView {
             .filter(|id| edit.decisions.get(id) == Some(&true))
             .copied()
             .collect::<Vec<_>>();
-        match self.runtime.as_ref() {
-            Some(runtime) => match runtime.executor.accept_edit(&edit.summary.id, &accepted) {
-                Ok(message) => {
-                    self.status = message;
-                    cx.emit(AgentStatus::Finished);
-                }
-                Err(error) => {
-                    self.status = format!("Edit failed: {error}");
-                    cx.emit(AgentStatus::Error);
-                }
-            },
-            None => {
-                self.status = "No active edit executor".into();
-                cx.emit(AgentStatus::Error);
-            }
-        }
-        cx.notify();
+        let proposal_id = edit.summary.id.clone();
+        let _ = self.apply_reviewed_edit(&proposal_id, &accepted, cx);
     }
 
     fn reject_edit(&mut self, cx: &mut Context<Self>) {
-        if let Some(edit) = self.pending_edit.take() {
-            if let Some(runtime) = &self.runtime {
-                runtime.executor.reject_edit(&edit.summary.id);
-            }
-            self.status = "AI edit rejected; disk was not changed".into();
-            cx.emit(AgentStatus::Finished);
-            cx.notify();
+        if let Some(proposal_id) = self
+            .pending_edit
+            .as_ref()
+            .map(|edit| edit.summary.id.clone())
+        {
+            let _ = self.reject_reviewed_edit(&proposal_id, cx);
         }
     }
 
@@ -612,6 +809,49 @@ impl ComposerView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let modifiers = event.keystroke.modifiers;
+        let primary = if cfg!(target_os = "macos") {
+            modifiers.platform
+        } else {
+            modifiers.control
+        };
+        if primary
+            && event.keystroke.key.eq_ignore_ascii_case("v")
+            && self.attach_clipboard_items(cx)
+        {
+            return;
+        }
+        if !self.path_suggestions.is_empty() {
+            match event.keystroke.key.as_str() {
+                "up" => {
+                    self.selected_path_suggestion = self.selected_path_suggestion.saturating_sub(1);
+                    cx.notify();
+                    return;
+                }
+                "down" => {
+                    self.selected_path_suggestion = (self.selected_path_suggestion + 1)
+                        .min(self.path_suggestions.len().saturating_sub(1));
+                    cx.notify();
+                    return;
+                }
+                "enter" | "return" => {
+                    if let Some(path) = self
+                        .path_suggestions
+                        .get(self.selected_path_suggestion)
+                        .cloned()
+                    {
+                        self.accept_path_suggestion(path, cx);
+                    }
+                    return;
+                }
+                "escape" => {
+                    self.path_suggestions.clear();
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
         match event.keystroke.key.as_str() {
             "enter" | "return" if !event.keystroke.modifiers.shift => self.submit(cx),
             "backspace" if self.cursor > 0 => {
@@ -624,6 +864,7 @@ impl ComposerView {
             "right" => self.cursor = (self.cursor + 1).min(self.draft.input.chars().count()),
             _ => return,
         }
+        self.update_path_suggestions();
         cx.notify();
     }
 
@@ -643,6 +884,7 @@ impl ComposerView {
 }
 
 impl EventEmitter<AgentStatus> for ComposerView {}
+impl EventEmitter<EditReviewRequested> for ComposerView {}
 
 async fn run_agent(
     runtime: AgentRuntime,
@@ -759,14 +1001,65 @@ impl gpui::Render for ComposerView {
                     .text_xs()
                     .child(SharedString::from(format!("{role}: {text}")))
             });
-        let chips = self.draft.attachments.iter().map(|attachment| {
+        let chips = self
+            .draft
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| {
+                div()
+                    .id(SharedString::from(format!("composer-attachment-{index}")))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(gpui::rgba(0x2d3748ff))
+                    .text_xs()
+                    .cursor_pointer()
+                    .child(SharedString::from(format!(
+                        "{}  ×",
+                        attachment.chip_label()
+                    )))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.draft.remove_attachment(index);
+                            cx.notify();
+                        }),
+                    )
+            });
+        let path_suggestions = (!self.path_suggestions.is_empty()).then(|| {
             div()
-                .px_2()
-                .py_1()
+                .flex()
+                .flex_col()
+                .mx_3()
+                .mt_1()
                 .rounded_md()
-                .bg(gpui::rgba(0x2d3748ff))
-                .text_xs()
-                .child(SharedString::from(attachment.chip_label()))
+                .border_1()
+                .border_color(gpui::rgba(0x4f8fefff))
+                .bg(gpui::rgba(0x202733ff))
+                .children(
+                    self.path_suggestions
+                        .iter()
+                        .enumerate()
+                        .map(|(index, path)| {
+                            let selected = index == self.selected_path_suggestion;
+                            let selected_path = path.clone();
+                            div()
+                                .id(SharedString::from(format!("composer-path-{index}")))
+                                .px_3()
+                                .py_1()
+                                .text_xs()
+                                .cursor_pointer()
+                                .when(selected, |row| row.bg(gpui::rgba(0x365880aa)))
+                                .child(SharedString::from(format!("@{path}")))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.accept_path_suggestion(selected_path.clone(), cx)
+                                    }),
+                                )
+                        }),
+                )
         });
         let approval = self.pending_approval.as_ref().map(|pending| {
             div()
@@ -994,6 +1287,7 @@ impl gpui::Render for ComposerView {
             .children(edit_review)
             .children(plan_review)
             .child(div().flex().flex_row().px_3().gap_1().children(chips))
+            .children(path_suggestions)
             .child(
                 div()
                     .flex()
@@ -1011,6 +1305,36 @@ impl gpui::Render for ComposerView {
                             .flex_1()
                             .text_sm()
                             .child(SharedString::from(self.display_input())),
+                    )
+                    .child(
+                        div()
+                            .id("composer-attach-file")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(gpui::rgba(0x293241ff))
+                            .cursor_pointer()
+                            .text_xs()
+                            .child("+ File")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.pick_attachment(false, cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("composer-attach-image")
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(gpui::rgba(0x293241ff))
+                            .cursor_pointer()
+                            .text_xs()
+                            .child("+ Image")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.pick_attachment(true, cx)),
+                            ),
                     )
                     .child(
                         div()
@@ -1124,6 +1448,7 @@ impl InputHandler for ComposerInputHandler {
                 view.draft.input.insert_str(byte, text);
                 view.cursor += text.chars().count();
                 view.marked_text.clear();
+                view.update_path_suggestions();
                 cx.notify();
             });
         }
@@ -1182,4 +1507,22 @@ fn char_to_byte(text: &str, index: usize) -> usize {
         .nth(index)
         .map(|(byte, _)| byte)
         .unwrap_or(text.len())
+}
+
+fn image_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        _ => "image/png",
+    }
 }

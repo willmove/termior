@@ -183,7 +183,20 @@ if ($env:TERMior_REAL_PROFILE -and (Test-Path $env:TERMior_REAL_PROFILE)) {
 $env:TERMior_HOSTNAME = if ($env:TERMior_HOSTNAME) { $env:TERMior_HOSTNAME } else { $env:COMPUTERNAME }
 
 function script:__termior_Osc7 {
-    $raw = \"file://$($env:TERMior_HOSTNAME)$($PWD.Path -replace '\\\\','/')\"
+    # Build a well-formed file URL: authority and path must be separated by '/'.
+    # Use ProviderPath and strip extended-length prefixes so the emitted path is
+    # always a plain drive/UNC path — otherwise the hostname glues onto the drive
+    # or the provider qualifier leaks into the URL. Skip non-FileSystem providers.
+    if (-not $PWD.Provider -or $PWD.Provider.Name -ne 'FileSystem') { return }
+    $path = $PWD.ProviderPath
+    if ($path.StartsWith('\\\\?\\UNC\\')) {
+        $path = '\\\\' + $path.Substring(8)
+    } elseif ($path.StartsWith('\\\\?\\')) {
+        $path = $path.Substring(4)
+    }
+    $path = $path -replace '\\\\','/'
+    if ($path -match '^[A-Za-z]:/') { $path = '/' + $path }
+    $raw = \"file://$($env:TERMior_HOSTNAME)$path\"
     [Console]::Write([char]27 + \"]7;\" + $raw + [char]7)
 }
 function script:__termior_MarkPrompt { [Console]::Write([char]27 + \"]133;A\" + [char]7) }
@@ -201,12 +214,14 @@ function global:prompt {
     __termior_MarkInput
     $out
 }
-# preexec: via PSReadLine SetKeyHandler fallback — emit command-start on first key after prompt.
+# preexec: emit command-start on Enter, then chain to the default accept-line action.
+# (Never bind Tab — that would replace the default tab-completion handler.)
 if (Get-Module -ListAvailable PSReadLine) {
-    Set-PSReadLineKeyHandler -Key Tab -BriefDescription TermiorMark -ScriptBlock {
+    Set-PSReadLineKeyHandler -Key Enter -BriefDescription TermiorMark -ScriptBlock {
         $line = $null
         [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$null)
         __termior_MarkCmd $line
+        [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
     }
 }
 ";
@@ -275,7 +290,58 @@ mod tests {
             .1
             .as_str();
         assert!(prof.contains("TERMior_REAL_PROFILE") || prof.contains("$PROFILE"));
+        assert!(prof.contains("$PWD.ProviderPath"));
+        assert!(prof.contains("FileSystem"));
         assert!(prof.contains("133"));
+    }
+
+    #[test]
+    fn pwsh_osc7_url_separates_authority_and_path() {
+        // Windows `$PWD.ProviderPath` is `C:\Users\...` → after `\`→`/` replace it does NOT
+        // start with `/`. Without an explicit separator the hostname glues onto the
+        // drive letter (`file://HOSTC:/Users/...`). The snippet must prefix `/` so
+        // the emitted URL is `file://host/C:/Users/...`.
+        let s = pwsh_snippets();
+        let prof = s
+            .files
+            .iter()
+            .find(|(n, _)| n == "profile.ps1")
+            .unwrap()
+            .1
+            .as_str();
+        assert!(
+            prof.contains(r"if ($path -match '^[A-Za-z]:/') { $path = '/' + $path }"),
+            "pwsh OSC 7 must ensure a '/' separates authority and path"
+        );
+        assert!(
+            prof.contains(r#"$raw = "file://$($env:TERMior_HOSTNAME)$path""#),
+            "pwsh OSC 7 must build the URL from the slash-prefixed path"
+        );
+        // The old broken form (path glued directly onto the hostname) must be gone.
+        assert!(!prof.contains(r#"file://$($env:TERMior_HOSTNAME)$($PWD"#));
+    }
+
+    #[test]
+    fn pwsh_does_not_bind_tab_and_marks_command_on_enter() {
+        // Binding Tab would replace the default tab-completion handler. The
+        // command-start mark must ride on Enter and chain to AcceptLine.
+        let s = pwsh_snippets();
+        let prof = s
+            .files
+            .iter()
+            .find(|(n, _)| n == "profile.ps1")
+            .unwrap()
+            .1
+            .as_str();
+        assert!(
+            !prof.contains("-Key Tab"),
+            "pwsh integration must not hijack the Tab key"
+        );
+        assert!(prof.contains("-Key Enter"), "command mark should bind Enter");
+        assert!(
+            prof.contains("[Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()"),
+            "Enter handler must chain to AcceptLine so the line still submits"
+        );
     }
 
     #[test]

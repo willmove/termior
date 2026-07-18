@@ -55,6 +55,10 @@ pub struct TerminalView {
     cols: usize,
     rows: usize,
     latest_cwd: Option<String>,
+    /// shell/程序经 OSC 0/2 设置的原始标题（已清洗控制字符）。
+    shell_title: Option<String>,
+    /// 最近一次已 emit 的展示标题，用于去重（OSC 7 每个 prompt 都会上报）。
+    emitted_title: Option<String>,
     localhost_urls: Vec<String>,
     agent_state: Option<AgentState>,
     marked_text: String,
@@ -150,7 +154,10 @@ impl TerminalView {
                     for ev in events {
                         log::info!("OSC event: {ev:?}");
                         match ev {
-                            OscEvent::Cwd { path, .. } => view.latest_cwd = Some(path),
+                            OscEvent::Cwd { path, .. } => {
+                                view.latest_cwd = Some(path);
+                                view.update_display_title(cx);
+                            }
                             OscEvent::AgentEvent(state) if view.agent_state != Some(state) => {
                                 view.agent_state = Some(state);
                                 cx.emit(state);
@@ -195,6 +202,8 @@ impl TerminalView {
             cols,
             rows,
             latest_cwd: None,
+            shell_title: None,
+            emitted_title: None,
             localhost_urls: Vec::new(),
             agent_state: None,
             marked_text: String::new(),
@@ -216,6 +225,16 @@ impl TerminalView {
         self.latest_cwd.as_deref()
     }
 
+    /// 重新计算标签页展示标题并在变化时 emit（OSC 7 每个 prompt 都上报，必须去重）。
+    fn update_display_title(&mut self, cx: &mut Context<Self>) {
+        let display = display_title(self.shell_title.as_deref(), self.latest_cwd.as_deref());
+        if display != self.emitted_title {
+            self.emitted_title = display.clone();
+            cx.emit(TerminalViewEvent::TitleChanged(display));
+            cx.notify();
+        }
+    }
+
     pub fn localhost_urls(&self) -> &[String] {
         &self.localhost_urls
     }
@@ -234,34 +253,44 @@ impl TerminalView {
             | AlacrittyEvent::CursorBlinkingChange
             | AlacrittyEvent::Wakeup => cx.notify(),
             AlacrittyEvent::Title(title) => {
-                cx.emit(TerminalViewEvent::TitleChanged(clean_terminal_title(title)));
-                cx.notify();
+                self.shell_title = clean_terminal_title(title);
+                self.update_display_title(cx);
             }
             AlacrittyEvent::ResetTitle => {
-                cx.emit(TerminalViewEvent::TitleChanged(None));
-                cx.notify();
+                self.shell_title = None;
+                self.update_display_title(cx);
             }
             AlacrittyEvent::ClipboardStore(kind, text) => {
                 let item = ClipboardItem::new_string(text);
-                match kind {
-                    // GPUI's view context exposes the system clipboard everywhere.
+                // Defer the clipboard access out of the current entity update: on
+                // Windows, opening the clipboard can dispatch sent messages back into
+                // our wndproc while this entity's RefCell is still borrowed.
+                cx.defer(move |cx| match kind {
+                    // GPUI's app context exposes the system clipboard everywhere.
                     // Primary selection is not portable (notably on Windows), so use
                     // the system clipboard as its fallback here.
                     ClipboardType::Clipboard | ClipboardType::Selection => {
                         cx.write_to_clipboard(item)
                     }
-                }
+                });
             }
             AlacrittyEvent::ClipboardLoad(kind, formatter) => {
-                let text = match kind {
-                    ClipboardType::Clipboard | ClipboardType::Selection => cx.read_from_clipboard(),
-                }
-                .and_then(|item| item.text())
-                .unwrap_or_default();
-                let reply = formatter(&text);
-                if let Err(error) = self.write_input(reply.as_bytes()) {
-                    log::warn!("terminal clipboard reply failed: {error}");
-                }
+                // Same re-entrancy hazard as ClipboardStore above: read the clipboard
+                // and reply to the PTY after the current update cycle completes.
+                let writer = self.bridge.writer();
+                cx.defer(move |cx| {
+                    let text = match kind {
+                        ClipboardType::Clipboard | ClipboardType::Selection => {
+                            cx.read_from_clipboard()
+                        }
+                    }
+                    .and_then(|item| item.text())
+                    .unwrap_or_default();
+                    let reply = formatter(&text);
+                    if let Err(error) = writer.write_all(reply.as_bytes()) {
+                        log::warn!("terminal clipboard reply failed: {error}");
+                    }
+                });
             }
             AlacrittyEvent::ColorRequest(index, formatter) => {
                 let color = self.term.colors()[index]
@@ -414,17 +443,25 @@ impl TerminalView {
         }
         if is_copy_shortcut(&ev.keystroke) {
             if let Some(text) = self.term.selection_to_string() {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                // Key listeners run inside this entity's update; defer the clipboard
+                // access so Windows clipboard message pumping cannot re-enter while
+                // the RefCell is borrowed (same hazard as in handle_terminal_event).
+                cx.defer(move |cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
             }
             return;
         }
         if is_paste_shortcut(&ev.keystroke) {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                let bytes = encode_paste(&text, *self.term.mode());
-                if let Err(error) = self.write_input(&bytes) {
-                    log::warn!("PTY paste error: {error}");
+            let mode = *self.term.mode();
+            let writer = self.bridge.writer();
+            // Same deferral as the copy path above.
+            cx.defer(move |cx| {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    let bytes = encode_paste(&text, mode);
+                    if let Err(error) = writer.write_all(&bytes) {
+                        log::warn!("PTY paste error: {error}");
+                    }
                 }
-            }
+            });
             return;
         }
         let bytes = keystroke_to_pty_bytes(&ev.keystroke, *self.term.mode());
@@ -711,7 +748,14 @@ impl Render for TerminalView {
                     }
                 },
                 move |_bounds, layout: LayoutInfo, window, cx| {
-                    window.handle_input(&input_focus, input_handler, cx);
+                    // Register the IME input handler only for the focused pane. With split
+                    // panes, unconditional per-frame registrations from every pane fight
+                    // each other, and on Windows each registration can trigger re-entrant
+                    // IME/TSF (COM) message traffic. Zed's terminal element gates the same
+                    // way (gpui's handle_input also checks focus internally on this rev).
+                    if input_focus.is_focused(window) {
+                        window.handle_input(&input_focus, input_handler, cx);
+                    }
                     paint_terminal(
                         &layout,
                         &snapshot,
@@ -1627,6 +1671,69 @@ fn clean_terminal_title(title: String) -> Option<String> {
     (!title.is_empty()).then(|| title.to_owned())
 }
 
+/// 计算标签页展示标题：
+/// - shell/程序设置的标题若不像路径（如 vim/ssh 设置的程序名），原样采用；
+/// - 路径式标题（如 PowerShell 启动时设置的全路径 `C:\...\pwsh.exe`）退化为
+///   当前目录名（OSC 7 上报的 cwd）；
+/// - 还没有 cwd 时退化为路径标题的程序名（如 `pwsh`）。
+fn display_title(shell_title: Option<&str>, cwd: Option<&str>) -> Option<String> {
+    if let Some(title) = shell_title {
+        if !looks_like_path(title) {
+            return Some(title.to_owned());
+        }
+    }
+    if let Some(dir) = cwd.and_then(dir_name) {
+        return Some(dir);
+    }
+    shell_title.and_then(program_name_from_path)
+}
+
+/// 标题是否形如文件系统路径（`C:\...`、`/...`、`~/...`、`\\server\...`）。
+fn looks_like_path(title: &str) -> bool {
+    let title = title.trim_start();
+    if title.starts_with('/') || title.starts_with('~') || title.starts_with("\\\\") {
+        return true;
+    }
+    let bytes = title.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+/// 路径的最后一个非空分量（目录名 / 文件名）。
+fn last_path_component(path: &str) -> Option<&str> {
+    path.trim()
+        .rsplit(['/', '\\'])
+        .find(|component| !component.is_empty())
+}
+
+/// cwd → 目录名（`C:\Users\willmove` → `willmove`；根目录退回自身，如 `C:` / `/`）。
+fn dir_name(cwd: &str) -> Option<String> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return None;
+    }
+    Some(
+        last_path_component(cwd)
+            .unwrap_or(cwd)
+            .trim_end_matches(['/', '\\'])
+            .to_owned(),
+    )
+    .filter(|name| !name.is_empty())
+    .or_else(|| Some(cwd.to_owned()))
+}
+
+/// 路径标题 → 程序名（去目录与扩展名：`C:\Tools\pwsh.exe` → `pwsh`）。
+fn program_name_from_path(path: &str) -> Option<String> {
+    let name = last_path_component(path)?;
+    let stem = match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => name,
+    };
+    Some(stem.to_owned())
+}
+
 fn dim_color(color: ThemeColor) -> ThemeColor {
     ThemeColor {
         r: color.r / 2,
@@ -1693,6 +1800,52 @@ mod protocol_tests {
     fn alternate_scroll_uses_application_cursor_sequences() {
         assert_eq!(alternate_scroll(2), b"\x1bOA\x1bOA");
         assert_eq!(alternate_scroll(-1), b"\x1bOB");
+    }
+
+    #[test]
+    fn display_title_prefers_program_titles_over_paths() {
+        // 程序设置的标题（不含路径形态）原样采用。
+        assert_eq!(
+            display_title(Some("vim - main.rs"), Some("C:\\Users\\willmove")),
+            Some("vim - main.rs".to_owned())
+        );
+        // PowerShell 启动时把标题设为全路径：优先展示当前目录名。
+        assert_eq!(
+            display_title(
+                Some("C:\\Program Files\\PowerShell\\7\\pwsh.exe"),
+                Some("C:\\Users\\willmove")
+            ),
+            Some("willmove".to_owned())
+        );
+        // 还没有 cwd 时退化为程序名（去目录与扩展名）。
+        assert_eq!(
+            display_title(Some("C:\\Program Files\\PowerShell\\7\\pwsh.exe"), None),
+            Some("pwsh".to_owned())
+        );
+        // Unix 风格同样处理。
+        assert_eq!(
+            display_title(Some("/usr/bin/bash"), Some("/home/u/proj")),
+            Some("proj".to_owned())
+        );
+        assert_eq!(
+            display_title(Some("/usr/bin/fish"), None),
+            Some("fish".to_owned())
+        );
+        // 无标题时用目录名；都没有则 None（上层回退 "Terminal"）。
+        assert_eq!(
+            display_title(None, Some("~/work/termior")),
+            Some("termior".to_owned())
+        );
+        assert_eq!(display_title(None, None), None);
+    }
+
+    #[test]
+    fn dir_name_handles_roots_and_separators() {
+        assert_eq!(dir_name("C:\\Users\\willmove"), Some("willmove".to_owned()));
+        assert_eq!(dir_name("C:/Users/willmove/"), Some("willmove".to_owned()));
+        assert_eq!(dir_name("C:\\"), Some("C:".to_owned()));
+        assert_eq!(dir_name("/"), Some("/".to_owned()));
+        assert_eq!(dir_name("   "), None);
     }
 
     #[test]

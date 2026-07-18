@@ -1,8 +1,10 @@
 //! Termior desktop application entry point.
 
+mod ai_diff_view;
 mod app_identity;
 mod composer_view;
 mod editor_view;
+mod git_views;
 mod keystroke;
 mod preview_view;
 mod settings_view;

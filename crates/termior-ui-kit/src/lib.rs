@@ -6,5 +6,5 @@
 mod layout;
 mod search;
 
-pub use layout::{LayoutError, LayoutNode, PaneId, PaneLayout, SplitDirection};
+pub use layout::{LayoutError, LayoutNode, PaneExtent, PaneId, PaneLayout, SplitDirection};
 pub use search::{SearchOptions, SearchOverlay};

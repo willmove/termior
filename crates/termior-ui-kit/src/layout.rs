@@ -10,6 +10,12 @@ pub enum SplitDirection {
     Down,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PaneExtent {
+    pub width: f32,
+    pub height: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LayoutNode {
@@ -71,6 +77,40 @@ impl PaneLayout {
         new
     }
 
+    pub fn focused_extent(&self, width: f32, height: f32, divider: f32) -> Option<PaneExtent> {
+        self.root.extent_for(
+            self.focused,
+            PaneExtent {
+                width: width.max(0.0),
+                height: height.max(0.0),
+            },
+            divider.max(0.0),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn can_split_focused(
+        &self,
+        direction: SplitDirection,
+        width: f32,
+        height: f32,
+        divider: f32,
+        min_width: f32,
+        min_height: f32,
+        max_panes: usize,
+    ) -> bool {
+        if self.panes().len() >= max_panes {
+            return false;
+        }
+        let Some(extent) = self.focused_extent(width, height, divider) else {
+            return false;
+        };
+        match direction {
+            SplitDirection::Right => extent.width >= min_width * 2.0 + divider,
+            SplitDirection::Down => extent.height >= min_height * 2.0 + divider,
+        }
+    }
+
     pub fn focus(&mut self, pane: PaneId) -> Result<(), LayoutError> {
         if self.root.contains(pane) {
             self.focused = pane;
@@ -91,17 +131,38 @@ impl PaneLayout {
     }
 
     pub fn close_focused(&mut self) -> Result<PaneId, LayoutError> {
+        self.close_pane(self.focused)
+    }
+
+    /// Close an arbitrary pane (e.g. its terminal process exited while unfocused).
+    /// Closing the focused pane moves focus to the first remaining pane.
+    pub fn close_pane(&mut self, pane: PaneId) -> Result<PaneId, LayoutError> {
         if self.panes().len() == 1 {
             return Err(LayoutError::FinalPane);
         }
-        let removed = self.focused;
+        if !self.root.contains(pane) {
+            return Err(LayoutError::PaneNotFound(pane));
+        }
         self.root = self
             .root
             .clone()
-            .remove(self.focused)
+            .remove(pane)
             .expect("more than one pane leaves a root");
-        self.focused = self.panes()[0];
-        Ok(removed)
+        if self.focused == pane {
+            self.focused = self.panes()[0];
+        }
+        Ok(pane)
+    }
+
+    pub fn close_other_panes(&mut self) -> Vec<PaneId> {
+        let focused = self.focused;
+        let removed = self
+            .panes()
+            .into_iter()
+            .filter(|pane| *pane != focused)
+            .collect();
+        self.root = LayoutNode::Pane { id: focused };
+        removed
     }
 
     pub fn resize_split(&mut self, path: &[usize], ratio: f32) -> Result<(), LayoutError> {
@@ -141,6 +202,55 @@ impl LayoutNode {
         match self {
             Self::Pane { id } => *id == pane,
             Self::Split { first, second, .. } => first.contains(pane) || second.contains(pane),
+        }
+    }
+
+    fn extent_for(&self, pane: PaneId, extent: PaneExtent, divider: f32) -> Option<PaneExtent> {
+        match self {
+            Self::Pane { id } => (*id == pane).then_some(extent),
+            Self::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                let ratio = ratio.clamp(0.0, 1.0);
+                let (first_extent, second_extent) = match direction {
+                    SplitDirection::Right => {
+                        let available = (extent.width - divider).max(0.0);
+                        let first_width = available * ratio;
+                        (
+                            PaneExtent {
+                                width: first_width,
+                                height: extent.height,
+                            },
+                            PaneExtent {
+                                width: available - first_width,
+                                height: extent.height,
+                            },
+                        )
+                    }
+                    SplitDirection::Down => {
+                        let available = (extent.height - divider).max(0.0);
+                        let first_height = available * ratio;
+                        (
+                            PaneExtent {
+                                width: extent.width,
+                                height: first_height,
+                            },
+                            PaneExtent {
+                                width: extent.width,
+                                height: available - first_height,
+                            },
+                        )
+                    }
+                };
+                if first.contains(pane) {
+                    first.extent_for(pane, first_extent, divider)
+                } else {
+                    second.extent_for(pane, second_extent, divider)
+                }
+            }
         }
     }
 
@@ -214,6 +324,25 @@ mod tests {
     }
 
     #[test]
+    fn close_unfocused_pane_keeps_focus() {
+        let mut layout = PaneLayout::new();
+        let first = layout.focused;
+        let second = layout.split_focused(SplitDirection::Right);
+        layout.focus(first).unwrap();
+
+        assert_eq!(layout.close_pane(second), Ok(second));
+        assert_eq!(layout.panes(), vec![first]);
+        assert_eq!(layout.focused, first);
+        // Single remaining pane: any close is a final-pane close.
+        assert_eq!(layout.close_pane(second), Err(LayoutError::FinalPane));
+
+        let second = layout.split_focused(SplitDirection::Right);
+        assert_eq!(layout.focused, second);
+        assert_eq!(layout.close_pane(second), Ok(second));
+        assert_eq!(layout.focused, first, "closing focused pane moves focus");
+    }
+
+    #[test]
     fn ratio_is_bounded() {
         let mut layout = PaneLayout::new();
         layout.split_focused(SplitDirection::Right);
@@ -222,5 +351,73 @@ mod tests {
             Err(LayoutError::InvalidRatio)
         );
         layout.resize_split(&[], 0.6).unwrap();
+    }
+
+    #[test]
+    fn focused_extent_tracks_nested_splits() {
+        let mut layout = PaneLayout::new();
+        layout.split_focused(SplitDirection::Right);
+        let extent = layout.focused_extent(1000.0, 800.0, 5.0).unwrap();
+        assert!((extent.width - 497.5).abs() < f32::EPSILON);
+        assert!((extent.height - 800.0).abs() < f32::EPSILON);
+
+        layout.split_focused(SplitDirection::Down);
+        let extent = layout.focused_extent(1000.0, 800.0, 5.0).unwrap();
+        assert!((extent.width - 497.5).abs() < f32::EPSILON);
+        assert!((extent.height - 397.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn split_constraints_follow_focused_pane_and_limit() {
+        let mut layout = PaneLayout::new();
+        assert!(layout.can_split_focused(
+            SplitDirection::Right,
+            1000.0,
+            800.0,
+            5.0,
+            320.0,
+            180.0,
+            8,
+        ));
+        layout.split_focused(SplitDirection::Right);
+        assert!(!layout.can_split_focused(
+            SplitDirection::Right,
+            1000.0,
+            800.0,
+            5.0,
+            320.0,
+            180.0,
+            8,
+        ));
+        assert!(layout.can_split_focused(
+            SplitDirection::Down,
+            1000.0,
+            800.0,
+            5.0,
+            320.0,
+            180.0,
+            8,
+        ));
+        assert!(!layout.can_split_focused(
+            SplitDirection::Down,
+            1000.0,
+            800.0,
+            5.0,
+            320.0,
+            180.0,
+            2,
+        ));
+    }
+
+    #[test]
+    fn close_other_panes_keeps_the_focused_pane() {
+        let mut layout = PaneLayout::new();
+        let first = layout.focused;
+        let second = layout.split_focused(SplitDirection::Right);
+        let third = layout.split_focused(SplitDirection::Down);
+
+        assert_eq!(layout.close_other_panes(), vec![first, second]);
+        assert_eq!(layout.panes(), vec![third]);
+        assert_eq!(layout.focused, third);
     }
 }

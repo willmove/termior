@@ -22,5 +22,5 @@ jobs:
           command: check
           # 排除 termior：其 GPUI 依赖（zed 树）含 GPL-3.0 crate（zlog/ztracing），
           # 属上游 zed 许可问题，不在本项目（Apache-2.0）纯逻辑层的许可范围内。
-          # 与 CI 同步：纯逻辑层三平台门禁不编译 termior（见 ci.yml）。
+          # GPUI 上游许可单独核验；CI 仍在三平台编译 termior 桌面产物。
           arguments: --exclude termior

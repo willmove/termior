@@ -34,11 +34,15 @@ pub struct PtySessionConfig {
     /// Keep shell integration opt-in so the plain interactive shell remains the reliability
     /// baseline while integration evolves independently.
     pub shell_integration: bool,
+    /// Whether the child receives the full application environment. Private terminals retain
+    /// only the small set of variables required to locate and start the user's shell.
+    pub inherit_environment: bool,
     pub rows: u16,
     pub cols: u16,
     pub cwd: Option<String>,
-    /// Authorization granted when the workspace was explicitly opened. A configured cwd is
-    /// rejected unless it is inside this registry (FR-SEC-04).
+    /// Authorization granted when the workspace was explicitly opened. A configured cwd that is
+    /// not inside this registry is dropped (spawn falls back to the default directory) so a bad
+    /// cwd can never kill the terminal, while unauthorized directories stay unused (FR-SEC-04).
     pub workspace_auth: Option<termior_security::workspace::WorkspaceAuthRegistry>,
 }
 
@@ -48,6 +52,7 @@ impl Default for PtySessionConfig {
             shell: None,
             shell_program: None,
             shell_integration: false,
+            inherit_environment: true,
             rows: 24,
             cols: 80,
             cwd: None,
@@ -60,10 +65,13 @@ impl Default for PtySessionConfig {
 ///
 /// reader 由 [`crate::bridge::TerminalBridge`] 在独立线程里消费（`take_reader`），
 /// 故此处不持有 reader。`integration_dir` 让注入脚本在会话存活期间不被清理。
+/// child 句柄可由 [`PtySession::take_child`] 取走交给退出监听线程（阻塞 `wait`），
+/// 会话侧保留 `clone_killer` 得到的 killer，kill 能力不受影响。
 pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     /// 保持 shell integration 脚本文件存活；drop 时随会话清理。
     _integration_dir: Option<tempfile::TempDir>,
     #[cfg(windows)]
@@ -73,17 +81,6 @@ pub struct PtySession {
 impl PtySession {
     /// 打开 PTY 并 spawn shell，按配置注入 shell integration。
     pub fn spawn(config: &PtySessionConfig) -> Result<Self, SpawnError> {
-        if let Some(cwd) = &config.cwd {
-            let authorized = config
-                .workspace_auth
-                .as_ref()
-                .is_some_and(|registry| registry.is_authorized(cwd));
-            if !authorized {
-                return Err(SpawnError::Spawn(format!(
-                    "workspace is not authorized for PTY cwd: {cwd}"
-                )));
-            }
-        }
         #[cfg(windows)]
         let _spawn_guard = conpty_spawn_lock()
             .lock()
@@ -114,7 +111,7 @@ impl PtySession {
             "PTY spawning shell: {:?} ({program}), integration={integration_enabled}",
             kind
         );
-        let (cmd, integration_dir) = build_command(kind, &program, integration_enabled, config)?;
+        let (cmd, integration_dir) = build_command(kind, &program, integration_enabled, &config)?;
 
         // child spawn 在 slave 上（CommandBuilder 按值消费）。
         let child = pair
@@ -146,10 +143,13 @@ impl PtySession {
             .take_writer()
             .map_err(|e| SpawnError::Open(format!("take_writer: {e}")))?;
 
+        let killer = child.clone_killer();
+
         Ok(Self {
             master: pair.master,
             writer: Arc::new(Mutex::new(writer)),
-            child,
+            killer,
+            child: Some(child),
             _integration_dir: integration_dir,
             #[cfg(windows)]
             _job: job,
@@ -180,17 +180,15 @@ impl PtySession {
             .map_err(|e| SpawnError::Io(std::io::Error::other(e.to_string())))
     }
 
-    /// 等待子进程退出（关闭 tab 时调用）。
-    pub fn wait(mut self) -> Result<(), SpawnError> {
-        self.child
-            .wait()
-            .map_err(|e| SpawnError::Spawn(format!("wait: {e}")))?;
-        Ok(())
+    /// 取走子进程句柄（一次性）：由调用方线程阻塞 `wait()` 监听退出。
+    /// 之后 [`PtySession::kill`] 仍有效（killer 是独立克隆的句柄）。
+    pub fn take_child(&mut self) -> Option<Box<dyn portable_pty::Child + Send + Sync>> {
+        self.child.take()
     }
 
     /// 尝试 kill 子进程。
     pub fn kill(&mut self) -> Result<(), SpawnError> {
-        self.child
+        self.killer
             .kill()
             .map_err(|e| SpawnError::Spawn(format!("kill: {e}")))
     }
@@ -302,6 +300,13 @@ fn build_command(
     config: &PtySessionConfig,
 ) -> Result<(CommandBuilder, Option<tempfile::TempDir>), SpawnError> {
     let mut cmd = CommandBuilder::new(program);
+    if !config.inherit_environment {
+        let retained = private_environment();
+        cmd.env_clear();
+        for (key, value) in retained {
+            cmd.env(key, value);
+        }
+    }
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("TERM_PROGRAM", "Termior");
@@ -323,11 +328,64 @@ fn build_command(
         None => None, // cmd 等无 shell integration 的 shell
     };
 
-    if let Some(cwd) = &config.cwd {
+    if let Some(cwd) = resolve_cwd(config) {
         cmd.cwd(cwd);
     }
 
     Ok((cmd, integration_dir))
+}
+
+/// 决定 spawn 实际使用的 cwd（FR-SEC-04）。
+///
+/// 无效 cwd 不应让整个终端 spawn 失败：**丢弃 cwd（继承默认目录）严格安全于
+/// 使用它**——授权检查依旧强制，只是降级为告警而非报错。丢弃场景：
+/// - 未授权（不在 [`WorkspaceAuthRegistry`]，或未提供注册表）；
+/// - 目录不存在（Windows 上过期 cwd 会让 ConPTY spawn 直接失败）。
+///
+/// 已授权且存在的 cwd 原样使用。
+fn resolve_cwd(config: &PtySessionConfig) -> Option<String> {
+    let cwd = config.cwd.as_ref()?;
+    let authorized = config
+        .workspace_auth
+        .as_ref()
+        .is_some_and(|registry| registry.is_authorized(cwd));
+    if !authorized {
+        log::warn!("PTY cwd is not authorized; spawning without a cwd: {cwd}");
+        return None;
+    }
+    if !std::path::Path::new(cwd).is_dir() {
+        log::warn!("PTY cwd is not an existing directory; spawning without a cwd: {cwd}");
+        return None;
+    }
+    Some(cwd.clone())
+}
+
+/// Keep the platform variables required to resolve executables, home directories and temporary
+/// files without leaking arbitrary application/session variables into a private terminal.
+fn private_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(key, _)| private_environment_key(key))
+        .collect()
+}
+
+fn private_environment_key(key: &std::ffi::OsStr) -> bool {
+    let key = key.to_string_lossy();
+    [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LC_ALL",
+        "SHELL",
+    ]
+    .iter()
+    .any(|allowed| key.eq_ignore_ascii_case(allowed))
 }
 
 /// shell 可执行名。
@@ -446,6 +504,30 @@ mod tests {
     }
 
     #[test]
+    fn private_terminal_keeps_only_required_environment() {
+        assert!(private_environment_key(std::ffi::OsStr::new("PATH")));
+        assert!(private_environment_key(std::ffi::OsStr::new("SystemRoot")));
+        assert!(!private_environment_key(std::ffi::OsStr::new(
+            "TERMIOR_PARENT_SESSION_SECRET"
+        )));
+
+        let config = PtySessionConfig {
+            inherit_environment: false,
+            ..PtySessionConfig::default()
+        };
+        let (command, _) = build_command(ShellKind::Cmd, "cmd", false, &config).unwrap();
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
+        if let Some((key, _)) =
+            std::env::vars_os().find(|(key, _)| !private_environment_key(key) && key != "TERM")
+        {
+            assert_eq!(command.get_env(key), None);
+        }
+    }
+
+    #[test]
     fn powershell_integration_keeps_the_shell_interactive() {
         let config = PtySessionConfig::default();
         let (command, integration_dir) =
@@ -472,6 +554,70 @@ mod tests {
         assert_eq!(args.len(), 3);
         assert!(args[2].ends_with("termior-bashrc.sh"));
         assert!(integration_dir.is_some());
+    }
+
+    #[test]
+    fn unauthorized_cwd_is_dropped_not_fatal() {
+        use termior_security::workspace::WorkspaceAuthRegistry;
+        // 类似 Windows OSC 7 解析畸形产生的垃圾 cwd：不授权 → 丢弃，spawn 继续。
+        let config = PtySessionConfig {
+            cwd: Some("DESKTOP-ABCC:/Users/x/proj".into()),
+            workspace_auth: Some(WorkspaceAuthRegistry::new()),
+            ..PtySessionConfig::default()
+        };
+        assert_eq!(resolve_cwd(&config), None);
+        let (command, _) = build_command(ShellKind::Bash, "bash", false, &config).unwrap();
+        assert!(
+            command.get_cwd().is_none(),
+            "unauthorized cwd must be dropped, not passed to the child"
+        );
+    }
+
+    #[test]
+    fn missing_auth_registry_drops_cwd() {
+        let config = PtySessionConfig {
+            cwd: Some("/home/u/proj".into()),
+            workspace_auth: None,
+            ..PtySessionConfig::default()
+        };
+        assert_eq!(resolve_cwd(&config), None);
+        let (command, _) = build_command(ShellKind::Bash, "bash", false, &config).unwrap();
+        assert!(command.get_cwd().is_none());
+    }
+
+    #[test]
+    fn authorized_existing_cwd_is_used() {
+        use termior_security::workspace::WorkspaceAuthRegistry;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let mut registry = WorkspaceAuthRegistry::new();
+        registry.authorize(&path);
+        let config = PtySessionConfig {
+            cwd: Some(path.clone()),
+            workspace_auth: Some(registry),
+            ..PtySessionConfig::default()
+        };
+        assert_eq!(resolve_cwd(&config), Some(path.clone()));
+        let (command, _) = build_command(ShellKind::Bash, "bash", false, &config).unwrap();
+        assert_eq!(
+            command.get_cwd().map(|c| c.to_string_lossy().into_owned()),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn authorized_but_nonexistent_cwd_is_dropped() {
+        use termior_security::workspace::WorkspaceAuthRegistry;
+        // Windows 上过期 cwd 会让 ConPTY spawn 失败：授权但不存在 → 丢弃。
+        let stale = "/no/such/termior-stale-dir";
+        let mut registry = WorkspaceAuthRegistry::new();
+        registry.authorize(stale);
+        let config = PtySessionConfig {
+            cwd: Some(stale.into()),
+            workspace_auth: Some(registry),
+            ..PtySessionConfig::default()
+        };
+        assert_eq!(resolve_cwd(&config), None);
     }
 
     #[test]

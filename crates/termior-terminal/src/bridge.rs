@@ -72,16 +72,19 @@ pub struct TerminalBridge {
     output_rx: Option<Receiver<PtyData>>,
     /// 持有 reader 线程句柄，drop 时自然分离（reader 线程在 PTY EOF 后退出）。
     _reader: thread::JoinHandle<()>,
+    /// 子进程退出监听线程句柄（退出时关闭输出 channel，drop 时自然分离）。
+    _watcher: thread::JoinHandle<()>,
 }
 
 impl TerminalBridge {
     /// spawn PTY 会话并启动 reader 线程；返回的 bridge 持有输出 channel 接收端。
     pub fn spawn(config: &PtySessionConfig) -> Result<Self, SpawnError> {
-        let session = PtySession::spawn(config)?;
+        let mut session = PtySession::spawn(config)?;
         let mut reader = session.take_reader()?;
         // Bound queued output so a fast producer (for example `cat` on a large file) applies
         // backpressure instead of growing application memory without limit.
         let (output_tx, output_rx) = mpsc::channel::<PtyData>(64);
+        let mut exit_signaler = output_tx.clone();
 
         let handle = thread::Builder::new()
             .name("termior-pty-reader".into())
@@ -90,10 +93,29 @@ impl TerminalBridge {
             })
             .map_err(|e| SpawnError::Open(format!("reader thread: {e}")))?;
 
+        // Windows 上 ConPTY 在 shell 退出后不会关闭输出管道——reader 线程永远等不到
+        // EOF，输出流不会结束。用独立线程阻塞 wait 子进程，退出即关闭输出 channel，
+        // 让消费方流正常走到结束（上层据此关闭窗格）。Unix 上 reader 会先到 EOF，
+        // 此处的 close_channel 是幂等的冗余保障，顺带回收僵尸进程。
+        let mut child = session
+            .take_child()
+            .ok_or_else(|| SpawnError::Spawn("spawned session has no child".into()))?;
+        let watcher = thread::Builder::new()
+            .name("termior-pty-child-watcher".into())
+            .spawn(move || {
+                match child.wait() {
+                    Ok(status) => log::info!("PTY child exited: {status:?}"),
+                    Err(error) => log::warn!("PTY child wait failed: {error}"),
+                }
+                exit_signaler.close_channel();
+            })
+            .map_err(|e| SpawnError::Open(format!("child watcher thread: {e}")))?;
+
         Ok(Self {
             session,
             output_rx: Some(output_rx),
             _reader: handle,
+            _watcher: watcher,
         })
     }
 
