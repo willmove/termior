@@ -99,6 +99,14 @@ impl EditorView {
         self.buffer.path()
     }
 
+    pub fn text(&self) -> String {
+        self.buffer.text()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.buffer.revision()
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.buffer.is_dirty()
     }

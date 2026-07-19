@@ -30,7 +30,7 @@ try {
     $serverErr = Join-Path $resolvedRunRoot "server.stderr.log"
     $python = (Get-Command python).Source
     $server = Start-Process -FilePath $python `
-        -ArgumentList @("-m", "http.server", "3000", "--bind", "127.0.0.1") `
+        -ArgumentList @("-u", "-m", "http.server", "3000", "--bind", "127.0.0.1") `
         -WorkingDirectory $repoRoot `
         -WindowStyle Hidden `
         -RedirectStandardOutput $serverOut `
@@ -53,6 +53,7 @@ try {
     $appErr = Join-Path $resolvedRunRoot "app.stderr.log"
     $app = Start-Process -FilePath $Binary `
         -WorkingDirectory $repoRoot `
+        -WindowStyle Hidden `
         -RedirectStandardOutput $appOut `
         -RedirectStandardError $appErr `
         -PassThru
@@ -61,13 +62,15 @@ try {
         throw "Preview smoke timed out after $TimeoutSeconds seconds"
     }
 
-    $stdout = Get-Content -Raw $appOut -ErrorAction SilentlyContinue
-    $stderr = Get-Content -Raw $appErr -ErrorAction SilentlyContinue
-    $requests = Get-Content -Raw $serverErr -ErrorAction SilentlyContinue
-    if ($stdout -notmatch "TERMIOR_PREVIEW_SMOKE_OK") {
+    [string]$stdout = Get-Content -Raw $appOut -ErrorAction SilentlyContinue
+    [string]$stderr = Get-Content -Raw $appErr -ErrorAction SilentlyContinue
+    [string]$requests = Get-Content -Raw $serverErr -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($stdout) -or
+        $stdout -notmatch "TERMIOR_PREVIEW_SMOKE_OK") {
         throw "Preview never became ready.`nSTDOUT:`n$stdout`nSTDERR:`n$stderr"
     }
-    if ($requests -notmatch 'GET / HTTP/') {
+    if ([string]::IsNullOrWhiteSpace($requests) -or
+        $requests -notmatch 'GET / HTTP/') {
         throw "Embedded preview did not request the fixture page.`nSERVER:`n$requests"
     }
     if ($stderr -match "RefCell already borrowed|panicked at") {
@@ -82,11 +85,24 @@ finally {
     Remove-Item Env:\TERMIOR_PREVIEW_SMOKE_TEST -ErrorAction SilentlyContinue
     if ($app -and -not $app.HasExited) {
         Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+        [void]$app.WaitForExit(5000)
     }
     if ($server -and -not $server.HasExited) {
         Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+        [void]$server.WaitForExit(5000)
     }
+    if ($app) { $app.Dispose() }
+    if ($server) { $server.Dispose() }
     if (Test-Path -LiteralPath $resolvedRunRoot) {
-        Remove-Item -LiteralPath $resolvedRunRoot -Recurse -Force
+        for ($attempt = 0; $attempt -lt 10; $attempt++) {
+            try {
+                Remove-Item -LiteralPath $resolvedRunRoot -Recurse -Force
+                break
+            }
+            catch {
+                if ($attempt -eq 9) { throw }
+                Start-Sleep -Milliseconds 100
+            }
+        }
     }
 }

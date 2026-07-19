@@ -6,6 +6,7 @@ mod composer_view;
 mod editor_view;
 mod git_views;
 mod keystroke;
+mod markdown_preview_view;
 mod preview_view;
 mod settings_view;
 mod terminal_view;
@@ -24,7 +25,10 @@ fn main() {
     let _ = env_logger::try_init();
     let smoke_test = std::env::var_os("TERMIOR_SMOKE_TEST").is_some();
     let preview_smoke_test = std::env::var_os("TERMIOR_PREVIEW_SMOKE_TEST").is_some();
-    let root = resolve_workspace_root(smoke_test || preview_smoke_test);
+    let markdown_preview_smoke_test =
+        std::env::var_os("TERMIOR_MARKDOWN_PREVIEW_SMOKE_TEST").is_some();
+    let root =
+        resolve_workspace_root(smoke_test || preview_smoke_test || markdown_preview_smoke_test);
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
         cx.open_window(
@@ -41,9 +45,11 @@ fn main() {
                     workspace.start_background_services(cx);
                     if preview_smoke_test {
                         workspace.start_preview_smoke(window, cx);
+                    } else if markdown_preview_smoke_test {
+                        workspace.start_markdown_preview_smoke(window, cx);
                     }
                 });
-                if smoke_test && !preview_smoke_test {
+                if smoke_test && !preview_smoke_test && !markdown_preview_smoke_test {
                     schedule_smoke_exit(window);
                 }
                 workspace

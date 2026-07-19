@@ -1,5 +1,5 @@
-//! Web preview discovery and tab lifecycle (FR-PREV). The platform-specific wry view is mounted by
-//! the app only while a preview tab exists.
+//! Preview-domain logic: Web preview discovery/lifecycle and native Markdown parsing.
+//! Platform-specific WebViews and GPUI rendering stay in the desktop application crate.
 
 #![forbid(unsafe_code)]
 
@@ -7,6 +7,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use url::Url;
+
+mod markdown;
+
+pub use markdown::{is_markdown_path, MarkdownDocument, MarkdownNode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreviewUrlError {

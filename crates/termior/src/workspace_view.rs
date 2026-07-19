@@ -3,6 +3,7 @@ use crate::app_identity;
 use crate::composer_view::{ComposerView, EditReviewRequested};
 use crate::editor_view::EditorView;
 use crate::git_views::{GitDiffAction, GitDiffView, GitHistoryAction, GitHistoryView};
+use crate::markdown_preview_view::MarkdownPreviewView;
 use crate::preview_view::PreviewView;
 use crate::settings_view::SettingsView;
 use crate::terminal_view::{TerminalView, TerminalViewEvent};
@@ -28,7 +29,7 @@ use termior_platform::{
     AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationContext,
     NotificationDecision, NotificationRouter, NotificationTarget, SystemNotifier,
 };
-use termior_preview::normalize_preview_url;
+use termior_preview::{is_markdown_path, normalize_preview_url};
 use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_store::{
     app_data_dir, atomic_write, default_settings, migrate, KeyAction, Settings, ShellDetection,
@@ -56,6 +57,7 @@ const MAX_PANES_PER_TAB: usize = 8;
 enum PaneContent {
     Terminal(Entity<TerminalView>),
     Editor(Entity<EditorView>),
+    Markdown(Entity<MarkdownPreviewView>),
     Preview(Entity<PreviewView>),
     AiDiff(Entity<AiDiffView>),
     GitDiff(Entity<GitDiffView>),
@@ -68,6 +70,7 @@ impl PaneContent {
         match self {
             Self::Terminal(entity) => div().size_full().child(entity.clone()).into_any_element(),
             Self::Editor(entity) => div().size_full().child(entity.clone()).into_any_element(),
+            Self::Markdown(entity) => div().size_full().child(entity.clone()).into_any_element(),
             Self::Preview(entity) => div().size_full().child(entity.clone()).into_any_element(),
             Self::AiDiff(entity) => div().size_full().child(entity.clone()).into_any_element(),
             Self::GitDiff(entity) => div().size_full().child(entity.clone()).into_any_element(),
@@ -112,6 +115,23 @@ enum CommandMode {
     GitCreateBranch,
     GitSwitchBranch,
     PreviewUrl,
+}
+
+impl CommandMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Browse => "Browse",
+            Self::FindFile => "Find file",
+            Self::SearchContent => "Search content",
+            Self::CreateFile => "Create file",
+            Self::CreateDirectory => "Create directory",
+            Self::Rename => "Rename",
+            Self::GitCommit => "Git commit",
+            Self::GitCreateBranch => "Create branch",
+            Self::GitSwitchBranch => "Switch branch",
+            Self::PreviewUrl => "Web preview URL",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +284,8 @@ impl WorkspaceView {
             .sidebar_width
             .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
         // A restored model needs runtime view owners; terminal/preview are restored asynchronously.
+        // Editor and Markdown tabs for the same file deliberately share one live buffer entity.
+        let mut restored_editors = HashMap::<PathBuf, Entity<EditorView>>::new();
         let tabs = model
             .tabs
             .iter()
@@ -277,13 +299,19 @@ impl WorkspaceView {
                         (
                             pane_id,
                             match tab.kind {
-                                TabKind::Editor | TabKind::Markdown => {
-                                    let editor = tab
-                                        .resource
-                                        .as_ref()
-                                        .map(PathBuf::from)
-                                        .map(|path| cx.new(|cx| EditorView::open(&path, cx)))
-                                        .unwrap_or_else(|| cx.new(EditorView::untitled));
+                                TabKind::Editor => {
+                                    let editor = if let Some(path) =
+                                        tab.resource.as_ref().map(PathBuf::from)
+                                    {
+                                        restored_editors
+                                            .entry(path.clone())
+                                            .or_insert_with(|| {
+                                                cx.new(|cx| EditorView::open(&path, cx))
+                                            })
+                                            .clone()
+                                    } else {
+                                        cx.new(EditorView::untitled)
+                                    };
                                     editor.update(cx, |editor, _| {
                                         editor.set_preferences(
                                             &settings.editor_theme_id,
@@ -292,6 +320,32 @@ impl WorkspaceView {
                                     });
                                     PaneContent::Editor(editor)
                                 }
+                                TabKind::Markdown => tab
+                                    .resource
+                                    .as_ref()
+                                    .map(PathBuf::from)
+                                    .map(|path| {
+                                        let source = restored_editors
+                                            .entry(path.clone())
+                                            .or_insert_with(|| {
+                                                cx.new(|cx| EditorView::open(&path, cx))
+                                            })
+                                            .clone();
+                                        source.update(cx, |editor, _| {
+                                            editor.set_preferences(
+                                                &settings.editor_theme_id,
+                                                settings.vim_mode,
+                                            )
+                                        });
+                                        PaneContent::Markdown(
+                                            cx.new(|cx| MarkdownPreviewView::new(path, source, cx)),
+                                        )
+                                    })
+                                    .unwrap_or_else(|| {
+                                        PaneContent::Placeholder(
+                                            "Markdown preview source is unavailable".into(),
+                                        )
+                                    }),
                                 TabKind::Terminal | TabKind::Preview => {
                                     PaneContent::Placeholder(format!("Restoring {}…", tab.title))
                                 }
@@ -531,6 +585,12 @@ impl WorkspaceView {
                     .flatten();
                 match backend {
                     Some(termior_preview::PreviewBackend::Embedded) => {
+                        // WebView2 reports controller readiness before the initial navigation has
+                        // necessarily reached the local server. Keep the window alive briefly so
+                        // the smoke can assert the real HTTP request, not just construction.
+                        cx.background_executor()
+                            .timer(Duration::from_millis(750))
+                            .await;
                         println!("TERMIOR_PREVIEW_SMOKE_OK");
                         let _ = cx.update(|_, cx| cx.quit());
                         return;
@@ -544,6 +604,62 @@ impl WorkspaceView {
                 }
             }
             eprintln!("TERMIOR_PREVIEW_SMOKE_FAILED: timed out waiting for WebView");
+            let _ = cx.update(|_, cx| cx.quit());
+        })
+        .detach();
+    }
+
+    /// Exercises the same request path as the header Preview button with an active Markdown file.
+    /// Used by `scripts/markdown-preview-smoke.ps1`; normal launches never call this method.
+    pub(crate) fn start_markdown_preview_smoke(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self.model.root.join("preview-smoke.md");
+        self.open_editor(path.clone(), cx);
+        self.request_preview(window, cx);
+        cx.spawn_in(window, async move |workspace, cx| {
+            // Keep the window alive long enough for GPUI to layout and paint the new native view.
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            let result = workspace.update_in(cx, |workspace, _, cx| {
+                let active_kind = workspace.model.active_tab().map(|tab| tab.kind);
+                let preview_source = workspace
+                    .model
+                    .active
+                    .and_then(|active| workspace.tabs.iter().find(|tab| tab.id == active))
+                    .and_then(|tab| {
+                        tab.panes.values().find_map(|pane| match pane {
+                            PaneContent::Markdown(preview)
+                                if preview
+                                    .read(cx)
+                                    .contains_text("renders the active document") =>
+                            {
+                                Some(preview.read(cx).source())
+                            }
+                            _ => None,
+                        })
+                    });
+                workspace.open_editor(path, cx);
+                let reopened_kind = workspace.model.active_tab().map(|tab| tab.kind);
+                let shared_source = preview_source
+                    .zip(workspace.active_editor().cloned())
+                    .is_some_and(|(preview, editor)| preview == editor);
+                (active_kind, reopened_kind, shared_source)
+            });
+            match result {
+                Ok((Some(TabKind::Markdown), Some(TabKind::Editor), true)) => {
+                    println!("TERMIOR_MARKDOWN_PREVIEW_SMOKE_OK");
+                }
+                Ok((active_kind, reopened_kind, shared_source)) => eprintln!(
+                    "TERMIOR_MARKDOWN_PREVIEW_SMOKE_FAILED: active_kind={active_kind:?}, reopened_kind={reopened_kind:?}, shared_source={shared_source}"
+                ),
+                Err(error) => {
+                    eprintln!("TERMIOR_MARKDOWN_PREVIEW_SMOKE_FAILED: {error}");
+                }
+            }
             let _ = cx.update(|_, cx| cx.quit());
         })
         .detach();
@@ -842,8 +958,7 @@ impl WorkspaceView {
             .tabs
             .iter()
             .find(|tab| {
-                matches!(tab.kind, TabKind::Editor | TabKind::Markdown)
-                    && tab.resource.as_deref() == Some(resource.as_str())
+                tab.kind == TabKind::Editor && tab.resource.as_deref() == Some(resource.as_str())
             })
             .map(|tab| tab.id)
         {
@@ -856,7 +971,21 @@ impl WorkspaceView {
             .and_then(|name| name.to_str())
             .unwrap_or("Editor")
             .to_owned();
-        let entity = cx.new(|cx| EditorView::open(&path, cx));
+        let entity = self
+            .model
+            .tabs
+            .iter()
+            .find(|tab| {
+                tab.kind == TabKind::Markdown && tab.resource.as_deref() == Some(resource.as_str())
+            })
+            .and_then(|model_tab| self.tabs.iter().find(|tab| tab.id == model_tab.id))
+            .and_then(|tab| {
+                tab.panes.values().find_map(|pane| match pane {
+                    PaneContent::Markdown(preview) => Some(preview.read(cx).source()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| cx.new(|cx| EditorView::open(&path, cx)));
         entity.update(cx, |editor, _| {
             editor.set_preferences(&self.settings.editor_theme_id, self.settings.vim_mode)
         });
@@ -876,6 +1005,28 @@ impl WorkspaceView {
     }
 
     fn request_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.request_markdown_preview(cx) {
+            self.request_web_preview(window, cx);
+        }
+    }
+
+    fn request_markdown_preview(&mut self, cx: &mut Context<Self>) -> bool {
+        let markdown_source = self.active_editor().and_then(|editor| {
+            editor
+                .read(cx)
+                .path()
+                .filter(|path| is_markdown_path(path))
+                .map(|path| (path.to_path_buf(), editor.clone()))
+        });
+        if let Some((path, source)) = markdown_source {
+            self.create_markdown_preview(path, source, cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn request_web_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(url) = self
             .active_terminal()
             .and_then(|terminal| terminal.read(cx).localhost_urls().last().cloned())
@@ -886,15 +1037,58 @@ impl WorkspaceView {
         self.command_mode = CommandMode::PreviewUrl;
         self.command_input.clear();
         self.command_marked_text.clear();
-        self.command_message =
-            Some("Enter an http(s) URL, e.g. localhost:3000, then press Enter".into());
+        self.command_message = Some(
+            "No local dev server was detected. Enter an http(s) URL, then press Enter.".into(),
+        );
         self.model.sidebar_visible = true;
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
+    fn create_markdown_preview(
+        &mut self,
+        path: PathBuf,
+        source: Entity<EditorView>,
+        cx: &mut Context<Self>,
+    ) {
+        let resource = path.to_string_lossy().into_owned();
+        if let Some(id) = self
+            .model
+            .tabs
+            .iter()
+            .find(|tab| {
+                tab.kind == TabKind::Markdown && tab.resource.as_deref() == Some(resource.as_str())
+            })
+            .map(|tab| tab.id)
+        {
+            self.activate_runtime(id, cx);
+            cx.notify();
+            return;
+        }
+
+        let source_title = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Markdown");
+        let id = self.model.new_tab(
+            TabKind::Markdown,
+            format!("Preview · {source_title}"),
+            false,
+        );
+        if let Some(tab) = self.model.active_tab_mut() {
+            tab.resource = Some(resource);
+        }
+        let preview = cx.new(|cx| MarkdownPreviewView::new(path, source, cx));
+        self.tabs.push(AppTab {
+            id,
+            panes: single_pane(PaneContent::Markdown(preview)),
+        });
+        self.activate_runtime(id, cx);
+        cx.notify();
+    }
+
     fn create_preview_url(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.model.new_tab(TabKind::Preview, "Preview", false);
+        let id = self.model.new_tab(TabKind::Preview, "Web Preview", false);
         if let Some(tab) = self.model.active_tab_mut() {
             tab.resource = Some(url.clone());
         }
@@ -1535,7 +1729,8 @@ impl WorkspaceView {
             PaneContent::Terminal(terminal) => Some(terminal.read(cx).focus_handle(cx)),
             PaneContent::Editor(editor) => Some(editor.read(cx).focus_handle(cx)),
             PaneContent::GitHistory(history) => Some(history.read(cx).focus_handle(cx)),
-            PaneContent::Preview(_)
+            PaneContent::Markdown(_)
+            | PaneContent::Preview(_)
             | PaneContent::AiDiff(_)
             | PaneContent::GitDiff(_)
             | PaneContent::Placeholder(_) => None,
@@ -1889,23 +2084,29 @@ impl WorkspaceView {
             }
             if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
                 for pane in tab.panes.values_mut() {
-                    if let PaneContent::Editor(editor) = pane {
-                        editor.update(cx, |editor, _| {
-                            let Some(current) = editor.path().map(Path::to_path_buf) else {
-                                return;
-                            };
-                            let retargeted = if current == old_path {
-                                Some(new_path.to_path_buf())
-                            } else {
-                                current
-                                    .strip_prefix(old_path)
-                                    .ok()
-                                    .map(|suffix| new_path.join(suffix))
-                            };
-                            if let Some(retargeted) = retargeted {
-                                editor.set_path_after_rename(retargeted);
-                            }
-                        });
+                    match pane {
+                        PaneContent::Editor(editor) => {
+                            editor.update(cx, |editor, _| {
+                                let Some(current) = editor.path().map(Path::to_path_buf) else {
+                                    return;
+                                };
+                                let retargeted = if current == old_path {
+                                    Some(new_path.to_path_buf())
+                                } else {
+                                    current
+                                        .strip_prefix(old_path)
+                                        .ok()
+                                        .map(|suffix| new_path.join(suffix))
+                                };
+                                if let Some(retargeted) = retargeted {
+                                    editor.set_path_after_rename(retargeted);
+                                }
+                            });
+                        }
+                        PaneContent::Markdown(preview) => preview.update(cx, |preview, cx| {
+                            preview.set_path_after_rename(path.clone(), cx)
+                        }),
+                        _ => {}
                     }
                 }
             }
@@ -2975,8 +3176,8 @@ impl WorkspaceView {
                 .bg(gpui_color(self.palette.surface[1]))
                 .text_xs()
                 .child(SharedString::from(format!(
-                    "{:?}: {}{}▏",
-                    self.command_mode,
+                    "{}: {}{}▏",
+                    self.command_mode.label(),
                     self.command_input,
                     if self.command_marked_text.is_empty() {
                         ""
@@ -3600,6 +3801,9 @@ impl gpui::Render for WorkspaceView {
         self.process_agent_updates(window, cx);
         let (cwd, preview_url) = self.sync_terminal_context(cx);
         let p = self.palette.clone();
+        let markdown_preview_available = self
+            .active_editor()
+            .is_some_and(|editor| editor.read(cx).path().is_some_and(is_markdown_path));
         let active = self.model.active;
         let tab_buttons = self
             .model
@@ -4292,12 +4496,23 @@ impl gpui::Render for WorkspaceView {
                                 cx,
                                 |this, _, _, cx| this.create_editor(cx),
                             ))
+                            .children(markdown_preview_available.then(|| {
+                                header_button(
+                                    "Preview Markdown",
+                                    "preview-markdown",
+                                    &p,
+                                    cx,
+                                    |this, _, _, cx| {
+                                        let _ = this.request_markdown_preview(cx);
+                                    },
+                                )
+                            }))
                             .child(header_button(
-                                "Preview",
-                                "new-preview",
+                                "Web Preview",
+                                "new-web-preview",
                                 &p,
                                 cx,
-                                |this, _, window, cx| this.request_preview(window, cx),
+                                |this, _, window, cx| this.request_web_preview(window, cx),
                             ))
                             .child(
                                 div()
@@ -4400,7 +4615,7 @@ impl gpui::Render for WorkspaceView {
                         self.model.ai_tools_running
                     )))
                     .when_some(preview_url, |bar, url| {
-                        let label = SharedString::from(format!("Open in preview: {url}"));
+                        let label = SharedString::from(format!("Open Web Preview: {url}"));
                         bar.child(
                             ui::button("open-detected-preview", label, ButtonKind::Subtle, &p)
                                 .on_mouse_down(
