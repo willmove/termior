@@ -758,6 +758,7 @@ impl WorkspaceView {
             inherit_environment: !private,
             cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
             workspace_auth: Some(workspace_auth),
+            wsl_distribution: self.settings.wsl_distribution.clone(),
             ..Default::default()
         };
         let spawn_task = cx

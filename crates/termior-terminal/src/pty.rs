@@ -44,6 +44,10 @@ pub struct PtySessionConfig {
     /// not inside this registry is dropped (spawn falls back to the default directory) so a bad
     /// cwd can never kill the terminal, while unauthorized directories stay unused (FR-SEC-04).
     pub workspace_auth: Option<termior_security::workspace::WorkspaceAuthRegistry>,
+    /// Optional WSL distribution name (Windows, FR-WS-06). When set, the PTY spawns into that
+    /// distribution via `wsl.exe -d <distro>` instead of a native Windows shell. Ignored on
+    /// non-Windows. [`ShellKind::Bash`] is assumed inside a distribution.
+    pub wsl_distribution: Option<String>,
 }
 
 impl Default for PtySessionConfig {
@@ -57,6 +61,7 @@ impl Default for PtySessionConfig {
             cols: 80,
             cwd: None,
             workspace_auth: None,
+            wsl_distribution: None,
         }
     }
 }
@@ -95,23 +100,53 @@ impl PtySession {
             })
             .map_err(|e| SpawnError::Open(e.to_string()))?;
 
+        let wsl = config.wsl_distribution.clone();
         let inferred_kind = config
             .shell_program
             .as_deref()
             .and_then(shell_kind_from_program);
-        let kind = config.shell.or(inferred_kind).unwrap_or_else(default_shell);
-        let program = config
-            .shell_program
-            .clone()
-            .unwrap_or_else(|| shell_program(kind));
+        // 在 WSL 发行版里，默认 shell 是 Linux 的；把 Windows 原生探测（pwsh/powershell/cmd）
+        // 过滤掉，只有用户显式选了 bash/zsh/fish 才尊重，否则按 Bash（WSL 发行版的通用默认）。
+        let wsl_native_kind = |kind: ShellKind| match kind {
+            ShellKind::Bash | ShellKind::Zsh | ShellKind::Fish => Some(kind),
+            ShellKind::Pwsh | ShellKind::PowerShell | ShellKind::Cmd => None,
+        };
+        let kind = if wsl.is_some() {
+            config
+                .shell
+                .or(inferred_kind)
+                .and_then(wsl_native_kind)
+                .unwrap_or(ShellKind::Bash)
+        } else {
+            config.shell.or(inferred_kind).unwrap_or_else(default_shell)
+        };
+        // 在 WSL 里，尊重用户显式设置的 Linux shell 程序；否则用按 kind 推出的可执行名。
+        // 若用户设了 Windows shell（pwsh/powershell/cmd），上面已把 kind 改写成 Bash，
+        // 这里同样丢弃那个 Windows 程序名，避免 `wsl.exe ... -- powershell` 的矛盾组合。
+        let program = if wsl.is_some() {
+            config
+                .shell_program
+                .as_deref()
+                .filter(|p| {
+                    wsl_native_kind(shell_kind_from_program(p).unwrap_or(ShellKind::Cmd)).is_some()
+                })
+                .map(String::from)
+                .unwrap_or_else(|| shell_program(kind))
+        } else {
+            config
+                .shell_program
+                .clone()
+                .unwrap_or_else(|| shell_program(kind))
+        };
         let known_integration_kind =
             config.shell.is_some() || inferred_kind.is_some() || config.shell_program.is_none();
         let integration_enabled = config.shell_integration && known_integration_kind;
         log::info!(
-            "PTY spawning shell: {:?} ({program}), integration={integration_enabled}",
-            kind
+            "PTY spawning shell: {:?} ({program}), integration={integration_enabled}, wsl={:?}",
+            kind,
+            wsl
         );
-        let (cmd, integration_dir) = build_command(kind, &program, integration_enabled, &config)?;
+        let (cmd, integration_dir) = build_command(kind, &program, integration_enabled, config)?;
 
         // child spawn 在 slave 上（CommandBuilder 按值消费）。
         let child = pair
@@ -299,6 +334,19 @@ fn build_command(
     integration_enabled: bool,
     config: &PtySessionConfig,
 ) -> Result<(CommandBuilder, Option<tempfile::TempDir>), SpawnError> {
+    if config.wsl_distribution.is_some() {
+        return build_wsl_command(kind, integration_enabled, config);
+    }
+    build_native_command(kind, program, integration_enabled, config)
+}
+
+/// 构造原生（非 WSL）shell 命令。
+fn build_native_command(
+    kind: ShellKind,
+    program: &str,
+    integration_enabled: bool,
+    config: &PtySessionConfig,
+) -> Result<(CommandBuilder, Option<tempfile::TempDir>), SpawnError> {
     let mut cmd = CommandBuilder::new(program);
     if !config.inherit_environment {
         let retained = private_environment();
@@ -333,6 +381,100 @@ fn build_command(
     }
 
     Ok((cmd, integration_dir))
+}
+
+/// 构造 WSL 命令（Windows, FR-WS-06）。spawn `wsl.exe -d <distro> --cd <cwd> -- bash <args>`，
+/// 让 shell integration 在 Linux 发行版里生效。
+#[cfg(windows)]
+fn build_wsl_command(
+    kind: ShellKind,
+    integration_enabled: bool,
+    config: &PtySessionConfig,
+) -> Result<(CommandBuilder, Option<tempfile::TempDir>), SpawnError> {
+    let distro = config.wsl_distribution.as_deref().unwrap_or_default();
+    let mut cmd = CommandBuilder::new("wsl.exe");
+    cmd.arg("-d");
+    cmd.arg(distro);
+    if let Some(cwd) = resolve_cwd(config) {
+        cmd.arg("--cd");
+        cmd.arg(cwd);
+    }
+    cmd.arg("--");
+    cmd.arg(shell_program(kind));
+
+    let snippets = integration_enabled
+        .then(|| termior_terminal_core::shell_integration::snippets_for(kind))
+        .flatten();
+    let integration_dir = match snippets {
+        Some(snippets) => {
+            let tempdir = tempfile::tempdir()
+                .map_err(|e| SpawnError::Integration(format!("shell integration tempdir: {e}")))?;
+            for (name, content) in &snippets.files {
+                let path = tempdir.path().join(name);
+                std::fs::write(&path, content)?;
+            }
+            apply_wsl_integration(&mut cmd, &snippets, tempdir.path(), kind);
+            Some(tempdir)
+        }
+        None => None,
+    };
+    Ok((cmd, integration_dir))
+}
+
+#[cfg(not(windows))]
+fn build_wsl_command(
+    _kind: ShellKind,
+    _integration_enabled: bool,
+    _config: &PtySessionConfig,
+) -> Result<(CommandBuilder, Option<tempfile::TempDir>), SpawnError> {
+    Err(SpawnError::Spawn(
+        "WSL distributions are only supported on Windows".into(),
+    ))
+}
+
+/// `wsl.exe --cd` 接受 Windows 路径并自动转换；shell 内部读取的 rcfile / ZDOTDIR 需要是
+/// `/mnt/<drive>/...` 形式，由 [`windows_to_wsl_path`] 转换。
+#[cfg(windows)]
+fn apply_wsl_integration(
+    cmd: &mut CommandBuilder,
+    snippets: &ShellIntegrationSnippets,
+    tempdir: &std::path::Path,
+    kind: ShellKind,
+) {
+    match kind {
+        ShellKind::Bash => {
+            let rcfile = windows_to_wsl_path(&tempdir.join("termior-bashrc.sh"));
+            cmd.arg("--rcfile");
+            cmd.arg(rcfile);
+        }
+        ShellKind::Zsh => {
+            if let Some(real) = std::env::var_os("ZDOTDIR") {
+                cmd.env("TERMior_REAL_ZDOTDIR", real);
+            }
+            cmd.env("ZDOTDIR", windows_to_wsl_path(tempdir));
+        }
+        ShellKind::Pwsh | ShellKind::PowerShell | ShellKind::Fish | ShellKind::Cmd => {
+            // PowerShell/Cmd/Fish 在 WSL 里通常不适用，跳过 integration wrapper。
+        }
+    }
+    for (k, v) in &snippets.env {
+        cmd.env(k, v);
+    }
+}
+
+/// 把 Windows 路径（`C:\Users\foo`）转成 WSL 内可见的 `/mnt/c/Users/foo`。
+/// 已是正斜杠或不可转换的路径原样返回（保守降级，不致 spawn 失败）。
+#[cfg(windows)]
+fn windows_to_wsl_path(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return s.into_owned();
+    }
+    let drive = (bytes[0] as char).to_ascii_lowercase();
+    let rest = &s[2..];
+    let rest = rest.replace('\\', "/");
+    format!("/mnt/{drive}{rest}")
 }
 
 /// 决定 spawn 实际使用的 cwd（FR-SEC-04）。
@@ -472,6 +614,60 @@ fn which(name: &str) -> std::io::Result<std::path::PathBuf> {
         }
     }
     Err(std::io::Error::other(format!("{name} not found in PATH")))
+}
+
+/// 列出本机已安装的 WSL 发行版（Windows, FR-WS-06）。非 Windows 或 wsl.exe 不可用时
+/// 返回空列表（调用方据此隐藏 WSL 选项）。
+pub fn list_wsl_distributions() -> std::io::Result<Vec<String>> {
+    if !cfg!(windows) {
+        return Ok(Vec::new());
+    }
+    let output = std::process::Command::new("wsl.exe")
+        .arg("--list")
+        .arg("--quiet")
+        .output()?;
+    Ok(parse_wsl_list_output(&output.stdout))
+}
+
+/// 解析 `wsl.exe --list --quiet` 的输出。该命令默认以 UTF-16LE 编码输出，且可能带 BOM。
+/// 非法 UTF-16 的孤立代理项被替换；空行与空白条目被忽略。纯函数，便于测试。
+pub fn parse_wsl_list_output(bytes: &[u8]) -> Vec<String> {
+    let text = decode_wsl_output(bytes);
+    text.lines()
+        .map(|line| line.trim_matches(|c: char| c == '\r' || c == '\n' || c == ' ' || c == '\u{0}'))
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect()
+}
+
+/// `wsl.exe` 输出通常是 UTF-16LE（可能带 BOM）；退化到 UTF-8 兜底。
+fn decode_wsl_output(bytes: &[u8]) -> String {
+    if let Some(stripped) = bytes.strip_prefix(b"\xFF\xFE") {
+        return decode_utf16_le(stripped);
+    }
+    if let Some(stripped) = bytes.strip_prefix(b"\xFE\xFF") {
+        return decode_utf16_be(stripped);
+    }
+    // 启发式：全是对齐的零高字节 → 视作 UTF-16LE。
+    if bytes.len() % 2 == 0 && bytes.iter().skip(1).step_by(2).all(|&b| b == 0) && !bytes.is_empty()
+    {
+        return decode_utf16_le(bytes);
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn decode_utf16_le(bytes: &[u8]) -> String {
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
+    String::from_utf16_lossy(&units.collect::<Vec<u16>>())
+}
+
+fn decode_utf16_be(bytes: &[u8]) -> String {
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]));
+    String::from_utf16_lossy(&units.collect::<Vec<u16>>())
 }
 
 #[cfg(test)]
@@ -631,5 +827,104 @@ mod tests {
             Some(ShellKind::Fish)
         );
         assert_eq!(shell_kind_from_program("nu"), None);
+    }
+
+    #[test]
+    fn parse_wsl_list_handles_utf16le_with_bom() {
+        // `wsl.exe --list --quiet` 典型输出：UTF-16LE + BOM，每行末尾带 CRLF（也编码在
+        // UTF-16 里）。行间夹的 NUL 是高字节。
+        let names = ["Ubuntu", "Debian", "kali-linux"];
+        let mut bytes = vec![0xFF, 0xFE];
+        for name in &names {
+            for ch in name.encode_utf16() {
+                bytes.extend_from_slice(&ch.to_le_bytes());
+            }
+            bytes.extend_from_slice(&0x000D_u16.to_le_bytes()); // \r
+            bytes.extend_from_slice(&0x000A_u16.to_le_bytes()); // \n
+        }
+        assert_eq!(parse_wsl_list_output(&bytes), names.to_vec());
+    }
+
+    #[test]
+    fn parse_wsl_list_handles_plain_utf8() {
+        // 非 Windows wsl 或被 `WSL_UTF8` 改写后可能直接是 UTF-8。
+        let bytes = b"Ubuntu\nDebian\n\nkali-linux\n";
+        assert_eq!(
+            parse_wsl_list_output(bytes),
+            vec!["Ubuntu", "Debian", "kali-linux"]
+        );
+    }
+
+    #[test]
+    fn parse_wsl_list_ignores_blank_and_whitespace_lines() {
+        let bytes = b"   \nUbuntu\n\n \n";
+        assert_eq!(parse_wsl_list_output(bytes), vec!["Ubuntu"]);
+    }
+
+    #[test]
+    fn parse_wsl_list_empty_output_yields_empty() {
+        assert!(parse_wsl_list_output(&[]).is_empty());
+        assert!(parse_wsl_list_output(b"\xFF\xFE").is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_to_wsl_path_converts_drive_and_separators() {
+        let p = std::path::PathBuf::from(r"C:\Users\foo\termior-bashrc.sh");
+        assert_eq!(
+            windows_to_wsl_path(&p),
+            "/mnt/c/Users/foo/termior-bashrc.sh"
+        );
+        // 无盘符路径原样返回（保守降级）。
+        let rel = std::path::PathBuf::from("relative/path");
+        assert_eq!(windows_to_wsl_path(&rel), "relative/path");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_build_command_targets_distribution_via_wsl_exe() {
+        let config = PtySessionConfig {
+            wsl_distribution: Some("Ubuntu".into()),
+            ..PtySessionConfig::default()
+        };
+        let (command, integration_dir) =
+            build_command(ShellKind::Bash, "bash", true, &config).unwrap();
+        let args = argv(&command);
+        assert_eq!(args[0], "wsl.exe");
+        // -d <distro> 后跟 -- --rcfile 的 Linux 形式。
+        let d_idx = args
+            .iter()
+            .position(|a| a == "-d")
+            .expect("wsl -d flag present");
+        assert_eq!(args[d_idx + 1], "Ubuntu");
+        assert!(args.iter().any(|a| a == "--"));
+        assert!(args.iter().any(|a| a == "bash"));
+        // rcfile 必须是 /mnt/... 形式，不能是 Windows 盘符。
+        let rcfile = args
+            .iter()
+            .find(|a| a.starts_with("/mnt/"))
+            .expect("rcfile converted to a WSL-visible path");
+        assert!(rcfile.ends_with("termior-bashrc.sh"));
+        assert!(integration_dir.is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_build_command_without_integration_skips_rcfile() {
+        let config = PtySessionConfig {
+            wsl_distribution: Some("Debian".into()),
+            shell_integration: false,
+            ..PtySessionConfig::default()
+        };
+        let (command, integration_dir) =
+            build_command(ShellKind::Bash, "bash", false, &config).unwrap();
+        let args = argv(&command);
+        assert_eq!(args[0], "wsl.exe");
+        assert!(args.iter().any(|a| a == "bash"));
+        assert!(
+            !args.iter().any(|a| a.starts_with("/mnt/")),
+            "no rcfile when integration is off"
+        );
+        assert!(integration_dir.is_none());
     }
 }

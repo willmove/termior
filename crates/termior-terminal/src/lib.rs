@@ -10,5 +10,7 @@ pub mod bridge;
 pub mod pty;
 
 pub use bridge::{PtyData, TerminalBridge, TerminalEventProxy, WriterHandle};
-pub use pty::{PtySession, PtySessionConfig, SpawnError};
+pub use pty::{
+    list_wsl_distributions, parse_wsl_list_output, PtySession, PtySessionConfig, SpawnError,
+};
 pub use termior_terminal_core::shell_integration::ShellKind;
