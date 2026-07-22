@@ -2,16 +2,28 @@
 
 use gpui::{
     canvas, div, prelude::*, px, uniform_list, AnyElement, App, Bounds, Context, FocusHandle,
-    Focusable, InputHandler, KeyDownEvent, Pixels, Point, ScrollStrategy, SharedString,
+    Focusable, InputHandler, KeyDownEvent, Pixels, Point, ScrollStrategy, SharedString, Task,
     UTF16Selection, UniformListScrollHandle, WeakEntity, Window,
 };
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use termior_ai::{
+    InlineCompletionContext, InlineCompleter, InlineCompletionResult,
+};
 use termior_editor::{
-    builtin_editor_themes, EditorBuffer, EditorTheme, HighlightKind, Motion, SyntaxDocument,
-    SyntaxLanguage, VimCommand, VimEngine, VimMode,
+    builtin_editor_themes, CompletionController, EditorBuffer, EditorTheme, HighlightKind, Motion,
+    SyntaxDocument, SyntaxLanguage, VimCommand, VimEngine, VimMode,
 };
 use termior_ui_kit::SearchOverlay;
+
+/// Editor-side debounce: how long after the last keystroke before a completion request fires
+/// (FR-EDIT-05「停顿触发」). Continuous typing keeps resetting this timer, cancelling in-flight
+/// requests along the way so no stale completion ever renders.
+const COMPLETION_DEBOUNCE_MS: u64 = 300;
+/// 单次补全请求的超时上限（FR-EDIT-05「请求失败/超时静默降级」）。Provider 卡住时这里主动
+/// 中止，避免拖住后续停顿触发的请求（聊天路径的 300s 超时对补全体验太长）。
+const COMPLETION_REQUEST_TIMEOUT_MS: u64 = 8_000;
 
 pub struct EditorView {
     buffer: EditorBuffer,
@@ -26,6 +38,12 @@ pub struct EditorView {
     vim: VimEngine,
     visual_anchor: Option<usize>,
     scroll_handle: UniformListScrollHandle,
+    completion: CompletionController,
+    /// 已配置好的补全 Provider（来自 Settings → Models 的 completion profile）。
+    /// 为 `None` 时（autocomplete 关闭或未配置补全模型）补全不触发。
+    completer: Option<Arc<InlineCompleter>>,
+    /// 进行中的 debounce + 请求 task；drop 即取消，避免连续输入堆积请求。
+    pending_completion: Option<Task<()>>,
 }
 
 impl EditorView {
@@ -44,6 +62,9 @@ impl EditorView {
             vim: VimEngine::default(),
             visual_anchor: None,
             scroll_handle: UniformListScrollHandle::default(),
+            completion: CompletionController::new(false),
+            completer: None,
+            pending_completion: None,
         }
     }
 
@@ -74,10 +95,19 @@ impl EditorView {
             vim: VimEngine::default(),
             visual_anchor: None,
             scroll_handle: UniformListScrollHandle::default(),
+            completion: CompletionController::new(false),
+            completer: None,
+            pending_completion: None,
         }
     }
 
-    pub fn set_preferences(&mut self, theme_id: &str, vim_enabled: bool) {
+    pub fn set_preferences(
+        &mut self,
+        theme_id: &str,
+        vim_enabled: bool,
+        completer: Option<Arc<InlineCompleter>>,
+        completion_enabled: bool,
+    ) {
         if let Some(theme) = builtin_editor_themes()
             .into_iter()
             .find(|theme| theme.id == theme_id)
@@ -88,6 +118,11 @@ impl EditorView {
         if !vim_enabled {
             self.vim = VimEngine::default();
             self.visual_anchor = None;
+        }
+        self.completer = completer;
+        self.completion.set_enabled(completion_enabled);
+        if !completion_enabled {
+            self.pending_completion = None;
         }
     }
 
@@ -124,6 +159,12 @@ impl EditorView {
 
     pub fn selected_text(&self) -> Option<String> {
         self.buffer.selected_text()
+    }
+
+    /// 当前显示中的 ghost text（无则为 `None`），供状态栏等外部观察。
+    #[allow(dead_code)]
+    pub fn ghost_text(&self) -> Option<&str> {
+        self.completion.ghost_text()
     }
 
     pub fn open_search(&mut self, cx: &mut Context<Self>) {
@@ -208,15 +249,24 @@ impl EditorView {
             cx.notify();
             return;
         }
+        // 行内补全：Esc 取消当前 ghost text（FR-EDIT-05）。
+        if !self.search.visible && key == "escape" && self.completion.ghost_text().is_some() {
+            self.dismiss_completion();
+            cx.notify();
+            return;
+        }
         let cursor = self.buffer.cursor().char_index;
+        let mut mutated = true;
         match key {
             "left" => {
                 let _ = self.buffer.set_cursor(cursor.saturating_sub(1));
+                mutated = false;
             }
             "right" => {
                 let _ = self
                     .buffer
                     .set_cursor((cursor + 1).min(self.buffer.len_chars()));
+                mutated = false;
             }
             "up" | "down" => {
                 if let Ok((line, column)) = self.buffer.line_col_for_char(cursor) {
@@ -228,24 +278,44 @@ impl EditorView {
                     let target = self.buffer.char_for_line_col(target, column);
                     let _ = self.buffer.set_cursor(target);
                 }
+                mutated = false;
             }
             "backspace" if cursor > 0 => {
+                self.completion.cancel();
                 let _ = self.buffer.delete(cursor - 1..cursor);
                 self.reparse();
             }
             "delete" if cursor < self.buffer.len_chars() => {
+                self.completion.cancel();
                 let _ = self.buffer.delete(cursor..cursor + 1);
                 self.reparse();
             }
             "enter" | "return" => {
+                self.completion.cancel();
                 let _ = self.buffer.insert("\n");
                 self.reparse();
             }
             "tab" => {
-                let _ = self.buffer.insert("    ");
-                self.reparse();
+                // 行内补全：Tab 接受当前 ghost text（FR-EDIT-05）；无 ghost text 时回退到缩进。
+                if let Some(accepted) = self
+                    .completion
+                    .accept(self.buffer.revision())
+                    .filter(|text| !text.is_empty())
+                {
+                    self.apply_accepted_completion(&accepted);
+                } else {
+                    let _ = self.buffer.insert("    ");
+                    self.reparse();
+                }
             }
             _ => return,
+        }
+        if mutated {
+            // 光标移动不触发补全；文本变更后 debounce 重新调度。
+            self.schedule_completion(cx);
+        } else {
+            self.completion.cancel();
+            self.pending_completion = None;
         }
         self.scroll_cursor_into_view();
         cx.notify();
@@ -257,6 +327,87 @@ impl EditorView {
             self.syntax.reparse_incremental(&self.buffer.text(), &edits);
         }
         self.update_search();
+    }
+
+    /// Debounce + 发起一次行内补全请求（FR-EDIT-05）。连续输入时旧的 task 被 drop 取消，
+    /// 在途请求即便稍后返回也会因 revision 不匹配被 [`CompletionController::receive`] 拒绝。
+    fn schedule_completion(&mut self, cx: &mut Context<Self>) {
+        // 取消上一轮：ghost text 立即消失，pending 请求即便到达也被拒绝。
+        self.completion.cancel();
+        let Some(completer) = self.completer.clone() else {
+            self.pending_completion = None;
+            return;
+        };
+        // Vim 非 Insert 模式、选区激活、IME 预编辑中均不补全。
+        if self.vim_enabled && self.vim.mode() != VimMode::Insert {
+            self.pending_completion = None;
+            return;
+        }
+        if self.buffer.selection().is_some() || !self.marked_text.is_empty() {
+            self.pending_completion = None;
+            return;
+        }
+        let cursor = self.buffer.cursor().char_index;
+        let context = InlineCompletionContext {
+            prefix: self.buffer.text().chars().take(cursor).collect(),
+            suffix: self.buffer.text().chars().skip(cursor).collect(),
+            language: Some(self.syntax.language().id().to_owned()),
+            path: self
+                .buffer
+                .path()
+                .and_then(|path| path.to_str())
+                .map(str::to_owned),
+        };
+        let revision = self.buffer.revision();
+        if !self.completion.request(revision) {
+            self.pending_completion = None;
+            return;
+        }
+        self.pending_completion = Some(cx.spawn(async move |editor, cx| {
+            // Debounce：停顿 COMPLETION_DEBOUNCE_MS 后才真正发起请求。
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(COMPLETION_DEBOUNCE_MS))
+                .await;
+            // 超时静默降级：把请求与一个超时 future 赛跑，先就绪者胜出（FR-EDIT-05）。
+            let request = completer.complete(&context);
+            futures::pin_mut!(request);
+            let timeout = cx
+                .background_executor()
+                .timer(std::time::Duration::from_millis(COMPLETION_REQUEST_TIMEOUT_MS));
+            let result = match futures::future::select(request, timeout).await {
+                futures::future::Either::Left((outcome, _)) => outcome,
+                // 超时：请求仍可能继续在后台线程跑，但其结果会被 revision 不匹配静默拒绝。
+                futures::future::Either::Right(_) => InlineCompletionResult::Empty,
+            };
+            let _ = editor.update(cx, |editor, cx| {
+                editor.apply_completion_result(revision, result);
+                cx.notify();
+            });
+        }));
+    }
+
+    /// 把一次补全结果投递给 [`CompletionController`]；过期/失败/空都静默降级。
+    fn apply_completion_result(&mut self, revision: u64, result: InlineCompletionResult) {
+        match result {
+            InlineCompletionResult::Completed(text) => {
+                self.completion.receive(revision, text);
+            }
+            // 空与错误都不打扰输入：前者保留 Idle，后者归一为 Idle（不显示错误）。
+            InlineCompletionResult::Empty | InlineCompletionResult::Error(_) => {
+                self.completion.cancel();
+            }
+        }
+    }
+
+    /// 把接受的 ghost text 插入到光标处（FR-EDIT-05「接受后正确插入到 Rope/缓冲」）。
+    fn apply_accepted_completion(&mut self, text: &str) {
+        let _ = self.buffer.insert(text);
+        self.reparse();
+    }
+
+    fn dismiss_completion(&mut self) {
+        self.completion.dismiss();
+        self.pending_completion = None;
     }
 
     fn scroll_cursor_into_view(&self) {
@@ -309,6 +460,17 @@ impl EditorView {
             .unwrap_or(usize::MAX);
         let marked_text = self.marked_text.clone();
         let theme = self.theme.clone();
+        // Ghost text 只在光标行渲染，且仅当光标落在当前视口内时才有意义。
+        let cursor_line = self
+            .buffer
+            .line_col_for_char(self.buffer.cursor().char_index)
+            .map(|(line, _)| line)
+            .ok();
+        let ghost_text = self
+            .completion
+            .ghost_text()
+            .filter(|_| cursor_byte != usize::MAX)
+            .map(str::to_owned);
         let selected_lines = self.buffer.selection().map(|selection| {
             let selection = selection.range();
             let start = self
@@ -330,12 +492,18 @@ impl EditorView {
             .enumerate()
             .map(|(offset, line_range)| {
                 let line_index = viewport.start_line + offset;
+                let line_ghost = if cursor_line == Some(line_index) {
+                    ghost_text.as_deref()
+                } else {
+                    None
+                };
                 let segments = highlighted_segments(
                     &viewport.text,
                     line_range,
                     &spans,
                     cursor_byte,
                     &marked_text,
+                    line_ghost,
                     &theme,
                 );
                 let is_match = self
@@ -719,6 +887,7 @@ impl InputHandler for EditorInputHandler {
             view.marked_text.clear();
             view.reparse();
             view.scroll_cursor_into_view();
+            view.schedule_completion(cx);
             cx.notify();
         });
     }
@@ -733,6 +902,8 @@ impl InputHandler for EditorInputHandler {
     ) {
         if let Some(view) = self.view.upgrade() {
             view.update(cx, |view, cx| {
+                // IME 预编辑开始：预编辑串内联显示，ghost text 让位（FR-EDIT-05 / NFR-07）。
+                view.dismiss_completion();
                 view.marked_text = new_text.to_owned();
                 cx.notify();
             });
@@ -821,8 +992,28 @@ fn highlighted_segments(
     spans: &[termior_editor::HighlightSpan],
     cursor: usize,
     marked_text: &str,
+    ghost_text: Option<&str>,
     theme: &EditorTheme,
 ) -> Vec<AnyElement> {
+    let ghost_color = parse_hex_alpha(&theme.foreground, 0x55);
+    let ghost = ghost_text.filter(|ghost| !ghost.is_empty());
+    // 光标标记块：竖线 + IME 预编辑串，其后内联渲染 ghost text（FR-EDIT-05）。
+    let push_cursor_block = |elements: &mut Vec<AnyElement>| {
+        elements.push(
+            div()
+                .text_color(parse_hex(&theme.cursor))
+                .child(SharedString::from(format!("▏{marked_text}")))
+                .into_any_element(),
+        );
+        if let Some(ghost) = ghost {
+            elements.push(
+                div()
+                    .text_color(ghost_color)
+                    .child(SharedString::from(ghost.to_owned()))
+                    .into_any_element(),
+            );
+        }
+    };
     let mut boundaries = vec![line.start, line.end];
     for span in spans {
         if span.byte_range.start < line.end && span.byte_range.end > line.start {
@@ -840,12 +1031,7 @@ fn highlighted_segments(
         let start = window[0];
         let end = window[1];
         if cursor == start {
-            elements.push(
-                div()
-                    .text_color(parse_hex(&theme.cursor))
-                    .child(SharedString::from(format!("▏{marked_text}")))
-                    .into_any_element(),
-            );
+            push_cursor_block(&mut elements);
         }
         if start < end {
             let kind = spans
@@ -861,12 +1047,7 @@ fn highlighted_segments(
         }
     }
     if line.start == line.end || cursor == line.end {
-        elements.push(
-            div()
-                .text_color(parse_hex(&theme.cursor))
-                .child(SharedString::from(format!("▏{marked_text}")))
-                .into_any_element(),
-        );
+        push_cursor_block(&mut elements);
     }
     elements
 }

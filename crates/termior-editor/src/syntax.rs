@@ -25,6 +25,26 @@ pub enum SyntaxLanguage {
 }
 
 impl SyntaxLanguage {
+    /// 稳定的语言 id（如 `"rust"`、`"typescript"`），作为补全 Provider 的语言提示。
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::TypeScript => "typescript",
+            Self::Tsx => "tsx",
+            Self::JavaScript => "javascript",
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::Go => "go",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::Java => "java",
+            Self::Html => "html",
+            Self::Css => "css",
+            Self::Json => "json",
+            Self::Markdown => "markdown",
+            Self::PlainText => "plaintext",
+        }
+    }
+
     pub fn detect(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
         let ext = path

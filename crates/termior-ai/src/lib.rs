@@ -24,6 +24,7 @@ pub mod composer;
 pub mod context;
 pub mod executor;
 pub mod http_provider;
+pub mod inline_completion;
 #[cfg(feature = "keyring-backend")]
 pub mod keyring_store;
 pub mod message;
@@ -43,6 +44,10 @@ pub use composer::{
 pub use context::{TerminalContext, TerminalContextProvider};
 pub use executor::{EditProposalSummary, ToolExecutor};
 pub use http_provider::{HttpProvider, ProviderConfig, ProviderTransportError};
+pub use inline_completion::{
+    completion_user_prompt, normalize_completion, InlineCompletionContext, InlineCompleter,
+    InlineCompletionResult, INLINE_COMPLETION_SYSTEM_PROMPT,
+};
 #[cfg(feature = "keyring-backend")]
 pub use keyring_store::KeyringSecretStore;
 pub use message::{ChatEvent, Message, Role, ToolCall, ToolResult};
