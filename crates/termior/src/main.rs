@@ -26,7 +26,9 @@ fn main() {
     let smoke_test = std::env::var_os("TERMIOR_SMOKE_TEST").is_some();
     let markdown_preview_smoke_test =
         std::env::var_os("TERMIOR_MARKDOWN_PREVIEW_SMOKE_TEST").is_some();
-    let root = resolve_workspace_root(smoke_test || markdown_preview_smoke_test);
+    let nfr_measure = std::env::var_os("TERMIOR_NFR_MEASURE").is_some();
+    let headless = smoke_test || markdown_preview_smoke_test || nfr_measure;
+    let root = resolve_workspace_root(headless);
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
         cx.open_window(
@@ -48,12 +50,84 @@ fn main() {
                 if smoke_test && !markdown_preview_smoke_test {
                     schedule_smoke_exit(window);
                 }
+                if nfr_measure {
+                    schedule_nfr_measurement(window);
+                }
                 workspace
             },
         )
         .expect("open Termior window");
         cx.activate(true);
     });
+}
+
+/// NFR 测量模式（`TERMIOR_NFR_MEASURE=1`，由 `termior-bench` 的 `nfr-run` 驱动）。
+///
+/// 协议（stdout 行，供 harness 采集）：
+/// - 第一帧渲染时打印 `TERMIOR_NFR_FIRST_FRAME` → 冷启动终点（NFR-01）。
+/// - 之后采样 `NFR_FPS_SAMPLE_SECS` 秒帧数，打印 `TERMIOR_NFR_FPS=NN` → 稳态帧率
+///   （NFR-03），随后 `cx.quit()` 退出。RSS 由 harness 用 sysinfo 旁路采集（NFR-04）。
+///
+/// 这是冒烟测试（`schedule_smoke_exit`）的性能采样对偶：smoke 验「能启动」，
+/// NFR 量「有多快/多重」。绝对值依赖硬件，门禁只看相对基线回归（见 docs/nfr-baselines.md）。
+///
+/// `on_next_frame` 只在注册的下一帧触发一次；要持续采样就用共享状态自重注册。
+fn schedule_nfr_measurement(window: &mut Window) {
+    let state = std::rc::Rc::new(std::cell::RefCell::new(NfrFrameState::start()));
+    nfr_next_frame(window, state);
+}
+
+fn nfr_next_frame(window: &mut Window, state: std::rc::Rc<std::cell::RefCell<NfrFrameState>>) {
+    window.on_next_frame(move |window, cx| {
+        let action = state.borrow_mut().on_frame();
+        match action {
+            NfrAction::Continue => nfr_next_frame(window, state),
+            NfrAction::Quit => cx.quit(),
+        }
+    });
+}
+
+const NFR_FPS_SAMPLE_SECS: f64 = 1.5;
+
+struct NfrFrameState {
+    first_frame_done: bool,
+    sample_start: Option<std::time::Instant>,
+    frame_count: u32,
+}
+
+enum NfrAction {
+    Continue,
+    Quit,
+}
+
+impl NfrFrameState {
+    fn start() -> Self {
+        Self {
+            first_frame_done: false,
+            sample_start: None,
+            frame_count: 0,
+        }
+    }
+
+    fn on_frame(&mut self) -> NfrAction {
+        if !self.first_frame_done {
+            self.first_frame_done = true;
+            println!("TERMIOR_NFR_FIRST_FRAME");
+            // 从下一帧开始计 FPS 采样窗口，避免把首帧的冷路径计入稳态。
+            self.sample_start = Some(std::time::Instant::now());
+            return NfrAction::Continue;
+        }
+        self.frame_count += 1;
+        if let Some(start) = self.sample_start {
+            let elapsed = start.elapsed().as_secs_f64();
+            if elapsed >= NFR_FPS_SAMPLE_SECS {
+                let fps = (self.frame_count as f64 / elapsed).round();
+                println!("TERMIOR_NFR_FPS={fps:.0}");
+                return NfrAction::Quit;
+            }
+        }
+        NfrAction::Continue
+    }
 }
 
 fn schedule_smoke_exit(window: &mut Window) {

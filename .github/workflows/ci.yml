@@ -107,6 +107,23 @@ jobs:
           if ($exitCode -ne 0 -or ($output | Out-String) -notmatch "TERMIOR_SMOKE_OK") {
             throw "Termior desktop smoke launch did not complete successfully"
           }
+      - name: NFR process-level gate (cold start / RSS / FPS)
+        if: matrix.platform == 'windows' || matrix.platform == 'macos'
+        shell: bash
+        run: |
+          # Build the run-harness binaries (nfr-run needs sysinfo; nfr-gate is pure).
+          cargo build -p termior-bench --features run-harness --release --bins
+          ./target/release/nfr-run --binary ./target/release/termior --dwell-secs 6 > nfr-run-payload.json
+          cat nfr-run-payload.json
+          ./target/release/nfr-gate --platform ${{ matrix.platform }} \
+            --payload nfr-run-payload.json \
+            --baselines docs/baselines/nfr-baselines.json
+      - name: Upload NFR payload
+        if: matrix.platform == 'windows' || matrix.platform == 'macos'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfr-run-payload-${{ matrix.platform }}
+          path: nfr-run-payload.json
 
   coverage:
     name: Core coverage ≥ 80%
@@ -140,7 +157,20 @@ jobs:
           workspaces: "."
       - name: Run quick benchmark gate
         run: cargo bench -p termior-editor --bench large_file -- --quick
+      - name: Run PTY/VTE throughput benchmark
+        run: cargo bench -p termior-bench --bench pty_throughput -- --quick
+      - name: NFR PTY throughput gate
+        run: |
+          cargo build -p termior-bench --release --bins
+          ./target/release/nfr-pty > nfr-pty-payload.json
+          ./target/release/nfr-gate --platform any \
+            --payload nfr-pty-payload.json \
+            --baselines docs/baselines/nfr-baselines.json
       - uses: actions/upload-artifact@v4
         with:
           name: editor-benchmark-report
           path: target/criterion
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nfr-pty-payload
+          path: nfr-pty-payload.json

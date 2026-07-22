@@ -1,0 +1,41 @@
+[package]
+name = "termior-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "NFR benchmark harness, baselines, and regression gate for Termior (spec §8 NFR)."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# nfr-pty 二进制与 bench 共用 VTE 解析路径（spec NFR-02）。
+alacritty_terminal = { workspace = true }
+
+# 仅 nfr-run 二进制需要：采集子进程 RSS（spec §8 NFR-01/04）。
+sysinfo = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[features]
+default = []
+# 启用进程级 harness（nfr-run），拉入 sysinfo。CI 在带显示的 runner 上启用。
+run-harness = ["dep:sysinfo"]
+
+[[bench]]
+name = "pty_throughput"
+harness = false
+
+[[bin]]
+name = "nfr-pty"
+path = "src/bin/nfr-pty.rs"
+
+[[bin]]
+name = "nfr-gate"
+path = "src/bin/nfr-gate.rs"
+
+[[bin]]
+name = "nfr-run"
+path = "src/bin/nfr-run.rs"
+required-features = ["run-harness"]
