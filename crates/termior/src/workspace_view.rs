@@ -247,14 +247,15 @@ pub struct WorkspaceView {
     next_toast_id: u64,
     bell_open: bool,
     system_is_dark: bool,
+    /// 背景图解码 + 模糊纹理缓存（FR-THEME-05；见 [`background_image`]）。
+    background_cache: crate::background_image::BackgroundImageCache,
 }
 
 impl WorkspaceView {
     pub fn new(root: PathBuf, system_is_dark: bool, cx: &mut Context<Self>) -> Self {
         let (settings, data_dir, migration_error) = load_settings();
         let completion_completer = build_completer_from_settings(&settings);
-        let completion_enabled =
-            settings.autocomplete_enabled && completion_completer.is_some();
+        let completion_enabled = settings.autocomplete_enabled && completion_completer.is_some();
         let themes = data_dir
             .as_ref()
             .and_then(|dir| {
@@ -462,6 +463,7 @@ impl WorkspaceView {
             next_toast_id: 1,
             bell_open: false,
             system_is_dark,
+            background_cache: crate::background_image::BackgroundImageCache::new(),
         }
     }
 
@@ -3768,6 +3770,122 @@ impl EntityInputHandler for WorkspaceView {
     }
 }
 
+impl WorkspaceView {
+    /// 计算当前背景图层（FR-THEME-05）。渲染帧同步调用，不阻塞。
+    ///
+    /// - 无有效路径 → [`BackgroundLayer::None`]（优雅回退到 `palette.background` 纯色）。
+    /// - `blur == 0` → [`BackgroundLayer::Path`]：直接交给 `gpui::img(path)`，走 gpui 自带资源缓存。
+    /// - `blur > 0` → [`BackgroundLayer::Blurred`]：用 [`BackgroundImageCache`] 的离屏模糊纹理；
+    ///   若缓存未就绪则返回 `Blurred(None)`（首帧先留白，后台解码完成后 `cx.notify` 触发重绘）。
+    ///
+    /// 调用方应在渲染前先调 [`Self::request_background_decode`] 触发后台解码（键变化才真正跑）。
+    fn background_layer(&self) -> BackgroundLayer {
+        let Some(path) = self
+            .settings
+            .background
+            .image_path
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+        else {
+            return BackgroundLayer::None;
+        };
+        let opacity = self.settings.background.opacity.clamp(0.0, 1.0);
+        let blur = self.settings.background.blur.clamp(0.0, 64.0);
+        if blur <= 0.0 {
+            BackgroundLayer::Path { path, opacity }
+        } else {
+            BackgroundLayer::Blurred {
+                opacity,
+                texture: self.background_cache.current(),
+            }
+        }
+    }
+
+    /// 若背景键（路径/模糊半径）变化，启动后台解码 + 模糊，完成后回填缓存并重绘。
+    /// 键不变则空操作（满足 spec「解码一次缓存」「不做逐帧后处理」）。
+    fn request_background_decode(&mut self, cx: &mut Context<Self>) {
+        let path = match self
+            .settings
+            .background
+            .image_path
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+        {
+            Some(path) => path,
+            None => {
+                // 无背景图：清空缓存键，下次配置了图才会解码。
+                if self.background_cache.current_key().is_some() {
+                    self.background_cache.begin(PathBuf::new(), 0.0);
+                }
+                return;
+            }
+        };
+        let blur = self.settings.background.blur.clamp(0.0, 64.0);
+        if !self.background_cache.needs(&path, blur) {
+            return;
+        }
+        self.background_cache.begin(path.clone(), blur);
+        let path_for_task = path.clone();
+        // 后台线程解码 + 模糊（CPU 密集，不阻塞 UI 线程）；完成后回填缓存并重绘。
+        // oneshot channel 适合「线程 → async 单次回传」；线程侧 `send` 不阻塞。
+        cx.spawn(async move |this, cx| {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            std::thread::spawn(move || {
+                let result = crate::background_image::decode_and_blur(&path_for_task, blur);
+                let _ = tx.send(result);
+            });
+            let result = rx.await.ok().flatten();
+            this.update(cx, |this, cx| {
+                let blur = this.settings.background.blur.clamp(0.0, 64.0);
+                if this.background_cache.store(&path, blur, result) {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+/// 背景图层计算结果（见 [`WorkspaceView::background_layer`]）。
+enum BackgroundLayer {
+    /// 无背景图：渲染层只保留纯色背景。
+    None,
+    /// 未模糊：直接用文件路径，由 gpui 资源缓存异步加载（现有路径）。
+    Path { path: PathBuf, opacity: f32 },
+    /// 已模糊：用离屏缓存的 [`gpui::RenderImage`] 纹理；`texture` 为 `None` 表示尚未解码完成。
+    Blurred {
+        opacity: f32,
+        texture: Option<std::sync::Arc<gpui::RenderImage>>,
+    },
+}
+
+/// 把 [`BackgroundLayer`] 转成可绘制的背景元素（铺满、Cover、按透明度叠加）。
+/// `None` / 未就绪的 `Blurred(None)` 返回 `None`，由渲染层保留纯色背景（优雅回退）。
+fn background_layer_element(layer: BackgroundLayer) -> Option<gpui::AnyElement> {
+    match layer {
+        BackgroundLayer::None => None,
+        BackgroundLayer::Path { path, opacity } => Some(
+            gpui::img(path)
+                .absolute()
+                .size_full()
+                .object_fit(gpui::ObjectFit::Cover)
+                .opacity(opacity)
+                .into_any_element(),
+        ),
+        BackgroundLayer::Blurred { opacity, texture } => texture.map(|image| {
+            gpui::img(image)
+                .absolute()
+                .size_full()
+                .object_fit(gpui::ObjectFit::Cover)
+                .opacity(opacity)
+                .into_any_element()
+        }),
+    }
+}
+
 impl gpui::Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let system_is_dark = matches!(
@@ -4020,14 +4138,9 @@ impl gpui::Render for WorkspaceView {
         };
 
         let theme_name = self.themes[self.theme_index].name.clone();
-        let background_image = self
-            .settings
-            .background
-            .image_path
-            .as_ref()
-            .map(PathBuf::from)
-            .filter(|path| path.is_file())
-            .map(|path| (path, self.settings.background.opacity.clamp(0.0, 1.0)));
+        // 触发后台解码（键变化才真正跑）；再同步取当前图层（命中即用，否则优雅回退）。
+        self.request_background_decode(cx);
+        let background_layer = self.background_layer();
         let workspace_name = self
             .model
             .root
@@ -4415,15 +4528,10 @@ impl gpui::Render for WorkspaceView {
                 .absolute()
                 .size_full(),
             )
-            .when_some(background_image, |root, (path, opacity)| {
-                root.child(
-                    gpui::img(path)
-                        .absolute()
-                        .size_full()
-                        .object_fit(gpui::ObjectFit::Cover)
-                        .opacity(opacity),
-                )
-            })
+            .when_some(
+                background_layer_element(background_layer),
+                |root, element| root.child(element),
+            )
             .child(
                 div()
                     .flex()
@@ -4941,9 +5049,7 @@ fn split_menu_item(
 
 /// 从设置构造行内补全 [`InlineCompleter`]（与聊天 profile 同规则；密钥只读钥匙串，INV-5）。
 /// 复用于 `WorkspaceView::new`（此时 `self` 尚未建成）与 `build_completer`。
-fn build_completer_from_settings(
-    settings: &Settings,
-) -> Option<std::sync::Arc<InlineCompleter>> {
+fn build_completer_from_settings(settings: &Settings) -> Option<std::sync::Arc<InlineCompleter>> {
     if !settings.autocomplete_enabled {
         return None;
     }

@@ -28,6 +28,7 @@ enum EditField {
     BaseUrl,
     ApiKey,
     BackgroundOpacity,
+    BackgroundBlur,
     AgentName,
     AgentPrompt,
     AgentTools,
@@ -36,8 +37,7 @@ enum EditField {
 }
 
 type SaveCallback = Box<dyn Fn(&Settings, &mut App)>;
-type ThemePreviewCallback =
-    Box<dyn Fn(&termior_theme::Theme, &str, Appearance, &mut App)>;
+type ThemePreviewCallback = Box<dyn Fn(&termior_theme::Theme, &str, Appearance, &mut App)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectMenu {
@@ -107,10 +107,7 @@ impl SettingsView {
             on_save,
             on_theme_preview,
             select_menu: None,
-            palette: termior_theme::default_theme().resolve(
-                termior_theme::Appearance::Dark,
-                true,
-            ),
+            palette: termior_theme::default_theme().resolve(termior_theme::Appearance::Dark, true),
         };
         view.refresh_credential_state();
         view
@@ -183,6 +180,7 @@ impl SettingsView {
                 }
             }
             EditField::BackgroundOpacity => self.settings.background.opacity.to_string(),
+            EditField::BackgroundBlur => self.settings.background.blur.to_string(),
             EditField::AgentName => self.agent().map(|a| a.name.clone()).unwrap_or_default(),
             EditField::AgentPrompt => self
                 .agent()
@@ -255,6 +253,10 @@ impl SettingsView {
             EditField::BackgroundOpacity => value
                 .parse::<f32>()
                 .map(|value| self.settings.background.opacity = value)
+                .map_err(|error| error.to_string()),
+            EditField::BackgroundBlur => value
+                .parse::<f32>()
+                .map(|value| self.settings.background.blur = value)
                 .map_err(|error| error.to_string()),
             EditField::AgentName => {
                 if let Some(agent) = self.agent_mut() {
@@ -876,7 +878,11 @@ impl SettingsView {
                     .flex()
                     .gap_2()
                     .child(
-                        Self::button(format!("Autocomplete: {}", on_off(autocomplete)), "autocomplete", &self.palette)
+                        Self::button(
+                            format!("Autocomplete: {}", on_off(autocomplete)),
+                            "autocomplete",
+                            &self.palette,
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| {
@@ -887,23 +893,28 @@ impl SettingsView {
                         ),
                     )
                     .child(
-                        Self::button(format!("Vim: {}", on_off(vim)), "vim", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.settings.vim_mode = !this.settings.vim_mode;
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(
-                        Self::button(format!("Dotfiles: {}", on_off(dotfiles)), "dotfiles", &self.palette)
+                        Self::button(format!("Vim: {}", on_off(vim)), "vim", &self.palette)
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
-                                    this.settings.show_dotfiles = !this.settings.show_dotfiles;
+                                    this.settings.vim_mode = !this.settings.vim_mode;
                                     cx.notify();
                                 }),
                             ),
+                    )
+                    .child(
+                        Self::button(
+                            format!("Dotfiles: {}", on_off(dotfiles)),
+                            "dotfiles",
+                            &self.palette,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.settings.show_dotfiles = !this.settings.show_dotfiles;
+                                cx.notify();
+                            }),
+                        ),
                     ),
             )
             .into_any_element()
@@ -925,20 +936,24 @@ impl SettingsView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(Self::button("‹", "previous-provider", &self.palette).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.cycle_profile(-1, cx)),
-                    ))
+                    .child(
+                        Self::button("‹", "previous-provider", &self.palette).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.cycle_profile(-1, cx)),
+                        ),
+                    )
                     .child(div().flex_1().text_lg().child(SharedString::from(format!(
                         "{}  ({}/{})",
                         profile.display_name,
                         self.profile_index + 1,
                         self.settings.models.profiles.len()
                     ))))
-                    .child(Self::button("›", "next-provider", &self.palette).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.cycle_profile(1, cx)),
-                    )),
+                    .child(
+                        Self::button("›", "next-provider", &self.palette).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.cycle_profile(1, cx)),
+                        ),
+                    ),
             )
             .children([
                 self.edit_row("Model", EditField::Model, cx),
@@ -951,39 +966,52 @@ impl SettingsView {
                     .flex_wrap()
                     .gap_2()
                     .child(
-                        Self::button(format!("Enabled: {}", on_off(profile.enabled)), "provider-enabled", &self.palette)
+                        Self::button(
+                            format!("Enabled: {}", on_off(profile.enabled)),
+                            "provider-enabled",
+                            &self.palette,
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.toggle_provider(cx)),
                         ),
                     )
                     .child(
-                        Self::button(if active_chat {
+                        Self::button(
+                            if active_chat {
                                 "✓ Default chat"
                             } else {
                                 "Use for chat"
-                            }, "active-chat", &self.palette)
+                            },
+                            "active-chat",
+                            &self.palette,
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.make_active_chat(cx)),
                         ),
                     )
                     .child(
-                        Self::button(if active_completion {
+                        Self::button(
+                            if active_completion {
                                 "✓ Default completion"
                             } else {
                                 "Use for completion"
-                            }, "active-completion", &self.palette)
+                            },
+                            "active-completion",
+                            &self.palette,
+                        )
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.make_active_completion(cx)),
                         ),
                     )
                     .child(
-                        Self::button("Test connection", "ping-provider", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.ping_provider(cx)),
-                        ),
+                        Self::button("Test connection", "ping-provider", &self.palette)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.ping_provider(cx)),
+                            ),
                     ),
             )
             .into_any_element()
@@ -1184,14 +1212,18 @@ impl SettingsView {
                 div()
                     .flex()
                     .gap_2()
-                    .child(Self::button("Import theme", "import-theme", &self.palette).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.import_theme(cx)),
-                    ))
-                    .child(Self::button("Export theme", "export-theme", &self.palette).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.export_theme(cx)),
-                    )),
+                    .child(
+                        Self::button("Import theme", "import-theme", &self.palette).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.import_theme(cx)),
+                        ),
+                    )
+                    .child(
+                        Self::button("Export theme", "export-theme", &self.palette).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.export_theme(cx)),
+                        ),
+                    ),
             )
             .child(SharedString::from(format!("Background: {background}")))
             .child(
@@ -1199,19 +1231,22 @@ impl SettingsView {
                     .flex()
                     .gap_2()
                     .child(
-                        Self::button("Choose image", "background-image", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.select_background(cx)),
-                        ),
+                        Self::button("Choose image", "background-image", &self.palette)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.select_background(cx)),
+                            ),
                     )
                     .child(
-                        Self::button("Clear image", "background-clear", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.clear_background(cx)),
-                        ),
+                        Self::button("Clear image", "background-clear", &self.palette)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.clear_background(cx)),
+                            ),
                     ),
             )
             .child(self.edit_row("Background opacity (0–1)", EditField::BackgroundOpacity, cx))
+            .child(self.edit_row("Background blur (0–64)", EditField::BackgroundBlur, cx))
             .into_any_element()
     }
 
@@ -1301,18 +1336,24 @@ impl SettingsView {
                     div()
                         .flex()
                         .gap_2()
-                        .child(Self::button("‹", "previous-agent", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.cycle_agent(-1, cx)),
-                        ))
-                        .child(Self::button("›", "next-agent", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.cycle_agent(1, cx)),
-                        ))
-                        .child(Self::button("Remove", "remove-agent", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.remove_agent(cx)),
-                        )),
+                        .child(
+                            Self::button("‹", "previous-agent", &self.palette).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.cycle_agent(-1, cx)),
+                            ),
+                        )
+                        .child(
+                            Self::button("›", "next-agent", &self.palette).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.cycle_agent(1, cx)),
+                            ),
+                        )
+                        .child(
+                            Self::button("Remove", "remove-agent", &self.palette).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.remove_agent(cx)),
+                            ),
+                        ),
                 )
                 .children([
                     self.edit_row("Name", EditField::AgentName, cx),
@@ -1335,23 +1376,29 @@ impl SettingsView {
                     .flex()
                     .gap_2()
                     .child(
-                        Self::button("Install hooks", "install-hooks", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.install_hooks(cx)),
-                        ),
+                        Self::button("Install hooks", "install-hooks", &self.palette)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.install_hooks(cx)),
+                            ),
                     )
                     .child(
-                        Self::button("Uninstall hooks", "uninstall-hooks", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.uninstall_hooks(cx)),
-                        ),
+                        Self::button("Uninstall hooks", "uninstall-hooks", &self.palette)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.uninstall_hooks(cx)),
+                            ),
                     ),
             )
             .child(
-                Self::button(format!(
+                Self::button(
+                    format!(
                         "Agent notifications: {}",
                         on_off(self.settings.agent_notifications)
-                    ), "agent-notifications", &self.palette)
+                    ),
+                    "agent-notifications",
+                    &self.palette,
+                )
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
@@ -1360,10 +1407,12 @@ impl SettingsView {
                     }),
                 ),
             )
-            .child(Self::button("New custom agent", "new-agent", &self.palette).on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.new_agent(cx)),
-            ))
+            .child(
+                Self::button("New custom agent", "new-agent", &self.palette).on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.new_agent(cx)),
+                ),
+            )
             .child(agent_controls)
             .into_any_element()
     }
@@ -1476,10 +1525,12 @@ impl gpui::Render for SettingsView {
                     .p_3()
                     .children(tabs)
                     .child(div().flex_1())
-                    .child(Self::button("Save", "save-settings", &self.palette).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.save(cx)),
-                    )),
+                    .child(
+                        Self::button("Save", "save-settings", &self.palette).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.save(cx)),
+                        ),
+                    ),
             )
             .child(
                 div()

@@ -2,6 +2,7 @@
 
 mod ai_diff_view;
 mod app_identity;
+mod background_image;
 mod composer_view;
 mod editor_view;
 mod git_views;
