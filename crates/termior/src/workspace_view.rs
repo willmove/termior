@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use termior_ai::AttachmentSource;
+use termior_ai::{HttpProvider, InlineCompleter, KeyringSecretStore, ProviderConfig, SecretStore};
 use termior_explorer::{
     ContentMatch, ContentSearch, FileEntry, FileIndex, IconKind, TreeState, WorkspaceWatcher,
 };
@@ -251,6 +252,9 @@ pub struct WorkspaceView {
 impl WorkspaceView {
     pub fn new(root: PathBuf, system_is_dark: bool, cx: &mut Context<Self>) -> Self {
         let (settings, data_dir, migration_error) = load_settings();
+        let completion_completer = build_completer_from_settings(&settings);
+        let completion_enabled =
+            settings.autocomplete_enabled && completion_completer.is_some();
         let themes = data_dir
             .as_ref()
             .and_then(|dir| {
@@ -316,6 +320,8 @@ impl WorkspaceView {
                                         editor.set_preferences(
                                             &settings.editor_theme_id,
                                             settings.vim_mode,
+                                            completion_completer.clone(),
+                                            completion_enabled,
                                         )
                                     });
                                     PaneContent::Editor(editor)
@@ -335,6 +341,8 @@ impl WorkspaceView {
                                             editor.set_preferences(
                                                 &settings.editor_theme_id,
                                                 settings.vim_mode,
+                                                completion_completer.clone(),
+                                                completion_enabled,
                                             )
                                         });
                                         PaneContent::Markdown(
@@ -875,9 +883,15 @@ impl WorkspaceView {
 
     fn create_editor(&mut self, cx: &mut Context<Self>) {
         let id = self.model.new_tab(TabKind::Editor, "Untitled", false);
+        let (completer, completion_enabled) = self.completion_config();
         let editor = cx.new(EditorView::untitled);
         editor.update(cx, |editor, _| {
-            editor.set_preferences(&self.settings.editor_theme_id, self.settings.vim_mode)
+            editor.set_preferences(
+                &self.settings.editor_theme_id,
+                self.settings.vim_mode,
+                completer,
+                completion_enabled,
+            )
         });
         self.tabs.push(AppTab {
             id,
@@ -922,8 +936,14 @@ impl WorkspaceView {
                 })
             })
             .unwrap_or_else(|| cx.new(|cx| EditorView::open(&path, cx)));
+        let (completer, completion_enabled) = self.completion_config();
         entity.update(cx, |editor, _| {
-            editor.set_preferences(&self.settings.editor_theme_id, self.settings.vim_mode)
+            editor.set_preferences(
+                &self.settings.editor_theme_id,
+                self.settings.vim_mode,
+                completer,
+                completion_enabled,
+            )
         });
         if entity.read(cx).path().is_none() {
             log::warn!("could not open editor file: {}", path.display());
@@ -1436,9 +1456,15 @@ impl WorkspaceView {
         let kind = self.model.active_tab().map(|tab| tab.kind);
         let pane = match kind {
             Some(TabKind::Editor) => {
+                let (completer, completion_enabled) = self.completion_config();
                 let editor = cx.new(EditorView::untitled);
                 editor.update(cx, |editor, _| {
-                    editor.set_preferences(&self.settings.editor_theme_id, self.settings.vim_mode)
+                    editor.set_preferences(
+                        &self.settings.editor_theme_id,
+                        self.settings.vim_mode,
+                        completer,
+                        completion_enabled,
+                    )
                 });
                 PaneContent::Editor(editor)
             }
@@ -1708,6 +1734,27 @@ impl WorkspaceView {
                     _ => None,
                 })
             })
+    }
+
+    /// 复用 FR-PROV 的 Provider 与密钥配置，构造一个行内补全 [`InlineCompleter`]。
+    ///
+    /// 遵循与 Composer 聊天 profile 相同的规则：profile 必须启用；非本地 profile 必须在
+    /// OS 钥匙串中存有 key（密钥永不落盘，INV-5）。配置缺失或校验失败时返回 `None`，
+    /// 编辑器侧静默不补全（FR-EDIT-05「请求失败/超时静默降级」）。
+    fn build_completer(&self) -> Option<std::sync::Arc<InlineCompleter>> {
+        build_completer_from_settings(&self.settings)
+    }
+
+    /// 当前补全配置：(completer, enabled)。enabled 为 false 或 completer 不可用时
+    /// 返回 `(None, false)`，确保编辑器侧无论如何都不会发起请求。
+    fn completion_config(&self) -> (Option<std::sync::Arc<InlineCompleter>>, bool) {
+        if !self.settings.autocomplete_enabled {
+            return (None, false);
+        }
+        match self.build_completer() {
+            Some(completer) => (Some(completer), true),
+            None => (None, false),
+        }
     }
 
     fn queue_agent_update(
@@ -2284,11 +2331,17 @@ impl WorkspaceView {
         self.palette =
             self.themes[self.theme_index].resolve(self.resolved_appearance(), self.system_is_dark);
         self.propagate_palette(cx);
+        let (completer, completion_enabled) = self.completion_config();
         for tab in &self.tabs {
             for pane in tab.panes.values() {
                 if let PaneContent::Editor(editor) = pane {
                     editor.update(cx, |editor, _| {
-                        editor.set_preferences(editor_theme_id, self.settings.vim_mode)
+                        editor.set_preferences(
+                            editor_theme_id,
+                            self.settings.vim_mode,
+                            completer.clone(),
+                            completion_enabled,
+                        )
                     });
                 }
             }
@@ -2348,12 +2401,7 @@ impl WorkspaceView {
                   app: &mut gpui::App| {
                 if let Some(workspace) = preview_workspace.upgrade() {
                     workspace.update(app, |workspace, cx| {
-                        workspace.apply_theme_preferences(
-                            theme,
-                            editor_theme_id,
-                            appearance,
-                            cx,
-                        );
+                        workspace.apply_theme_preferences(theme, editor_theme_id, appearance, cx);
                     });
                 }
             },
@@ -2397,12 +2445,17 @@ impl WorkspaceView {
             self.themes[self.theme_index].resolve(self.resolved_appearance(), self.system_is_dark);
         self.propagate_palette(cx);
         self.schedule_explorer_scan(self.explorer_requested_root.clone(), cx);
+        let (completer, completion_enabled) = self.completion_config();
         for tab in &self.tabs {
             for pane in tab.panes.values() {
                 if let PaneContent::Editor(editor) = pane {
                     editor.update(cx, |editor, _| {
-                        editor
-                            .set_preferences(&self.settings.editor_theme_id, self.settings.vim_mode)
+                        editor.set_preferences(
+                            &self.settings.editor_theme_id,
+                            self.settings.vim_mode,
+                            completer.clone(),
+                            completion_enabled,
+                        )
                     });
                 } else if let PaneContent::Terminal(terminal) = pane {
                     terminal.update(cx, |terminal, cx| {
@@ -4884,6 +4937,41 @@ fn split_menu_item(
                     }
                 }))
         })
+}
+
+/// 从设置构造行内补全 [`InlineCompleter`]（与聊天 profile 同规则；密钥只读钥匙串，INV-5）。
+/// 复用于 `WorkspaceView::new`（此时 `self` 尚未建成）与 `build_completer`。
+fn build_completer_from_settings(
+    settings: &Settings,
+) -> Option<std::sync::Arc<InlineCompleter>> {
+    if !settings.autocomplete_enabled {
+        return None;
+    }
+    let profile = settings
+        .models
+        .active_completion_profile
+        .as_deref()
+        .and_then(|id| {
+            settings
+                .models
+                .profiles
+                .iter()
+                .find(|profile| profile.id == id)
+        })
+        .filter(|profile| profile.enabled)?;
+    let api_key = KeyringSecretStore::new()
+        .get(&format!("provider:{}", profile.id))
+        .ok()
+        .flatten();
+    if !profile.local && api_key.is_none() {
+        return None;
+    }
+    let config = ProviderConfig::from_settings(profile, api_key).ok()?;
+    let provider = HttpProvider::new(config).ok()?;
+    Some(std::sync::Arc::new(InlineCompleter::new(
+        Box::new(provider),
+        profile.model.clone(),
+    )))
 }
 
 fn terminal_agent_status(state: AgentState) -> AgentStatus {

@@ -4,10 +4,10 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
 
-- [ ] 编辑器停顿（debounce）触发补全请求，连续输入时取消在途请求
-- [ ] 复用 FR-PROV 的 Provider 与密钥配置发起补全请求
-- [ ] 返回结果以 ghost text 形式渲染在光标处
-- [ ] Tab 接受、Esc 取消，接受后正确插入到 Rope/缓冲
-- [ ] 请求失败/超时静默降级，不打扰输入
+- [x] 编辑器停顿（debounce）触发补全请求，连续输入时取消在途请求
+- [x] 复用 FR-PROV 的 Provider 与密钥配置发起补全请求
+- [x] 返回结果以 ghost text 形式渲染在光标处
+- [x] Tab 接受、Esc 取消，接受后正确插入到 Rope/缓冲
+- [x] 请求失败/超时静默降级，不打扰输入
