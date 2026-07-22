@@ -510,7 +510,7 @@ impl WorkspaceView {
                     for pane_id in pane_ids {
                         tab.panes.insert(
                             pane_id,
-                            PaneContent::Preview(new_preview_view(url.clone(), window, cx)),
+                            PaneContent::Preview(new_preview_view(url.clone(), cx)),
                         );
                     }
                 }
@@ -542,71 +542,6 @@ impl WorkspaceView {
                 break;
             }
         }));
-    }
-
-    /// Runs the real preview creation path and exits after the embedded WebView is ready.
-    /// Used by `scripts/preview-smoke.ps1`; normal launches never call this method.
-    pub(crate) fn start_preview_smoke(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |workspace, cx| {
-            // Let the explorer scan and watcher schedule foreground work. This is the
-            // timing that exposed the Windows WebView2/GPUI re-entrancy crash.
-            cx.background_executor()
-                .timer(Duration::from_millis(750))
-                .await;
-            if workspace
-                .update_in(cx, |workspace, window, cx| {
-                    workspace.create_preview_url("http://localhost:3000".into(), window, cx)
-                })
-                .is_err()
-            {
-                return;
-            }
-
-            for _ in 0..80 {
-                cx.background_executor()
-                    .timer(Duration::from_millis(100))
-                    .await;
-                let backend = workspace
-                    .update_in(cx, |workspace, _window, cx| {
-                        workspace
-                            .tabs
-                            .iter()
-                            .find(|tab| Some(tab.id) == workspace.model.active)
-                            .and_then(|tab| {
-                                tab.panes.values().find_map(|pane| match pane {
-                                    PaneContent::Preview(preview) => {
-                                        Some(preview.read(cx).backend())
-                                    }
-                                    _ => None,
-                                })
-                            })
-                    })
-                    .ok()
-                    .flatten();
-                match backend {
-                    Some(termior_preview::PreviewBackend::Embedded) => {
-                        // WebView2 reports controller readiness before the initial navigation has
-                        // necessarily reached the local server. Keep the window alive briefly so
-                        // the smoke can assert the real HTTP request, not just construction.
-                        cx.background_executor()
-                            .timer(Duration::from_millis(750))
-                            .await;
-                        println!("TERMIOR_PREVIEW_SMOKE_OK");
-                        let _ = cx.update(|_, cx| cx.quit());
-                        return;
-                    }
-                    Some(termior_preview::PreviewBackend::ExternalBrowser) => {
-                        eprintln!("TERMIOR_PREVIEW_SMOKE_FAILED: embedded WebView unavailable");
-                        let _ = cx.update(|_, cx| cx.quit());
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-            eprintln!("TERMIOR_PREVIEW_SMOKE_FAILED: timed out waiting for WebView");
-            let _ = cx.update(|_, cx| cx.quit());
-        })
-        .detach();
     }
 
     /// Exercises the same request path as the header Preview button with an active Markdown file.
@@ -1087,12 +1022,12 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn create_preview_url(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn create_preview_url(&mut self, url: String, _window: &mut Window, cx: &mut Context<Self>) {
         let id = self.model.new_tab(TabKind::Preview, "Web Preview", false);
         if let Some(tab) = self.model.active_tab_mut() {
             tab.resource = Some(url.clone());
         }
-        let preview = new_preview_view(url, window, cx);
+        let preview = new_preview_view(url, cx);
         self.tabs.push(AppTab {
             id,
             panes: single_pane(PaneContent::Preview(preview)),
@@ -1653,15 +1588,10 @@ impl WorkspaceView {
         }
     }
 
-    fn activate_runtime(&mut self, id: TabId, cx: &mut Context<Self>) {
+    fn activate_runtime(&mut self, id: TabId, _cx: &mut Context<Self>) {
         let _ = self.model.switch_to(id);
-        for tab in &self.tabs {
-            for pane in tab.panes.values() {
-                if let PaneContent::Preview(preview) = pane {
-                    preview.update(cx, |preview, cx| preview.set_active(tab.id == id, cx));
-                }
-            }
-        }
+        // No per-pane activation hook is needed now that the embedded WebView is gone
+        // (ADR 0002): preview tabs render a placeholder and have no surface to show/hide.
     }
 
     /// A terminal's shell exited: close its pane, and the whole tab when the pane
@@ -4650,14 +4580,8 @@ fn single_pane(content: PaneContent) -> HashMap<PaneId, PaneContent> {
     HashMap::from([(PaneId(1), content)])
 }
 
-fn new_preview_view(
-    url: String,
-    window: &mut Window,
-    cx: &mut Context<WorkspaceView>,
-) -> Entity<PreviewView> {
-    let preview = cx.new(|_| PreviewView::new(url));
-    preview.update(cx, |preview, cx| preview.initialize(window, cx));
-    preview
+fn new_preview_view(url: String, cx: &mut Context<WorkspaceView>) -> Entity<PreviewView> {
+    cx.new(|_| PreviewView::new(url))
 }
 
 fn explorer_entry_visible(entry: &FileEntry, tree: &TreeState) -> bool {

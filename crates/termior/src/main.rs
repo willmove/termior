@@ -24,11 +24,9 @@ fn main() {
     install_panic_log();
     let _ = env_logger::try_init();
     let smoke_test = std::env::var_os("TERMIOR_SMOKE_TEST").is_some();
-    let preview_smoke_test = std::env::var_os("TERMIOR_PREVIEW_SMOKE_TEST").is_some();
     let markdown_preview_smoke_test =
         std::env::var_os("TERMIOR_MARKDOWN_PREVIEW_SMOKE_TEST").is_some();
-    let root =
-        resolve_workspace_root(smoke_test || preview_smoke_test || markdown_preview_smoke_test);
+    let root = resolve_workspace_root(smoke_test || markdown_preview_smoke_test);
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
         cx.open_window(
@@ -43,13 +41,11 @@ fn main() {
                 workspace.update(cx, |workspace, cx| {
                     workspace.restore_or_create_runtime(window, cx);
                     workspace.start_background_services(cx);
-                    if preview_smoke_test {
-                        workspace.start_preview_smoke(window, cx);
-                    } else if markdown_preview_smoke_test {
+                    if markdown_preview_smoke_test {
                         workspace.start_markdown_preview_smoke(window, cx);
                     }
                 });
-                if smoke_test && !preview_smoke_test && !markdown_preview_smoke_test {
+                if smoke_test && !markdown_preview_smoke_test {
                     schedule_smoke_exit(window);
                 }
                 workspace

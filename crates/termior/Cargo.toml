@@ -35,13 +35,6 @@ rfd = "0.17.2"
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 
-[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
-gpui-wry = "0.5"
-wry = "0.53.3"
-
-[target.'cfg(target_os = "windows")'.dependencies]
-raw-window-handle = "0.6"
-
 [build-dependencies]
 winresource = "0.1"
 
