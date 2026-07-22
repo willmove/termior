@@ -31,9 +31,10 @@ log = { workspace = true }
 env_logger = "0.11"
 serde_json = { workspace = true }
 rfd = "0.17.2"
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
+# 背景图 GPU 渲染（FR-THEME-05）：解码 + 一次性高斯模糊缓存纹理。
+# features 对齐 rfd 文件选择过滤项（png/jpg/jpeg/webp/gif）；跨平台直接依赖
+# （之前仅 Linux 窗口图标用到，现 Windows/macOS 也需解码）。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 
 [build-dependencies]
 winresource = "0.1"
