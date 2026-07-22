@@ -6318,6 +6318,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "termior-bench"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "criterion",
+ "serde",
+ "serde_json",
+ "sysinfo",
+]
+
+[[package]]
 name = "termior-diff"
 version = "0.1.0"
 dependencies = [

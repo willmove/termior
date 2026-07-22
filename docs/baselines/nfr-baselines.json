@@ -1,0 +1,54 @@
+{
+  "notes": "NFR 回归基线（spec §8 NFR-01~04）。基线值由首次固化采集得到；CI 每次把当前测量与基线对比，退化超 threshold_percent 即 fail。绝对值依赖硬件，故门禁只看相对回归；spec 绝对目标（如冷启动 <800ms）作为发布验收参考记录在 docs/nfr-baselines.md。PTY 吞吐基线跨平台一致（纯 CPU），platform 填 any。",
+  "baselines": [
+    {
+      "kind": "pty_throughput_mibps",
+      "platform": "any",
+      "scenario": "vte_parse",
+      "value": 100.0,
+      "threshold_percent": 30.0
+    },
+    {
+      "kind": "cold_start_ms",
+      "platform": "windows",
+      "scenario": "typical",
+      "value": 1500.0,
+      "threshold_percent": 40.0
+    },
+    {
+      "kind": "cold_start_ms",
+      "platform": "macos",
+      "scenario": "typical",
+      "value": 1200.0,
+      "threshold_percent": 40.0
+    },
+    {
+      "kind": "rss_mib",
+      "platform": "windows",
+      "scenario": "typical",
+      "value": 300.0,
+      "threshold_percent": 30.0
+    },
+    {
+      "kind": "rss_mib",
+      "platform": "macos",
+      "scenario": "typical",
+      "value": 250.0,
+      "threshold_percent": 30.0
+    },
+    {
+      "kind": "fps",
+      "platform": "windows",
+      "scenario": "typical",
+      "value": 58.0,
+      "threshold_percent": 20.0
+    },
+    {
+      "kind": "fps",
+      "platform": "macos",
+      "scenario": "typical",
+      "value": 58.0,
+      "threshold_percent": 20.0
+    }
+  ]
+}
