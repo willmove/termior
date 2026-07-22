@@ -1,7 +1,7 @@
 # Termior — 终端优先 AI 原生开发工作台（ADE）SDD 规格说明书
 
 > **版本**：v0.1 草案 · 2026-07
-> **架构基线**：Rust + GPUI（单进程原生 GPU 渲染；Web 预览按需使用隔离的子 WebView）
+> **架构基线**：Rust + GPUI（单进程原生 GPU 渲染；Web 预览统一交给系统浏览器，详见 ADR 0002）
 > **产品代号**：`Termior`（占位名，可全局替换；对应 bundle id、配置文件名、记忆文件名等均随之替换）
 
 ---
@@ -31,7 +31,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 - **单进程原生应用**：核心 UI 由 GPUI 直接渲染，终端仿真、编辑器、AI Agent 运行时均以原生 Rust 模块运行，通过进程内 async channel 与 GPUI Entity 状态模型通信；
 - **终端优先工作流**：终端是工作区的主要交互面，编辑器、文件浏览器、Git、预览和 AI 围绕活动终端的 cwd 与上下文协同；
 - **状态持续存在**：tab 切换只改变可见性，不销毁 PTY、编辑缓冲、undo 栈或预览页面状态；
-- **按需隔离 Web 内容**：核心工作区不依赖 WebView，仅 Web 预览 tab 在存活期间创建 wry 子 WebView，并提供外部浏览器降级路径。
+- **按需隔离 Web 内容**：核心工作区不依赖 WebView；Web 预览统一交给系统浏览器打开（ADR 0002）。
 
 ### 1.3 核心价值主张（必须写进 README）
 
@@ -77,7 +77,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | 异步运行时 | GPUI executor（主线程调度）+ **独立 tokio 运行时线程**承载网络/PTY IO，channel 桥接 | 隔离 UI 调度与阻塞或高吞吐 IO |
 | 持久化 | serde_json + 原子写（tempfile + rename）+ 启动 schema 迁移 | 满足 6.14 与第 7 节的数据安全要求 |
 | 密钥存储 | **keyring crate** | 统一接入系统钥匙串，避免密钥进入应用数据文件 |
-| Web 预览 | **gpui-wry / wry 子 WebView** | 与 gpui-component 主 UI crate 解耦；仅预览 tab 按需创建，初始化失败时降级为外部浏览器 |
+| Web 预览 | **系统默认浏览器**（经 `Termior-platform::open_external`） | 不内嵌 WebView（ADR 0002）；与上游 Zed 处理 URL/OAuth 一致，消除 z-order/焦点与 WebView2 重入风险 |
 | 系统通知 | macOS: UNUserNotificationCenter；Windows: WinRT Toast；Linux: notify-rust | 统一封装进 `platform` crate |
 | 语音输入 | **cpal** 采集 + Provider STT（云 Whisper 或本地 whisper-rs） | P2 |
 | Git | **gix（gitoxide）或 git2** 做 status/diff/log/graph；push/pull/fetch 走系统 `git` CLI | CLI 可直接使用用户现有 credential helper 与 SSH 配置 |
@@ -106,10 +106,10 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 - 最终代码编辑器、AI diff 引擎和语法解析架构；M2 临时编辑器也必须藏在 `Termior-editor` API 后；
 - Workspace、Agent、会话及其他领域状态；
 - 中央主题的源模型；`Termior-ui-kit` 只负责把 Termior token 映射到控件样式；
-- Web 预览；该能力使用独立的 `gpui-wry`/wry 集成；
+- Web 预览；该能力使用系统浏览器，不再内嵌 WebView（ADR 0002）；
 - 不启用包含全部语法的 `tree-sitter-languages` 聚合 feature，只按实际支持语言逐项引入语法 crate。
 
-**版本与依赖纪律**：gpui、gpui-component 与 gpui-wry 均锁定确切 tag/rev；升级集中在显式升级窗口中进行。`cargo tree` 与产物体积报告进入 CI，新增 UI 依赖必须说明其 Release 体积、冷启动和空闲内存影响。
+**版本与依赖纪律**：gpui、gpui-component 均锁定确切 tag/rev；升级集中在显式升级窗口中进行。`cargo tree` 与产物体积报告进入 CI，新增 UI 依赖必须说明其 Release 体积、冷启动和空闲内存影响。
 
 **M0 决策实验**：在 macOS、Linux、Windows 上用完全相同的 Release 配置（LTO、strip、panic 策略一致）构建并记录三组基线：
 
@@ -144,8 +144,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 │  ├── PTY reader 线程 × N ──── VTE 解析 → 网格 diff → 事件通道         │
 │  │        └── OSC 7/133/777 字节过滤器（cwd / 命令边界 / 代理信号）    │
 │  ├── tokio 运行时线程池 ──── AI HTTP/SSE、git CLI 子进程、STT          │
-│  ├── fs 索引线程 ──── ignore walk / nucleo 匹配 / grep 搜索           │
-│  └── wry 子 WebView（仅 Web 预览 tab 存活期间）                       │
+│  └── fs 索引线程 ──── ignore walk / nucleo 匹配 / grep 搜索           │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -262,14 +261,16 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 
 ### 6.6 Web 预览（FR-PREV）
 
+> 经 ADR 0002：Termior 不内嵌 WebView。预览 tab 检测并校验 URL 后统一交给系统默认浏览器打开；localhost 检测、URL 校验与原生 Markdown 预览等正交能力全部保留。
+
 | ID | 需求 | 优先级 |
 |---|---|---|
-| FR-PREV-01 | 在 PTY 输出中检测 localhost URL（localhost / 127.0.0.1，Vite/Next 等格式），状态栏出现「Open in preview」pill；检测基于 PTY 输出流而非终端缓冲快照，重绘型 TUI 不误触发 | P1 |
-| FR-PREV-02 | `Cmd+P` 手动新建预览 tab，可输入任意 URL | P1 |
-| FR-PREV-03 | 预览 tab 用 wry 子 WebView 承载，位于 GPUI 窗口内对应区域；后台切换保持页面状态（INV-1）；HMR（Vite/Next/Astro）经原生 WebSocket 直通 | P1 |
-| FR-PREV-04 | 降级路径：wry 初始化失败或平台不支持时，pill 变为「在浏览器打开」 | P1 |
+| FR-PREV-01 | 在 PTY 输出中检测 localhost URL（localhost / 127.0.0.1，Vite/Next 等格式），状态栏出现「Open Web Preview」pill；检测基于 PTY 输出流而非终端缓冲快照，重绘型 TUI 不误触发 | P1 |
+| FR-PREV-02 | `Cmd+P` 手动新建预览 tab，可输入任意 http(s) URL；输入经 `normalize_preview_url` 校验（HTTP/HTTPS-only，必须有 host） | P1 |
+| FR-PREV-03 | 预览 tab 不承载网页渲染，仅作为「Open in browser」入口，URL 与校验状态在 tab 存活期间按 INV-1 保留；点击即在系统默认浏览器打开 | P1 |
+| FR-PREV-04 | 统一降级即默认路径：所有平台一律经 `Termior-platform::open_external` 打开，无内嵌后端，故无「初始化失败」分支 | P1 |
 
-**技术要点**：使用独立的 `gpui-wry`/wry 集成，不依赖 gpui-component 主 UI crate；子 WebView 与 GPUI 合成存在 z-order 限制（WebView 恒在最上层），布局上避免浮层遮盖预览区，弹窗类 UI 在预览 tab 激活时改用侧栏呈现。此为已知架构妥协，记入风险 R2。
+**技术要点**：预览域逻辑（localhost 正则扫描、URL 校验、`PreviewTab` 状态机、原生 Markdown 解析）位于无 IO 的 `Termior-preview` crate；系统浏览器打开由 `Termior-platform::open_external` 跨平台分发（Windows `rundll32 url.dll,FileProtocolHandler`、macOS `open`、Linux `xdg-open`），且同样强制 http/https 边界。预览 tab 的 GPUI 视图只渲染占位面板与「Open in browser」主按钮。
 
 ### 6.7 主题与背景（FR-THEME）
 
@@ -425,7 +426,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | **M1 终端 MVP** | FR-TERM 全量（P0 项）、shell integration、OSC 7/133 管线、分屏、行内搜索；Windows ConPTY、Job Object 与 pwsh/powershell/cmd 支持 | 三平台终端验收通过；vim/htop/tmux 或对应平台终端程序可用；6.2 验收标准全过 |
 | **M2 浏览器 + 编辑器基础** | FR-EXPL 全量、FR-EDIT-01/02/03、fuzzy/grep | 6.4 验收标准全过；大文件编辑流畅 |
 | **M3 AI 核心** | FR-PROV（P0）、FR-AGENT 全 P0、FR-EDIT-04（ai-diff）、FR-SESS-01/02、FR-SEC 全量 | 端到端：提问 → 工具调用 → 审批 → hunk 审阅 → 落盘；deny-list 与授权注册表红队用例全拦截 |
-| **M4 外围子系统** | FR-VCS、FR-PREV、FR-NOTIF、FR-TAGENT | git 日常流可用；dev server 预览 + HMR；Claude Code 状态进通知铃铛 |
+| **M4 外围子系统** | FR-VCS、FR-PREV、FR-NOTIF、FR-TAGENT | git 日常流可用；localhost 检测 + 系统浏览器预览（ADR 0002，不内嵌 WebView）；Claude Code 状态进通知铃铛 |
 | **M5 完善** | FR-PLAN、FR-SESS-03/04、FR-EDIT-05/06/07、FR-SET-02、其余 P1/P2、三平台发行与回归测试收尾 | Plan mode / 子代理 / 自定义代理可用；Vim + 补全可用；三平台发行物通过验收 |
 
 ---
@@ -435,7 +436,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | ID | 风险 | 缓解 |
 |---|---|---|
 | R1 | Windows 的 IME、ConPTY、Job Object 与系统集成可能出现平台特有回归 | Windows 与 macOS/Linux 同列 P0；CI 持续运行三平台构建、单测与关键交互验收，所有里程碑均以三平台通过为门槛 |
-| R2 | wry 子 WebView 与 GPUI 合成的 z-order/焦点限制 | 预览 tab 激活时禁用浮层 UI；保留「外部浏览器打开」降级（FR-PREV-04） |
+| R2 | ~~wry 子 WebView 与 GPUI 合成的 z-order/焦点限制~~（已由 ADR 0002 移除内嵌 WebView 消解） | Web 预览改为系统浏览器打开（FR-PREV-03/04）；若未来重新引入内嵌后端，需重开本风险并恢复浮层规避策略 |
 | R3 | 自研编辑器工作量（最大不确定项） | 分阶段（6.3）；M2 可在 `Termior-editor` 内部临时适配 gpui-component 编辑器，但最终实现与迁移不得泄漏其 API |
 | R4 | gpui / gpui-component 版本追踪与 API 波动 | 锁定确切 tag/rev，集中升级窗口；gpui-component 依赖面收敛在 `Termior-ui-kit`，业务 crate 不直接导入 |
 | R5 | tokio 与 GPUI executor 双运行时桥接复杂度 | 统一封装 `spawn_net()` 桥接工具，禁止业务代码直接触碰两个运行时 |

@@ -1,5 +1,7 @@
 //! Preview-domain logic: Web preview discovery/lifecycle and native Markdown parsing.
-//! Platform-specific WebViews and GPUI rendering stay in the desktop application crate.
+//! Per ADR 0002 Termior no longer embeds a WebView — previews open in the system browser —
+//! so this crate only owns URL detection, validation, the (now browser-only) tab state, and
+//! Markdown parsing. GPUI rendering lives in the desktop application crate.
 
 #![forbid(unsafe_code)]
 
@@ -24,7 +26,8 @@ pub enum PreviewUrlError {
     MissingHost,
 }
 
-/// Normalizes user-entered preview addresses while keeping the WebView boundary HTTP-only.
+/// Normalizes user-entered preview addresses, enforcing an HTTP/HTTPS-only boundary so the
+/// system-browser opener never receives a non-web scheme.
 pub fn normalize_preview_url(input: &str) -> Result<String, PreviewUrlError> {
     let input = input.trim();
     if input.is_empty() {

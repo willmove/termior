@@ -7,8 +7,8 @@
 - 启动 GPUI 主窗口，恢复工作区布局并创建/恢复 PTY 终端；
 - 终端 OSC cwd 驱动状态栏、Explorer 根目录、新 tab cwd 与 Agent 实时上下文；
 - Explorer 打开文件进入 Rope/tree-sitter 编辑器，编辑缓冲在 tab 切换时保持；
-- PTY 输出中的 localhost URL 可创建内嵌预览或走系统浏览器降级；
-- 活动 Markdown 文档可打开原生渲染预览，并与共享编辑缓冲实时同步；Web Preview 使用独立入口；
+- PTY 输出中的 localhost URL 经检测与校验后，可创建预览 tab 并在系统默认浏览器打开（不内嵌 WebView，ADR 0002）；
+- 活动 Markdown 文档可打开原生渲染预览，并与共享编辑缓冲实时同步；Web 预览与 Markdown 预览使用独立入口；
 - 设置窗口可编辑 General/Models/Themes/Agents 关键配置，并把 API key 单独写入 OS 钥匙串；
 - Composer 构建经过 secret deny-list 的附件载荷，调用真实 Provider 和只读工具；
 - 危险工具暂停在审批卡片，`write_file` 仅生成 diff，逐 hunk 决策后原子写入；
@@ -38,7 +38,7 @@ GitHub Actions 另在 Windows/macOS/Linux 构建 release 桌面二进制、记�
 - 多窗口工作区切换与跨窗口 tab 管理；
 - WSL 发行版切换、背景图片实际 GPU 渲染、语音输入；
 - 行内补全 Provider 的停顿调度与 ghost text 网络接线；
-- Linux 内嵌 WebView 的发行策略、代码签名与原生安装器/自动更新；
+- Linux 代码签名与原生安装器/自动更新（ADR 0002 已移除内嵌 WebView，发行不再受 WebView 运行时依赖阻塞）；
 - NFR 冷启动、RSS、帧率与 PTY 吞吐的正式基准与达标证据（5 MiB 编辑器基准和二进制/压缩包体积门禁已进入 CI）。
 
 因此，本里程碑的含义是“主要架构与安全链路已可构建、可测试、可继续迭代”，并不把尚未验收的条目宣称为完成。
