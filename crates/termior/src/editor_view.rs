@@ -8,9 +8,7 @@ use gpui::{
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use termior_ai::{
-    InlineCompletionContext, InlineCompleter, InlineCompletionResult,
-};
+use termior_ai::{InlineCompleter, InlineCompletionContext, InlineCompletionResult};
 use termior_editor::{
     builtin_editor_themes, CompletionController, EditorBuffer, EditorTheme, HighlightKind, Motion,
     SyntaxDocument, SyntaxLanguage, VimCommand, VimEngine, VimMode,
@@ -373,7 +371,9 @@ impl EditorView {
             futures::pin_mut!(request);
             let timeout = cx
                 .background_executor()
-                .timer(std::time::Duration::from_millis(COMPLETION_REQUEST_TIMEOUT_MS));
+                .timer(std::time::Duration::from_millis(
+                    COMPLETION_REQUEST_TIMEOUT_MS,
+                ));
             let result = match futures::future::select(request, timeout).await {
                 futures::future::Either::Left((outcome, _)) => outcome,
                 // 超时：请求仍可能继续在后台线程跑，但其结果会被 revision 不匹配静默拒绝。

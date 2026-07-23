@@ -2411,7 +2411,28 @@ impl WorkspaceView {
         let bounds = Bounds::centered(None, size(px(760.0), px(520.0)), cx);
         let _ = cx.open_window(
             app_identity::window_options(WindowBounds::Windowed(bounds)),
-            |_window, cx| {
+            |window, cx| {
+                // 接管设置窗口的关闭流程。默认情况下点击标题栏关闭按钮会走
+                // Win32 `DefWindowProcW(WM_CLOSE)` → `DestroyWindow`,随后 GPUI 在
+                // `WindowsWindow::drop` 里又对同一 HWND 调一次 `DestroyWindow`,
+                // 在已销毁的句柄上触发 `window not found` / `无效的窗口句柄`
+                // (主窗口关闭时这些日志会被随后的 `cx.quit()` 吞掉,但关闭子窗口时
+                // 应用仍存活,错误就暴露出来了)。
+                //
+                // 这里返回 `false` 阻止 Win32 自行销毁窗口,与 Zed 自身
+                // (`zed/src/zed.rs`) 关闭子窗口的做法一致:改由 GPUI 的 `remove_window`
+                // 走它自己的清理路径——`WindowsWindow::drop` 唯一一次 `DestroyWindow`,
+                // 避免对死句柄的二次操作。
+                //
+                // 必须在回调里**同步**调用 `remove_window`:该回调运行在 GPUI 的
+                // `update_window` 内部,返回后 `update_window_id` 的 `trail` 会立即
+                // 检查 `window.removed` 并在同一帧移除窗口。若用 `cx.spawn` 异步执行,
+                // 窗口会多存活到下一个 vsync,期间 `on_request_frame` 仍会对已标记
+                // removed 的窗口 `handle.update().log_err()`,打出一条 `window not found`。
+                window.on_window_should_close(cx, |window, _cx| {
+                    window.remove_window();
+                    false
+                });
                 cx.new(|cx| {
                     SettingsView::new(
                         settings,

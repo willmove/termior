@@ -68,6 +68,11 @@ pub struct SettingsView {
     select_menu: Option<SelectMenu>,
     /// 渲染期缓存的当前主题色板(每帧从全局刷新,供 edit_row 等辅助方法使用)。
     palette: termior_theme::ResolvedPalette,
+    /// 进行中的异步任务(ping / rfd 对话框)。保存为字段而非 `.detach()`,
+    /// 这样在设置窗口关闭、`SettingsView` 被 drop 时任务会随实体一并取消,
+    /// 避免任务在 ~10s 后回写状态并触发对已销毁窗口的 `cx.notify()`,
+    /// 产生 `window not found` / `无效的窗口句柄` 错误。
+    pending_tasks: Vec<gpui::Task<()>>,
 }
 
 impl SettingsView {
@@ -108,6 +113,7 @@ impl SettingsView {
             on_theme_preview,
             select_menu: None,
             palette: termior_theme::default_theme().resolve(termior_theme::Appearance::Dark, true),
+            pending_tasks: Vec::new(),
         };
         view.refresh_credential_state();
         view
@@ -145,6 +151,13 @@ impl SettingsView {
             .profile_key()
             .and_then(|key| KeyringSecretStore::new().get(&key).ok().flatten())
             .is_some();
+    }
+
+    /// 跟踪一个 fire-and-forget 的异步任务,使其在设置窗口关闭时随实体一起被取消。
+    /// 丢弃已完成的任务,避免无界增长。
+    fn track_task(&mut self, task: gpui::Task<()>) {
+        self.pending_tasks.retain(|task| !task.is_ready());
+        self.pending_tasks.push(task);
     }
 
     fn begin_edit(&mut self, field: EditField, window: &mut Window, cx: &mut Context<Self>) {
@@ -392,7 +405,7 @@ impl SettingsView {
             .profile_key()
             .and_then(|key| KeyringSecretStore::new().get(&key).ok().flatten());
         self.status = "Checking provider…".into();
-        cx.spawn(async move |view, cx| {
+        let task = cx.spawn(async move |view, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
@@ -408,8 +421,8 @@ impl SettingsView {
                 };
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        self.track_task(task);
         cx.notify();
     }
 
@@ -456,7 +469,7 @@ impl SettingsView {
         // Blocking dialogs inside GPUI handlers deadlock/panic on Windows
         // (re-entrant dispatch while the `App` RefCell is borrowed), so the
         // async dialog is awaited before touching the view again.
-        cx.spawn(async move |view, cx| {
+        let task = cx.spawn(async move |view, cx| {
             let Some(handle) = rfd::AsyncFileDialog::new()
                 .add_filter("Theme JSON", &["json"])
                 .pick_file()
@@ -479,8 +492,8 @@ impl SettingsView {
                 };
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        self.track_task(task);
     }
 
     fn export_theme(&mut self, cx: &mut Context<Self>) {
@@ -494,7 +507,7 @@ impl SettingsView {
             cx.notify();
             return;
         };
-        cx.spawn(async move |view, cx| {
+        let task = cx.spawn(async move |view, cx| {
             let Some(handle) = rfd::AsyncFileDialog::new()
                 .set_file_name(format!("{}.json", theme.id))
                 .save_file()
@@ -514,12 +527,12 @@ impl SettingsView {
                 view.status = status;
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        self.track_task(task);
     }
 
     fn select_background(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |view, cx| {
+        let task = cx.spawn(async move |view, cx| {
             let Some(handle) = rfd::AsyncFileDialog::new()
                 .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"])
                 .pick_file()
@@ -532,8 +545,8 @@ impl SettingsView {
                 view.settings.background.image_path = Some(path.to_string_lossy().into_owned());
                 cx.notify();
             });
-        })
-        .detach();
+        });
+        self.track_task(task);
     }
 
     fn clear_background(&mut self, cx: &mut Context<Self>) {

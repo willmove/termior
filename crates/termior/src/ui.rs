@@ -62,8 +62,11 @@ pub fn focus_ring(p: &ResolvedPalette) -> Rgba {
 }
 
 fn blend(a: Color, b: Color, amount: f32) -> Color {
-    let mix =
-        |x: u8, y: u8| (x as f32 * (1.0 - amount) + y as f32 * amount).round().clamp(0.0, 255.0) as u8;
+    let mix = |x: u8, y: u8| {
+        (x as f32 * (1.0 - amount) + y as f32 * amount)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
     Color::rgb(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b))
 }
 
@@ -159,4 +162,3 @@ pub fn button(
         }
     }
 }
-
