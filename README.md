@@ -61,6 +61,36 @@ crates/
 
 需要 stable Rust、平台原生编译工具，以及 GPUI/wry 对应的系统依赖。
 
+### Windows：先加载 MSVC 开发环境
+
+项目编译 `libgit2-sys`、`libz-sys` 等 C 代码，依赖 `cl.exe` 能找到 C 标准库头文件（如 `time.h`）。
+在 Git Bash / 普通终端中直接运行 `cargo build` 时，`INCLUDE`、`LIB`、`VCINSTALLDIR` 等变量为空，
+`cl.exe` 会报 `fatal error C1083: Cannot open include file: 'time.h'`（cc-rs 日志里表现为
+`command did not execute successfully (status code exit code: 2)`）。因此构建前需先激活 MSVC 环境。
+
+任选一种方式，使 `INCLUDE` / `LIB` / `VCINSTALLDIR` 不再为空：
+
+- **x64 Native Tools Command Prompt for VS 2022**（最简单）：从开始菜单打开，其中已内置上述变量，直接执行下方命令即可。
+- **PowerShell / cmd**：先运行 `vcvars64.bat` 再编译：
+  ```bat
+  "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+  cargo build
+  ```
+- **Git Bash**：用 cmd 包一层，确保 `.bat` 在正确的解释器里执行：
+  ```bash
+  cmd //c '"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" && cargo build'
+  ```
+
+验证环境是否就绪：
+
+```bat
+echo %INCLUDE%   &  rem 应指向 MSVC 头文件与 Windows SDK 的 ucrt/shared/um 目录
+echo %LIB%       &  rem 应指向对应的库目录
+echo %VCINSTALLDIR%
+```
+
+### 验证
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
