@@ -1,9 +1,9 @@
+use crate::ui::{self, ButtonKind};
 use gpui::{
     canvas, div, prelude::*, px, relative, App, Bounds, Context, EventEmitter, FocusHandle,
     Focusable, InputHandler, KeyDownEvent, MouseButton, Pixels, Point, SharedString,
     UTF16Selection, WeakEntity, Window,
 };
-use crate::ui::{self, ButtonKind};
 use std::ops::Range;
 use termior_vcs::{parse_diff_hunks, ChangeGroup, CommitInfo, GitDiffHunk};
 
@@ -123,22 +123,22 @@ impl gpui::Render for GitDiffView {
                         ButtonKind::Subtle,
                         &p,
                     )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |_this, _, _, cx| {
-                                if group == ChangeGroup::Staged {
-                                    cx.emit(GitDiffAction::UnstageHunk {
-                                        path: path.clone(),
-                                        patch: patch.clone(),
-                                    });
-                                } else {
-                                    cx.emit(GitDiffAction::StageHunk {
-                                        path: path.clone(),
-                                        patch: patch.clone(),
-                                    });
-                                }
-                            }),
-                        )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_this, _, _, cx| {
+                            if group == ChangeGroup::Staged {
+                                cx.emit(GitDiffAction::UnstageHunk {
+                                    path: path.clone(),
+                                    patch: patch.clone(),
+                                });
+                            } else {
+                                cx.emit(GitDiffAction::StageHunk {
+                                    path: path.clone(),
+                                    patch: patch.clone(),
+                                });
+                            }
+                        }),
+                    )
                 }))
         });
         let patch_lines = self.patch.lines().map(|line| {
@@ -197,16 +197,11 @@ impl gpui::Render for GitDiffView {
                             .flex()
                             .gap_2()
                             .child(
-                                ui::button(
-                                    "git-file-action",
-                                    file_label,
-                                    ButtonKind::Primary,
-                                    &p,
-                                )
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| this.file_action(cx)),
-                                ),
+                                ui::button("git-file-action", file_label, ButtonKind::Primary, &p)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.file_action(cx)),
+                                    ),
                             )
                             .children((group != ChangeGroup::Staged).then(|| {
                                 ui::button(
@@ -219,9 +214,7 @@ impl gpui::Render for GitDiffView {
                                     ButtonKind::Danger,
                                     &p,
                                 )
-                                .when(!self.confirm_discard, |button| {
-                                    button.opacity(0.85)
-                                })
+                                .when(!self.confirm_discard, |button| button.opacity(0.85))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| this.discard(cx)),
@@ -473,14 +466,14 @@ impl gpui::Render for GitHistoryView {
                                             ButtonKind::Subtle,
                                             &p,
                                         )
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |_this, _, _, cx| {
-                                                    cx.emit(GitHistoryAction::OpenRemote(
-                                                        commit.clone(),
-                                                    ))
-                                                }),
-                                            )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |_this, _, _, cx| {
+                                                cx.emit(GitHistoryAction::OpenRemote(
+                                                    commit.clone(),
+                                                ))
+                                            }),
+                                        )
                                     })),
                             )
                             .child(

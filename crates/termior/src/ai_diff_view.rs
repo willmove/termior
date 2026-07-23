@@ -198,11 +198,16 @@ impl gpui::Render for AiDiffView {
                                 ),
                             )
                             .child(
-                                ui::button("ai-diff-reject-all", "Reject all", ButtonKind::Danger, &p)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.reject_all(cx)),
-                                    ),
+                                ui::button(
+                                    "ai-diff-reject-all",
+                                    "Reject all",
+                                    ButtonKind::Danger,
+                                    &p,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.reject_all(cx)),
+                                ),
                             ),
                     ),
             )
