@@ -1,9 +1,11 @@
 //! `termior-theme` — 中央主题引擎（FR-THEME-01/02，P0）。
 //!
 //! 一份 Rust 主题 token 结构（语义色板）同时驱动 UI 组件、终端 16+ 色调色板、diff
-//! 颜色、通知样式（FR-THEME-01）。浅色/深色/跟随系统三态独立于色板选择。
+//! 颜色、通知样式（FR-THEME-01）。每个主题声明原生外观归属；`FollowSystem` 在设置层
+//! 通过浅/深主题配对实现，不再对同一主题做算法浅色推导。
 //!
-//! 内置 10 套应用主题，并支持自定义主题 JSON 导入/导出。
+//! 内置主题含独立的浅色配对候选（default-light / nord-light），并支持自定义主题
+//! JSON 导入/导出。
 //!
 //! 切换时上层（GPUI Entity）广播重绘；本模块只提供主题数据与解析，不依赖 GPUI。
 
@@ -11,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 外观模式。`FollowSystem` 表示由运行时解析为 Light 或 Dark。
+/// 外观模式（设置层）。`FollowSystem` 表示在浅/深主题配对之间切换。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Appearance {
@@ -20,20 +22,52 @@ pub enum Appearance {
     FollowSystem,
 }
 
-/// 语义色板 token（FR-THEME-01）。一个主题同时定义浅/深两套，按外观解析。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ThemeTokens {
-    pub light: Palette,
-    pub dark: Palette,
+/// 主题的原生外观归属（非三态）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeAppearance {
+    Light,
+    Dark,
 }
 
-/// 解析后的可用色板（不含三态，已按外观选择）。
+impl NativeAppearance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+
+    pub fn to_appearance(self) -> Appearance {
+        match self {
+            Self::Light => Appearance::Light,
+            Self::Dark => Appearance::Dark,
+        }
+    }
+}
+
+/// 主题色板 token：每个主题只持有一套原生色板。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThemeTokens {
+    pub palette: Palette,
+}
+
+/// 解析后的可用色板。
+///
+/// 表面层级用语义字段，不再用下标数组——同一语义不得被无关用途复用。
+/// 旧的 `surface: [a, b, c]` JSON 仍可导入，见 [`ResolvedPalette`] 的反序列化。
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ResolvedPalette {
     pub background: Color,
     pub foreground: Color,
-    /// 三级 surface（最底/卡片/悬浮）。
-    pub surface: [Color; 3],
+    /// 窗口 chrome：标题栏、状态栏。
+    pub chrome: Color,
+    /// 侧栏与活动栏底色。
+    pub panel: Color,
+    /// 面板内抬起面：输入框、卡片、列表选中外的次级底。
+    pub elevated: Color,
+    /// 浮层：菜单、Tooltip、toast。
+    pub overlay: Color,
     pub accent: Color,
     /// 四级状态色：info / success / warning / danger。
     pub status: [Color; 4],
@@ -41,6 +75,79 @@ pub struct ResolvedPalette {
     pub diff: [Color; 3],
     /// 终端 16 色调色板：black/red/green/yellow/blue/magenta/cyan/white × normal/bright。
     pub terminal: TerminalPalette,
+}
+
+/// 反序列化中间态：同时接受新语义字段与旧 `surface` 数组。
+#[derive(Debug, Deserialize)]
+struct PaletteSerde {
+    background: Color,
+    foreground: Color,
+    #[serde(default)]
+    chrome: Option<Color>,
+    #[serde(default)]
+    panel: Option<Color>,
+    #[serde(default)]
+    elevated: Option<Color>,
+    #[serde(default)]
+    overlay: Option<Color>,
+    /// 旧格式：`[panel, elevated, chrome]`。
+    #[serde(default)]
+    surface: Option<[Color; 3]>,
+    accent: Color,
+    status: [Color; 4],
+    diff: [Color; 3],
+    terminal: TerminalPalette,
+}
+
+impl From<PaletteSerde> for ResolvedPalette {
+    fn from(value: PaletteSerde) -> Self {
+        let (chrome, panel, elevated, overlay) = match (
+            value.chrome,
+            value.panel,
+            value.elevated,
+            value.overlay,
+            value.surface,
+        ) {
+            (Some(chrome), Some(panel), Some(elevated), Some(overlay), _) => {
+                (chrome, panel, elevated, overlay)
+            }
+            (Some(chrome), Some(panel), Some(elevated), None, _) => {
+                (chrome, panel, elevated, chrome)
+            }
+            (_, _, _, _, Some([panel, elevated, chrome])) => (chrome, panel, elevated, chrome),
+            _ => {
+                // 缺字段时退回 background 派生，保证导入不崩；调用方应尽快写出新格式。
+                let fallback = value.background;
+                (
+                    value.chrome.unwrap_or(fallback),
+                    value.panel.unwrap_or(fallback),
+                    value.elevated.unwrap_or(fallback),
+                    value.overlay.unwrap_or(fallback),
+                )
+            }
+        };
+        Self {
+            background: value.background,
+            foreground: value.foreground,
+            chrome,
+            panel,
+            elevated,
+            overlay,
+            accent: value.accent,
+            status: value.status,
+            diff: value.diff,
+            terminal: value.terminal,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolvedPalette {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        PaletteSerde::deserialize(deserializer).map(Into::into)
+    }
 }
 
 /// 终端 16 色。
@@ -113,38 +220,151 @@ impl Color {
     }
 }
 
-/// 一个已命名的应用主题（含浅/深 token）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Theme {
-    pub id: String,
-    pub name: String,
-    pub tokens: ThemeTokens,
+/// 相对亮度（sRGB 近似，0–1）。
+pub fn luminance(c: Color) -> f32 {
+    (0.2126 * c.r as f32 + 0.7152 * c.g as f32 + 0.0722 * c.b as f32) / 255.0
 }
 
-impl Theme {
-    /// 按 [`Appearance`] 解析出 [`ResolvedPalette`]（FR-THEME-01）。
-    /// `FollowSystem` 在此用 `system_is_dark` 解析为具体值。
-    pub fn resolve(&self, appearance: Appearance, system_is_dark: bool) -> ResolvedPalette {
-        let palette = match appearance {
-            Appearance::Light => &self.tokens.light,
-            Appearance::Dark => &self.tokens.dark,
-            Appearance::FollowSystem => {
-                if system_is_dark {
-                    &self.tokens.dark
-                } else {
-                    &self.tokens.light
-                }
-            }
-        };
-        palette.clone()
+/// 按背景亮度推断原生外观。
+pub fn infer_native_appearance(palette: &Palette) -> NativeAppearance {
+    if luminance(palette.background) >= 0.5 {
+        NativeAppearance::Light
+    } else {
+        NativeAppearance::Dark
     }
 }
 
-/// 内置主题注册表（FR-THEME-02 完整十套）。
+/// 一个已命名的应用主题（单套原生色板 + 外观归属）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Theme {
+    pub id: String,
+    pub name: String,
+    pub native_appearance: NativeAppearance,
+    pub tokens: ThemeTokens,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThemeSerde {
+    id: String,
+    name: String,
+    #[serde(default)]
+    native_appearance: Option<NativeAppearance>,
+    tokens: ThemeTokensSerde,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ThemeTokensSerde {
+    /// 新格式：`{ "palette": { ... } }`
+    Single { palette: Palette },
+    /// 旧格式：同时含 light/dark；按暗色底板取原生侧。
+    Dual { light: Palette, dark: Palette },
+}
+
+impl From<ThemeSerde> for Theme {
+    fn from(value: ThemeSerde) -> Self {
+        let (palette, inferred) = match value.tokens {
+            ThemeTokensSerde::Single { palette } => {
+                let inferred = infer_native_appearance(&palette);
+                (palette, inferred)
+            }
+            ThemeTokensSerde::Dual { light, dark } => {
+                // 旧双色板：优先保留暗色侧（历史主题多为深色原生），若暗色其实偏亮则用浅色。
+                if luminance(dark.background) < 0.5 {
+                    (dark, NativeAppearance::Dark)
+                } else {
+                    (light, NativeAppearance::Light)
+                }
+            }
+        };
+        Self {
+            id: value.id,
+            name: value.name,
+            native_appearance: value.native_appearance.unwrap_or(inferred),
+            tokens: ThemeTokens { palette },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Theme {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        ThemeSerde::deserialize(deserializer).map(Into::into)
+    }
+}
+
+impl Theme {
+    /// 主题的原生色板。
+    pub fn palette(&self) -> &ResolvedPalette {
+        &self.tokens.palette
+    }
+
+    /// 兼容旧调用：忽略 appearance，始终返回原生色板。
+    pub fn resolve(&self, _appearance: Appearance, _system_is_dark: bool) -> ResolvedPalette {
+        self.palette().clone()
+    }
+}
+
+/// 按设置解析当前应使用的主题 id。
+pub fn active_theme_id<'a>(
+    appearance: Appearance,
+    theme_id: &'a str,
+    light_theme_id: &'a str,
+    dark_theme_id: &'a str,
+    system_is_dark: bool,
+) -> &'a str {
+    match appearance {
+        Appearance::FollowSystem => {
+            if system_is_dark {
+                dark_theme_id
+            } else {
+                light_theme_id
+            }
+        }
+        Appearance::Light | Appearance::Dark => theme_id,
+    }
+}
+
+/// 在主题列表中解析当前色板。
+pub fn resolve_active_palette(
+    themes: &[Theme],
+    appearance: Appearance,
+    theme_id: &str,
+    light_theme_id: &str,
+    dark_theme_id: &str,
+    system_is_dark: bool,
+) -> ResolvedPalette {
+    let id = active_theme_id(
+        appearance,
+        theme_id,
+        light_theme_id,
+        dark_theme_id,
+        system_is_dark,
+    );
+    themes
+        .iter()
+        .find(|theme| theme.id == id)
+        .map(|theme| theme.palette().clone())
+        .unwrap_or_else(|| default_theme().palette().clone())
+}
+
+/// 按原生外观过滤主题（FollowSystem 配对候选）。
+pub fn themes_for_native_appearance(themes: &[Theme], appearance: NativeAppearance) -> Vec<&Theme> {
+    themes
+        .iter()
+        .filter(|theme| theme.native_appearance == appearance)
+        .collect()
+}
+
+/// 内置主题注册表：8 套深色风格主题 + default/nord 的浅深各一。
 pub fn builtin_themes() -> Vec<Theme> {
     vec![
         default_theme(),
+        default_light_theme(),
         nord_theme(),
+        nord_light_theme(),
         styled_theme(
             "tide",
             "Tide",
@@ -208,80 +428,111 @@ pub fn find_theme(id: &str) -> Option<Theme> {
     builtin_themes().into_iter().find(|t| t.id == id)
 }
 
-/// `Termior-default` 主题。
-pub fn default_theme() -> Theme {
+fn theme_with(id: &str, name: &str, native: NativeAppearance, palette: Palette) -> Theme {
     Theme {
-        id: "default".into(),
-        name: "Termior Default".into(),
-        tokens: ThemeTokens {
-            light: base_light(),
-            dark: base_dark(),
-        },
+        id: id.into(),
+        name: name.into(),
+        native_appearance: native,
+        tokens: ThemeTokens { palette },
     }
 }
 
-/// `nord` 主题（基于 Nord 色板，自定义命名）。
+/// `Termior Default`（深色原生）。
+pub fn default_theme() -> Theme {
+    theme_with(
+        "default",
+        "Termior Default",
+        NativeAppearance::Dark,
+        base_dark(),
+    )
+}
+
+/// `Termior Default Light`（浅色配对候选）。
+pub fn default_light_theme() -> Theme {
+    theme_with(
+        "default-light",
+        "Termior Default Light",
+        NativeAppearance::Light,
+        base_light(),
+    )
+}
+
+/// `nord`（深色原生）。
 pub fn nord_theme() -> Theme {
-    // Nord 调色板
     let n = |rgb: u32| Color::hex3(rgb);
-    Theme {
-        id: "nord".into(),
-        name: "Nord".into(),
-        tokens: ThemeTokens {
-            light: Palette {
-                background: n(0xeceff4),
-                foreground: n(0x2e3440),
-                surface: [n(0xe5e9f0), n(0xd8dee9), n(0xeceff4)],
-                accent: n(0x5e81ac),
-                status: [n(0x5e81ac), n(0xa3be8c), n(0xebcb8b), n(0xbf616a)],
-                diff: [n(0xa3be8c), n(0xbf616a), n(0x4c566a)],
-                terminal: TerminalPalette {
-                    black: n(0x2e3440),
-                    red: n(0xbf616a),
-                    green: n(0xa3be8c),
-                    yellow: n(0xebcb8b),
-                    blue: n(0x5e81ac),
-                    magenta: n(0xb48ead),
-                    cyan: n(0x88c0d0),
-                    white: n(0xe5e9f0),
-                    bright_black: n(0x4c566a),
-                    bright_red: n(0xbf616a),
-                    bright_green: n(0xa3be8c),
-                    bright_yellow: n(0xebcb8b),
-                    bright_blue: n(0x81a1c1),
-                    bright_magenta: n(0xb48ead),
-                    bright_cyan: n(0x8fbcbb),
-                    bright_white: n(0xeceff4),
-                },
-            },
-            dark: Palette {
-                background: n(0x2e3440),
-                foreground: n(0xd8dee9),
-                surface: [n(0x2e3440), n(0x3b4252), n(0x434c5e)],
-                accent: n(0x88c0d0),
-                status: [n(0x81a1c1), n(0xa3be8c), n(0xebcb8b), n(0xbf616a)],
-                diff: [n(0xa3be8c), n(0xbf616a), n(0x4c566a)],
-                terminal: TerminalPalette {
-                    black: n(0x3b4252),
-                    red: n(0xbf616a),
-                    green: n(0xa3be8c),
-                    yellow: n(0xebcb8b),
-                    blue: n(0x81a1c1),
-                    magenta: n(0xb48ead),
-                    cyan: n(0x88c0d0),
-                    white: n(0xe5e9f0),
-                    bright_black: n(0x4c566a),
-                    bright_red: n(0xbf616a),
-                    bright_green: n(0xa3be8c),
-                    bright_yellow: n(0xebcb8b),
-                    bright_blue: n(0x81a1c1),
-                    bright_magenta: n(0xb48ead),
-                    bright_cyan: n(0x8fbcbb),
-                    bright_white: n(0xeceff4),
-                },
+    theme_with(
+        "nord",
+        "Nord",
+        NativeAppearance::Dark,
+        Palette {
+            background: n(0x2e3440),
+            foreground: n(0xd8dee9),
+            chrome: n(0x3b4252),
+            panel: n(0x242933),
+            elevated: n(0x3b4252),
+            overlay: n(0x434c5e),
+            accent: n(0x88c0d0),
+            status: [n(0x81a1c1), n(0xa3be8c), n(0xebcb8b), n(0xbf616a)],
+            diff: [n(0xa3be8c), n(0xbf616a), n(0x4c566a)],
+            terminal: TerminalPalette {
+                black: n(0x3b4252),
+                red: n(0xbf616a),
+                green: n(0xa3be8c),
+                yellow: n(0xebcb8b),
+                blue: n(0x81a1c1),
+                magenta: n(0xb48ead),
+                cyan: n(0x88c0d0),
+                white: n(0xe5e9f0),
+                bright_black: n(0x4c566a),
+                bright_red: n(0xbf616a),
+                bright_green: n(0xa3be8c),
+                bright_yellow: n(0xebcb8b),
+                bright_blue: n(0x81a1c1),
+                bright_magenta: n(0xb48ead),
+                bright_cyan: n(0x8fbcbb),
+                bright_white: n(0xeceff4),
             },
         },
-    }
+    )
+}
+
+/// `nord-light`（浅色配对候选）。
+pub fn nord_light_theme() -> Theme {
+    let n = |rgb: u32| Color::hex3(rgb);
+    theme_with(
+        "nord-light",
+        "Nord Light",
+        NativeAppearance::Light,
+        Palette {
+            background: n(0xeceff4),
+            foreground: n(0x2e3440),
+            chrome: n(0xd8dee9),
+            panel: n(0xe0e4ec),
+            elevated: n(0xf5f7fb),
+            overlay: n(0xffffff),
+            accent: n(0x5e81ac),
+            status: [n(0x5e81ac), n(0xa3be8c), n(0xebcb8b), n(0xbf616a)],
+            diff: [n(0xa3be8c), n(0xbf616a), n(0x4c566a)],
+            terminal: TerminalPalette {
+                black: n(0x2e3440),
+                red: n(0xbf616a),
+                green: n(0xa3be8c),
+                yellow: n(0xebcb8b),
+                blue: n(0x5e81ac),
+                magenta: n(0xb48ead),
+                cyan: n(0x88c0d0),
+                white: n(0xe5e9f0),
+                bright_black: n(0x4c566a),
+                bright_red: n(0xbf616a),
+                bright_green: n(0xa3be8c),
+                bright_yellow: n(0xebcb8b),
+                bright_blue: n(0x81a1c1),
+                bright_magenta: n(0xb48ead),
+                bright_cyan: n(0x8fbcbb),
+                bright_white: n(0xeceff4),
+            },
+        },
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -317,9 +568,9 @@ impl StyledColors {
     }
 }
 
+/// 深色原生主题：只生成暗色色板，不再算法推导浅色变体。
 fn styled_theme(id: &str, name: &str, colors: StyledColors) -> Theme {
     let white = Color::rgb(255, 255, 255);
-    let black = Color::rgb(18, 18, 20);
     let background = Color::hex3(colors.background);
     let accent = Color::hex3(colors.accent);
     let red = Color::hex3(colors.red);
@@ -328,60 +579,16 @@ fn styled_theme(id: &str, name: &str, colors: StyledColors) -> Theme {
     let magenta = Color::hex3(colors.magenta);
     let cyan = Color::hex3(colors.cyan);
 
-    // Keep the visual identity in both appearance modes. Previously the light
-    // variants copied `base_light()` wholesale and changed only the accent,
-    // so most themes rendered identical application chrome.
-    let light_foreground = blend(background, black, 0.10);
-    let light_accent = blend(accent, black, 0.18);
-    let light = Palette {
-        background: blend(background, white, 0.94),
-        foreground: light_foreground,
-        surface: [
-            blend(background, white, 0.89),
-            blend(background, white, 0.975),
-            blend(background, white, 0.84),
-        ],
-        accent: light_accent,
-        status: [
-            light_accent,
-            blend(green, black, 0.14),
-            blend(yellow, black, 0.16),
-            blend(red, black, 0.12),
-        ],
-        diff: [
-            blend(green, white, 0.70),
-            blend(red, white, 0.72),
-            blend(background, white, 0.76),
-        ],
-        terminal: TerminalPalette {
-            black: light_foreground,
-            red: blend(red, black, 0.12),
-            green: blend(green, black, 0.16),
-            yellow: blend(yellow, black, 0.18),
-            blue: light_accent,
-            magenta: blend(magenta, black, 0.12),
-            cyan: blend(cyan, black, 0.16),
-            white: blend(background, white, 0.88),
-            bright_black: blend(background, white, 0.42),
-            bright_red: blend(red, white, 0.14),
-            bright_green: blend(green, white, 0.10),
-            bright_yellow: blend(yellow, white, 0.10),
-            bright_blue: blend(accent, white, 0.10),
-            bright_magenta: blend(magenta, white, 0.12),
-            bright_cyan: blend(cyan, white, 0.10),
-            bright_white: blend(background, white, 0.98),
-        },
-    };
-
     let dark_foreground = blend(background, white, 0.90);
-    let dark = Palette {
+    let pure_black = Color::rgb(0, 0, 0);
+    let palette = Palette {
         background,
         foreground: dark_foreground,
-        surface: [
-            background,
-            blend(background, white, 0.08),
-            blend(background, white, 0.14),
-        ],
+        chrome: blend(background, white, 0.14),
+        // 用纯黑压暗，避免与接近黑的主题底色混合后几乎不变。
+        panel: blend(background, pure_black, 0.35),
+        elevated: blend(background, white, 0.08),
+        overlay: blend(background, white, 0.20),
         accent,
         status: [accent, green, yellow, red],
         diff: [
@@ -408,11 +615,7 @@ fn styled_theme(id: &str, name: &str, colors: StyledColors) -> Theme {
             bright_white: blend(background, white, 0.96),
         },
     };
-    Theme {
-        id: id.into(),
-        name: name.into(),
-        tokens: ThemeTokens { light, dark },
-    }
+    theme_with(id, name, NativeAppearance::Dark, palette)
 }
 
 fn blend(a: Color, b: Color, amount: f32) -> Color {
@@ -478,7 +681,10 @@ fn base_light() -> Palette {
     Palette {
         background: c(0xffffff),
         foreground: c(0x1f2328),
-        surface: [c(0xf6f8fa), c(0xffffff), c(0xeaeef2)],
+        chrome: c(0xeaeef2),
+        panel: c(0xf6f8fa),
+        elevated: c(0xffffff),
+        overlay: c(0xffffff),
         accent: c(0x0969da),
         status: [c(0x0969da), c(0x1a7f37), c(0x9a6700), c(0xcf222e)],
         diff: [c(0x1a7f37), c(0xcf222e), c(0x6e7781)],
@@ -508,7 +714,10 @@ fn base_dark() -> Palette {
     Palette {
         background: c(0x0d1117),
         foreground: c(0xe6edf3),
-        surface: [c(0x010409), c(0x0d1117), c(0x161b22)],
+        chrome: c(0x1c2128),
+        panel: c(0x010409),
+        elevated: c(0x161b22),
+        overlay: c(0x21262d),
         accent: c(0x2f81f7),
         status: [c(0x2f81f7), c(0x3fb950), c(0xd29922), c(0xf85149)],
         diff: [c(0x3fb950), c(0xf85149), c(0x8b949e)],
@@ -561,70 +770,254 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_themes_has_ten() {
+    fn builtin_themes_cover_light_and_dark_natives() {
         let t = builtin_themes();
-        assert_eq!(t.len(), 10, "FR-THEME-02: ships the full theme set");
-        let ids: Vec<String> = t.iter().map(|x| x.id.clone()).collect();
-        assert!(ids.iter().any(|x| x == "default"));
-        assert!(ids.iter().any(|x| x == "nord"));
+        assert!(t.len() >= 10, "FR-THEME-02: ships the full theme set");
+        let ids: Vec<&str> = t.iter().map(|x| x.id.as_str()).collect();
+        assert!(ids.contains(&"default"));
+        assert!(ids.contains(&"default-light"));
+        assert!(ids.contains(&"nord"));
+        assert!(ids.contains(&"nord-light"));
+        assert!(ids.contains(&"tokyo-night"));
+        assert!(t
+            .iter()
+            .any(|x| x.native_appearance == NativeAppearance::Light));
+        assert!(t
+            .iter()
+            .any(|x| x.native_appearance == NativeAppearance::Dark));
+    }
+
+    #[test]
+    fn every_builtin_has_native_appearance_label() {
+        for theme in builtin_themes() {
+            let inferred = infer_native_appearance(theme.palette());
+            assert_eq!(
+                theme.native_appearance, inferred,
+                "{} native_appearance should match palette luminance",
+                theme.id
+            );
+        }
     }
 
     #[test]
     fn builtin_themes_have_distinct_chrome_palettes() {
         let themes = builtin_themes();
-        for appearance in [Appearance::Light, Appearance::Dark] {
-            for (index, theme) in themes.iter().enumerate() {
-                let palette = theme.resolve(appearance, false);
-                for other in themes.iter().skip(index + 1) {
-                    let other_palette = other.resolve(appearance, false);
-                    assert_ne!(
-                        (palette.background, palette.foreground, palette.surface),
-                        (
-                            other_palette.background,
-                            other_palette.foreground,
-                            other_palette.surface
-                        ),
-                        "{} and {} render the same app chrome in {appearance:?} mode",
-                        theme.id,
-                        other.id
-                    );
-                }
+        for (index, theme) in themes.iter().enumerate() {
+            let palette = theme.palette();
+            for other in themes.iter().skip(index + 1) {
+                let other_palette = other.palette();
+                assert_ne!(
+                    (
+                        palette.background,
+                        palette.foreground,
+                        palette.chrome,
+                        palette.panel
+                    ),
+                    (
+                        other_palette.background,
+                        other_palette.foreground,
+                        other_palette.chrome,
+                        other_palette.panel
+                    ),
+                    "{} and {} render the same app chrome",
+                    theme.id,
+                    other.id
+                );
             }
         }
+    }
+
+    /// chrome / panel 相对 content background 必须可分辨——浅色糊成一片的病灶。
+    #[test]
+    fn chrome_and_panel_contrast_against_background() {
+        for theme in builtin_themes() {
+            let p = theme.palette();
+            let bg = luminance(p.background);
+            let chrome_delta = (luminance(p.chrome) - bg).abs();
+            let panel_delta = (luminance(p.panel) - bg).abs();
+            assert!(
+                chrome_delta >= 0.04,
+                "{}: chrome vs background delta={chrome_delta:.3}",
+                theme.id
+            );
+            assert!(
+                panel_delta >= 0.025,
+                "{}: panel vs background delta={panel_delta:.3}",
+                theme.id
+            );
+        }
+    }
+
+    #[test]
+    fn old_surface_array_format_still_imports() {
+        let json = r#"{
+            "id": "legacy-theme",
+            "name": "Legacy",
+            "tokens": {
+                "light": {
+                    "background": {"r":255,"g":255,"b":255},
+                    "foreground": {"r":0,"g":0,"b":0},
+                    "surface": [
+                        {"r":240,"g":240,"b":240},
+                        {"r":250,"g":250,"b":250},
+                        {"r":230,"g":230,"b":230}
+                    ],
+                    "accent": {"r":0,"g":100,"b":200},
+                    "status": [
+                        {"r":0,"g":100,"b":200},
+                        {"r":0,"g":160,"b":0},
+                        {"r":200,"g":160,"b":0},
+                        {"r":200,"g":0,"b":0}
+                    ],
+                    "diff": [
+                        {"r":0,"g":160,"b":0},
+                        {"r":200,"g":0,"b":0},
+                        {"r":100,"g":100,"b":100}
+                    ],
+                    "terminal": {
+                        "black":{"r":0,"g":0,"b":0},"red":{"r":1,"g":0,"b":0},
+                        "green":{"r":0,"g":1,"b":0},"yellow":{"r":1,"g":1,"b":0},
+                        "blue":{"r":0,"g":0,"b":1},"magenta":{"r":1,"g":0,"b":1},
+                        "cyan":{"r":0,"g":1,"b":1},"white":{"r":1,"g":1,"b":1},
+                        "bright_black":{"r":2,"g":2,"b":2},"bright_red":{"r":3,"g":0,"b":0},
+                        "bright_green":{"r":0,"g":3,"b":0},"bright_yellow":{"r":3,"g":3,"b":0},
+                        "bright_blue":{"r":0,"g":0,"b":3},"bright_magenta":{"r":3,"g":0,"b":3},
+                        "bright_cyan":{"r":0,"g":3,"b":3},"bright_white":{"r":4,"g":4,"b":4}
+                    }
+                },
+                "dark": {
+                    "background": {"r":10,"g":10,"b":10},
+                    "foreground": {"r":240,"g":240,"b":240},
+                    "surface": [
+                        {"r":20,"g":20,"b":20},
+                        {"r":30,"g":30,"b":30},
+                        {"r":40,"g":40,"b":40}
+                    ],
+                    "accent": {"r":0,"g":100,"b":200},
+                    "status": [
+                        {"r":0,"g":100,"b":200},
+                        {"r":0,"g":160,"b":0},
+                        {"r":200,"g":160,"b":0},
+                        {"r":200,"g":0,"b":0}
+                    ],
+                    "diff": [
+                        {"r":0,"g":160,"b":0},
+                        {"r":200,"g":0,"b":0},
+                        {"r":100,"g":100,"b":100}
+                    ],
+                    "terminal": {
+                        "black":{"r":0,"g":0,"b":0},"red":{"r":1,"g":0,"b":0},
+                        "green":{"r":0,"g":1,"b":0},"yellow":{"r":1,"g":1,"b":0},
+                        "blue":{"r":0,"g":0,"b":1},"magenta":{"r":1,"g":0,"b":1},
+                        "cyan":{"r":0,"g":1,"b":1},"white":{"r":1,"g":1,"b":1},
+                        "bright_black":{"r":2,"g":2,"b":2},"bright_red":{"r":3,"g":0,"b":0},
+                        "bright_green":{"r":0,"g":3,"b":0},"bright_yellow":{"r":3,"g":3,"b":0},
+                        "bright_blue":{"r":0,"g":0,"b":3},"bright_magenta":{"r":3,"g":0,"b":3},
+                        "bright_cyan":{"r":0,"g":3,"b":3},"bright_white":{"r":4,"g":4,"b":4}
+                    }
+                }
+            }
+        }"#;
+        let theme = from_json(json).unwrap();
+        assert_eq!(theme.native_appearance, NativeAppearance::Dark);
+        assert_eq!(theme.tokens.palette.panel, Color::rgb(20, 20, 20));
+        assert_eq!(theme.tokens.palette.chrome, Color::rgb(40, 40, 40));
+        assert_eq!(theme.tokens.palette.overlay, Color::rgb(40, 40, 40));
+    }
+
+    #[test]
+    fn import_infers_native_appearance_from_luminance() {
+        let json = r#"{
+            "id": "bright-custom",
+            "name": "Bright",
+            "tokens": {
+                "palette": {
+                    "background": {"r":250,"g":250,"b":250},
+                    "foreground": {"r":20,"g":20,"b":20},
+                    "chrome": {"r":230,"g":230,"b":230},
+                    "panel": {"r":240,"g":240,"b":240},
+                    "elevated": {"r":255,"g":255,"b":255},
+                    "overlay": {"r":255,"g":255,"b":255},
+                    "accent": {"r":0,"g":100,"b":200},
+                    "status": [
+                        {"r":0,"g":100,"b":200},
+                        {"r":0,"g":160,"b":0},
+                        {"r":200,"g":160,"b":0},
+                        {"r":200,"g":0,"b":0}
+                    ],
+                    "diff": [
+                        {"r":0,"g":160,"b":0},
+                        {"r":200,"g":0,"b":0},
+                        {"r":100,"g":100,"b":100}
+                    ],
+                    "terminal": {
+                        "black":{"r":0,"g":0,"b":0},"red":{"r":1,"g":0,"b":0},
+                        "green":{"r":0,"g":1,"b":0},"yellow":{"r":1,"g":1,"b":0},
+                        "blue":{"r":0,"g":0,"b":1},"magenta":{"r":1,"g":0,"b":1},
+                        "cyan":{"r":0,"g":1,"b":1},"white":{"r":1,"g":1,"b":1},
+                        "bright_black":{"r":2,"g":2,"b":2},"bright_red":{"r":3,"g":0,"b":0},
+                        "bright_green":{"r":0,"g":3,"b":0},"bright_yellow":{"r":3,"g":3,"b":0},
+                        "bright_blue":{"r":0,"g":0,"b":3},"bright_magenta":{"r":3,"g":0,"b":3},
+                        "bright_cyan":{"r":0,"g":3,"b":3},"bright_white":{"r":4,"g":4,"b":4}
+                    }
+                }
+            }
+        }"#;
+        let theme = from_json(json).unwrap();
+        assert_eq!(theme.native_appearance, NativeAppearance::Light);
+        let exported = to_json(&theme).unwrap();
+        assert!(exported.contains("\"native_appearance\": \"light\""));
+        assert!(exported.contains("\"palette\""));
+        assert!(!exported.contains("\"light\":"));
     }
 
     #[test]
     fn find_theme_works() {
         assert!(find_theme("nord").is_some());
+        assert!(find_theme("default-light").is_some());
         assert!(find_theme("nope").is_none());
     }
 
     #[test]
-    fn resolve_light_vs_dark_differ() {
-        let t = default_theme();
-        let light = t.resolve(Appearance::Light, true);
-        let dark = t.resolve(Appearance::Dark, true);
-        assert_ne!(light.background, dark.background);
+    fn resolve_active_palette_follows_pairing() {
+        let themes = builtin_themes();
+        let light = resolve_active_palette(
+            &themes,
+            Appearance::FollowSystem,
+            "tokyo-night",
+            "default-light",
+            "tokyo-night",
+            false,
+        );
+        let dark = resolve_active_palette(
+            &themes,
+            Appearance::FollowSystem,
+            "tokyo-night",
+            "default-light",
+            "tokyo-night",
+            true,
+        );
+        assert_eq!(light.background, default_light_theme().palette().background);
+        assert_eq!(
+            dark.background,
+            find_theme("tokyo-night").unwrap().palette().background
+        );
     }
 
     #[test]
-    fn follow_system_resolves_correctly() {
-        let t = default_theme();
-        let dark = t.resolve(Appearance::FollowSystem, true);
-        let light = t.resolve(Appearance::FollowSystem, false);
-        assert_eq!(dark.background, t.tokens.dark.background);
-        assert_eq!(light.background, t.tokens.light.background);
+    fn selecting_theme_uses_native_palette() {
+        let tokyo = find_theme("tokyo-night").unwrap();
+        assert_eq!(tokyo.native_appearance, NativeAppearance::Dark);
+        assert!(luminance(tokyo.palette().background) < 0.5);
     }
 
     #[test]
     fn terminal_palette_complete() {
         for t in builtin_themes() {
-            for pal in [t.tokens.light.terminal.all(), t.tokens.dark.terminal.all()] {
-                assert_eq!(pal.len(), 16);
-                // 无全黑（避免漏配）
-                for c in pal {
-                    assert!((c.r, c.g, c.b) != (0, 0, 0), "all-black color in {}", t.id);
-                }
+            let pal = t.palette().terminal.all();
+            assert_eq!(pal.len(), 16);
+            for c in pal {
+                assert!((c.r, c.g, c.b) != (0, 0, 0), "all-black color in {}", t.id);
             }
         }
     }
@@ -632,18 +1025,14 @@ mod tests {
     #[test]
     fn diff_palette_has_three_colors() {
         for t in builtin_themes() {
-            for pal in [&t.tokens.light, &t.tokens.dark] {
-                assert_eq!(pal.diff.len(), 3);
-            }
+            assert_eq!(t.palette().diff.len(), 3);
         }
     }
 
     #[test]
     fn status_palette_has_four_colors() {
         for t in builtin_themes() {
-            for pal in [&t.tokens.light, &t.tokens.dark] {
-                assert_eq!(pal.status.len(), 4);
-            }
+            assert_eq!(t.palette().status.len(), 4);
         }
     }
 
@@ -653,7 +1042,8 @@ mod tests {
         let json = to_json(&t).unwrap();
         let back = from_json(&json).unwrap();
         assert_eq!(back.id, t.id);
-        assert_eq!(back.tokens.dark.background, t.tokens.dark.background);
+        assert_eq!(back.native_appearance, NativeAppearance::Dark);
+        assert_eq!(back.tokens.palette.background, t.tokens.palette.background);
     }
 
     #[test]
@@ -687,5 +1077,21 @@ mod tests {
             target.save_custom(default_theme()),
             Err(ThemeError::BuiltinId(_))
         ));
+    }
+
+    #[test]
+    fn themes_for_native_filters_pairing_candidates() {
+        let themes = builtin_themes();
+        let light = themes_for_native_appearance(&themes, NativeAppearance::Light);
+        let dark = themes_for_native_appearance(&themes, NativeAppearance::Dark);
+        assert!(light
+            .iter()
+            .all(|t| t.native_appearance == NativeAppearance::Light));
+        assert!(dark
+            .iter()
+            .all(|t| t.native_appearance == NativeAppearance::Dark));
+        assert!(light.iter().any(|t| t.id == "default-light"));
+        assert!(dark.iter().any(|t| t.id == "tokyo-night"));
+        assert!(!light.iter().any(|t| t.id == "tokyo-night"));
     }
 }

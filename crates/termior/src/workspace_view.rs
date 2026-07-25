@@ -1,28 +1,35 @@
-use crate::ai_diff_view::{AiDiffAction, AiDiffView};
-use crate::app_identity;
-use crate::composer_view::{ComposerView, EditReviewRequested};
-use crate::editor_view::EditorView;
-use crate::git_views::{GitDiffAction, GitDiffView, GitHistoryAction, GitHistoryView};
-use crate::markdown_preview_view::MarkdownPreviewView;
-use crate::preview_view::PreviewView;
-use crate::settings_view::SettingsView;
-use crate::terminal_view::{TerminalView, TerminalViewEvent};
-use crate::ui::{self, ButtonKind};
+use crate::{
+    ai_diff_view::{AiDiffAction, AiDiffView},
+    app_identity,
+    composer_view::{ComposerView, EditReviewRequested},
+    editor_view::EditorView,
+    git_views::{GitDiffAction, GitDiffView, GitHistoryAction, GitHistoryView},
+    markdown_preview_view::MarkdownPreviewView,
+    preview_view::PreviewView,
+    settings_view::SettingsView,
+    terminal_view::{TerminalView, TerminalViewEvent},
+    ui::{self, ButtonKind},
+};
 use futures::StreamExt;
 use gpui::{
-    anchored, canvas, div, prelude::*, px, relative, size, AnyElement, AnyWindowHandle, App,
-    Bounds, Context, CursorStyle, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
-    Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, PromptButton, PromptLevel, Role, SharedString, Task, UTF16Selection, Window,
-    WindowAppearance, WindowBounds,
+    anchored, canvas, div, ease_in_out, prelude::*, px, relative, size, Animation, AnimationExt as _,
+    AnyElement, AnyWindowHandle, App, Bounds, Context, CursorStyle, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, PromptButton, PromptLevel, Role, SharedString,
+    Task, UTF16Selection, Window, WindowAppearance, WindowBounds, WindowControlArea,
 };
-use std::collections::{BTreeMap, HashMap};
-use std::ops::Range;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
-use termior_ai::AttachmentSource;
-use termior_ai::{HttpProvider, InlineCompleter, KeyringSecretStore, ProviderConfig, SecretStore};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Range,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::Duration,
+};
+use termior_ai::{
+    AttachmentSource, HttpProvider, InlineCompleter, KeyringSecretStore, ProviderConfig,
+    SecretStore,
+};
 use termior_explorer::{
     ContentMatch, ContentSearch, FileEntry, FileIndex, IconKind, TreeState, WorkspaceWatcher,
 };
@@ -36,9 +43,23 @@ use termior_store::{
     app_data_dir, atomic_write, default_settings, migrate, KeyAction, Settings, ShellDetection,
 };
 use termior_terminal_core::osc::AgentState;
-use termior_theme::{Appearance, ResolvedPalette, Theme, ThemeLibrary};
+use termior_theme::{
+    active_theme_id, resolve_active_palette, Appearance, ResolvedPalette, Theme, ThemeLibrary,
+};
 use termior_ui::{SidebarPanel, TabId, TabKind, WorkspaceState};
-use termior_ui_kit::{LayoutNode, PaneId, SplitDirection};
+use termior_ui_kit::{
+    empty_hint, empty_state_message, icon, menu_panel, menu_separator, text as ui_text,
+    titlebar::{draws_own_window_controls, window_controls},
+    tokens::{self, icon_size},
+    Icon, LayoutNode, PaneId, SplitDirection, Tooltip,
+};
+
+/// Short oneshot fade for sidebar / toast / menus. Never `.repeat()` — that would break idle zero-redraw.
+const UI_FADE_IN: Duration = Duration::from_millis(160);
+
+/// Idle-redraw probe (`TERMIOR_IDLE_REDRAW_PROBE`): count `WorkspaceView::render` calls while armed.
+static IDLE_REDRAW_ARMED: AtomicBool = AtomicBool::new(false);
+static IDLE_REDRAW_FRAMES: AtomicU64 = AtomicU64::new(0);
 use termior_vcs::{
     BranchState, ChangeGroup, ChangedFile, CommitInfo, GitRepository, RemoteOperation,
 };
@@ -46,9 +67,15 @@ use termior_vcs::{
 const DEFAULT_SIDEBAR_WIDTH: f32 = 280.0;
 const MIN_SIDEBAR_WIDTH: f32 = 220.0;
 const MAX_SIDEBAR_WIDTH: f32 = 520.0;
-const WORKSPACE_HEADER_HEIGHT: f32 = 40.0;
+/// 标题栏行高。窗口没有系统标题栏，这一行同时承载标签页、操作区与窗口控制按钮。
+const WORKSPACE_HEADER_HEIGHT: f32 = tokens::height::TITLE_BAR;
+/// 标题栏拖拽区的最小宽度。标签页再多也要留下能抓住窗口的地方。
+const TITLE_BAR_DRAG_MIN_WIDTH: f32 = 48.0;
 const STATUS_BAR_HEIGHT: f32 = 24.0;
-const COMPOSER_MAX_HEIGHT: f32 = 330.0;
+/// 有消息后 Composer 可增长到的上限（分栏尺寸预留与 Composer 自身 max 对齐）。
+const COMPOSER_MAX_HEIGHT: f32 = 280.0;
+/// 多 pane 时非活动 pane 的不透明度——压暗可辨，终端文本仍可读。
+const INACTIVE_PANE_OPACITY: f32 = 0.78;
 const PANE_DIVIDER_SIZE: f32 = 5.0;
 const MIN_PANE_WIDTH: f32 = 320.0;
 const MIN_PANE_HEIGHT: f32 = 180.0;
@@ -67,7 +94,7 @@ enum PaneContent {
 }
 
 impl PaneContent {
-    fn element(&self) -> AnyElement {
+    fn element(&self, palette: &ResolvedPalette) -> AnyElement {
         match self {
             Self::Terminal(entity) => div().size_full().child(entity.clone()).into_any_element(),
             Self::Editor(entity) => div().size_full().child(entity.clone()).into_any_element(),
@@ -76,13 +103,13 @@ impl PaneContent {
             Self::AiDiff(entity) => div().size_full().child(entity.clone()).into_any_element(),
             Self::GitDiff(entity) => div().size_full().child(entity.clone()).into_any_element(),
             Self::GitHistory(entity) => div().size_full().child(entity.clone()).into_any_element(),
-            Self::Placeholder(message) => div()
-                .flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .child(SharedString::from(message.clone()))
-                .into_any_element(),
+            Self::Placeholder(message) => empty_state_message(
+                Icon::Terminal,
+                SharedString::from(message.clone()),
+                None,
+                palette,
+            )
+            .into_any_element(),
         }
     }
 }
@@ -142,6 +169,19 @@ struct ExplorerContextMenu {
 }
 
 #[derive(Debug, Clone)]
+struct PaneContextMenu {
+    position: Point<Pixels>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewTabAction {
+    Terminal,
+    Editor,
+    MarkdownPreview,
+    WebPreview,
+}
+
+#[derive(Debug, Clone)]
 struct PaneResizeState {
     path: Vec<usize>,
     direction: SplitDirection,
@@ -197,7 +237,6 @@ enum ExplorerContextAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SplitMenuAction {
-    Smart,
     Right,
     Down,
     CloseActive,
@@ -219,6 +258,8 @@ pub struct WorkspaceView {
     explorer_loading: bool,
     explorer_scan_generation: u64,
     explorer_error: Option<String>,
+    /// Whether the explorer footer listing skipped unreadable entries is expanded.
+    explorer_skips_expanded: bool,
     _background_task: Option<Task<()>>,
     command_mode: CommandMode,
     command_input: String,
@@ -227,8 +268,9 @@ pub struct WorkspaceView {
     pending_name_parent: Option<PathBuf>,
     pending_rename_target: Option<PathBuf>,
     explorer_context_menu: Option<ExplorerContextMenu>,
-    split_menu_open: bool,
-    theme_menu_open: bool,
+    /// 标签栏新建下拉的锚点；`None` 表示关闭。
+    new_tab_menu: Option<Point<Pixels>>,
+    pane_context_menu: Option<PaneContextMenu>,
     sidebar_resizing: bool,
     pane_resizing: Option<PaneResizeState>,
     content_matches: Vec<ContentMatch>,
@@ -266,16 +308,23 @@ impl WorkspaceView {
             })
             .unwrap_or_default()
             .all();
+        let active_id = active_theme_id(
+            map_appearance(settings.appearance),
+            &settings.theme_id,
+            &settings.light_theme_id,
+            &settings.dark_theme_id,
+            system_is_dark,
+        );
         let theme_index = themes
             .iter()
-            .position(|theme| theme.id == settings.theme_id)
+            .position(|theme| theme.id == active_id)
             .unwrap_or(0);
-        let palette = themes[theme_index].resolve(
-            match settings.appearance {
-                termior_store::settings::Appearance::Light => Appearance::Light,
-                termior_store::settings::Appearance::Dark => Appearance::Dark,
-                termior_store::settings::Appearance::FollowSystem => Appearance::FollowSystem,
-            },
+        let palette = resolve_active_palette(
+            &themes,
+            map_appearance(settings.appearance),
+            &settings.theme_id,
+            &settings.light_theme_id,
+            &settings.dark_theme_id,
             system_is_dark,
         );
         cx.set_global(ui::ActiveTheme(palette.clone()));
@@ -352,7 +401,7 @@ impl WorkspaceView {
                                     })
                                     .unwrap_or_else(|| {
                                         PaneContent::Placeholder(
-                                            "Markdown preview source is unavailable".into(),
+                                            ui_text::empty::MARKDOWN_SOURCE_UNAVAILABLE.into(),
                                         )
                                     }),
                                 TabKind::Terminal | TabKind::Preview => {
@@ -360,13 +409,15 @@ impl WorkspaceView {
                                 }
                                 TabKind::AiDiff | TabKind::GitDiff | TabKind::GitCommitFile => {
                                     PaneContent::Placeholder(format!(
-                                        "{} · reopen the source item to refresh this diff",
-                                        tab.title
+                                        "{} · {}",
+                                        tab.title,
+                                        ui_text::empty::DIFF_REOPEN_HINT
                                     ))
                                 }
                                 TabKind::GitHistory => PaneContent::Placeholder(format!(
-                                    "{} · history is available in the sidebar",
-                                    tab.title
+                                    "{} · {}",
+                                    tab.title,
+                                    ui_text::empty::GIT_HISTORY_SIDEBAR
                                 )),
                             },
                         )
@@ -435,6 +486,7 @@ impl WorkspaceView {
             explorer_loading: true,
             explorer_scan_generation: 0,
             explorer_error: None,
+            explorer_skips_expanded: false,
             _background_task: None,
             command_mode: CommandMode::Browse,
             command_input: String::new(),
@@ -443,8 +495,8 @@ impl WorkspaceView {
             pending_name_parent: None,
             pending_rename_target: None,
             explorer_context_menu: None,
-            split_menu_open: false,
-            theme_menu_open: false,
+            new_tab_menu: None,
+            pane_context_menu: None,
             sidebar_resizing: false,
             pane_resizing: None,
             content_matches: Vec::new(),
@@ -554,6 +606,35 @@ impl WorkspaceView {
         }));
     }
 
+    /// Opens the settings window then closes it via the same `remove_window` path as the
+    /// title-bar close button, so CI / local smoke can assert no `window not found` log.
+    /// Used by `scripts/settings-close-smoke.ps1`; normal launches never call this method.
+    pub(crate) fn start_settings_close_smoke(&self, cx: &mut Context<Self>) {
+        let handle = self.open_settings_window(cx);
+        cx.spawn(async move |_, cx| {
+            // Let the settings window paint at least once (matches real title-bar close timing).
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            let closed = handle
+                .update(cx, |_, window, _| {
+                    window.remove_window();
+                })
+                .is_ok();
+            // Allow deferred DestroyWindow / activate callbacks to flush.
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            if closed {
+                println!("TERMIOR_SETTINGS_CLOSE_SMOKE_OK");
+            } else {
+                eprintln!("TERMIOR_SETTINGS_CLOSE_SMOKE_FAILED: settings window already gone");
+            }
+            let _ = cx.update(|cx| cx.quit());
+        })
+        .detach();
+    }
+
     /// Exercises the same request path as the header Preview button with an active Markdown file.
     /// Used by `scripts/markdown-preview-smoke.ps1`; normal launches never call this method.
     pub(crate) fn start_markdown_preview_smoke(
@@ -613,10 +694,9 @@ impl WorkspaceView {
     fn schedule_explorer_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         if !root.is_dir() {
             self.explorer_loading = false;
-            self.explorer_error = Some(format!(
-                "Explorer root is not a directory: {}",
-                root.display()
-            ));
+            self.explorer = None;
+            self.explorer_skips_expanded = false;
+            self.explorer_error = Some(ui_text::explorer::ROOT_INVALID.into());
             return;
         }
 
@@ -624,6 +704,7 @@ impl WorkspaceView {
         self.explorer_tree.set_root(root.clone());
         self.explorer_loading = true;
         self.explorer_error = None;
+        self.explorer_skips_expanded = false;
         self.explorer_scan_generation = self.explorer_scan_generation.saturating_add(1);
         let generation = self.explorer_scan_generation;
         let show_dotfiles = self.settings.show_dotfiles;
@@ -655,12 +736,18 @@ impl WorkspaceView {
                         workspace
                             .composer
                             .update(cx, |composer, _| composer.set_workspace_paths(paths));
+                        if index.skipped().is_empty() {
+                            workspace.explorer_skips_expanded = false;
+                        }
                         workspace.explorer = Some(index);
                         workspace.explorer_error = None;
                     }
                     Ok(_) => return,
-                    Err(error) => {
-                        workspace.explorer_error = Some(error.to_string());
+                    Err(_) => {
+                        workspace.explorer = None;
+                        workspace.explorer_skips_expanded = false;
+                        workspace.explorer_error =
+                            Some(ui_text::explorer::ROOT_INVALID.into());
                     }
                 }
                 cx.notify();
@@ -730,7 +817,9 @@ impl WorkspaceView {
         let cwd = self.model.active_tab().map(|tab| tab.cwd.clone());
         self.tabs.push(AppTab {
             id,
-            panes: single_pane(PaneContent::Placeholder("Starting terminal…".into())),
+            panes: single_pane(PaneContent::Placeholder(
+                ui_text::empty::STARTING_TERMINAL.into(),
+            )),
         });
         self.activate_runtime(id, cx);
         self.spawn_terminal_into(
@@ -781,8 +870,10 @@ impl WorkspaceView {
                     let _ = workspace.update(cx, |workspace, cx| {
                         if let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                             if let Some(pane) = tab.panes.get_mut(&pane_id) {
-                                *pane =
-                                    PaneContent::Placeholder(format!("Terminal failed: {error}"));
+                                *pane = PaneContent::Placeholder(format!(
+                                    "{} ({error})",
+                                    ui_text::empty::TERMINAL_FAILED
+                                ));
                             }
                         }
                         cx.notify();
@@ -1332,6 +1423,7 @@ impl WorkspaceView {
         } else {
             0.0
         };
+        // 分栏可用性按 Composer 上限预留，略偏保守，避免内容增长后分栏过窄。
         let composer_height = if self.model.composer_visible {
             COMPOSER_MAX_HEIGHT
         } else {
@@ -1368,28 +1460,6 @@ impl WorkspaceView {
             MIN_PANE_HEIGHT,
             MAX_PANES_PER_TAB,
         )
-    }
-
-    fn preferred_split_direction(&self, window: &Window) -> Option<SplitDirection> {
-        let can_right = self.can_split_active(SplitDirection::Right, window);
-        let can_down = self.can_split_active(SplitDirection::Down, window);
-        match (can_right, can_down) {
-            (true, false) => Some(SplitDirection::Right),
-            (false, true) => Some(SplitDirection::Down),
-            (false, false) => None,
-            (true, true) => {
-                let tab = self.model.active_tab()?;
-                let (width, height) = self.pane_area_size(window);
-                let extent = tab
-                    .layout
-                    .focused_extent(width, height, PANE_DIVIDER_SIZE)?;
-                if extent.width >= extent.height {
-                    Some(SplitDirection::Right)
-                } else {
-                    Some(SplitDirection::Down)
-                }
-            }
-        }
     }
 
     fn split_unavailable_message(&self, direction: Option<SplitDirection>) -> String {
@@ -1429,13 +1499,10 @@ impl WorkspaceView {
         );
     }
 
-    fn smart_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.split_menu_open = false;
-        if let Some(direction) = self.preferred_split_direction(window) {
-            self.split_active(direction, window, cx);
-        } else {
-            self.show_split_unavailable(None, cx);
-        }
+    fn close_chrome_menus(&mut self) {
+        self.new_tab_menu = None;
+        self.pane_context_menu = None;
+        self.explorer_context_menu = None;
     }
 
     fn split_active(
@@ -1444,7 +1511,7 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.split_menu_open = false;
+        self.close_chrome_menus();
         if !self.can_split_active(direction, window) {
             self.show_split_unavailable(Some(direction), cx);
             return;
@@ -1470,8 +1537,10 @@ impl WorkspaceView {
                 });
                 PaneContent::Editor(editor)
             }
-            Some(TabKind::Terminal) => PaneContent::Placeholder("Starting split terminal…".into()),
-            _ => PaneContent::Placeholder("Split view".into()),
+            Some(TabKind::Terminal) => {
+                PaneContent::Placeholder(ui_text::empty::STARTING_SPLIT_TERMINAL.into())
+            }
+            _ => PaneContent::Placeholder(ui_text::empty::SPLIT_VIEW.into()),
         };
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active) {
             tab.panes.insert(pane_id, pane);
@@ -1499,7 +1568,7 @@ impl WorkspaceView {
     }
 
     fn close_active_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.split_menu_open = false;
+        self.close_chrome_menus();
         if self.active_pane_count() <= 1 {
             self.enqueue_toast(
                 Notification {
@@ -1527,7 +1596,7 @@ impl WorkspaceView {
     }
 
     fn close_other_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.split_menu_open = false;
+        self.close_chrome_menus();
         let Some(tab_id) = self.model.active else {
             return;
         };
@@ -1553,7 +1622,6 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         match action {
-            SplitMenuAction::Smart => self.smart_split(window, cx),
             SplitMenuAction::Right => self.split_active(SplitDirection::Right, window, cx),
             SplitMenuAction::Down => self.split_active(SplitDirection::Down, window, cx),
             SplitMenuAction::CloseActive => self.close_active_pane(window, cx),
@@ -1738,6 +1806,52 @@ impl WorkspaceView {
             })
     }
 
+    fn focused_pane_content(&self) -> Option<&PaneContent> {
+        let active = self.model.active?;
+        let tab = self.tabs.iter().find(|tab| tab.id == active)?;
+        let focused = self.model.active_tab()?.layout.focused;
+        tab.panes.get(&focused)
+    }
+
+    fn status_context_label(&self, cwd: &str, cx: &App) -> String {
+        match self.focused_pane_content() {
+            Some(PaneContent::Terminal(_)) => path_breadcrumb(cwd),
+            Some(PaneContent::Editor(editor)) => {
+                let editor = editor.read(cx);
+                let (line, column) = editor.cursor_line_col();
+                let path = editor
+                    .path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| editor.title().to_owned());
+                format!("{path} · {}:{}", line + 1, column + 1)
+            }
+            Some(PaneContent::Markdown(_)) => "Markdown preview".into(),
+            Some(PaneContent::Preview(_)) => "Web preview".into(),
+            Some(PaneContent::AiDiff(_)) => "AI diff".into(),
+            Some(PaneContent::GitDiff(_)) => "Git diff".into(),
+            Some(PaneContent::GitHistory(_)) => "Git history".into(),
+            Some(PaneContent::Placeholder(message)) => message.clone(),
+            None => path_breadcrumb(cwd),
+        }
+    }
+
+    fn handle_new_tab_action(
+        &mut self,
+        action: NewTabAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_chrome_menus();
+        match action {
+            NewTabAction::Terminal => self.create_terminal(false, window, cx),
+            NewTabAction::Editor => self.create_editor(cx),
+            NewTabAction::MarkdownPreview => {
+                let _ = self.request_markdown_preview(cx);
+            }
+            NewTabAction::WebPreview => self.request_web_preview(window, cx),
+        }
+    }
+
     /// 复用 FR-PROV 的 Provider 与密钥配置，构造一个行内补全 [`InlineCompleter`]。
     ///
     /// 遵循与 Composer 聊天 profile 相同的规则：profile 必须启用；非本地 profile 必须在
@@ -1899,6 +2013,71 @@ impl WorkspaceView {
         });
         self.model.composer_visible = true;
         cx.notify();
+    }
+
+    fn explorer_skipped_footer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let skipped = self.explorer.as_ref()?.skipped();
+        if skipped.is_empty() {
+            return None;
+        }
+        let count = skipped.len();
+        let expanded = self.explorer_skips_expanded;
+        let chevron = if expanded { "▾" } else { "▸" };
+        let summary = format!(
+            "{chevron} {}",
+            ui_text::explorer::skipped_summary(count)
+        );
+        let details = expanded.then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .pt_1()
+                .children(skipped.iter().map(|entry| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(ui::color(self.palette.foreground))
+                                .child(SharedString::from(entry.display_path())),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(ui::muted(&self.palette))
+                                .child(entry.reason.as_str()),
+                        )
+                }))
+        });
+        Some(
+            div()
+                .id("explorer-skipped")
+                .flex()
+                .flex_col()
+                .px_2()
+                .py_1()
+                .border_t_1()
+                .border_color(ui::border(&self.palette))
+                .bg(ui::color(self.palette.chrome))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.explorer_skips_expanded = !this.explorer_skips_expanded;
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(ui::muted(&self.palette))
+                        .child(SharedString::from(summary)),
+                )
+                .children(details)
+                .into_any_element(),
+        )
     }
 
     fn show_explorer_context_menu(
@@ -2292,54 +2471,30 @@ impl WorkspaceView {
         }
     }
 
-    fn select_theme(&mut self, theme_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(theme_index) = self.themes.iter().position(|theme| theme.id == theme_id) else {
-            return;
-        };
-        self.system_is_dark = matches!(
-            window.appearance(),
-            WindowAppearance::Dark | WindowAppearance::VibrantDark
-        );
-        self.theme_index = theme_index;
-        self.settings.theme_id = self.themes[theme_index].id.clone();
-        self.palette =
-            self.themes[theme_index].resolve(self.resolved_appearance(), self.system_is_dark);
-        self.theme_menu_open = false;
-        self.propagate_palette(cx);
-        cx.notify();
-    }
-
-    fn apply_theme_preferences(
-        &mut self,
-        theme: &Theme,
-        editor_theme_id: &str,
-        appearance: termior_store::settings::Appearance,
-        cx: &mut Context<Self>,
-    ) {
-        self.settings.theme_id = theme.id.clone();
-        self.settings.editor_theme_id = editor_theme_id.to_owned();
-        self.settings.appearance = appearance;
-        self.theme_index = if let Some(index) = self
-            .themes
-            .iter()
-            .position(|candidate| candidate.id == theme.id)
-        {
-            self.themes[index] = theme.clone();
-            index
-        } else {
-            self.themes.push(theme.clone());
-            self.themes.len() - 1
-        };
-        self.palette =
-            self.themes[self.theme_index].resolve(self.resolved_appearance(), self.system_is_dark);
-        self.propagate_palette(cx);
+    fn apply_theme_preferences(&mut self, settings: &Settings, cx: &mut Context<Self>) {
+        self.settings.theme_id = settings.theme_id.clone();
+        self.settings.light_theme_id = settings.light_theme_id.clone();
+        self.settings.dark_theme_id = settings.dark_theme_id.clone();
+        self.settings.editor_theme_id = settings.editor_theme_id.clone();
+        self.settings.appearance = settings.appearance;
+        // 预览期间把设置里尚未入库的自定义主题并入列表。
+        if let Some(library) = self.data_dir.as_ref().and_then(|dir| {
+            termior_store::DataFiles::new(dir)
+                .themes::<ThemeLibrary>()
+                .load()
+                .ok()
+        }) {
+            self.themes = library.all();
+        }
+        self.sync_theme_index();
+        self.recompute_palette(cx);
         let (completer, completion_enabled) = self.completion_config();
         for tab in &self.tabs {
             for pane in tab.panes.values() {
                 if let PaneContent::Editor(editor) = pane {
                     editor.update(cx, |editor, _| {
                         editor.set_preferences(
-                            editor_theme_id,
+                            &self.settings.editor_theme_id,
                             self.settings.vim_mode,
                             completer.clone(),
                             completion_enabled,
@@ -2351,13 +2506,31 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// 设置中的外观三态 → 主题解析用的外观。
-    fn resolved_appearance(&self) -> Appearance {
-        match self.settings.appearance {
-            termior_store::settings::Appearance::Light => Appearance::Light,
-            termior_store::settings::Appearance::Dark => Appearance::Dark,
-            termior_store::settings::Appearance::FollowSystem => Appearance::FollowSystem,
-        }
+    fn sync_theme_index(&mut self) {
+        let active_id = active_theme_id(
+            map_appearance(self.settings.appearance),
+            &self.settings.theme_id,
+            &self.settings.light_theme_id,
+            &self.settings.dark_theme_id,
+            self.system_is_dark,
+        );
+        self.theme_index = self
+            .themes
+            .iter()
+            .position(|theme| theme.id == active_id)
+            .unwrap_or(0);
+    }
+
+    fn recompute_palette(&mut self, cx: &mut Context<Self>) {
+        self.palette = resolve_active_palette(
+            &self.themes,
+            map_appearance(self.settings.appearance),
+            &self.settings.theme_id,
+            &self.settings.light_theme_id,
+            &self.settings.dark_theme_id,
+            self.system_is_dark,
+        );
+        self.propagate_palette(cx);
     }
 
     /// 主题变更后同步全局色板并推送到所有已打开的终端(终端 16 色随主题走)。
@@ -2379,10 +2552,39 @@ impl WorkspaceView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_settings_window(cx);
+        let _ = self.open_settings_window(cx);
     }
 
-    fn open_settings_window(&self, cx: &mut Context<Self>) {
+    /// UI screenshot helper (`TERMIOR_OPEN_SETTINGS`): open settings without SendKeys.
+    pub(crate) fn open_settings_for_ui_shot(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> gpui::WindowHandle<SettingsView> {
+        self.open_settings_window(cx)
+    }
+
+    /// Idle zero-redraw probe (`TERMIOR_IDLE_REDRAW_PROBE=<secs>`).
+    ///
+    /// Settles for a few seconds (explorer indexing / first paint), then arms a
+    /// render counter for the probe window and prints `TERMIOR_IDLE_REDRAW_FRAMES=N`.
+    /// NFR-03 expects N == 0 when nothing schedules `cx.notify()` / repeating animations.
+    pub(crate) fn start_idle_redraw_probe(&self, probe_secs: u64, cx: &mut Context<Self>) {
+        let settle = Duration::from_secs(3);
+        let probe = Duration::from_secs(probe_secs.max(1));
+        cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(settle).await;
+            IDLE_REDRAW_FRAMES.store(0, Ordering::Relaxed);
+            IDLE_REDRAW_ARMED.store(true, Ordering::Relaxed);
+            cx.background_executor().timer(probe).await;
+            IDLE_REDRAW_ARMED.store(false, Ordering::Relaxed);
+            let frames = IDLE_REDRAW_FRAMES.load(Ordering::Relaxed);
+            println!("TERMIOR_IDLE_REDRAW_FRAMES={frames}");
+            let _ = cx.update(|cx| cx.quit());
+        })
+        .detach();
+    }
+
+    fn open_settings_window(&self, cx: &mut Context<Self>) -> gpui::WindowHandle<SettingsView> {
         let settings = self.settings.clone();
         let migration_error = self.migration_error.clone();
         let data_dir = self.data_dir.clone();
@@ -2396,28 +2598,21 @@ impl WorkspaceView {
                 });
             }
         });
-        let on_theme_preview = Box::new(
-            move |theme: &Theme,
-                  editor_theme_id: &str,
-                  appearance: termior_store::settings::Appearance,
-                  app: &mut gpui::App| {
-                if let Some(workspace) = preview_workspace.upgrade() {
-                    workspace.update(app, |workspace, cx| {
-                        workspace.apply_theme_preferences(theme, editor_theme_id, appearance, cx);
-                    });
-                }
-            },
-        );
-        let bounds = Bounds::centered(None, size(px(760.0), px(520.0)), cx);
-        let _ = cx.open_window(
+        let on_theme_preview = Box::new(move |settings: &Settings, app: &mut gpui::App| {
+            if let Some(workspace) = preview_workspace.upgrade() {
+                workspace.update(app, |workspace, cx| {
+                    workspace.apply_theme_preferences(settings, cx);
+                });
+            }
+        });
+        let bounds = Bounds::centered(None, size(px(880.0), px(560.0)), cx);
+        cx.open_window(
             app_identity::window_options(WindowBounds::Windowed(bounds)),
             |window, cx| {
                 // 接管设置窗口的关闭流程。默认情况下点击标题栏关闭按钮会走
                 // Win32 `DefWindowProcW(WM_CLOSE)` → `DestroyWindow`,随后 GPUI 在
                 // `WindowsWindow::drop` 里又对同一 HWND 调一次 `DestroyWindow`,
-                // 在已销毁的句柄上触发 `window not found` / `无效的窗口句柄`
-                // (主窗口关闭时这些日志会被随后的 `cx.quit()` 吞掉,但关闭子窗口时
-                // 应用仍存活,错误就暴露出来了)。
+                // 在已销毁的句柄上触发 `无效的窗口句柄`。
                 //
                 // 这里返回 `false` 阻止 Win32 自行销毁窗口,与 Zed 自身
                 // (`zed/src/zed.rs`) 关闭子窗口的做法一致:改由 GPUI 的 `remove_window`
@@ -2426,14 +2621,13 @@ impl WorkspaceView {
                 //
                 // 必须在回调里**同步**调用 `remove_window`:该回调运行在 GPUI 的
                 // `update_window` 内部,返回后 `update_window_id` 的 `trail` 会立即
-                // 检查 `window.removed` 并在同一帧移除窗口。若用 `cx.spawn` 异步执行,
-                // 窗口会多存活到下一个 vsync,期间 `on_request_frame` 仍会对已标记
-                // removed 的窗口 `handle.update().log_err()`,打出一条 `window not found`。
-                window.on_window_should_close(cx, |window, _cx| {
-                    window.remove_window();
-                    false
-                });
-                cx.new(|cx| {
+                // 检查 `window.removed` 并在同一帧移除窗口。
+                //
+                // 注意:仅靠这一步仍可能打出 `window not found`——`WindowsWindow::drop`
+                // 会异步 `DestroyWindow`,在 HWND 销毁前 `WM_ACTIVATE`/`WM_PAINT` 仍可能
+                // 触发 `handle.update().log_err()`。该竞态需在 GPUI Windows 侧于 Drop
+                // 时先清空 platform callbacks 才能根治(见 vendor/gpui_windows)。
+                let view = cx.new(|cx| {
                     SettingsView::new(
                         settings,
                         migration_error,
@@ -2442,9 +2636,19 @@ impl WorkspaceView {
                         Some(on_theme_preview),
                         cx,
                     )
-                })
+                });
+                let flush_view = view.downgrade();
+                window.on_window_should_close(cx, move |window, cx| {
+                    if let Some(view) = flush_view.upgrade() {
+                        view.update(cx, |view, cx| view.flush_save(cx));
+                    }
+                    window.remove_window();
+                    false
+                });
+                view
             },
-        );
+        )
+        .expect("open settings window")
     }
 
     fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
@@ -2459,14 +2663,8 @@ impl WorkspaceView {
         }
         self.notification_router
             .set_enabled(self.settings.agent_notifications);
-        self.theme_index = self
-            .themes
-            .iter()
-            .position(|theme| theme.id == self.settings.theme_id)
-            .unwrap_or(0);
-        self.palette =
-            self.themes[self.theme_index].resolve(self.resolved_appearance(), self.system_is_dark);
-        self.propagate_palette(cx);
+        self.sync_theme_index();
+        self.recompute_palette(cx);
         self.schedule_explorer_scan(self.explorer_requested_root.clone(), cx);
         let (completer, completion_enabled) = self.completion_config();
         for tab in &self.tabs {
@@ -2994,7 +3192,9 @@ impl WorkspaceView {
                 self.model.sidebar_visible = true;
                 self.begin_command(CommandMode::GitCommit, cx);
             }
-            KeyAction::OpenSettings => self.open_settings_window(cx),
+            KeyAction::OpenSettings => {
+                let _ = self.open_settings_window(cx);
+            }
             KeyAction::Undo | KeyAction::Redo => {
                 if let Some(editor) = self.active_editor().cloned() {
                     if action == KeyAction::Undo {
@@ -3051,27 +3251,30 @@ impl WorkspaceView {
         path: Vec<usize>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let workspace_accent = self.palette.accent;
+        let multi_pane = panes.len() > 1;
         match node {
             LayoutNode::Pane { id } => {
                 let pane_id = *id;
-                let content = panes.get(id).map(PaneContent::element).unwrap_or_else(|| {
-                    div()
-                        .flex()
-                        .size_full()
-                        .items_center()
-                        .justify_center()
-                        .child("Pane unavailable")
+                let inactive = multi_pane && *id != focused;
+                let content = panes
+                    .get(id)
+                    .map(|pane| pane.element(&self.palette))
+                    .unwrap_or_else(|| {
+                        empty_state_message(
+                            Icon::Terminal,
+                            ui_text::empty::PANE_UNAVAILABLE,
+                            None,
+                            &self.palette,
+                        )
                         .into_any_element()
-                });
+                    });
                 div()
                     .id(SharedString::from(format!("pane-{}", id.0)))
                     .relative()
                     .size_full()
                     .overflow_hidden()
-                    .when(*id == focused, |pane| {
-                        pane.border_1().border_color(gpui_color(workspace_accent))
-                    })
+                    // 单 pane 不画焦点框；多 pane 时压暗非活动侧，活动侧不加装饰。
+                    .when(inactive, |pane| pane.opacity(INACTIVE_PANE_OPACITY))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |workspace, _event, window, cx| {
@@ -3079,6 +3282,22 @@ impl WorkspaceView {
                                 let _ = tab.layout.focus(pane_id);
                             }
                             workspace.focus_active_pane(window, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |workspace, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            if let Some(tab) = workspace.model.active_tab_mut() {
+                                let _ = tab.layout.focus(pane_id);
+                            }
+                            workspace.focus_active_pane(window, cx);
+                            workspace.explorer_context_menu = None;
+                            workspace.new_tab_menu = None;
+                            workspace.pane_context_menu = Some(PaneContextMenu {
+                                position: event.position,
+                            });
                             cx.notify();
                         }),
                     )
@@ -3180,7 +3399,7 @@ impl WorkspaceView {
                 .rounded_md()
                 .border_1()
                 .border_color(gpui_color(self.palette.accent))
-                .bg(gpui_color(self.palette.surface[1]))
+                .bg(gpui_color(self.palette.elevated))
                 .text_xs()
                 .child(SharedString::from(format!(
                     "{}: {}{}▏",
@@ -3207,37 +3426,42 @@ impl WorkspaceView {
                     .flex_row()
                     .gap_1()
                     .mb_1()
-                    .child(sidebar_button(
-                        "Find",
+                    .child(explorer_tool_button(
                         "explorer-find",
+                        Icon::Search,
+                        ui_text::explorer::FIND,
                         &self.palette,
                         cx,
                         |this, cx| this.begin_command(CommandMode::FindFile, cx),
                     ))
-                    .child(sidebar_button(
-                        "Search",
+                    .child(explorer_tool_button(
                         "explorer-search",
+                        Icon::FileText,
+                        ui_text::explorer::SEARCH,
                         &self.palette,
                         cx,
                         |this, cx| this.begin_command(CommandMode::SearchContent, cx),
                     ))
-                    .child(sidebar_button(
-                        "+F",
+                    .child(explorer_tool_button(
                         "explorer-new-file",
+                        Icon::File,
+                        ui_text::explorer::NEW_FILE,
                         &self.palette,
                         cx,
                         |this, cx| this.begin_command(CommandMode::CreateFile, cx),
                     ))
-                    .child(sidebar_button(
-                        "+D",
+                    .child(explorer_tool_button(
                         "explorer-new-dir",
+                        Icon::Folder,
+                        ui_text::explorer::NEW_DIRECTORY,
                         &self.palette,
                         cx,
                         |this, cx| this.begin_command(CommandMode::CreateDirectory, cx),
                     ))
-                    .child(sidebar_button(
-                        "↻",
+                    .child(explorer_tool_button(
                         "explorer-refresh",
+                        Icon::Refresh,
+                        ui_text::explorer::REFRESH,
                         &self.palette,
                         cx,
                         |this, cx| this.refresh_workspace_data(cx),
@@ -3254,8 +3478,6 @@ impl WorkspaceView {
                     .active_tab()
                     .and_then(|tab| tab.resource.as_deref())
                     .map(PathBuf::from);
-                let icon_surface = gpui_color(self.palette.surface[1]);
-                let icon_panel = gpui_color(self.palette.surface[2]);
                 let (visible_entries, visible_entry_count) = self
                     .explorer
                     .as_ref()
@@ -3366,12 +3588,7 @@ impl WorkspaceView {
                                         .items_center()
                                         .gap_1()
                                         .whitespace_nowrap()
-                                        .child(explorer_icon(
-                                            icon,
-                                            expanded,
-                                            icon_surface,
-                                            icon_panel,
-                                        ))
+                                        .child(explorer_icon(icon, expanded, &self.palette))
                                         .child(SharedString::from(label)),
                                 )
                                 .on_mouse_down(
@@ -3466,14 +3683,11 @@ impl WorkspaceView {
                                         .as_ref()
                                         .is_some_and(|index| index.entries().is_empty()))
                                 .then(|| {
-                                    div()
-                                        .p_2()
-                                        .text_xs()
-                                        .text_color(ui::muted(&self.palette))
-                                        .child("This workspace has no visible files")
+                                    empty_hint(ui_text::empty::NO_VISIBLE_FILES, &self.palette)
                                 }),
                             ),
                     )
+                    .children(self.explorer_skipped_footer(cx))
                     .into_any_element()
             }
             SidebarPanel::SourceControl => {
@@ -3489,49 +3703,49 @@ impl WorkspaceView {
                     .gap_1()
                     .mb_1()
                     .child(sidebar_button(
-                        "All+",
+                        ui_text::git::STAGE_ALL,
                         "git-stage-all",
                         &self.palette,
                         cx,
                         |this, cx| this.stage_all(cx),
                     ))
                     .child(sidebar_button(
-                        "Commit",
+                        ui_text::git::COMMIT,
                         "git-commit",
                         &self.palette,
                         cx,
                         |this, cx| this.begin_command(CommandMode::GitCommit, cx),
                     ))
                     .child(sidebar_button(
-                        "Fetch",
+                        ui_text::git::FETCH,
                         "git-fetch",
                         &self.palette,
                         cx,
                         |this, cx| this.run_remote(RemoteOperation::Fetch, cx),
                     ))
                     .child(sidebar_button(
-                        "Pull",
+                        ui_text::git::PULL,
                         "git-pull",
                         &self.palette,
                         cx,
                         |this, cx| this.run_remote(RemoteOperation::PullFfOnly, cx),
                     ))
                     .child(sidebar_button(
-                        "Push",
+                        ui_text::git::PUSH,
                         "git-push",
                         &self.palette,
                         cx,
                         |this, cx| this.run_remote(RemoteOperation::Push, cx),
                     ))
                     .child(sidebar_button(
-                        "+Branch",
+                        ui_text::git::NEW_BRANCH,
                         "git-new-branch",
                         &self.palette,
                         cx,
                         |this, cx| this.begin_command(CommandMode::GitCreateBranch, cx),
                     ))
                     .child(sidebar_button(
-                        "Switch",
+                        ui_text::git::SWITCH_BRANCH,
                         "git-switch-branch",
                         &self.palette,
                         cx,
@@ -3587,17 +3801,21 @@ impl WorkspaceView {
                             )))
                     })
                     .collect::<Vec<_>>();
+                let empty = rows.is_empty().then(|| {
+                    empty_hint(ui_text::empty::NO_GIT_HISTORY, &self.palette).into_any_element()
+                });
                 div()
                     .flex()
                     .flex_col()
                     .child(sidebar_button(
-                        "Open full history",
+                        ui_text::git::OPEN_FULL_HISTORY,
                         "git-open-history",
                         &self.palette,
                         cx,
                         |this, cx| this.open_git_history(cx),
                     ))
                     .children(rows)
+                    .children(empty)
                     .into_any_element()
             }
         };
@@ -3909,6 +4127,9 @@ fn background_layer_element(layer: BackgroundLayer) -> Option<gpui::AnyElement> 
 
 impl gpui::Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if IDLE_REDRAW_ARMED.load(Ordering::Relaxed) {
+            IDLE_REDRAW_FRAMES.fetch_add(1, Ordering::Relaxed);
+        }
         let system_is_dark = matches!(
             window.appearance(),
             WindowAppearance::Dark | WindowAppearance::VibrantDark
@@ -3916,9 +4137,8 @@ impl gpui::Render for WorkspaceView {
         if self.system_is_dark != system_is_dark {
             self.system_is_dark = system_is_dark;
             if self.settings.appearance == termior_store::settings::Appearance::FollowSystem {
-                self.palette = self.themes[self.theme_index]
-                    .resolve(Appearance::FollowSystem, self.system_is_dark);
-                self.propagate_palette(cx);
+                self.sync_theme_index();
+                self.recompute_palette(cx);
             }
         }
         self.process_agent_updates(window, cx);
@@ -3952,7 +4172,7 @@ impl gpui::Render for WorkspaceView {
                     .bg(if selected {
                         gpui_color(p.background)
                     } else {
-                        gpui_color(p.surface[2])
+                        gpui_color(p.chrome)
                     })
                     .text_color(if selected {
                         gpui_color(p.foreground)
@@ -3960,7 +4180,7 @@ impl gpui::Render for WorkspaceView {
                         gpui_color_alpha(p.foreground, 0.55)
                     })
                     .when(!selected, |d| {
-                        d.hover(move |style| style.bg(gpui_color(p.surface[1])))
+                        d.hover(move |style| style.bg(gpui_color(p.elevated)))
                     })
                     // 激活 tab 顶部 accent 条 + tab 间细分隔线，划清每个 tab 的边界。
                     .when(selected, |d| {
@@ -3993,9 +4213,12 @@ impl gpui::Render for WorkspaceView {
                             .text_sm()
                             .child(SharedString::from(tab.title.clone())),
                     )
-                    .child(
+                    .child({
+                        let close_id = SharedString::from(format!("tab-close-{}", id.0));
                         div()
-                            .id(SharedString::from(format!("tab-close-{}", id.0)))
+                            .id(close_id.clone())
+                            .group(close_id.clone())
+                            .aria_label("Close tab")
                             .flex_shrink_0()
                             .w(px(18.0))
                             .h(px(18.0))
@@ -4004,20 +4227,25 @@ impl gpui::Render for WorkspaceView {
                             .items_center()
                             .justify_center()
                             .rounded_sm()
-                            .text_xs()
-                            .text_color(gpui_color_alpha(p.foreground, 0.5))
-                            .hover(move |style| {
-                                style.bg(close_hover).text_color(gpui_color(p.foreground))
-                            })
-                            .child("✕")
+                            .hover(move |style| style.bg(close_hover))
+                            .child(
+                                ui::icon(
+                                    Icon::Close,
+                                    icon_size::XS,
+                                    gpui_color_alpha(p.foreground, 0.5),
+                                )
+                                .group_hover(close_id, move |style| {
+                                    style.text_color(gpui_color(p.foreground))
+                                }),
+                            )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _event, _window, cx| {
                                     cx.stop_propagation();
                                     this.close_tab(id, cx);
                                 }),
-                            ),
-                    )
+                            )
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _event, window, cx| {
@@ -4036,29 +4264,78 @@ impl gpui::Render for WorkspaceView {
                     )
             })
             .collect::<Vec<_>>();
+        let new_tab_hover = ui::hover_wash(&p);
         let new_tab_button = div()
-            .id("new-tab")
             .flex_shrink_0()
-            .w(px(26.0))
-            .h(px(26.0))
-            .my_auto()
             .ml_1()
+            .my_auto()
             .flex()
             .items_center()
-            .justify_center()
             .rounded_md()
-            .cursor_pointer()
-            .text_color(gpui_color_alpha(p.foreground, 0.7))
-            .hover({
-                let wash = ui::hover_wash(&p);
-                move |style| style.bg(wash).text_color(gpui_color(p.foreground))
-            })
-            .child("+")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _event, window, cx| {
-                    this.create_terminal(false, window, cx);
-                }),
+            .child(
+                div()
+                    .id("new-tab")
+                    .group("new-tab")
+                    .aria_label("New terminal tab")
+                    .tooltip({
+                        let palette = p.clone();
+                        move |_window, cx| Tooltip::view("New terminal tab", &palette, cx)
+                    })
+                    .w(px(26.0))
+                    .h(px(26.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_l_md()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(new_tab_hover))
+                    .child(
+                        ui::icon(
+                            Icon::Plus,
+                            icon_size::SM,
+                            gpui_color_alpha(p.foreground, 0.7),
+                        )
+                        .group_hover("new-tab", move |style| {
+                            style.text_color(gpui_color(p.foreground))
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, window, cx| {
+                            cx.stop_propagation();
+                            this.handle_new_tab_action(NewTabAction::Terminal, window, cx);
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("new-tab-menu-toggle")
+                    .aria_label("Open new tab menu")
+                    .aria_expanded(self.new_tab_menu.is_some())
+                    .w(px(18.0))
+                    .h(px(26.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_r_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(new_tab_hover))
+                    .child("▾")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                            this.explorer_context_menu = None;
+                            this.pane_context_menu = None;
+                            this.new_tab_menu = if this.new_tab_menu.is_some() {
+                                None
+                            } else {
+                                Some(event.position)
+                            };
+                            cx.notify();
+                        }),
+                    ),
             );
 
         let active_content = active
@@ -4068,13 +4345,13 @@ impl gpui::Render for WorkspaceView {
                 self.layout_element(&layout.root, &tab.panes, layout.focused, cx)
             })
             .unwrap_or_else(|| {
-                div()
-                    .flex()
-                    .size_full()
-                    .items_center()
-                    .justify_center()
-                    .child("No tabs. Press Ctrl/Cmd+T for a terminal.")
-                    .into_any_element()
+                empty_state_message(
+                    Icon::Terminal,
+                    ui_text::empty::NO_TABS,
+                    Some(SharedString::from(ui_text::empty::NO_TABS_DETAIL)),
+                    &p,
+                )
+                .into_any_element()
             });
 
         let sidebar = if self.model.sidebar_visible {
@@ -4091,20 +4368,42 @@ impl gpui::Render for WorkspaceView {
                         .items_center()
                         .gap_2()
                         .pt_2()
-                        .bg(gpui_color(p.surface[0]))
+                        .bg(gpui_color(p.panel))
                         .border_r_1()
                         .border_color(ui::border(&p))
                         .children(
                             [
-                                ("▱", SidebarPanel::Explorer),
-                                ("⑂", SidebarPanel::SourceControl),
-                                ("◷", SidebarPanel::GitHistory),
+                                (
+                                    Icon::Files,
+                                    SidebarPanel::Explorer,
+                                    ui_text::activity::EXPLORER,
+                                ),
+                                (
+                                    Icon::GitBranch,
+                                    SidebarPanel::SourceControl,
+                                    ui_text::activity::SOURCE_CONTROL,
+                                ),
+                                (
+                                    Icon::GitCommit,
+                                    SidebarPanel::GitHistory,
+                                    ui_text::activity::GIT_HISTORY,
+                                ),
                             ]
                             .into_iter()
-                            .map(|(label, panel)| {
+                            .map(|(glyph, panel, label)| {
                                 let selected = self.model.sidebar_panel == panel;
+                                let tint = if selected {
+                                    gpui_color(p.accent)
+                                } else {
+                                    ui::muted(&p)
+                                };
                                 div()
                                     .id(SharedString::from(format!("sidebar-{panel:?}")))
+                                    .aria_label(label)
+                                    .tooltip({
+                                        let palette = p.clone();
+                                        move |_window, cx| Tooltip::view(label, &palette, cx)
+                                    })
                                     .w(px(32.0))
                                     .h(px(32.0))
                                     .flex()
@@ -4112,17 +4411,12 @@ impl gpui::Render for WorkspaceView {
                                     .justify_center()
                                     .rounded_md()
                                     .cursor_pointer()
-                                    .text_color(if selected {
-                                        gpui_color(p.accent)
-                                    } else {
-                                        ui::muted(&p)
-                                    })
                                     .when(selected, |button| button.bg(ui::selected_wash(&p)))
                                     .when(!selected, |button| {
                                         let wash = ui::hover_wash(&p);
                                         button.hover(move |style| style.bg(wash))
                                     })
-                                    .child(label)
+                                    .child(ui::icon(glyph, icon_size::MD, tint))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _event, _window, cx| {
@@ -4153,15 +4447,67 @@ impl gpui::Render for WorkspaceView {
                         .cursor(CursorStyle::ResizeColumn)
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::start_sidebar_resize)),
                 )
+                .with_animation(
+                    "sidebar-fade-in",
+                    Animation::new(UI_FADE_IN).with_easing(ease_in_out),
+                    |style, delta| style.opacity(delta),
+                )
                 .into_any_element()
         } else {
             div().w(px(0.0)).into_any_element()
         };
 
-        let theme_name = self.themes[self.theme_index].name.clone();
         // 触发后台解码（键变化才真正跑）；再同步取当前图层（命中即用，否则优雅回退）。
         self.request_background_decode(cx);
         let background_layer = self.background_layer();
+        let agent_indicators = self
+            .notification_router
+            .bell_items()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let bell_count = agent_indicators.len();
+        let bell_needs_attention = agent_indicators.iter().any(|indicator| {
+            matches!(
+                indicator.status,
+                AgentStatus::Attention | AgentStatus::Error
+            )
+        });
+        let ai_status = agent_indicators
+            .iter()
+            .find(|indicator| {
+                matches!(
+                    indicator.status,
+                    AgentStatus::Working
+                        | AgentStatus::Started
+                        | AgentStatus::Attention
+                        | AgentStatus::Error
+                )
+            })
+            .map(|indicator| indicator.status)
+            .or_else(|| agent_indicators.first().map(|indicator| indicator.status))
+            .unwrap_or(AgentStatus::Finished);
+        let ai_tools_running = agent_indicators
+            .iter()
+            .filter(|indicator| {
+                matches!(
+                    indicator.status,
+                    AgentStatus::Working | AgentStatus::Started
+                )
+            })
+            .count();
+        self.model.ai_tools_running = ai_tools_running;
+        let git_branch_label = self
+            .vcs_branch
+            .as_ref()
+            .and_then(|branch| {
+                branch
+                    .name
+                    .clone()
+                    .or_else(|| branch.detached.then(|| "detached".into()))
+            })
+            .unwrap_or_else(|| "no branch".into());
+        let status_left = self.status_context_label(&cwd, cx);
         let workspace_name = self
             .model
             .root
@@ -4169,23 +4515,6 @@ impl gpui::Render for WorkspaceView {
             .and_then(|name| name.to_str())
             .unwrap_or("Workspace")
             .to_owned();
-        let agent_indicators = self
-            .notification_router
-            .bell_items()
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let bell_label = if agent_indicators.is_empty() {
-            "🔔".to_owned()
-        } else {
-            format!("🔔 {}", agent_indicators.len())
-        };
-        let bell_needs_attention = agent_indicators.iter().any(|indicator| {
-            matches!(
-                indicator.status,
-                AgentStatus::Attention | AgentStatus::Error
-            )
-        });
         let bell_rows = agent_indicators
             .into_iter()
             .map(|indicator| {
@@ -4221,11 +4550,16 @@ impl gpui::Render for WorkspaceView {
                 .id("agent-bell-panel")
                 .flex()
                 .flex_col()
-                .bg(gpui_color(p.surface[2]))
+                .bg(gpui_color(p.overlay))
                 .border_b_1()
                 .border_color(ui::border(&p))
                 .child(div().px_3().py_2().text_sm().child("Agent activity"))
                 .children(bell_rows)
+                .with_animation(
+                    "bell-panel-fade-in",
+                    Animation::new(UI_FADE_IN).with_easing(ease_in_out),
+                    |style, delta| style.opacity(delta),
+                )
         });
         let toast_elements = self
             .toasts
@@ -4244,7 +4578,7 @@ impl gpui::Render for WorkspaceView {
                     .rounded_md()
                     .border_1()
                     .border_color(gpui_color(color))
-                    .bg(gpui_color(p.surface[1]))
+                    .bg(gpui_color(p.elevated))
                     .cursor_pointer()
                     .child(
                         div()
@@ -4272,21 +4606,19 @@ impl gpui::Render for WorkspaceView {
                             workspace.open_notification_target(target, cx);
                         }),
                     )
+                    .with_animation(
+                        SharedString::from(format!("toast-fade-{id}")),
+                        Animation::new(UI_FADE_IN).with_easing(ease_in_out),
+                        |style, delta| style.opacity(delta),
+                    )
             })
             .collect::<Vec<_>>();
         let explorer_context_menu = self.explorer_context_menu.clone().map(|menu| {
             let target_kind = menu.target.kind();
             anchored().position(menu.position).child(
-                div()
+                menu_panel(&p)
                     .id("explorer-context-menu")
                     .w(px(220.0))
-                    .occlude()
-                    .p_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(ui::border(&p))
-                    .bg(gpui_color(p.surface[2]))
-                    .shadow_md()
                     .children(explorer_context_actions(target_kind).iter().copied().map(
                         |action| {
                             div()
@@ -4308,207 +4640,105 @@ impl gpui::Render for WorkspaceView {
                                     }),
                                 )
                         },
-                    )),
+                    ))
+                    .with_animation(
+                        "explorer-menu-fade-in",
+                        Animation::new(UI_FADE_IN).with_easing(ease_in_out),
+                        |style, delta| style.opacity(delta),
+                    ),
             )
         });
         let can_split_right = self.can_split_active(SplitDirection::Right, window);
         let can_split_down = self.can_split_active(SplitDirection::Down, window);
-        let can_smart_split = can_split_right || can_split_down;
         let has_multiple_panes = self.active_pane_count() > 1;
-        let split_description = if can_smart_split {
-            "Split the focused pane using the best available direction".to_owned()
-        } else {
-            self.split_unavailable_message(None)
-        };
-        let split_focus_ring = ui::focus_ring(&p);
-        let split_hover = ui::hover_wash(&p);
-        let split_button = div()
-            .id("split-smart")
-            .px_2()
-            .py_1()
-            .rounded_l_md()
-            .text_xs()
-            .opacity(if can_smart_split { 1.0 } else { 0.45 })
-            .focusable()
-            .tab_stop(can_smart_split)
-            .role(Role::Button)
-            .aria_label("Split focused pane")
-            .aria_description(SharedString::from(split_description))
-            .focus_visible(move |style| style.border_1().border_color(split_focus_ring))
-            .child("Split")
-            .when(can_smart_split, |button| {
-                button
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(split_hover))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _event, window, cx| {
-                            cx.stop_propagation();
-                            this.smart_split(window, cx);
-                        }),
-                    )
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                        if matches!(event.keystroke.key.as_str(), "enter" | "return" | "space") {
-                            cx.stop_propagation();
-                            this.smart_split(window, cx);
-                        }
-                    }))
-            });
-        let split_menu_toggle = div()
-            .id("split-menu-toggle")
-            .px_1()
-            .py_1()
-            .rounded_r_md()
-            .text_xs()
-            .cursor_pointer()
-            .focusable()
-            .tab_stop(true)
-            .role(Role::Button)
-            .aria_label("Open split pane menu")
-            .aria_expanded(self.split_menu_open)
-            .focus_visible(move |style| style.border_1().border_color(split_focus_ring))
-            .hover(move |style| style.bg(split_hover))
-            .child("▾")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _event, _window, cx| {
-                    cx.stop_propagation();
-                    this.explorer_context_menu = None;
-                    this.theme_menu_open = false;
-                    this.split_menu_open = !this.split_menu_open;
-                    cx.notify();
-                }),
+        let new_tab_menu = self.new_tab_menu.map(|position| {
+            anchored().position(position).child(
+                menu_panel(&p)
+                    .id("new-tab-menu")
+                    .w(px(220.0))
+                    .child(new_tab_menu_item(
+                        "Terminal",
+                        "new-tab-terminal",
+                        true,
+                        NewTabAction::Terminal,
+                        &p,
+                        cx,
+                    ))
+                    .child(new_tab_menu_item(
+                        "Editor",
+                        "new-tab-editor",
+                        true,
+                        NewTabAction::Editor,
+                        &p,
+                        cx,
+                    ))
+                    .child(new_tab_menu_item(
+                        "Markdown preview",
+                        "new-tab-markdown",
+                        markdown_preview_available,
+                        NewTabAction::MarkdownPreview,
+                        &p,
+                        cx,
+                    ))
+                    .child(new_tab_menu_item(
+                        "Web preview",
+                        "new-tab-web",
+                        true,
+                        NewTabAction::WebPreview,
+                        &p,
+                        cx,
+                    ))
+                    .with_animation(
+                        "new-tab-menu-fade-in",
+                        Animation::new(UI_FADE_IN).with_easing(ease_in_out),
+                        |style, delta| style.opacity(delta),
+                    ),
             )
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "return" | "space") {
-                    cx.stop_propagation();
-                    this.explorer_context_menu = None;
-                    this.theme_menu_open = false;
-                    this.split_menu_open = !this.split_menu_open;
-                    cx.notify();
-                }
-            }));
-        let split_menu = self.split_menu_open.then(|| {
-            let menu_x = (f32::from(window.viewport_size().width) - 330.0).max(0.0);
-            anchored()
-                .position(Point::new(px(menu_x), px(WORKSPACE_HEADER_HEIGHT)))
-                .child(
-                    div()
-                        .id("split-pane-menu")
-                        .w(px(270.0))
-                        .occlude()
-                        .p_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(ui::border(&p))
-                        .bg(gpui_color(p.surface[2]))
-                        .shadow_md()
-                        .when(!can_smart_split, |menu| {
-                            menu.child(
-                                div().px_2().py_1().mb_1().text_xs().opacity(0.65).child(
-                                    SharedString::from(self.split_unavailable_message(None)),
-                                ),
-                            )
-                        })
-                        .child(split_menu_item(
-                            "Smart split",
-                            "split-menu-smart",
-                            can_smart_split,
-                            SplitMenuAction::Smart,
-                            &p,
-                            cx,
-                        ))
-                        .child(split_menu_item(
-                            "Split right",
-                            "split-menu-right",
-                            can_split_right,
-                            SplitMenuAction::Right,
-                            &p,
-                            cx,
-                        ))
-                        .child(split_menu_item(
-                            "Split down",
-                            "split-menu-down",
-                            can_split_down,
-                            SplitMenuAction::Down,
-                            &p,
-                            cx,
-                        ))
-                        .child(div().h(px(1.0)).my_1().bg(ui::border(&p)))
-                        .child(split_menu_item(
-                            "Close focused pane",
-                            "split-menu-close",
-                            has_multiple_panes,
-                            SplitMenuAction::CloseActive,
-                            &p,
-                            cx,
-                        ))
-                        .child(split_menu_item(
-                            "Keep only focused pane",
-                            "split-menu-close-others",
-                            has_multiple_panes,
-                            SplitMenuAction::CloseOthers,
-                            &p,
-                            cx,
-                        )),
-                )
         });
-        let theme_menu = self.theme_menu_open.then(|| {
-            let menu_x = (f32::from(window.viewport_size().width) - 300.0).max(0.0);
-            anchored()
-                .position(Point::new(px(menu_x), px(WORKSPACE_HEADER_HEIGHT)))
-                .child(
-                    div()
-                        .id("application-theme-menu")
-                        .w(px(250.0))
-                        .occlude()
-                        .p_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(ui::border(&p))
-                        .bg(gpui_color(p.surface[2]))
-                        .shadow_md()
-                        .children(self.themes.iter().map(|theme| {
-                            let theme_id = theme.id.clone();
-                            let selected = theme.id == self.settings.theme_id;
-                            let option_palette =
-                                theme.resolve(self.resolved_appearance(), self.system_is_dark);
-                            div()
-                                .id(SharedString::from(format!("theme-option-{}", theme.id)))
-                                .w_full()
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .text_sm()
-                                .cursor_pointer()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .when(selected, |item| item.bg(ui::selected_wash(&p)))
-                                .when(!selected, |item| {
-                                    let wash = ui::hover_wash(&p);
-                                    item.hover(move |style| style.bg(wash))
-                                })
-                                .child(
-                                    div()
-                                        .w(px(12.0))
-                                        .h(px(12.0))
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(ui::border(&option_palette))
-                                        .bg(gpui_color(option_palette.accent)),
-                                )
-                                .child(div().flex_1().child(SharedString::from(theme.name.clone())))
-                                .child(if selected { "✓" } else { "" })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, window, cx| {
-                                        cx.stop_propagation();
-                                        this.select_theme(&theme_id, window, cx);
-                                    }),
-                                )
-                        })),
-                )
+        let pane_context_menu = self.pane_context_menu.clone().map(|menu| {
+            anchored().position(menu.position).child(
+                menu_panel(&p)
+                    .id("pane-context-menu")
+                    .w(px(240.0))
+                    .child(split_menu_item(
+                        "Split right",
+                        "pane-menu-split-right",
+                        can_split_right,
+                        SplitMenuAction::Right,
+                        &p,
+                        cx,
+                    ))
+                    .child(split_menu_item(
+                        "Split down",
+                        "pane-menu-split-down",
+                        can_split_down,
+                        SplitMenuAction::Down,
+                        &p,
+                        cx,
+                    ))
+                    .child(menu_separator(&p))
+                    .child(split_menu_item(
+                        "Close focused pane",
+                        "pane-menu-close",
+                        has_multiple_panes,
+                        SplitMenuAction::CloseActive,
+                        &p,
+                        cx,
+                    ))
+                    .child(split_menu_item(
+                        "Keep only focused pane",
+                        "pane-menu-close-others",
+                        has_multiple_panes,
+                        SplitMenuAction::CloseOthers,
+                        &p,
+                        cx,
+                    ))
+                    .with_animation(
+                        "pane-menu-fade-in",
+                        Animation::new(UI_FADE_IN).with_easing(ease_in_out),
+                        |style, delta| style.opacity(delta),
+                    ),
+            )
         });
         let input_focus = self.focus_handle.clone();
         let input_entity = cx.entity();
@@ -4522,10 +4752,10 @@ impl gpui::Render for WorkspaceView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event, _window, cx| {
-                    let closed_explorer_menu = this.explorer_context_menu.take().is_some();
-                    let closed_split_menu = std::mem::take(&mut this.split_menu_open);
-                    let closed_theme_menu = std::mem::take(&mut this.theme_menu_open);
-                    if closed_explorer_menu || closed_split_menu || closed_theme_menu {
+                    let closed_explorer = this.explorer_context_menu.take().is_some();
+                    let closed_new_tab = this.new_tab_menu.take().is_some();
+                    let closed_pane = this.pane_context_menu.take().is_some();
+                    if closed_explorer || closed_new_tab || closed_pane {
                         cx.notify();
                     }
                 }),
@@ -4554,26 +4784,42 @@ impl gpui::Render for WorkspaceView {
                 |root, element| root.child(element),
             )
             .child(
+                // 标题栏：系统标题栏已关闭，这一行自己承担标签页、操作区与窗口
+                // 控制按钮。窗口控制按钮不自己处理点击 —— 平台层认得
+                // `WindowControlArea`，于是 Snap Layouts、双击最大化、系统菜单
+                // 都还是原生行为。
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .h(px(WORKSPACE_HEADER_HEIGHT))
-                    .bg(gpui_color(p.surface[2]))
+                    .bg(gpui_color(p.chrome))
+                    // macOS 的红绿灯由系统画在左上角，内容得给它让位。
+                    .pl(px(app_identity::titlebar_leading_inset()))
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .flex_1()
                             .min_w(px(0.0))
                             .h_full()
                             .overflow_hidden()
                             .children(tab_buttons)
                             .child(new_tab_button),
                     )
+                    // 唯一的拖拽区。只覆盖标签页与操作区之间的空隙，而不是整条
+                    // 标题栏：命中测试按绘制顺序返回第一个匹配，父级先于子级插入，
+                    // 若把拖拽区铺满整行，里面每个控件都得 `occlude()` 才不会被
+                    // 吞掉，而 `occlude()` 又会让根节点收不到"点空白处关菜单"的点击。
                     .child(
-                        // 头部右侧操作区：统一间距与主题化按钮。
+                        div()
+                            .flex_1()
+                            .min_w(px(TITLE_BAR_DRAG_MIN_WIDTH))
+                            .h_full()
+                            .window_control_area(WindowControlArea::Drag),
+                    )
+                    .child(
+                        // 标题栏操作区只保留通知与设置。
                         div()
                             .flex()
                             .flex_row()
@@ -4581,112 +4827,57 @@ impl gpui::Render for WorkspaceView {
                             .flex_shrink_0()
                             .gap_1()
                             .px_2()
-                            .child(
-                                ui::button(
-                                    "open-workspace",
-                                    SharedString::from(workspace_name),
-                                    ButtonKind::Ghost,
-                                    &p,
-                                )
-                                .max_w(px(180.0))
-                                .overflow_hidden()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(Self::open_workspace_picker),
-                                ),
-                            )
-                            .child(header_button(
-                                "+ Terminal",
-                                "new-terminal",
-                                &p,
-                                cx,
-                                |this, _, window, cx| this.create_terminal(false, window, cx),
-                            ))
-                            .child(header_button(
-                                "+ Editor",
-                                "new-editor",
-                                &p,
-                                cx,
-                                |this, _, _, cx| this.create_editor(cx),
-                            ))
-                            .children(markdown_preview_available.then(|| {
-                                header_button(
-                                    "Preview Markdown",
-                                    "preview-markdown",
-                                    &p,
-                                    cx,
-                                    |this, _, _, cx| {
-                                        let _ = this.request_markdown_preview(cx);
-                                    },
-                                )
-                            }))
-                            .child(header_button(
-                                "Web Preview",
-                                "new-web-preview",
-                                &p,
-                                cx,
-                                |this, _, window, cx| this.request_web_preview(window, cx),
-                            ))
-                            .child(
+                            .child({
+                                // 需要注意时用状态色着色，而不是把整个按钮刷成实底 ——
+                                // 一个提醒不该盖过它旁边的所有东西。
+                                let tint = if bell_needs_attention {
+                                    gpui_color(p.status[2])
+                                } else {
+                                    gpui_color_alpha(p.foreground, 0.72)
+                                };
+                                let wash = ui::hover_wash(&p);
                                 div()
+                                    .id("agent-bell")
+                                    .aria_label("Agent activity")
+                                    .tooltip({
+                                        let palette = p.clone();
+                                        move |_window, cx| {
+                                            Tooltip::view("Agent activity", &palette, cx)
+                                        }
+                                    })
+                                    .h(px(tokens::height::REGULAR))
+                                    .px(px(tokens::space::SM))
                                     .flex()
                                     .items_center()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(ui::border(&p))
-                                    .bg(gpui_color(p.surface[2]))
-                                    .child(split_button)
-                                    .child(div().w(px(1.0)).h(px(16.0)).bg(ui::border(&p)))
-                                    .child(split_menu_toggle),
-                            )
+                                    .gap(px(tokens::space::XS))
+                                    .rounded(px(tokens::radius::MD))
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(wash))
+                                    .child(ui::icon(Icon::Bell, icon_size::SM, tint))
+                                    .when(bell_count > 0, |bell| {
+                                        bell.child(
+                                            div()
+                                                .text_size(px(tokens::font_size::MICRO))
+                                                .text_color(tint)
+                                                .child(SharedString::from(bell_count.to_string())),
+                                        )
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::toggle_bell),
+                                    )
+                            })
                             .child(
-                                ui::button(
-                                    "theme-select",
-                                    SharedString::from(format!("{theme_name}  ▾")),
-                                    ButtonKind::Ghost,
-                                    &p,
-                                )
-                                .text_color(ui::muted(&p))
-                                .aria_label("Select application theme")
-                                .aria_expanded(self.theme_menu_open)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.explorer_context_menu = None;
-                                        this.split_menu_open = false;
-                                        this.theme_menu_open = !this.theme_menu_open;
-                                        cx.notify();
-                                    }),
-                                ),
-                            )
-                            .child(
-                                ui::button(
-                                    "agent-bell",
-                                    SharedString::from(bell_label),
-                                    if bell_needs_attention {
-                                        ButtonKind::Primary
-                                    } else {
-                                        ButtonKind::Ghost
-                                    },
-                                    &p,
-                                )
-                                .when(bell_needs_attention, |button| {
-                                    button
-                                        .bg(gpui_color(p.status[2]))
-                                        .text_color(ui::on_color(p.status[2]))
-                                })
-                                .on_mouse_down(MouseButton::Left, cx.listener(Self::toggle_bell)),
-                            )
-                            .child(
-                                ui::button("settings", "⚙", ButtonKind::Ghost, &p)
-                                    .text_sm()
+                                ui::icon_button("settings", Icon::Settings, "Settings", &p)
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(Self::open_settings),
                                     ),
                             ),
-                    ),
+                    )
+                    .when(draws_own_window_controls(), |bar| {
+                        bar.child(window_controls(&p, window.is_maximized()))
+                    }),
             )
             .children(bell_panel)
             .children(toast_elements)
@@ -4710,39 +4901,83 @@ impl gpui::Render for WorkspaceView {
                     .justify_between()
                     .h(px(STATUS_BAR_HEIGHT))
                     .px_3()
-                    .bg(gpui_color(p.surface[2]))
+                    .gap_3()
+                    .bg(gpui_color(p.chrome))
                     .border_t_1()
                     .border_color(ui::border(&p))
                     .text_xs()
                     .text_color(ui::muted(&p))
                     .child(
                         div()
+                            .flex_1()
                             .min_w(px(0.0))
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .child(SharedString::from(cwd)),
+                            .child(SharedString::from(status_left)),
                     )
-                    .child(SharedString::from(format!(
-                        "AI tools: {}",
-                        self.model.ai_tools_running
-                    )))
-                    .when_some(preview_url, |bar, url| {
-                        let label = SharedString::from(format!("Open Web Preview: {url}"));
-                        bar.child(
-                            ui::button("open-detected-preview", label, ButtonKind::Subtle, &p)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_3()
+                            .flex_shrink_0()
+                            .child(
+                                ui::button(
+                                    "status-open-workspace",
+                                    SharedString::from(workspace_name),
+                                    ButtonKind::Ghost,
+                                    &p,
+                                )
+                                .text_xs()
+                                .text_color(ui::muted(&p))
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(move |workspace, _, window, cx| {
-                                        workspace.create_preview_url(url.clone(), window, cx)
-                                    }),
+                                    cx.listener(Self::open_workspace_picker),
                                 ),
-                        )
-                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(ui::icon(Icon::GitBranch, icon_size::SM, ui::muted(&p)))
+                                    .child(SharedString::from(git_branch_label)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(gpui_color(status_color(&p, ai_status)))
+                                    .child(SharedString::from(format!(
+                                        "AI {}",
+                                        status_label(ai_status)
+                                    ))),
+                            )
+                            .when(ai_tools_running > 0, |row| {
+                                row.child(SharedString::from(format!("tools: {ai_tools_running}")))
+                            })
+                            .when_some(preview_url, |row, url| {
+                                let label = SharedString::from(format!("Open Web Preview: {url}"));
+                                row.child(
+                                    ui::button(
+                                        "open-detected-preview",
+                                        label,
+                                        ButtonKind::Subtle,
+                                        &p,
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |workspace, _, window, cx| {
+                                            workspace.create_preview_url(url.clone(), window, cx)
+                                        }),
+                                    ),
+                                )
+                            }),
+                    ),
             )
             .children(explorer_context_menu)
-            .children(split_menu)
-            .children(theme_menu)
+            .children(new_tab_menu)
+            .children(pane_context_menu)
     }
 }
 
@@ -4801,103 +5036,42 @@ fn explorer_content_width(entries: &[FileEntry]) -> f32 {
         .fold(1.0, f32::max)
 }
 
-fn explorer_icon(
-    icon: IconKind,
-    expanded: bool,
-    surface_bg: gpui::Rgba,
-    panel_bg: gpui::Rgba,
-) -> gpui::Div {
-    if icon == IconKind::Folder {
-        let color = gpui::rgba(0xe5c07bff);
-        let folder = div()
-            .relative()
-            .w(px(18.0))
-            .h(px(16.0))
-            .flex_shrink_0()
-            .child(
-                div()
-                    .absolute()
-                    .top(px(2.0))
-                    .left(px(2.0))
-                    .w(px(7.0))
-                    .h(px(5.0))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(color)
-                    .bg(panel_bg),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(5.0))
-                    .left(px(1.0))
-                    .w(px(15.0))
-                    .h(px(10.0))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(color)
-                    .bg(panel_bg),
-            );
-        return if expanded {
-            folder.child(
-                div()
-                    .absolute()
-                    .top(px(8.0))
-                    .left(px(0.0))
-                    .w(px(17.0))
-                    .h(px(7.0))
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(color)
-                    .bg(surface_bg),
-            )
-        } else {
-            folder
-        };
-    }
-
-    let (label, color) = match icon {
-        IconKind::Rust => ("R", gpui::rgba(0xd08770ff)),
-        IconKind::JavaScript => ("J", gpui::rgba(0xebcb8bff)),
-        IconKind::TypeScript => ("T", gpui::rgba(0x5e81acff)),
-        IconKind::Python => ("P", gpui::rgba(0x81a1c1ff)),
-        IconKind::Go => ("G", gpui::rgba(0x88c0d0ff)),
-        IconKind::Java => ("J", gpui::rgba(0xbf616aff)),
-        IconKind::Html => ("H", gpui::rgba(0xd08770ff)),
-        IconKind::Css => ("C", gpui::rgba(0xb48eadff)),
-        IconKind::Json => ("{", gpui::rgba(0xa3be8cff)),
-        IconKind::Markdown => ("M", gpui::rgba(0x81a1c1ff)),
-        IconKind::Image => ("I", gpui::rgba(0xb48eadff)),
-        IconKind::Config => ("C", gpui::rgba(0x8fbcbbff)),
-        IconKind::File | IconKind::Folder => ("", gpui::rgba(0x9aa6b7ff)),
+/// 文件树图标：Lucide SVG，颜色取自主题（禁止硬编码 rgba）。
+fn explorer_icon(kind: IconKind, expanded: bool, p: &ResolvedPalette) -> gpui::Svg {
+    let (glyph, tint) = match kind {
+        IconKind::Folder if expanded => (Icon::FolderOpen, ui::color(p.accent)),
+        IconKind::Folder => (Icon::Folder, ui::color(p.accent)),
+        IconKind::Rust
+        | IconKind::JavaScript
+        | IconKind::TypeScript
+        | IconKind::Python
+        | IconKind::Go
+        | IconKind::Java
+        | IconKind::Html
+        | IconKind::Css => (Icon::FileCode, ui::alpha(p.foreground, 0.78)),
+        IconKind::Json => (Icon::Braces, ui::alpha(p.foreground, 0.78)),
+        IconKind::Markdown | IconKind::File => (Icon::FileText, ui::alpha(p.foreground, 0.72)),
+        IconKind::Image => (Icon::FileImage, ui::alpha(p.foreground, 0.78)),
+        IconKind::Config => (Icon::FileCog, ui::alpha(p.foreground, 0.78)),
     };
-    div()
-        .relative()
-        .w(px(18.0))
-        .h(px(16.0))
-        .flex_shrink_0()
-        .child(
-            div()
-                .absolute()
-                .top(px(1.0))
-                .left(px(1.0))
-                .w(px(12.0))
-                .h(px(14.0))
-                .rounded_sm()
-                .border_1()
-                .border_color(color)
-                .bg(surface_bg),
-        )
-        .child(
-            div()
-                .absolute()
-                .top(px(5.0))
-                .left(px(4.0))
-                .text_size(px(7.0))
-                .line_height(px(7.0))
-                .text_color(color)
-                .child(label),
-        )
+    icon(glyph, icon_size::SM, tint)
+}
+
+fn explorer_tool_button(
+    id: &'static str,
+    glyph: Icon,
+    label: &'static str,
+    p: &ResolvedPalette,
+    cx: &mut Context<WorkspaceView>,
+    listener: impl Fn(&mut WorkspaceView, &mut Context<WorkspaceView>) + 'static,
+) -> impl IntoElement {
+    ui::icon_button(id, glyph, label, p).on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |workspace, _event, window, cx| {
+            window.focus(&workspace.focus_handle, cx);
+            listener(workspace, cx);
+        }),
+    )
 }
 
 fn explorer_context_actions(kind: ExplorerContextTargetKind) -> &'static [ExplorerContextAction] {
@@ -5009,16 +5183,57 @@ fn sidebar_button(
     )
 }
 
-fn header_button(
+fn path_breadcrumb(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return normalized;
+    }
+    // Windows 盘符保留在首段。
+    if normalized.chars().nth(1) == Some(':') {
+        let drive = parts[0];
+        let rest = parts[1..].join(" › ");
+        if rest.is_empty() {
+            format!("{drive}/")
+        } else {
+            format!("{drive}/ › {rest}")
+        }
+    } else {
+        parts.join(" › ")
+    }
+}
+
+fn new_tab_menu_item(
     label: &'static str,
     id: &'static str,
+    enabled: bool,
+    action: NewTabAction,
     p: &ResolvedPalette,
     cx: &mut Context<WorkspaceView>,
-    listener: impl Fn(&mut WorkspaceView, &MouseDownEvent, &mut Window, &mut Context<WorkspaceView>)
-        + 'static,
 ) -> impl IntoElement {
-    ui::button(id, label, ButtonKind::Subtle, p)
-        .on_mouse_down(MouseButton::Left, cx.listener(listener))
+    let hover_bg = ui::hover_wash(p);
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .text_xs()
+        .opacity(if enabled { 1.0 } else { 0.45 })
+        .child(label)
+        .when(enabled, |item| {
+            item.cursor_pointer()
+                .hover(move |style| style.bg(hover_bg))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, window, cx| {
+                        cx.stop_propagation();
+                        this.handle_new_tab_action(action, window, cx);
+                    }),
+                )
+        })
 }
 
 fn split_menu_item(
@@ -5150,6 +5365,14 @@ fn gpui_color(color: termior_theme::Color) -> gpui::Rgba {
 /// 带透明度的主题色（tab 非激活文字、分隔线等弱化元素用）。
 fn gpui_color_alpha(color: termior_theme::Color, alpha: f32) -> gpui::Rgba {
     ui::alpha(color, alpha)
+}
+
+fn map_appearance(appearance: termior_store::settings::Appearance) -> Appearance {
+    match appearance {
+        termior_store::settings::Appearance::Light => Appearance::Light,
+        termior_store::settings::Appearance::Dark => Appearance::Dark,
+        termior_store::settings::Appearance::FollowSystem => Appearance::FollowSystem,
+    }
 }
 
 fn load_settings() -> (Settings, Option<PathBuf>, Option<String>) {

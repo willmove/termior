@@ -13,8 +13,10 @@
 //! 编排（后台线程跑解码、回填缓存、触发重绘）在 `WorkspaceView` 侧完成，保持本模块
 //! 的缓存/模糊逻辑可独立单测。
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use gpui::RenderImage;
 use image::{Frame, RgbaImage};

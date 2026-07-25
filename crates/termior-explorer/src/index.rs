@@ -29,19 +29,52 @@ pub struct FileEntry {
     pub icon: IconKind,
 }
 
+/// Why a walk entry was skipped. Values are user-facing labels, not raw OS text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    PermissionDenied,
+    NotFound,
+    Loop,
+    Unreadable,
+}
+
+impl SkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PermissionDenied => "Permission denied",
+            Self::NotFound => "Not found",
+            Self::Loop => "Symbolic link loop",
+            Self::Unreadable => "Unable to read",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedEntry {
+    /// Path relative to the workspace root when possible; otherwise absolute.
+    pub path: PathBuf,
+    pub reason: SkipReason,
+}
+
+impl SkippedEntry {
+    /// Platform-native separators for UI (no mixed `/` and `\`).
+    pub fn display_path(&self) -> String {
+        platform_path(&self.path)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileIndex {
     root: PathBuf,
     show_dotfiles: bool,
     entries: Vec<FileEntry>,
+    skipped: Vec<SkippedEntry>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
     #[error("workspace root is not a directory: {0}")]
     NotDirectory(PathBuf),
-    #[error("walk error: {0}")]
-    Walk(String),
 }
 
 impl FileIndex {
@@ -54,6 +87,7 @@ impl FileIndex {
             root: root.to_path_buf(),
             show_dotfiles,
             entries: Vec::new(),
+            skipped: Vec::new(),
         };
         index.refresh()?;
         Ok(index)
@@ -67,12 +101,19 @@ impl FileIndex {
         &self.entries
     }
 
+    pub fn skipped(&self) -> &[SkippedEntry] {
+        &self.skipped
+    }
+
     pub fn set_show_dotfiles(&mut self, show: bool) -> Result<(), IndexError> {
         self.show_dotfiles = show;
         self.refresh()
     }
 
     pub fn refresh(&mut self) -> Result<(), IndexError> {
+        if !self.root.is_dir() {
+            return Err(IndexError::NotDirectory(self.root.clone()));
+        }
         let mut builder = WalkBuilder::new(&self.root);
         builder
             .hidden(!self.show_dotfiles)
@@ -83,8 +124,30 @@ impl FileIndex {
             .ignore(true)
             .parents(true);
         let mut entries = Vec::new();
+        let mut skipped = Vec::new();
         for result in builder.build() {
-            let dent = result.map_err(|error| IndexError::Walk(error.to_string()))?;
+            let dent = match result {
+                Ok(dent) => dent,
+                Err(error) => {
+                    // Soft ignore-file / glob issues must not abort or clutter the UI.
+                    if is_soft_walk_error(&error) {
+                        continue;
+                    }
+                    let path = walk_error_path(&error).unwrap_or_else(|| self.root.clone());
+                    if path == self.root {
+                        return Err(IndexError::NotDirectory(self.root.clone()));
+                    }
+                    let relative = path
+                        .strip_prefix(&self.root)
+                        .unwrap_or(path.as_path())
+                        .to_path_buf();
+                    skipped.push(SkippedEntry {
+                        path: relative,
+                        reason: classify_walk_error(&error),
+                    });
+                    continue;
+                }
+            };
             if dent.path() == self.root {
                 continue;
             }
@@ -104,7 +167,13 @@ impl FileIndex {
             (false, true) => std::cmp::Ordering::Greater,
             _ => a.relative.to_lowercase().cmp(&b.relative.to_lowercase()),
         });
+        skipped.sort_by(|a, b| {
+            platform_path(&a.path)
+                .to_lowercase()
+                .cmp(&platform_path(&b.path).to_lowercase())
+        });
         self.entries = entries;
+        self.skipped = skipped;
         Ok(())
     }
 
@@ -122,8 +191,63 @@ impl FileIndex {
     }
 }
 
+fn is_soft_walk_error(error: &ignore::Error) -> bool {
+    if error.is_partial() {
+        return true;
+    }
+    matches!(
+        error,
+        ignore::Error::Glob { .. }
+            | ignore::Error::UnrecognizedFileType(_)
+            | ignore::Error::InvalidDefinition
+    )
+}
+
+fn walk_error_path(error: &ignore::Error) -> Option<PathBuf> {
+    match error {
+        ignore::Error::WithPath { path, .. } => Some(path.clone()),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err)
+        }
+        ignore::Error::Partial(errors) => errors.iter().find_map(walk_error_path),
+        ignore::Error::Loop { child, .. } => Some(child.clone()),
+        _ => None,
+    }
+}
+
+fn classify_walk_error(error: &ignore::Error) -> SkipReason {
+    if walk_error_is_loop(error) {
+        return SkipReason::Loop;
+    }
+    match error.io_error().map(|io| io.kind()) {
+        Some(std::io::ErrorKind::PermissionDenied) => SkipReason::PermissionDenied,
+        Some(std::io::ErrorKind::NotFound) => SkipReason::NotFound,
+        _ => SkipReason::Unreadable,
+    }
+}
+
+fn walk_error_is_loop(error: &ignore::Error) -> bool {
+    match error {
+        ignore::Error::Loop { .. } => true,
+        ignore::Error::WithPath { err, .. }
+        | ignore::Error::WithDepth { err, .. }
+        | ignore::Error::WithLineNumber { err, .. } => walk_error_is_loop(err),
+        ignore::Error::Partial(errors) => errors.iter().any(walk_error_is_loop),
+        _ => false,
+    }
+}
+
+/// Internal index paths stay `/`-normalized for fuzzy matching.
 fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// UI / skipped-entry paths use the platform separator consistently.
+fn platform_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(std::path::MAIN_SEPARATOR_STR)
 }
 
 fn icon_for(path: &Path, is_dir: bool) -> IconKind {
@@ -163,6 +287,7 @@ fn icon_for(path: &Path, is_dir: bool) -> IconKind {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
 
     #[test]
     fn index_respects_gitignore_and_dotfiles() {
@@ -181,6 +306,7 @@ mod tests {
         assert!(paths.contains(&"src/main.rs"));
         assert!(!paths.contains(&"ignored.log"));
         assert!(!paths.contains(&".hidden"));
+        assert!(index.skipped().is_empty());
     }
 
     #[test]
@@ -192,5 +318,104 @@ mod tests {
         let hits = index.fuzzy("main", 10);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "src/main.rs");
+    }
+
+    #[test]
+    fn missing_root_is_the_only_hard_failure() {
+        let missing = tempfile::tempdir().unwrap().path().join("does-not-exist");
+        let error = FileIndex::build(&missing, false).unwrap_err();
+        assert!(matches!(error, IndexError::NotDirectory(_)));
+    }
+
+    #[test]
+    fn unreadable_subdirectory_is_skipped_and_rest_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main(){}").unwrap();
+        fs::write(dir.path().join("readme.md"), "hi").unwrap();
+        let secret = dir.path().join("secret");
+        fs::create_dir_all(&secret).unwrap();
+        fs::write(secret.join("hidden.txt"), "nope").unwrap();
+
+        let _guard = deny_read(&secret);
+
+        let index = FileIndex::build(dir.path(), true).unwrap();
+        let paths: Vec<&str> = index
+            .entries()
+            .iter()
+            .map(|e| e.relative.as_str())
+            .collect();
+        assert!(
+            paths.contains(&"src/main.rs"),
+            "readable files must still be indexed: {paths:?}"
+        );
+        assert!(paths.contains(&"readme.md"), "{paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.contains("hidden")),
+            "contents of unreadable dir must not appear: {paths:?}"
+        );
+        assert!(
+            !index.skipped().is_empty(),
+            "expected at least one skipped entry"
+        );
+        for skipped in index.skipped() {
+            let shown = skipped.display_path();
+            #[cfg(windows)]
+            assert!(!shown.contains('/'), "windows path must use \\: {shown}");
+            #[cfg(unix)]
+            assert!(!shown.contains('\\'), "unix path must use /: {shown}");
+            assert!(!skipped.reason.as_str().is_empty());
+            // Must not surface raw OS / HRESULT text.
+            assert!(!skipped.reason.as_str().contains("os error"));
+            assert!(!skipped.reason.as_str().contains("0x"));
+        }
+    }
+
+    struct DenyReadGuard(PathBuf);
+
+    impl Drop for DenyReadGuard {
+        fn drop(&mut self) {
+            restore_read(&self.0);
+        }
+    }
+
+    fn deny_read(path: &Path) -> DenyReadGuard {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o000);
+            fs::set_permissions(path, perms).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            // Deny Everyone (S-1-1-0) read on the directory so WalkBuilder cannot list it.
+            let status = Command::new("icacls")
+                .arg(path)
+                .args(["/deny", "*S-1-1-0:(OI)(CI)R"])
+                .status()
+                .expect("icacls deny");
+            assert!(status.success(), "icacls deny failed");
+        }
+        DenyReadGuard(path.to_path_buf())
+    }
+
+    fn restore_read(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = fs::metadata(path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o755);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = Command::new("icacls")
+                .arg(path)
+                .args(["/remove:d", "*S-1-1-0"])
+                .status();
+        }
     }
 }

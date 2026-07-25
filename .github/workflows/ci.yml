@@ -54,6 +54,15 @@ jobs:
         run: cargo build --workspace --exclude termior --all-targets
       - name: Test
         run: cargo test --workspace --exclude termior --all-targets
+      # ui-kit 的布局/搜索逻辑必须在不编译 GPUI 时也能测通（feature gate 的契约）。
+      - name: UI kit without GPUI
+        shell: bash
+        run: |
+          cargo test -p termior-ui-kit --no-default-features
+          if cargo tree -p termior-ui-kit --no-default-features -e normal | grep -E '(^| )gpui v'; then
+            echo "gpui leaked into --no-default-features dependency tree" >&2
+            exit 1
+          fi
 
   desktop:
     name: Desktop (${{ matrix.platform }})

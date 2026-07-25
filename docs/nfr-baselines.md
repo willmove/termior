@@ -30,6 +30,7 @@
 | NFR-01 | 冷启动 | ms | `nfr-run` 计时：进程 spawn → 应用打印 `TERMIOR_NFR_FIRST_FRAME`（首帧可交互） | 越小越好 |
 | NFR-04 | 常驻 RSS | MiB | `nfr-run` 用 sysinfo 轮询子进程 `Process::memory()`，取 dwell 窗口峰值 | 越小越好 |
 | NFR-03 | 稳态帧率 | fps | 应用内 `on_next_frame` 采样 1.5s 计帧数，打印 `TERMIOR_NFR_FPS=NN` | 越大越好 |
+| NFR-03 | 空闲零重绘 | frames | `scripts/idle-redraw-smoke.ps1`：`TERMIOR_IDLE_REDRAW_PROBE` 在 settle 后统计 `WorkspaceView::render` 次数，期望 `TERMIOR_IDLE_REDRAW_FRAMES=0` | 必须为 0 |
 | NFR-02 | PTY/VTE 吞吐 | MiB/s | `nfr-pty`/bench：5 MiB 合成 `cat` 输出 → `vte::Processor::advance` 喂 alacritty `Term` 网格 | 越大越好 |
 
 ### 为什么 PTY 吞吐是 headless 主干项

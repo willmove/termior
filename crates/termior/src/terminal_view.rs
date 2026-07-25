@@ -25,8 +25,11 @@ use gpui::{
 };
 use termior_store::{TerminalSettings, UserKeymap};
 use termior_terminal::{PtySessionConfig, TerminalBridge, TerminalEventProxy};
-use termior_terminal_core::osc::{AgentState, OscEvent};
-use termior_terminal_core::{find_hyperlinks, TerminalSearch};
+use termior_terminal_core::{
+    find_hyperlinks,
+    osc::{AgentState, OscEvent},
+    TerminalSearch,
+};
 use termior_theme::{Color as ThemeColor, ResolvedPalette, TerminalPalette};
 use termior_ui_kit::SearchOverlay;
 
@@ -799,7 +802,7 @@ impl Render for TerminalView {
                         .rounded_md()
                         .border_1()
                         .border_color(crate::ui::color(self.palette.accent))
-                        .bg(crate::ui::color(self.palette.surface[2]))
+                        .bg(crate::ui::color(self.palette.overlay))
                         .text_color(crate::ui::color(self.palette.foreground))
                         .shadow_md()
                         .child(SharedString::from(format!(
@@ -837,7 +840,7 @@ impl Render for TerminalView {
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
-                                .bg(crate::ui::alpha(self.palette.surface[2], 0.92))
+                                .bg(crate::ui::alpha(self.palette.overlay, 0.92))
                                 .border_1()
                                 .border_color(crate::ui::border(&self.palette))
                                 .text_color(crate::ui::color(self.palette.accent))

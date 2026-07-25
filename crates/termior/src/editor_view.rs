@@ -5,9 +5,11 @@ use gpui::{
     Focusable, InputHandler, KeyDownEvent, Pixels, Point, ScrollStrategy, SharedString, Task,
     UTF16Selection, UniformListScrollHandle, WeakEntity, Window,
 };
-use std::ops::Range;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use termior_ai::{InlineCompleter, InlineCompletionContext, InlineCompletionResult};
 use termior_editor::{
     builtin_editor_themes, CompletionController, EditorBuffer, EditorTheme, HighlightKind, Motion,
@@ -130,6 +132,13 @@ impl EditorView {
 
     pub fn path(&self) -> Option<&Path> {
         self.buffer.path()
+    }
+
+    /// 光标行列（0-based），供状态栏上下文条显示。
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        self.buffer
+            .line_col_for_char(self.buffer.cursor().char_index)
+            .unwrap_or((0, 0))
     }
 
     pub fn text(&self) -> String {
@@ -741,7 +750,7 @@ impl Render for EditorView {
                 .rounded_md()
                 .border_1()
                 .border_color(crate::ui::color(p.accent))
-                .bg(crate::ui::color(p.surface[2]))
+                .bg(crate::ui::color(p.overlay))
                 .text_color(crate::ui::color(p.foreground))
                 .shadow_md()
                 .child(SharedString::from(format!("Find: {}▏", self.search.query)))
@@ -773,7 +782,7 @@ impl Render for EditorView {
                 .px_2()
                 .py_1()
                 .rounded_md()
-                .bg(crate::ui::alpha(p.surface[2], 0.9))
+                .bg(crate::ui::alpha(p.overlay, 0.9))
                 .border_1()
                 .border_color(crate::ui::border(&p))
                 .text_xs()
