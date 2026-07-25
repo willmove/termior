@@ -3,17 +3,22 @@ use gpui::{
     InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, SharedString,
     StatefulInteractiveElement, UTF16Selection, WeakEntity, Window,
 };
-use std::ops::Range;
-use std::path::PathBuf;
+use std::{ops::Range, path::PathBuf, time::Duration};
+
+const SETTINGS_NAV_WIDTH: f32 = 180.0;
+const SETTINGS_CONTENT_MAX_WIDTH: f32 = 640.0;
+const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 use termior_ai::{
     AgentDefinition, AgentDefinitionStore, HttpProvider, KeyringSecretStore, ProviderConfig,
     SecretStore,
 };
-use termior_store::settings::Appearance;
 use termior_store::{
-    atomic_write, default_keymap, DataFiles, KeyAction, Platform, Settings, UserKeyBinding,
+    atomic_write, default_keymap, settings::Appearance, DataFiles, KeyAction, Platform, Settings,
+    UserKeyBinding,
 };
-use termior_theme::ThemeLibrary;
+use termior_theme::{
+    resolve_active_palette, themes_for_native_appearance, NativeAppearance, ThemeLibrary,
+};
 use termior_ui::SettingsPage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,11 +42,13 @@ enum EditField {
 }
 
 type SaveCallback = Box<dyn Fn(&Settings, &mut App)>;
-type ThemePreviewCallback = Box<dyn Fn(&termior_theme::Theme, &str, Appearance, &mut App)>;
+type ThemePreviewCallback = Box<dyn Fn(&Settings, &mut App)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectMenu {
     ApplicationTheme,
+    LightTheme,
+    DarkTheme,
     EditorTheme,
     Appearance,
 }
@@ -58,6 +65,8 @@ pub struct SettingsView {
     cursor: usize,
     marked_text: String,
     credential_present: bool,
+    /// 已输入但尚未写入钥匙串的 API key（需显式 Save API key）。
+    pending_api_key: Option<String>,
     capture_shortcut: Option<KeyAction>,
     themes: ThemeLibrary,
     agents: AgentDefinitionStore,
@@ -68,11 +77,15 @@ pub struct SettingsView {
     select_menu: Option<SelectMenu>,
     /// 渲染期缓存的当前主题色板(每帧从全局刷新,供 edit_row 等辅助方法使用)。
     palette: termior_theme::ResolvedPalette,
-    /// 进行中的异步任务(ping / rfd 对话框)。保存为字段而非 `.detach()`,
+    /// 进行中的异步任务(ping / rfd 对话框 / 防抖保存)。保存为字段而非 `.detach()`,
     /// 这样在设置窗口关闭、`SettingsView` 被 drop 时任务会随实体一并取消,
     /// 避免任务在 ~10s 后回写状态并触发对已销毁窗口的 `cx.notify()`,
     /// 产生 `window not found` / `无效的窗口句柄` 错误。
     pending_tasks: Vec<gpui::Task<()>>,
+    /// 防抖保存代数；递增可取消尚未触发的写盘。
+    save_generation: u64,
+    /// `commit_edit` 改了 settings 后置位，由调用方 `schedule_save`。
+    settings_dirty: bool,
 }
 
 impl SettingsView {
@@ -104,6 +117,7 @@ impl SettingsView {
             cursor: 0,
             marked_text: String::new(),
             credential_present: false,
+            pending_api_key: None,
             capture_shortcut: None,
             themes,
             agents,
@@ -112,8 +126,10 @@ impl SettingsView {
             on_save,
             on_theme_preview,
             select_menu: None,
-            palette: termior_theme::default_theme().resolve(termior_theme::Appearance::Dark, true),
+            palette: termior_theme::default_theme().palette().clone(),
             pending_tasks: Vec::new(),
+            save_generation: 0,
+            settings_dirty: false,
         };
         view.refresh_credential_state();
         view
@@ -121,8 +137,20 @@ impl SettingsView {
 
     fn set_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
         self.commit_edit();
+        self.schedule_save_if_dirty(cx);
         self.page = page;
         cx.notify();
+    }
+
+    fn page_label(page: SettingsPage) -> &'static str {
+        match page {
+            SettingsPage::General => "General",
+            SettingsPage::Models => "Models",
+            SettingsPage::Themes => "Themes",
+            SettingsPage::Shortcuts => "Shortcuts",
+            SettingsPage::Agents => "Agents",
+            SettingsPage::About => "About",
+        }
     }
 
     fn profile(&self) -> Option<&termior_store::ModelProviderSettings> {
@@ -162,6 +190,7 @@ impl SettingsView {
 
     fn begin_edit(&mut self, field: EditField, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_edit();
+        self.schedule_save_if_dirty(cx);
         self.edit_field = Some(field);
         self.draft = self.value_for(field);
         if field == EditField::ApiKey {
@@ -186,7 +215,9 @@ impl SettingsView {
                 .map(|p| p.base_url.clone())
                 .unwrap_or_default(),
             EditField::ApiKey => {
-                if self.credential_present {
+                if self.pending_api_key.is_some() {
+                    "•••••••• (unsaved — click Save API key)".into()
+                } else if self.credential_present {
                     "•••••••• (stored in OS keychain)".into()
                 } else {
                     "Click to add a key".into()
@@ -250,16 +281,14 @@ impl SettingsView {
                 Ok(())
             }
             EditField::ApiKey => {
-                if !value.is_empty() {
-                    let key = self.profile_key().unwrap_or_default();
-                    let stored = KeyringSecretStore::new()
-                        .set(&key, &value)
-                        .map_err(|error| error.to_string());
-                    if stored.is_ok() {
-                        self.credential_present = true;
-                    }
-                    stored
+                // 敏感凭据不随字段失焦写入钥匙串，等显式 Save API key。
+                if value.is_empty() {
+                    Ok(())
                 } else {
+                    self.pending_api_key = Some(value);
+                    self.status =
+                        "API key ready — click Save API key to store it in the OS keychain"
+                            .into();
                     Ok(())
                 }
             }
@@ -307,16 +336,51 @@ impl SettingsView {
                 Ok(())
             }
         };
-        if let Err(error) = result {
-            self.status = format!("Invalid value: {error}");
+        match result {
+            Err(error) => self.status = format!("Invalid value: {error}"),
+            Ok(()) if field != EditField::ApiKey => {
+                self.settings_dirty = true;
+            }
+            Ok(()) => {}
         }
         self.draft.clear();
         self.cursor = 0;
         self.marked_text.clear();
     }
 
-    fn save(&mut self, cx: &mut Context<Self>) {
+    fn schedule_save_if_dirty(&mut self, cx: &mut Context<Self>) {
+        if self.settings_dirty {
+            self.settings_dirty = false;
+            self.schedule_save(cx);
+        }
+    }
+
+    /// 防抖写盘；逐字符编辑不会每次都落盘。
+    fn schedule_save(&mut self, cx: &mut Context<Self>) {
+        self.save_generation = self.save_generation.wrapping_add(1);
+        let generation = self.save_generation;
+        let task = cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(SETTINGS_SAVE_DEBOUNCE)
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                if view.save_generation == generation {
+                    view.persist(cx);
+                }
+            });
+        });
+        self.track_task(task);
+    }
+
+    /// 立即写盘（关闭窗口或换页前 flush）。
+    pub fn flush_save(&mut self, cx: &mut Context<Self>) {
         self.commit_edit();
+        self.settings_dirty = false;
+        self.save_generation = self.save_generation.wrapping_add(1);
+        self.persist(cx);
+    }
+
+    fn persist(&mut self, cx: &mut Context<Self>) {
         if let Err(error) = self.settings.validate() {
             self.status = error.to_string();
             cx.notify();
@@ -357,7 +421,13 @@ impl SettingsView {
             });
         match result {
             Ok(()) => {
-                self.status = "Settings saved".into();
+                if self.status.starts_with("Save failed")
+                    || self.status.starts_with("Invalid")
+                    || self.status.is_empty()
+                    || self.status == "Settings saved"
+                {
+                    self.status.clear();
+                }
                 if let Some(on_save) = &self.on_save {
                     on_save(&self.settings, cx);
                 }
@@ -367,8 +437,60 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn save_api_key(&mut self, cx: &mut Context<Self>) {
+        self.commit_edit();
+        let Some(value) = self.pending_api_key.take() else {
+            self.status = if self.credential_present {
+                "API key already stored in the OS keychain".into()
+            } else {
+                "Enter an API key first".into()
+            };
+            cx.notify();
+            return;
+        };
+        let key = self.profile_key().unwrap_or_default();
+        match KeyringSecretStore::new().set(&key, &value) {
+            Ok(()) => {
+                self.credential_present = true;
+                self.status = "API key saved to the OS keychain".into();
+            }
+            Err(error) => {
+                self.pending_api_key = Some(value);
+                self.status = format!("Could not save API key: {error}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// 仅写盘、不依赖 GPUI（窗口 Drop 时的兜底）。
+    fn persist_to_disk(&self) -> Result<(), String> {
+        self.settings
+            .validate()
+            .map_err(|error| error.to_string())?;
+        let dir = self
+            .data_dir
+            .as_ref()
+            .ok_or_else(|| "application data directory is unavailable".to_owned())?;
+        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        let json =
+            serde_json::to_string_pretty(&self.settings).map_err(|error| error.to_string())?;
+        atomic_write(&dir.join("Termior-settings.json"), &json)
+            .map_err(|error| error.to_string())?;
+        let files = DataFiles::new(dir);
+        files
+            .themes()
+            .save(&self.themes)
+            .map_err(|error| error.to_string())?;
+        files
+            .agents()
+            .save(&self.agents)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     fn cycle_profile(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.commit_edit();
+        self.schedule_save_if_dirty(cx);
         let len = self.settings.models.profiles.len();
         if len > 0 {
             self.profile_index =
@@ -383,16 +505,19 @@ impl SettingsView {
         if let Some(profile) = self.profile_mut() {
             profile.enabled = !profile.enabled;
         }
+        self.schedule_save(cx);
         cx.notify();
     }
 
     fn make_active_chat(&mut self, cx: &mut Context<Self>) {
         self.settings.models.active_chat_profile = self.profile().map(|p| p.id.clone());
+        self.schedule_save(cx);
         cx.notify();
     }
 
     fn make_active_completion(&mut self, cx: &mut Context<Self>) {
         self.settings.models.active_completion_profile = self.profile().map(|p| p.id.clone());
+        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -432,36 +557,68 @@ impl SettingsView {
     }
 
     fn preview_theme_preferences(&self, cx: &mut Context<Self>) {
-        let Some(theme) = self
-            .themes
-            .all()
-            .into_iter()
-            .find(|theme| theme.id == self.settings.theme_id)
-        else {
-            return;
-        };
         if let Some(callback) = &self.on_theme_preview {
-            callback(
-                &theme,
-                &self.settings.editor_theme_id,
-                self.settings.appearance,
-                cx,
-            );
+            callback(&self.settings, cx);
             return;
         }
 
+        let themes = self.themes.all();
         let appearance = match self.settings.appearance {
             Appearance::Light => termior_theme::Appearance::Light,
             Appearance::Dark => termior_theme::Appearance::Dark,
             Appearance::FollowSystem => termior_theme::Appearance::FollowSystem,
         };
-        crate::ui::set_palette(cx, theme.resolve(appearance, true));
+        crate::ui::set_palette(
+            cx,
+            resolve_active_palette(
+                &themes,
+                appearance,
+                &self.settings.theme_id,
+                &self.settings.light_theme_id,
+                &self.settings.dark_theme_id,
+                true,
+            ),
+        );
     }
 
     fn select_app_theme(&mut self, theme_id: String, cx: &mut Context<Self>) {
-        self.settings.theme_id = theme_id;
+        let Some(theme) = self
+            .themes
+            .all()
+            .into_iter()
+            .find(|theme| theme.id == theme_id)
+        else {
+            return;
+        };
+        self.settings.theme_id = theme.id.clone();
+        self.settings.appearance = match theme.native_appearance {
+            NativeAppearance::Light => Appearance::Light,
+            NativeAppearance::Dark => Appearance::Dark,
+        };
+        match theme.native_appearance {
+            NativeAppearance::Light => self.settings.light_theme_id = theme.id,
+            NativeAppearance::Dark => self.settings.dark_theme_id = theme.id,
+        }
         self.select_menu = None;
         self.preview_theme_preferences(cx);
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn select_pair_theme(
+        &mut self,
+        slot: NativeAppearance,
+        theme_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        match slot {
+            NativeAppearance::Light => self.settings.light_theme_id = theme_id,
+            NativeAppearance::Dark => self.settings.dark_theme_id = theme_id,
+        }
+        self.settings.appearance = Appearance::FollowSystem;
+        self.select_menu = None;
+        self.preview_theme_preferences(cx);
+        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -484,9 +641,22 @@ impl SettingsView {
                     .and_then(|json| view.themes.import(&json).map_err(|error| error.to_string()))
                 {
                     Ok(theme) => {
-                        view.settings.theme_id = theme.id;
+                        view.settings.theme_id = theme.id.clone();
+                        view.settings.appearance = match theme.native_appearance {
+                            NativeAppearance::Light => Appearance::Light,
+                            NativeAppearance::Dark => Appearance::Dark,
+                        };
+                        match theme.native_appearance {
+                            NativeAppearance::Light => {
+                                view.settings.light_theme_id = theme.id;
+                            }
+                            NativeAppearance::Dark => {
+                                view.settings.dark_theme_id = theme.id;
+                            }
+                        }
                         view.preview_theme_preferences(cx);
-                        "Theme imported and previewed; save settings to keep it".into()
+                        view.schedule_save(cx);
+                        "Theme imported".into()
                     }
                     Err(error) => format!("Theme import failed: {error}"),
                 };
@@ -543,6 +713,7 @@ impl SettingsView {
             let path = handle.path().to_path_buf();
             let _ = view.update(cx, |view, cx| {
                 view.settings.background.image_path = Some(path.to_string_lossy().into_owned());
+                view.schedule_save(cx);
                 cx.notify();
             });
         });
@@ -551,6 +722,7 @@ impl SettingsView {
 
     fn clear_background(&mut self, cx: &mut Context<Self>) {
         self.settings.background.image_path = None;
+        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -573,11 +745,13 @@ impl SettingsView {
             color: "#4f8fef".into(),
         });
         self.agent_index = self.agents.agents.len() - 1;
+        self.schedule_save(cx);
         cx.notify();
     }
 
     fn cycle_agent(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.commit_edit();
+        self.schedule_save_if_dirty(cx);
         let len = self.agents.agents.len();
         if len > 0 {
             self.agent_index =
@@ -594,6 +768,7 @@ impl SettingsView {
                 .agent_index
                 .min(self.agents.agents.len().saturating_sub(1));
         }
+        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -601,13 +776,24 @@ impl SettingsView {
         self.settings.editor_theme_id = theme_id;
         self.select_menu = None;
         self.preview_theme_preferences(cx);
+        self.schedule_save(cx);
         cx.notify();
     }
 
     fn select_appearance(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
         self.settings.appearance = appearance;
+        match appearance {
+            Appearance::Light => {
+                self.settings.theme_id = self.settings.light_theme_id.clone();
+            }
+            Appearance::Dark => {
+                self.settings.theme_id = self.settings.dark_theme_id.clone();
+            }
+            Appearance::FollowSystem => {}
+        }
         self.select_menu = None;
         self.preview_theme_preferences(cx);
+        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -680,6 +866,7 @@ impl SettingsView {
             self.status = match self.settings.keymap.rebind(action, binding) {
                 Ok(()) => {
                     self.capture_shortcut = None;
+                    self.schedule_save(cx);
                     format!("Updated {action:?}")
                 }
                 Err(error) => error.to_string(),
@@ -692,7 +879,10 @@ impl SettingsView {
             return;
         }
         match event.keystroke.key.as_str() {
-            "enter" | "return" => self.commit_edit(),
+            "enter" | "return" => {
+                self.commit_edit();
+                self.schedule_save_if_dirty(cx);
+            }
             "escape" => {
                 self.edit_field = None;
                 self.draft.clear();
@@ -750,6 +940,7 @@ impl SettingsView {
     fn edit_row(
         &self,
         label: &'static str,
+        description: &'static str,
         field: EditField,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -758,26 +949,16 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_1()
+            .child(div().text_sm().child(label))
             .child(
                 div()
                     .text_xs()
                     .text_color(crate::ui::muted(&p))
-                    .child(label),
+                    .child(description),
             )
             .child(
-                div()
+                termior_ui_kit::input_field(&p, self.edit_field == Some(field))
                     .id(SharedString::from(format!("edit-{field:?}")))
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if self.edit_field == Some(field) {
-                        crate::ui::color(p.accent)
-                    } else {
-                        crate::ui::border(&p)
-                    })
-                    .bg(crate::ui::color(p.surface[1]))
-                    .cursor_text()
                     .child(SharedString::from(self.display_edit(field)))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -786,6 +967,34 @@ impl SettingsView {
                         }),
                     ),
             )
+            .into_any_element()
+    }
+
+    fn section(
+        &self,
+        title: &'static str,
+        description: &'static str,
+        children: impl IntoIterator<Item = AnyElement>,
+    ) -> AnyElement {
+        let p = &self.palette;
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_lg().child(title))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(crate::ui::muted(p))
+                            .child(description),
+                    ),
+            )
+            .children(children)
             .into_any_element()
     }
 
@@ -819,7 +1028,7 @@ impl SettingsView {
             } else {
                 crate::ui::border(p)
             })
-            .bg(crate::ui::color(p.surface[1]))
+            .bg(crate::ui::color(p.elevated))
             .text_sm()
             .cursor_pointer()
             .flex()
@@ -870,6 +1079,41 @@ impl SettingsView {
             .child(label.into())
     }
 
+    fn pair_theme_menu(
+        &self,
+        slot: NativeAppearance,
+        selected_id: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let themes = self.themes.all();
+        let candidates = themes_for_native_appearance(&themes, slot);
+        div()
+            .w(px(360.0))
+            .p_1()
+            .rounded_md()
+            .border_1()
+            .border_color(crate::ui::border(&self.palette))
+            .bg(crate::ui::color(self.palette.overlay))
+            .shadow_md()
+            .children(candidates.into_iter().map(|theme| {
+                let theme_id = theme.id.clone();
+                let selected = theme.id == selected_id;
+                Self::select_option(
+                    theme.name.clone(),
+                    SharedString::from(format!("pair-theme-option-{}-{}", slot.as_str(), theme.id)),
+                    selected,
+                    &self.palette,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.select_pair_theme(slot, theme_id.clone(), cx);
+                    }),
+                )
+            }))
+    }
+
     fn general_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let autocomplete = self.settings.autocomplete_enabled;
         let vim = self.settings.vim_mode;
@@ -877,59 +1121,102 @@ impl SettingsView {
         div()
             .flex()
             .flex_col()
-            .gap_3()
-            .children([
-                self.edit_row("Terminal font family", EditField::FontFamily, cx),
-                self.edit_row("Font size (8–32)", EditField::FontSize, cx),
-                self.edit_row("Line height (0.8–3)", EditField::LineHeight, cx),
-                self.edit_row("Letter spacing (-2–8)", EditField::LetterSpacing, cx),
-                self.edit_row("Scrollback rows (200–50,000)", EditField::Scrollback, cx),
-                self.edit_row("Global custom instructions", EditField::Instructions, cx),
-            ])
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        Self::button(
-                            format!("Autocomplete: {}", on_off(autocomplete)),
-                            "autocomplete",
-                            &self.palette,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.settings.autocomplete_enabled =
-                                    !this.settings.autocomplete_enabled;
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(
-                        Self::button(format!("Vim: {}", on_off(vim)), "vim", &self.palette)
+            .gap_6()
+            .child(self.section(
+                "Terminal",
+                "Defaults for new terminal panes. Changes apply after auto-save.",
+                [
+                    self.edit_row(
+                        "Font family",
+                        "Typeface used for terminal glyphs.",
+                        EditField::FontFamily,
+                        cx,
+                    ),
+                    self.edit_row(
+                        "Font size",
+                        "Point size between 8 and 32.",
+                        EditField::FontSize,
+                        cx,
+                    ),
+                    self.edit_row(
+                        "Line height",
+                        "Multiplier for line spacing (0.8–3.0).",
+                        EditField::LineHeight,
+                        cx,
+                    ),
+                    self.edit_row(
+                        "Letter spacing",
+                        "Extra glyph spacing in logical pixels (−2–8).",
+                        EditField::LetterSpacing,
+                        cx,
+                    ),
+                    self.edit_row(
+                        "Scrollback rows",
+                        "How many lines of history each terminal keeps (200–50,000).",
+                        EditField::Scrollback,
+                        cx,
+                    ),
+                ],
+            ))
+            .child(self.section(
+                "Editor & explorer",
+                "Cross-cutting preferences for editing and the file tree.",
+                [
+                    self.edit_row(
+                        "Custom instructions",
+                        "Optional guidance appended to built-in agent prompts.",
+                        EditField::Instructions,
+                        cx,
+                    ),
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Self::button(
+                                format!("Autocomplete: {}", on_off(autocomplete)),
+                                "autocomplete",
+                                &self.palette,
+                            )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
-                                    this.settings.vim_mode = !this.settings.vim_mode;
+                                    this.settings.autocomplete_enabled =
+                                        !this.settings.autocomplete_enabled;
+                                    this.schedule_save(cx);
                                     cx.notify();
                                 }),
                             ),
-                    )
-                    .child(
-                        Self::button(
-                            format!("Dotfiles: {}", on_off(dotfiles)),
-                            "dotfiles",
-                            &self.palette,
                         )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.settings.show_dotfiles = !this.settings.show_dotfiles;
-                                cx.notify();
-                            }),
-                        ),
-                    ),
-            )
+                        .child(
+                            Self::button(format!("Vim: {}", on_off(vim)), "vim", &self.palette)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.settings.vim_mode = !this.settings.vim_mode;
+                                        this.schedule_save(cx);
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .child(
+                            Self::button(
+                                format!("Dotfiles: {}", on_off(dotfiles)),
+                                "dotfiles",
+                                &self.palette,
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.settings.show_dotfiles = !this.settings.show_dotfiles;
+                                    this.schedule_save(cx);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .into_any_element(),
+                ],
+            ))
             .into_any_element()
     }
 
@@ -943,9 +1230,11 @@ impl SettingsView {
         div()
             .flex()
             .flex_col()
-            .gap_3()
-            .child(
-                div()
+            .gap_6()
+            .child(self.section(
+                "Provider",
+                "Credentials stay in the OS keychain and are never written to settings JSON.",
+                [div()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -966,15 +1255,62 @@ impl SettingsView {
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.cycle_profile(1, cx)),
                         ),
+                    )
+                    .into_any_element()],
+            ))
+            .child(self.section(
+                "Endpoint",
+                "Model id and base URL for the selected provider profile.",
+                [
+                    self.edit_row(
+                        "Model",
+                        "Provider model identifier used for requests.",
+                        EditField::Model,
+                        cx,
                     ),
-            )
-            .children([
-                self.edit_row("Model", EditField::Model, cx),
-                self.edit_row("Base URL", EditField::BaseUrl, cx),
-                self.edit_row("API key (never written to settings)", EditField::ApiKey, cx),
-            ])
-            .child(
-                div()
+                    self.edit_row(
+                        "Base URL",
+                        "HTTPS endpoint for the provider API.",
+                        EditField::BaseUrl,
+                        cx,
+                    ),
+                ],
+            ))
+            .child(self.section(
+                "Credentials",
+                "Saving an API key and testing connectivity require explicit actions.",
+                [
+                    self.edit_row(
+                        "API key",
+                        "Never written to settings files — stored only in the OS keychain.",
+                        EditField::ApiKey,
+                        cx,
+                    ),
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Self::button("Save API key", "save-api-key", &self.palette)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.save_api_key(cx)),
+                                ),
+                        )
+                        .child(
+                            Self::button("Test connection", "ping-provider", &self.palette)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.ping_provider(cx)),
+                                ),
+                        )
+                        .into_any_element(),
+                ],
+            ))
+            .child(self.section(
+                "Defaults",
+                "Which profile Composer and inline completion use.",
+                [div()
                     .flex()
                     .flex_wrap()
                     .gap_2()
@@ -1019,14 +1355,8 @@ impl SettingsView {
                             cx.listener(|this, _, _, cx| this.make_active_completion(cx)),
                         ),
                     )
-                    .child(
-                        Self::button("Test connection", "ping-provider", &self.palette)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.ping_provider(cx)),
-                            ),
-                    ),
-            )
+                    .into_any_element()],
+            ))
             .into_any_element()
     }
 
@@ -1039,10 +1369,11 @@ impl SettingsView {
             .unwrap_or("None")
             .to_owned();
         let app_themes = self.themes.all();
+        let follow_system = self.settings.appearance == Appearance::FollowSystem;
         let app_theme_name = app_themes
             .iter()
             .find(|theme| theme.id == self.settings.theme_id)
-            .map(|theme| theme.name.clone())
+            .map(|theme| format!("{} · {}", theme.name, theme.native_appearance.as_str()))
             .unwrap_or_else(|| self.settings.theme_id.clone());
         let app_menu_open = self.select_menu == Some(SelectMenu::ApplicationTheme);
         let app_theme_menu = app_menu_open.then(|| {
@@ -1052,13 +1383,14 @@ impl SettingsView {
                 .rounded_md()
                 .border_1()
                 .border_color(crate::ui::border(&self.palette))
-                .bg(crate::ui::color(self.palette.surface[2]))
+                .bg(crate::ui::color(self.palette.overlay))
                 .shadow_md()
-                .children(app_themes.into_iter().map(|theme| {
+                .children(app_themes.iter().cloned().map(|theme| {
                     let theme_id = theme.id.clone();
                     let selected = theme.id == self.settings.theme_id;
+                    let label = format!("{} · {}", theme.name, theme.native_appearance.as_str());
                     Self::select_option(
-                        theme.name,
+                        label,
                         SharedString::from(format!("app-theme-option-{}", theme.id)),
                         selected,
                         &self.palette,
@@ -1071,6 +1403,25 @@ impl SettingsView {
                         }),
                     )
                 }))
+        });
+
+        let light_name = app_themes
+            .iter()
+            .find(|theme| theme.id == self.settings.light_theme_id)
+            .map(|theme| theme.name.clone())
+            .unwrap_or_else(|| self.settings.light_theme_id.clone());
+        let dark_name = app_themes
+            .iter()
+            .find(|theme| theme.id == self.settings.dark_theme_id)
+            .map(|theme| theme.name.clone())
+            .unwrap_or_else(|| self.settings.dark_theme_id.clone());
+        let light_menu_open = self.select_menu == Some(SelectMenu::LightTheme);
+        let dark_menu_open = self.select_menu == Some(SelectMenu::DarkTheme);
+        let light_theme_menu = light_menu_open.then(|| {
+            self.pair_theme_menu(NativeAppearance::Light, &self.settings.light_theme_id, cx)
+        });
+        let dark_theme_menu = dark_menu_open.then(|| {
+            self.pair_theme_menu(NativeAppearance::Dark, &self.settings.dark_theme_id, cx)
         });
 
         let editor_themes = termior_editor::builtin_editor_themes();
@@ -1087,7 +1438,7 @@ impl SettingsView {
                 .rounded_md()
                 .border_1()
                 .border_color(crate::ui::border(&self.palette))
-                .bg(crate::ui::color(self.palette.surface[2]))
+                .bg(crate::ui::color(self.palette.overlay))
                 .shadow_md()
                 .children(editor_themes.into_iter().map(|theme| {
                     let theme_id = theme.id.clone();
@@ -1121,7 +1472,7 @@ impl SettingsView {
                 .rounded_md()
                 .border_1()
                 .border_color(crate::ui::border(&self.palette))
-                .bg(crate::ui::color(self.palette.surface[2]))
+                .bg(crate::ui::color(self.palette.overlay))
                 .shadow_md()
                 .children(
                     [
@@ -1148,118 +1499,195 @@ impl SettingsView {
                 )
         });
 
+        let mut appearance_items: Vec<AnyElement> = vec![
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    Self::select_button(
+                        "Application theme",
+                        app_theme_name,
+                        "app-theme-select",
+                        app_menu_open,
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_select_menu(SelectMenu::ApplicationTheme, cx);
+                        }),
+                    ),
+                )
+                .when_some(app_theme_menu, |select, menu| select.child(menu))
+                .into_any_element(),
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    Self::select_button(
+                        "Appearance",
+                        appearance_label,
+                        "appearance-select",
+                        appearance_menu_open,
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_select_menu(SelectMenu::Appearance, cx);
+                        }),
+                    ),
+                )
+                .when_some(appearance_menu, |select, menu| select.child(menu))
+                .into_any_element(),
+        ];
+        if follow_system {
+            appearance_items.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(crate::ui::muted(&self.palette))
+                            .child(SharedString::from(
+                                "Light slot lists light-native themes only; dark slot lists dark-native themes only.",
+                            )),
+                    )
+                    .child(
+                        Self::select_button(
+                            "Light theme",
+                            light_name,
+                            "light-theme-select",
+                            light_menu_open,
+                            &self.palette,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_select_menu(SelectMenu::LightTheme, cx);
+                            }),
+                        ),
+                    )
+                    .when_some(light_theme_menu, |select, menu| select.child(menu))
+                    .child(
+                        Self::select_button(
+                            "Dark theme",
+                            dark_name,
+                            "dark-theme-select",
+                            dark_menu_open,
+                            &self.palette,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_select_menu(SelectMenu::DarkTheme, cx);
+                            }),
+                        ),
+                    )
+                    .when_some(dark_theme_menu, |select, menu| select.child(menu))
+                    .into_any_element(),
+            );
+        }
+        appearance_items.push(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    Self::select_button(
+                        "Editor theme",
+                        editor_theme_name,
+                        "editor-theme-select",
+                        editor_menu_open,
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_select_menu(SelectMenu::EditorTheme, cx);
+                        }),
+                    ),
+                )
+                .when_some(editor_theme_menu, |select, menu| select.child(menu))
+                .into_any_element(),
+        );
+        appearance_items.push(
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    Self::button("Import theme", "import-theme", &self.palette).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.import_theme(cx)),
+                    ),
+                )
+                .child(
+                    Self::button("Export theme", "export-theme", &self.palette).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.export_theme(cx)),
+                    ),
+                )
+                .into_any_element(),
+        );
+
         div()
             .flex()
             .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        Self::select_button(
-                            "Application theme",
-                            app_theme_name,
-                            "app-theme-select",
-                            app_menu_open,
-                            &self.palette,
+            .gap_6()
+            .child(self.section(
+                "Appearance",
+                "Each theme has a native light or dark look. Choosing a theme locks appearance to that native side. Follow system pairs one light theme with one dark theme.",
+                appearance_items,
+            ))
+            .child(self.section(
+                "Background",
+                "Optional wallpaper behind the workspace chrome.",
+                [
+                    div()
+                        .text_sm()
+                        .child(SharedString::from(format!("Image: {background}")))
+                        .into_any_element(),
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Self::button("Choose image", "background-image", &self.palette)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.select_background(cx)),
+                                ),
                         )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_select_menu(SelectMenu::ApplicationTheme, cx);
-                            }),
-                        ),
-                    )
-                    .when_some(app_theme_menu, |select, menu| select.child(menu)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        Self::select_button(
-                            "Editor theme",
-                            editor_theme_name,
-                            "editor-theme-select",
-                            editor_menu_open,
-                            &self.palette,
+                        .child(
+                            Self::button("Clear image", "background-clear", &self.palette)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.clear_background(cx)),
+                                ),
                         )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_select_menu(SelectMenu::EditorTheme, cx);
-                            }),
-                        ),
-                    )
-                    .when_some(editor_theme_menu, |select, menu| select.child(menu)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        Self::select_button(
-                            "Appearance",
-                            appearance_label,
-                            "appearance-select",
-                            appearance_menu_open,
-                            &self.palette,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_select_menu(SelectMenu::Appearance, cx);
-                            }),
-                        ),
-                    )
-                    .when_some(appearance_menu, |select, menu| select.child(menu)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        Self::button("Import theme", "import-theme", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.import_theme(cx)),
-                        ),
-                    )
-                    .child(
-                        Self::button("Export theme", "export-theme", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.export_theme(cx)),
-                        ),
+                        .into_any_element(),
+                    self.edit_row(
+                        "Background opacity",
+                        "0 = invisible overlay, 1 = fully opaque.",
+                        EditField::BackgroundOpacity,
+                        cx,
                     ),
-            )
-            .child(SharedString::from(format!("Background: {background}")))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        Self::button("Choose image", "background-image", &self.palette)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.select_background(cx)),
-                            ),
-                    )
-                    .child(
-                        Self::button("Clear image", "background-clear", &self.palette)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.clear_background(cx)),
-                            ),
+                    self.edit_row(
+                        "Background blur",
+                        "Gaussian blur radius in logical pixels (0–64).",
+                        EditField::BackgroundBlur,
+                        cx,
                     ),
-            )
-            .child(self.edit_row("Background opacity (0–1)", EditField::BackgroundOpacity, cx))
-            .child(self.edit_row("Background blur (0–64)", EditField::BackgroundBlur, cx))
+                ],
+            ))
             .into_any_element()
     }
 
@@ -1307,17 +1735,17 @@ impl SettingsView {
                     }),
                 )
         });
-        div()
-            .flex()
-            .flex_col()
-            .children(rows)
-            .child(
+        self.section(
+            "Keymap",
+            "Click a row, then press a new Cmd/Ctrl chord. Conflicting bindings are rejected.",
+            [
                 div()
-                    .pt_3()
-                    .text_xs()
-                    .child("Rebinding uses the persisted keymap and rejects conflicting chords."),
-            )
-            .into_any_element()
+                    .flex()
+                    .flex_col()
+                    .children(rows)
+                    .into_any_element(),
+            ],
+        )
     }
 
     fn agents_page(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1369,42 +1797,75 @@ impl SettingsView {
                         ),
                 )
                 .children([
-                    self.edit_row("Name", EditField::AgentName, cx),
-                    self.edit_row("System prompt", EditField::AgentPrompt, cx),
-                    self.edit_row("Tools (comma separated)", EditField::AgentTools, cx),
-                    self.edit_row("Icon", EditField::AgentIcon, cx),
-                    self.edit_row("Color", EditField::AgentColor, cx),
+                    self.edit_row(
+                        "Name",
+                        "Display name in the Composer agent switcher.",
+                        EditField::AgentName,
+                        cx,
+                    ),
+                    self.edit_row(
+                        "System prompt",
+                        "Instructions prepended to every chat with this agent.",
+                        EditField::AgentPrompt,
+                        cx,
+                    ),
+                    self.edit_row(
+                        "Tools",
+                        "Comma-separated tool ids this agent may call.",
+                        EditField::AgentTools,
+                        cx,
+                    ),
+                    self.edit_row(
+                        "Icon",
+                        "Icon key shown next to the agent name.",
+                        EditField::AgentIcon,
+                        cx,
+                    ),
+                    self.edit_row(
+                        "Color",
+                        "Accent color hex for the agent chip.",
+                        EditField::AgentColor,
+                        cx,
+                    ),
                 ])
                 .into_any_element()
         };
         div()
             .flex()
             .flex_col()
-            .gap_3()
-            .child(SharedString::from(format!(
-                "Claude Code hooks: {hook_status}"
-            )))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        Self::button("Install hooks", "install-hooks", &self.palette)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.install_hooks(cx)),
-                            ),
-                    )
-                    .child(
-                        Self::button("Uninstall hooks", "uninstall-hooks", &self.palette)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.uninstall_hooks(cx)),
-                            ),
-                    ),
-            )
-            .child(
-                Self::button(
+            .gap_6()
+            .child(self.section(
+                "Claude Code hooks",
+                "Install or remove Claude Code hooks that notify Termior about agent activity.",
+                [
+                    div()
+                        .text_sm()
+                        .child(SharedString::from(format!("Status: {hook_status}")))
+                        .into_any_element(),
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            Self::button("Install hooks", "install-hooks", &self.palette)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.install_hooks(cx)),
+                                ),
+                        )
+                        .child(
+                            Self::button("Uninstall hooks", "uninstall-hooks", &self.palette)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.uninstall_hooks(cx)),
+                                ),
+                        )
+                        .into_any_element(),
+                ],
+            ))
+            .child(self.section(
+                "Notifications",
+                "Desktop toasts when an agent finishes or needs attention.",
+                [Self::button(
                     format!(
                         "Agent notifications: {}",
                         on_off(self.settings.agent_notifications)
@@ -1416,17 +1877,25 @@ impl SettingsView {
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
                         this.settings.agent_notifications = !this.settings.agent_notifications;
+                        this.schedule_save(cx);
                         cx.notify();
                     }),
-                ),
-            )
-            .child(
-                Self::button("New custom agent", "new-agent", &self.palette).on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| this.new_agent(cx)),
-                ),
-            )
-            .child(agent_controls)
+                )
+                .into_any_element()],
+            ))
+            .child(self.section(
+                "Custom agents",
+                "Local agent profiles available in the Composer switcher.",
+                [
+                    Self::button("New custom agent", "new-agent", &self.palette)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.new_agent(cx)),
+                        )
+                        .into_any_element(),
+                    agent_controls,
+                ],
+            ))
             .into_any_element()
     }
 
@@ -1437,18 +1906,37 @@ impl SettingsView {
             SettingsPage::Themes => self.themes_page(cx),
             SettingsPage::Shortcuts => self.shortcuts_page(cx),
             SettingsPage::Agents => self.agents_page(cx),
-            SettingsPage::About => div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(format!("Termior {}", env!("CARGO_PKG_VERSION")))
-                .child("Apache-2.0 · No account · No telemetry · Offline with local providers")
-                .child(SharedString::from(format!(
-                    "Migration status: {}",
-                    self.migration_error.as_deref().unwrap_or("OK")
-                )))
-                .into_any_element(),
+            SettingsPage::About => self.section(
+                "About",
+                "Build identity and settings migration status.",
+                [
+                    div()
+                        .text_sm()
+                        .child(format!("Termior {}", env!("CARGO_PKG_VERSION")))
+                        .into_any_element(),
+                    div()
+                        .text_sm()
+                        .text_color(crate::ui::muted(&self.palette))
+                        .child("Apache-2.0 · No account · No telemetry · Offline with local providers")
+                        .into_any_element(),
+                    div()
+                        .text_xs()
+                        .text_color(crate::ui::muted(&self.palette))
+                        .child(SharedString::from(format!(
+                            "Migration status: {}",
+                            self.migration_error.as_deref().unwrap_or("OK")
+                        )))
+                        .into_any_element(),
+                ],
+            ),
         }
+    }
+}
+
+impl Drop for SettingsView {
+    fn drop(&mut self) {
+        self.commit_edit();
+        let _ = self.persist_to_disk();
     }
 }
 
@@ -1467,7 +1955,7 @@ impl gpui::Render for SettingsView {
         let handler = SettingsInputHandler {
             view: cx.entity().downgrade(),
         };
-        let tabs = [
+        let nav = [
             SettingsPage::General,
             SettingsPage::Models,
             SettingsPage::Themes,
@@ -1479,26 +1967,23 @@ impl gpui::Render for SettingsView {
         .map(|page| {
             let active = self.page == page;
             div()
-                .id(SharedString::from(format!("settings-{page:?}")))
+                .id(SharedString::from(format!("settings-nav-{page:?}")))
+                .w_full()
                 .px_3()
                 .py_2()
                 .rounded_md()
-                .bg(if active {
-                    crate::ui::color(p.accent)
-                } else {
-                    crate::ui::color(p.surface[1])
-                })
+                .when(active, |item| item.bg(crate::ui::selected_wash(&p)))
                 .text_color(if active {
-                    crate::ui::on_color(p.accent)
+                    crate::ui::color(p.foreground)
                 } else {
                     crate::ui::muted(&p)
                 })
-                .when(!active, |tab| {
+                .when(!active, |item| {
                     let wash = crate::ui::hover_wash(&p);
-                    tab.hover(move |style| style.bg(wash))
+                    item.hover(move |style| style.bg(wash))
                 })
                 .cursor_pointer()
-                .child(SharedString::from(format!("{page:?}")))
+                .child(Self::page_label(page))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| this.set_page(page, cx)),
@@ -1516,7 +2001,6 @@ impl gpui::Render for SettingsView {
                 }),
             )
             .flex()
-            .flex_col()
             .size_full()
             .bg(crate::ui::color(p.background))
             .text_color(crate::ui::color(p.foreground))
@@ -1532,37 +2016,64 @@ impl gpui::Render for SettingsView {
             )
             .child(
                 div()
+                    .w(px(SETTINGS_NAV_WIDTH))
+                    .h_full()
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .p_3()
-                    .children(tabs)
-                    .child(div().flex_1())
-                    .child(
-                        Self::button("Save", "save-settings", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.save(cx)),
-                        ),
-                    ),
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .py_4()
+                    .border_r_1()
+                    .border_color(crate::ui::border(&p))
+                    .bg(crate::ui::color(p.panel))
+                    .children(nav),
             )
             .child(
                 div()
-                    .id("settings-scroll")
                     .flex_1()
-                    .overflow_y_scroll()
-                    .p_5()
-                    .text_sm()
-                    .child(self.page_body(cx)),
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id("settings-scroll")
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .px_6()
+                            .py_5()
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_center()
+                                    .w_full()
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
+                                            .text_sm()
+                                            .child(self.page_body(cx)),
+                                    ),
+                            ),
+                    )
+                    .when(!self.status.is_empty(), |root| {
+                        root.child(
+                            div()
+                                .flex()
+                                .justify_center()
+                                .w_full()
+                                .px_6()
+                                .pb_3()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
+                                        .text_xs()
+                                        .text_color(crate::ui::muted(&p))
+                                        .child(SharedString::from(self.status.clone())),
+                                ),
+                        )
+                    }),
             )
-            .when(!self.status.is_empty(), |root| {
-                root.child(
-                    div()
-                        .px_5()
-                        .pb_3()
-                        .text_xs()
-                        .child(SharedString::from(self.status.clone())),
-                )
-            })
     }
 }
 

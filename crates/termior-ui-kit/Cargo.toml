@@ -5,9 +5,19 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# The GPUI widget layer. Split behind a feature so the pure layout/search logic
+# stays testable without compiling GPUI (`cargo test -p termior-ui-kit --no-default-features`).
+default = ["gpui-kit"]
+gpui-kit = ["dep:gpui", "dep:termior-theme"]
+
 [dependencies]
 serde = { workspace = true }
 thiserror = { workspace = true }
+# Pinned to the same zed rev as the `termior` application crate; a mismatch would
+# produce two incompatible `gpui` crate instances.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49", optional = true }
+termior-theme = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

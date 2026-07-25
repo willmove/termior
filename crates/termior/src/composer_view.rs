@@ -4,10 +4,12 @@ use gpui::{
     Focusable, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
     SharedString, UTF16Selection, WeakEntity, Window,
 };
-use std::collections::HashMap;
-use std::ops::Range;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 use termior_ai::{
     Agent, AgentDefinition, AgentDefinitionStore, AgentOutcome, ApprovalDecision, ApprovalRequest,
     AttachmentSource, ComposerDraft, EditProposalSummary, HttpProvider, KeyringSecretStore,
@@ -881,6 +883,30 @@ impl ComposerView {
         );
         input
     }
+
+    /// 空对话且无审批/附件时收缩到输入行高度。
+    pub fn is_compact(&self) -> bool {
+        self.history
+            .iter()
+            .all(|message| !matches!(message.role, Role::User | Role::Assistant))
+            && self.pending_approval.is_none()
+            && self.pending_edit.is_none()
+            && !self.awaiting_plan_confirmation
+            && self.draft.attachments.is_empty()
+            && self.path_suggestions.is_empty()
+    }
+
+    fn model_setup_placeholder(&self) -> Option<&str> {
+        if self.runtime.is_some() {
+            return None;
+        }
+        let status = self.status.as_str();
+        if status.contains("Settings → Models") || status.contains("API key") {
+            Some(status)
+        } else {
+            None
+        }
+    }
 }
 
 impl EventEmitter<AgentStatus> for ComposerView {}
@@ -974,7 +1000,7 @@ impl Focusable for ComposerView {
 }
 
 impl gpui::Render for ComposerView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = crate::ui::palette(cx);
         let focus = self.focus_handle.clone();
         let input_focus = focus.clone();
@@ -982,6 +1008,18 @@ impl gpui::Render for ComposerView {
             view: cx.entity().downgrade(),
         };
         let agent_label = format!("Agent: {}", self.active_agent_name());
+        let compact = self.is_compact();
+        let placeholder = self.model_setup_placeholder();
+        let show_status_row = placeholder.is_none() && !self.status.is_empty();
+        let input_display = if self.draft.input.is_empty() {
+            if let Some(hint) = placeholder {
+                format!("{hint}▏")
+            } else {
+                self.display_input()
+            }
+        } else {
+            self.display_input()
+        };
         let messages = self
             .history
             .iter()
@@ -1013,7 +1051,7 @@ impl gpui::Render for ComposerView {
                     .px_2()
                     .py_1()
                     .rounded_md()
-                    .bg(crate::ui::color(p.surface[2]))
+                    .bg(crate::ui::color(p.elevated))
                     .border_1()
                     .border_color(crate::ui::border(&p))
                     .text_xs()
@@ -1039,7 +1077,7 @@ impl gpui::Render for ComposerView {
                 .rounded_md()
                 .border_1()
                 .border_color(crate::ui::color(p.accent))
-                .bg(crate::ui::color(p.surface[2]))
+                .bg(crate::ui::color(p.elevated))
                 .shadow_md()
                 .children(
                     self.path_suggestions
@@ -1135,7 +1173,7 @@ impl gpui::Render for ComposerView {
                         .bg(if decision == Some(true) {
                             crate::ui::color(p.status[1])
                         } else {
-                            crate::ui::color(p.surface[2])
+                            crate::ui::color(p.elevated)
                         })
                         .text_color(if decision == Some(true) {
                             crate::ui::on_color(p.status[1])
@@ -1158,7 +1196,7 @@ impl gpui::Render for ComposerView {
                         .bg(if decision == Some(false) {
                             crate::ui::color(p.status[3])
                         } else {
-                            crate::ui::color(p.surface[2])
+                            crate::ui::color(p.elevated)
                         })
                         .text_color(if decision == Some(false) {
                             crate::ui::on_color(p.status[3])
@@ -1278,11 +1316,11 @@ impl gpui::Render for ComposerView {
             .flex_col()
             .relative()
             .w_full()
-            .min_h(px(165.0))
-            .max_h(px(330.0))
+            .when(compact, |root| root.min_h(px(72.0)))
+            .when(!compact, |root| root.min_h(px(120.0)).max_h(px(280.0)))
             .border_t_1()
             .border_color(crate::ui::border(&p))
-            .bg(crate::ui::color(p.surface[1]))
+            .bg(crate::ui::color(p.elevated))
             .text_color(crate::ui::color(p.foreground))
             .track_focus(&focus)
             .on_key_down(cx.listener(Self::handle_key_down))
@@ -1296,38 +1334,42 @@ impl gpui::Render for ComposerView {
                 .absolute()
                 .size_full(),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .px_3()
-                    .pt_2()
-                    .gap_1()
-                    .children(messages),
-            )
+            .when(!compact, |root| {
+                root.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_hidden()
+                        .px_3()
+                        .pt_2()
+                        .gap_1()
+                        .children(messages),
+                )
+            })
             .children(approval)
             .children(edit_review)
             .children(plan_review)
             .child(div().flex().flex_row().px_3().gap_1().children(chips))
             .children(path_suggestions)
             .child(
-                div()
+                termior_ui_kit::input_field(&p, self.focus_handle.is_focused(window))
                     .flex()
                     .items_center()
                     .gap_2()
                     .mx_3()
                     .mt_2()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(crate::ui::border(&p))
-                    .bg(crate::ui::color(p.background))
+                    .mb_2()
                     .child(
                         div()
                             .flex_1()
                             .text_sm()
-                            .child(SharedString::from(self.display_input())),
+                            .when(
+                                self.draft.input.is_empty() && placeholder.is_some(),
+                                |text| text.text_color(crate::ui::muted(&p)),
+                            )
+                            .child(SharedString::from(input_display)),
                     )
                     .child(
                         div()
@@ -1335,7 +1377,7 @@ impl gpui::Render for ComposerView {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(crate::ui::color(p.surface[2]))
+                            .bg(crate::ui::color(p.elevated))
                             .cursor_pointer()
                             .text_xs()
                             .child("+ File")
@@ -1350,7 +1392,7 @@ impl gpui::Render for ComposerView {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(crate::ui::color(p.surface[2]))
+                            .bg(crate::ui::color(p.elevated))
                             .cursor_pointer()
                             .text_xs()
                             .child("+ Image")
@@ -1365,7 +1407,7 @@ impl gpui::Render for ComposerView {
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(crate::ui::color(p.surface[2]))
+                            .bg(crate::ui::color(p.elevated))
                             .cursor_pointer()
                             .text_xs()
                             .child(SharedString::from(agent_label))
@@ -1383,7 +1425,7 @@ impl gpui::Render for ComposerView {
                             .bg(if self.plan_mode {
                                 crate::ui::color(p.accent)
                             } else {
-                                crate::ui::color(p.surface[2])
+                                crate::ui::color(p.elevated)
                             })
                             .text_color(if self.plan_mode {
                                 crate::ui::on_color(p.accent)
@@ -1416,14 +1458,16 @@ impl gpui::Render for ComposerView {
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::send)),
                     ),
             )
-            .child(
-                div()
-                    .px_3()
-                    .py_1()
-                    .text_xs()
-                    .text_color(crate::ui::muted(&p))
-                    .child(SharedString::from(self.status.clone())),
-            )
+            .when(show_status_row, |root| {
+                root.child(
+                    div()
+                        .px_3()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(crate::ui::muted(&p))
+                        .child(SharedString::from(self.status.clone())),
+                )
+            })
     }
 }
 

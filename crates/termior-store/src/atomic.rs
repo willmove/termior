@@ -2,8 +2,7 @@
 //!
 //! 先写入同目录临时文件，fsync 后 rename 覆盖目标，保证崩溃后文件完好。
 
-use std::io::Write;
-use std::path::Path;
+use std::{io::Write, path::Path};
 
 /// 原子写错误。
 #[derive(Debug, thiserror::Error)]

@@ -177,7 +177,7 @@ fn render_block(node: &MarkdownNode, p: &ResolvedPalette) -> AnyElement {
             .rounded_md()
             .border_1()
             .border_color(ui::border(p))
-            .bg(ui::color(p.surface[1]))
+            .bg(ui::color(p.elevated))
             .when_some(language.clone(), |block, language| {
                 block.child(
                     div()
@@ -254,7 +254,7 @@ fn render_block(node: &MarkdownNode, p: &ResolvedPalette) -> AnyElement {
             .rounded_md()
             .border_1()
             .border_color(ui::border(p))
-            .bg(ui::color(p.surface[1]))
+            .bg(ui::color(p.elevated))
             .p_3()
             .font_family("monospace")
             .text_xs()
@@ -264,7 +264,7 @@ fn render_block(node: &MarkdownNode, p: &ResolvedPalette) -> AnyElement {
         MarkdownNode::DisplayMath(math) => div()
             .mb_3()
             .rounded_md()
-            .bg(ui::color(p.surface[1]))
+            .bg(ui::color(p.elevated))
             .p_3()
             .font_family("monospace")
             .text_center()
@@ -338,7 +338,7 @@ fn render_table(children: &[MarkdownNode], element_id: usize, p: &ResolvedPalett
                 .w_full()
                 .border_b_1()
                 .border_color(ui::border(p))
-                .when(header, |row| row.bg(ui::color(p.surface[1])))
+                .when(header, |row| row.bg(ui::color(p.elevated)))
                 .children(cells.iter().map(|cell| {
                     let content = match cell {
                         MarkdownNode::TableCell(children) => children.as_slice(),
@@ -543,7 +543,7 @@ fn append_run(
         highlight.font_style = Some(FontStyle::Italic);
     }
     if style.code {
-        highlight.background_color = Some(ui::color(p.surface[2]).into());
+        highlight.background_color = Some(ui::color(p.elevated).into());
         highlight.color = Some(ui::color(p.status[0]).into());
     } else if style.link {
         highlight.color = Some(ui::color(p.accent).into());

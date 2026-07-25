@@ -1,10 +1,11 @@
 //! Type-safe atomic JSON files from spec section 7.
 
 use crate::{assert_no_persistent_secret, atomic_write, AtomicWriteError, PersistentSecretError};
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
+use serde::{de::DeserializeOwned, Serialize};
+use std::{
+    marker::PhantomData,
+    path::{Path, PathBuf},
+};
 
 pub const SETTINGS_FILE: &str = "Termior-settings.json";
 pub const SESSIONS_FILE: &str = "Termior-ai-sessions.json";

@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// 当前 schema 版本（由 [`crate::migrate`] 消费）。
-pub const SETTINGS_VERSION: u32 = 1;
+pub const SETTINGS_VERSION: u32 = 2;
 
 /// 应用偏好根结构（`Termior-settings.json`，FR-DATA）。
 ///
@@ -20,8 +20,14 @@ pub struct Settings {
     #[serde(default = "default_version")]
     pub version: u32,
     pub appearance: Appearance,
-    /// 应用主题 id（FR-THEME-02）。
+    /// 固定外观下使用的应用主题 id（FR-THEME-02）。
     pub theme_id: String,
+    /// `FollowSystem` 时浅色模式使用的主题 id。
+    #[serde(default = "default_light_theme_id")]
+    pub light_theme_id: String,
+    /// `FollowSystem` 时深色模式使用的主题 id。
+    #[serde(default = "default_dark_theme_id")]
+    pub dark_theme_id: String,
     /// 编辑器主题 id（独立于应用主题，FR-EDIT-07，P1）。
     pub editor_theme_id: String,
     pub terminal: TerminalSettings,
@@ -50,6 +56,14 @@ pub struct Settings {
 
 fn default_version() -> u32 {
     SETTINGS_VERSION
+}
+
+fn default_light_theme_id() -> String {
+    "default-light".into()
+}
+
+fn default_dark_theme_id() -> String {
+    "default".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -288,6 +302,8 @@ pub fn default_settings() -> Settings {
         version: SETTINGS_VERSION,
         appearance: Appearance::default(),
         theme_id: "default".into(),
+        light_theme_id: default_light_theme_id(),
+        dark_theme_id: default_dark_theme_id(),
         editor_theme_id: "default".into(),
         terminal: TerminalSettings::default(),
         autocomplete_enabled: false,
@@ -363,6 +379,8 @@ mod tests {
         assert!(s.show_dotfiles);
         assert!(s.agent_notifications);
         assert_eq!(s.theme_id, "default");
+        assert_eq!(s.light_theme_id, "default-light");
+        assert_eq!(s.dark_theme_id, "default");
         s.validate().unwrap();
     }
 

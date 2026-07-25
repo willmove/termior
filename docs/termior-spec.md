@@ -67,11 +67,11 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | 领域 | Termior 方案 | 理由 / 备注 |
 |---|---|---|
 | 应用框架 | **GPUI**（zed-industries/gpui） | 单进程原生 GPU 渲染，使用 Entity/Context 构建事件驱动 UI |
-| UI 组件 | **GPUI + `Termior-ui-kit`**；由后者有限封装 **gpui-component**（longbridge）与自研视图 | gpui-component 仅作为可替换的通用控件实现，不得成为业务状态或核心渲染的架构边界；采用与否受 3.1/NFR-11 的轻量化门槛约束 |
+| UI 组件 | **GPUI + `Termior-ui-kit`（自建轻量控件）** | 不采用 gpui-component（ADR 0003）；通用控件与尺寸 token 落在 ui-kit，业务状态不得泄漏进控件层 |
 | 应用状态 | GPUI `Entity`/`Context` 模型 | 每个子系统维护一个核心 Entity，通过事件更新状态 |
 | 终端仿真 | **alacritty_terminal**（VTE 解析 + 网格模型）+ GPUI 自绘 | 解析、网格状态和渲染职责清晰分离，兼顾性能与兼容性 |
 | PTY | **portable-pty** | 提供跨平台 PTY 抽象；Windows 侧补充 Job Object 与 ConPTY 串行化定制 |
-| 编辑器 | **ropey + tree-sitter** 自研（M2 起步可先用 gpui-component 编辑器组件过渡） | 最大工作量项，按 6.3 分阶段交付 |
+| 编辑器 | **ropey + tree-sitter** 自研 | 最大工作量项，按 6.3 分阶段交付；不依赖第三方 GPUI 编辑器组件 |
 | AI SDK | **自研 Provider 抽象层**（reqwest + SSE 解析）+ 原生 Agent 循环 | 统一不同模型服务的流式消息、工具调用和错误语义 |
 | 模块通信 | 进程内 `async channel` + GPUI 事件 | 避免序列化边界，保持异步 IO 与 UI 状态解耦 |
 | 异步运行时 | GPUI executor（主线程调度）+ **独立 tokio 运行时线程**承载网络/PTY IO，channel 桥接 | 隔离 UI 调度与阻塞或高吞吐 IO |
@@ -85,39 +85,21 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | 内容搜索 | grep-* crates | 使用 ripgrep 搜索引擎 |
 | 文件遍历/忽略 | ignore crate | 尊重 `.gitignore`/`.ignore` |
 | 文件图标 | 内嵌 SVG 资源 + Rust 侧 resolver | 图标集需确认许可后打包 |
-| Markdown 渲染 tab | pulldown-cmark + GPUI 渲染；gpui-component Markdown 仅作为通过体积门槛后的备选 | 同时服务 AI 消息渲染，避免为单一能力无条件扩大依赖面 |
+| Markdown 渲染 tab | pulldown-cmark + GPUI 渲染 | 同时服务 AI 消息渲染，避免为单一能力无条件扩大依赖面 |
 
-### 3.1 gpui-component 采用边界与轻量化门槛
+### 3.1 UI 控件层：不采用 gpui-component（ADR 0003）
 
-**决策**：有限采用，不直接依赖。gpui-component 只负责通用桌面控件，通过内部 crate `Termior-ui-kit` 暴露稳定接口；除 `Termior-ui-kit` 外，业务 crate 禁止直接依赖或导入 gpui-component。这样既复用成熟的跨平台交互能力，也保留按组件替换、自研或移除依赖的路径。
+**决策**：不引入 gpui-component。通用桌面控件（Icon、IconButton、Tooltip、Input chrome、ListRow、Menu、EmptyState、尺寸 token 等）在内部 crate `Termior-ui-kit` 自建；除该 crate 外，业务 crate 只依赖 GPUI 与 ui-kit，禁止新增对 gpui-component 的依赖。
 
-**权衡依据**：采用 gpui-component 可直接获得 Dock、输入、焦点、弹层、虚拟列表、IME/CJK 等成熟能力，显著降低 M0–M3 的开发周期与三平台交互缺陷风险；完全不用则能更精确地控制依赖与最终产物，但必须长期自行维护上述通用基础设施。鉴于其主 UI crate 尚未按单个控件提供完整 feature gate，编译依赖和最终链接成本不能只靠未使用代码消除来假定，故不做无条件全量采用，而以内部隔离层和实测预算控制。
+**权衡依据**：gpui-component 将其 gpui 钉在与本仓库不同的 Zed rev，而 Termior 已 vendor 并修补 `gpui_windows`（窗口关闭竞态等）。对齐意味着迁移 gpui rev、重打补丁并长期跟随其升级节奏，成本高于自建当前所需的薄控件面。详见 `docs/adr/0003-no-gpui-component.md`。
 
-**允许采用的范围**：
+**控件层职责边界**：
 
-- `Root` 与窗口级 overlay，以及 Input、搜索框、设置表单；
-- Dock/Tiles/Resizable、List/Tree、Popover/Dialog/Menu；
-- Notification、Tooltip；
-- Markdown 组件仅在 M0 体积评估通过后启用。
-
-**不得作为最终实现或状态边界的范围**：
-
-- 终端网格、PTY 与终端渲染；
-- 最终代码编辑器、AI diff 引擎和语法解析架构；M2 临时编辑器也必须藏在 `Termior-editor` API 后；
-- Workspace、Agent、会话及其他领域状态；
-- 中央主题的源模型；`Termior-ui-kit` 只负责把 Termior token 映射到控件样式；
-- Web 预览；该能力使用系统浏览器，不再内嵌 WebView（ADR 0002）；
+- `Termior-ui-kit`：无业务状态的可复用控件与 token；可选 `gpui-kit` feature 隔离 GPUI。
+- 不得作为控件层状态边界：终端网格/PTY、最终代码编辑器与 AI diff、Workspace/Agent/会话、中央主题源模型、Web 预览（系统浏览器，ADR 0002）。
 - 不启用包含全部语法的 `tree-sitter-languages` 聚合 feature，只按实际支持语言逐项引入语法 crate。
 
-**版本与依赖纪律**：gpui、gpui-component 均锁定确切 tag/rev；升级集中在显式升级窗口中进行。`cargo tree` 与产物体积报告进入 CI，新增 UI 依赖必须说明其 Release 体积、冷启动和空闲内存影响。
-
-**M0 决策实验**：在 macOS、Linux、Windows 上用完全相同的 Release 配置（LTO、strip、panic 策略一致）构建并记录三组基线：
-
-1. 纯 GPUI 空窗口；
-2. GPUI + gpui-component 初始化；
-3. GPUI + Termior 实际需要的 Dock、Input、Tree、Dialog、Notification。
-
-以第 3 组相对第 1 组的增量作为长期保留依据：单二进制增量 ≤ 5MB、首帧时间增量 ≤ 50ms、空闲 RSS 增量 ≤ 10MB，并保持空闲零重绘；M1 还必须确认终端键入回显与持续输出性能无可测回归。任何一项超标时，优先为上游能力增加细粒度 feature gate；仍不满足时，由 `Termior-ui-kit` 替换超预算组件或维护最小内部实现。
+**版本与依赖纪律**：gpui 锁定确切 tag/rev；升级集中在显式升级窗口中进行。`cargo tree` 与产物体积报告进入 CI，新增 UI 依赖必须说明其 Release 体积、冷启动和空闲内存影响。
 
 ---
 
@@ -186,13 +168,13 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | FR-WS-02 | tab 切换不销毁状态（见 INV-1）；新 tab 继承活动 tab 的 cwd | P0 |
 | FR-WS-03 | 任意 tab 可分栏：`Cmd+D` 右分、`Cmd+Shift+D` 下分、`Cmd+[` / `Cmd+]` 切换焦点、`Cmd+W` 关闭焦点 pane（最后一个 pane 时关闭 tab）；pane 可拖拽调整尺寸、独立关闭 | P0 |
 | FR-WS-04 | sidebar 活动栏含三个面板：文件浏览器、源码管理、Git 历史；`Cmd+B` 折叠/展开，`Cmd+Shift+E` 聚焦浏览器 | P0 |
-| FR-WS-05 | 状态栏：活动终端 cwd 面包屑（OSC 7 驱动）、AI 工具运行指示器、localhost 预览 pill | P0 |
-| FR-WS-06 | header：tab 栏、工作区切换器（本地 + Windows 下的 WSL 发行版）、通知铃铛 | P0（WSL 为 P1） |
-| FR-WS-07 | 设置为独立 GPUI 窗口（`Cmd+,`），六个页签：General / Models / Themes / Shortcuts / Agents / About | P0 |
+| FR-WS-05 | 状态栏为上下文条：终端显示 cwd 面包屑（OSC 7），编辑器显示文件路径与行列；右侧含工作区名、git 分支、AI 状态（工具计数仅在 >0 时显示）、localhost 预览 pill | P0 |
+| FR-WS-06 | 自绘标题栏：标签栏与窗口控制合并为一行；操作区仅通知铃铛与设置；分栏入口在 pane 上下文菜单；主题选择在设置窗；工作区切换（本地 + Windows WSL）在状态栏 | P0（WSL 为 P1） |
+| FR-WS-07 | 设置为独立 GPUI 窗口（`Cmd+,`），左侧竖向导航六页：General / Models / Themes / Shortcuts / Agents / About；自动保存（敏感凭据仍显式确认） | P0 |
 
 **验收标准**：终端 tab 中运行 `npm run dev`，切走再切回，输出无丢帧无重启；分栏内两个 PTY 独立收发；关闭窗口时所有布局状态持久化并在下次启动恢复（P1）。
 
-**技术要点**：分栏通过 `Termior-ui-kit` 的布局接口实现，M0 默认适配 gpui-component Dock/Tiles，但业务视图不得直接依赖其类型；tab 内容以 `AnyView` 持有，隐藏时跳过 paint 但保留 Entity；cwd 继承读取终端模块暴露的 `latest_cwd()`。
+**技术要点**：分栏通过 `Termior-ui-kit` 的 `PaneLayout` 实现；主窗口 `TitlebarOptions { appears_transparent: true }` 自绘 chrome；tab 内容以 Entity 持有，隐藏时跳过 paint 但保留状态；cwd 继承读取终端模块暴露的 `latest_cwd()`。
 
 ### 6.2 终端（FR-TERM）
 
@@ -277,12 +259,12 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | ID | 需求 | 优先级 |
 |---|---|---|
 | FR-THEME-01 | 中央主题引擎：一份 Rust 主题 token 结构（语义色板）同时驱动 UI 组件、终端 16+ 色调色板、diff 颜色、通知样式 | P0 |
-| FR-THEME-02 | 内置 10 套应用主题（Termior-default、nord、tide、catppuccin、tokyo-night、caffeine、claude、gruvbox、sage、rose-pine 风格自定义命名）；浅色/深色/跟随系统三态独立于色板选择 | P0（首发 4 套，其余 P1） |
+| FR-THEME-02 | 内置应用主题各带原生外观归属（Light/Dark）；选择主题即锁定到其原生外观。`FollowSystem` 使用浅色槽位 + 深色槽位主题配对（候选按原生外观过滤）。内置含 default / default-light、nord / nord-light 及 tide、catppuccin、tokyo-night、caffeine、claude、gruvbox、sage、rose-pine 等 | P0（首发子集，其余 P1） |
 | FR-THEME-03 | 编辑器主题独立选择（见 FR-EDIT-07），允许深色编辑器配浅色应用 | P1 |
-| FR-THEME-04 | 自定义主题：基于任意预设在应用内改 token、保存并列展示；JSON 格式持久化（`Termior-custom-themes.json`），支持导入/导出分享 | P1 |
+| FR-THEME-04 | 自定义主题：基于任意预设在应用内改 token、保存并列展示；JSON 含 `native_appearance` 与单色板；支持导入/导出（旧双色板格式仍可导入） | P1 |
 | FR-THEME-05 | 背景图：任选图片，透明度滑杆（与背景色混合）+ 高斯模糊滑杆（模糊图片不糊前景）；作用于整窗最底层；图片解码一次缓存 | P2 |
 
-**技术要点**：Termior `Theme` 结构体 + 全局 Entity 是唯一主题源，切换时广播重绘；`Termior-ui-kit` 负责把语义 token 映射到 gpui-component 或自研控件，业务层不得读取 gpui-component 主题状态；背景模糊用离屏一次性高斯模糊缓存纹理，不做逐帧后处理。
+**技术要点**：Termior `Theme` + `NativeAppearance` 与全局 Entity 是唯一主题源，切换时广播重绘；`Termior-ui-kit` 把语义 token 映射到自研控件样式；不再做算法推导的浅色变体。背景模糊用离屏一次性高斯模糊缓存纹理，不做逐帧后处理。
 
 ### 6.8 通知（FR-NOTIF）
 
@@ -414,7 +396,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | NFR-08 | 隐私 | 无遥测、无账号、离线可用（本地 Provider 路径全功能） |
 | NFR-09 | 许可 | 项目以 Apache-2.0 发布；所有第三方 crate、图标、字体与其他打包资产均需核验许可并保留必要声明 |
 | NFR-10 | 可测性 | 网格解析、diff/hunk、graph lane、deny-list、SSRF 判定、hooks 安装器均为纯函数/独立模块，单测覆盖率 ≥ 80% |
-| NFR-11 | UI 依赖预算 | 按 3.1 的三组 Release 基线测试：实际 gpui-component 方案相对纯 GPUI 的单二进制增量 ≤ 5MB、首帧增量 ≤ 50ms、空闲 RSS 增量 ≤ 10MB；空闲零重绘，M1 终端性能无可测回归 |
+| NFR-11 | UI 依赖预算 | 不引入 gpui-component（ADR 0003）；新增 UI 依赖须说明 Release 体积、冷启动与空闲 RSS 影响，并由 NFR-01/04/05 门禁把关；空闲零重绘见 NFR-03 |
 
 ---
 
@@ -437,16 +419,16 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 |---|---|---|
 | R1 | Windows 的 IME、ConPTY、Job Object 与系统集成可能出现平台特有回归 | Windows 与 macOS/Linux 同列 P0；CI 持续运行三平台构建、单测与关键交互验收，所有里程碑均以三平台通过为门槛 |
 | R2 | ~~wry 子 WebView 与 GPUI 合成的 z-order/焦点限制~~（已由 ADR 0002 移除内嵌 WebView 消解） | Web 预览改为系统浏览器打开（FR-PREV-03/04）；若未来重新引入内嵌后端，需重开本风险并恢复浮层规避策略 |
-| R3 | 自研编辑器工作量（最大不确定项） | 分阶段（6.3）；M2 可在 `Termior-editor` 内部临时适配 gpui-component 编辑器，但最终实现与迁移不得泄漏其 API |
-| R4 | gpui / gpui-component 版本追踪与 API 波动 | 锁定确切 tag/rev，集中升级窗口；gpui-component 依赖面收敛在 `Termior-ui-kit`，业务 crate 不直接导入 |
+| R3 | 自研编辑器工作量（最大不确定项） | 分阶段（6.3）；编辑器实现藏在 `Termior-editor` API 后 |
+| R4 | gpui 版本追踪与 API 波动 | 锁定确切 tag/rev，集中升级窗口；Windows 平台补丁维护在 vendor `gpui_windows` |
 | R5 | tokio 与 GPUI executor 双运行时桥接复杂度 | 统一封装 `spawn_net()` 桥接工具，禁止业务代码直接触碰两个运行时 |
-| R6 | 原生 UI、gpui-component 的非细粒度依赖、语法解析器与内嵌资产可能推高二进制体积 | 同时执行 NFR-05 与 NFR-11；CI 持续输出三平台 `cargo tree`、产物体积与基线差值，超标时优先 feature gate 或替换对应组件 |
+| R6 | 原生 UI、自研控件、语法解析器与内嵌资产可能推高二进制体积 | 同时执行 NFR-05 与 NFR-11；CI 持续输出三平台 `cargo tree`、产物体积与基线差值 |
 | R7 | 语音输入的跨平台采集与 STT 成本 | 定为 P2；首选复用已配置 Provider 的转写端点 |
 
 **开放问题**：
 
 - Q1：正式产品名（`Termior` 为占位）与 bundle id 归属。
-- Q2：M0 基准完成后，gpui-component 是否整体满足 NFR-11；若超标，具体保留哪些控件、哪些改为 feature gate 或 `Termior-ui-kit` 内部实现？
+- Q2：~~gpui-component 是否满足 NFR-11 / 保留范围~~ — **已关闭**（ADR 0003：不采用 gpui-component，自建 `Termior-ui-kit`）。
 - Q3：会话消息历史膨胀策略（单文件 JSON 何时拆分为每会话一文件）。
 - Q4：Claude Code 之外第二个终端代理（Codex 等）的 hooks 适配排期。
 

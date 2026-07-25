@@ -338,36 +338,27 @@ impl gpui::Render for GitHistoryView {
                 } else {
                     format!("  [{}]", commit.decorations.join(", "))
                 };
-                div()
+                termior_ui_kit::list_row(&p, selected, 0)
                     .id(SharedString::from(format!("history-{}", commit.id)))
                     .flex()
                     .gap_2()
                     .px_3()
                     .py_2()
-                    .cursor_pointer()
-                    .when(selected, |row| row.bg(ui::selected_wash(&p)))
                     .child(
                         div()
                             .font_family("monospace")
                             .text_color(ui::color(p.accent))
                             .child(SharedString::from(graph)),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(SharedString::from(format!(
-                                "{}{}",
-                                commit.summary, decorations
-                            )))
-                            .child(div().text_xs().text_color(ui::muted(&p)).child(
-                                SharedString::from(format!(
-                                    "{} · {}",
-                                    &commit.id[..7.min(commit.id.len())],
-                                    commit.author
-                                )),
-                            )),
-                    )
+                    .child(termior_ui_kit::list_row_meta(
+                        SharedString::from(format!("{}{}", commit.summary, decorations)),
+                        SharedString::from(format!(
+                            "{} · {}",
+                            &commit.id[..7.min(commit.id.len())],
+                            commit.author
+                        )),
+                        &p,
+                    ))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.select_commit(id.clone(), cx)),
@@ -425,7 +416,7 @@ impl gpui::Render for GitHistoryView {
                     .rounded_md()
                     .border_1()
                     .border_color(ui::color(p.accent))
-                    .bg(ui::color(p.surface[1]))
+                    .bg(ui::color(p.elevated))
                     .child(SharedString::from(format!(
                         "Search history: {}▏",
                         self.query

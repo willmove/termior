@@ -1,5 +1,9 @@
 //! Termior desktop application entry point.
 
+// Windows: GUI subsystem — no console window; closing a terminal won't kill the app.
+// Smoke/NFR scripts that redirect stdout still receive println! via inherited pipes.
+#![windows_subsystem = "windows"]
+
 mod ai_diff_view;
 mod app_identity;
 mod background_image;
@@ -16,9 +20,7 @@ mod workspace_view;
 
 use gpui::{px, size, App, AppContext, Bounds, Entity, Window, WindowAppearance, WindowBounds};
 use gpui_platform::application;
-use std::ffi::OsString;
-use std::io::Write as _;
-use std::path::PathBuf;
+use std::{ffi::OsString, io::Write as _, path::PathBuf};
 use workspace_view::WorkspaceView;
 
 fn main() {
@@ -27,39 +29,63 @@ fn main() {
     let smoke_test = std::env::var_os("TERMIOR_SMOKE_TEST").is_some();
     let markdown_preview_smoke_test =
         std::env::var_os("TERMIOR_MARKDOWN_PREVIEW_SMOKE_TEST").is_some();
+    let settings_close_smoke_test = std::env::var_os("TERMIOR_SETTINGS_CLOSE_SMOKE_TEST").is_some();
+    let open_settings = std::env::var_os("TERMIOR_OPEN_SETTINGS").is_some();
     let nfr_measure = std::env::var_os("TERMIOR_NFR_MEASURE").is_some();
-    let headless = smoke_test || markdown_preview_smoke_test || nfr_measure;
+    let idle_redraw_probe_secs = std::env::var("TERMIOR_IDLE_REDRAW_PROBE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let headless = smoke_test
+        || markdown_preview_smoke_test
+        || settings_close_smoke_test
+        || nfr_measure
+        || idle_redraw_probe_secs.is_some();
     let root = resolve_workspace_root(headless);
-    application().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
-        cx.open_window(
-            app_identity::window_options(WindowBounds::Windowed(bounds)),
-            |window, cx| {
-                let system_is_dark = matches!(
-                    window.appearance(),
-                    WindowAppearance::Dark | WindowAppearance::VibrantDark
-                );
-                let workspace: Entity<WorkspaceView> =
-                    cx.new(|cx| WorkspaceView::new(root.clone(), system_is_dark, cx));
-                workspace.update(cx, |workspace, cx| {
-                    workspace.restore_or_create_runtime(window, cx);
-                    workspace.start_background_services(cx);
-                    if markdown_preview_smoke_test {
-                        workspace.start_markdown_preview_smoke(window, cx);
+    application()
+        .with_assets(termior_ui_kit::IconAssets)
+        .run(move |cx: &mut App| {
+            let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
+            cx.open_window(
+                app_identity::main_window_options(WindowBounds::Windowed(bounds)),
+                |window, cx| {
+                    let system_is_dark = matches!(
+                        window.appearance(),
+                        WindowAppearance::Dark | WindowAppearance::VibrantDark
+                    );
+                    let workspace: Entity<WorkspaceView> =
+                        cx.new(|cx| WorkspaceView::new(root.clone(), system_is_dark, cx));
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.restore_or_create_runtime(window, cx);
+                        workspace.start_background_services(cx);
+                        if markdown_preview_smoke_test {
+                            workspace.start_markdown_preview_smoke(window, cx);
+                        }
+                    });
+                    if settings_close_smoke_test {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.start_settings_close_smoke(cx);
+                        });
+                    } else if smoke_test && !markdown_preview_smoke_test {
+                        schedule_smoke_exit(window);
+                    } else if open_settings {
+                        workspace.update(cx, |workspace, cx| {
+                            let _ = workspace.open_settings_for_ui_shot(cx);
+                        });
                     }
-                });
-                if smoke_test && !markdown_preview_smoke_test {
-                    schedule_smoke_exit(window);
-                }
-                if nfr_measure {
-                    schedule_nfr_measurement(window);
-                }
-                workspace
-            },
-        )
-        .expect("open Termior window");
-        cx.activate(true);
-    });
+                    if let Some(secs) = idle_redraw_probe_secs {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.start_idle_redraw_probe(secs, cx);
+                        });
+                    }
+                    if nfr_measure {
+                        schedule_nfr_measurement(window);
+                    }
+                    workspace
+                },
+            )
+            .expect("open Termior window");
+            cx.activate(true);
+        });
 }
 
 /// NFR 测量模式（`TERMIOR_NFR_MEASURE=1`，由 `termior-bench` 的 `nfr-run` 驱动）。

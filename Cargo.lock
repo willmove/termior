@@ -2595,7 +2595,6 @@ dependencies = [
 [[package]]
 name = "gpui_windows"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed?rev=3565c49#3565c49dad884e8437b86a1b1beaa76bfac67fc3"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -6485,8 +6484,10 @@ dependencies = [
 name = "termior-ui-kit"
 version = "0.1.0"
 dependencies = [
+ "gpui",
  "serde",
  "serde_json",
+ "termior-theme",
  "thiserror 1.0.69",
 ]
 
