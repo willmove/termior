@@ -77,8 +77,31 @@ pub enum IndexError {
     NotDirectory(PathBuf),
 }
 
+/// Walk depth that yields only the workspace root's direct children.
+///
+/// Matches `ignore::WalkBuilder::max_depth(Some(1))`: depth 0 is the root itself
+/// (skipped), depth 1 is immediate children.
+pub const SHALLOW_MAX_DEPTH: usize = 1;
+
 impl FileIndex {
+    /// Full recursive index (respects gitignore / ignore files).
     pub fn build(root: impl AsRef<Path>, show_dotfiles: bool) -> Result<Self, IndexError> {
+        Self::build_with_max_depth(root, show_dotfiles, None)
+    }
+
+    /// Index only direct children of `root` for a fast first paint.
+    ///
+    /// A subsequent [`Self::build`] / [`Self::refresh`] can replace this atomically
+    /// with a deep index for the same root.
+    pub fn build_shallow(root: impl AsRef<Path>, show_dotfiles: bool) -> Result<Self, IndexError> {
+        Self::build_with_max_depth(root, show_dotfiles, Some(SHALLOW_MAX_DEPTH))
+    }
+
+    fn build_with_max_depth(
+        root: impl AsRef<Path>,
+        show_dotfiles: bool,
+        max_depth: Option<usize>,
+    ) -> Result<Self, IndexError> {
         let root = root.as_ref();
         if !root.is_dir() {
             return Err(IndexError::NotDirectory(root.to_path_buf()));
@@ -89,7 +112,7 @@ impl FileIndex {
             entries: Vec::new(),
             skipped: Vec::new(),
         };
-        index.refresh()?;
+        index.refresh_with_max_depth(max_depth)?;
         Ok(index)
     }
 
@@ -111,6 +134,15 @@ impl FileIndex {
     }
 
     pub fn refresh(&mut self) -> Result<(), IndexError> {
+        self.refresh_with_max_depth(None)
+    }
+
+    /// Replace entries with a shallow (direct-children) listing of the same root.
+    pub fn refresh_shallow(&mut self) -> Result<(), IndexError> {
+        self.refresh_with_max_depth(Some(SHALLOW_MAX_DEPTH))
+    }
+
+    fn refresh_with_max_depth(&mut self, max_depth: Option<usize>) -> Result<(), IndexError> {
         if !self.root.is_dir() {
             return Err(IndexError::NotDirectory(self.root.clone()));
         }
@@ -122,7 +154,8 @@ impl FileIndex {
             .git_exclude(true)
             .require_git(false)
             .ignore(true)
-            .parents(true);
+            .parents(true)
+            .max_depth(max_depth);
         let mut entries = Vec::new();
         let mut skipped = Vec::new();
         for result in builder.build() {
@@ -325,6 +358,98 @@ mod tests {
         let missing = tempfile::tempdir().unwrap().path().join("does-not-exist");
         let error = FileIndex::build(&missing, false).unwrap_err();
         assert!(matches!(error, IndexError::NotDirectory(_)));
+    }
+
+    #[test]
+    fn shallow_index_lists_only_direct_children() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src/nested")).unwrap();
+        fs::write(dir.path().join("readme.md"), "hi").unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main(){}").unwrap();
+        fs::write(dir.path().join("src/nested/deep.rs"), "x").unwrap();
+
+        let shallow = FileIndex::build_shallow(dir.path(), true).unwrap();
+        let paths: Vec<&str> = shallow
+            .entries()
+            .iter()
+            .map(|e| e.relative.as_str())
+            .collect();
+        assert!(paths.contains(&"readme.md"), "{paths:?}");
+        assert!(paths.contains(&"src"), "{paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.contains('/')),
+            "shallow must not include nested paths: {paths:?}"
+        );
+
+        let deep = FileIndex::build(dir.path(), true).unwrap();
+        let deep_paths: Vec<&str> = deep
+            .entries()
+            .iter()
+            .map(|e| e.relative.as_str())
+            .collect();
+        assert!(deep_paths.contains(&"src/main.rs"), "{deep_paths:?}");
+        assert!(deep_paths.contains(&"src/nested/deep.rs"), "{deep_paths:?}");
+    }
+
+    #[test]
+    fn shallow_then_deep_can_atomically_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "x").unwrap();
+
+        let mut index = FileIndex::build_shallow(dir.path(), true).unwrap();
+        assert_eq!(index.root(), dir.path());
+        assert!(index.entries().iter().all(|e| !e.relative.contains('/')));
+
+        index.refresh().unwrap();
+        assert_eq!(index.root(), dir.path());
+        assert!(
+            index
+                .entries()
+                .iter()
+                .any(|e| e.relative == "src/main.rs"),
+            "deep refresh must replace shallow entries"
+        );
+    }
+
+    #[test]
+    fn shallow_stays_fast_on_wide_nested_tree() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..150 {
+            let nested = dir.path().join(format!("bucket{i}/nested/deep"));
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(nested.join("file.txt"), "x").unwrap();
+        }
+        let start = Instant::now();
+        let shallow = FileIndex::build_shallow(dir.path(), true).unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "shallow listing should stay interactive, took {elapsed:?}"
+        );
+        assert_eq!(shallow.entries().len(), 150);
+        assert!(shallow.entries().iter().all(|e| !e.relative.contains('/')));
+    }
+
+    #[test]
+    fn shallow_build_survives_unreadable_child() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("ok.txt"), "x").unwrap();
+        let secret = dir.path().join("secret");
+        fs::create_dir_all(&secret).unwrap();
+        let _guard = deny_read(&secret);
+
+        let index = FileIndex::build_shallow(dir.path(), true).unwrap();
+        let paths: Vec<&str> = index
+            .entries()
+            .iter()
+            .map(|e| e.relative.as_str())
+            .collect();
+        assert!(paths.contains(&"ok.txt"), "{paths:?}");
+        assert!(paths.contains(&"src"), "{paths:?}");
     }
 
     #[test]

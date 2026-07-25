@@ -50,6 +50,8 @@ pub mod explorer {
     pub const NEW_DIRECTORY: &str = "New folder";
     pub const REFRESH: &str = "Refresh";
     pub const ROOT_INVALID: &str = "Workspace folder is missing or is not a directory";
+    /// Shown when a deep index timed out but shallow/partial results remain.
+    pub const INDEX_INCOMPLETE: &str = "Index incomplete — showing partial results";
 
     pub fn skipped_summary(count: usize) -> String {
         match count {

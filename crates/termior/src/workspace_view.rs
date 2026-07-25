@@ -10,7 +10,10 @@ use crate::{
     terminal_view::{TerminalView, TerminalViewEvent},
     ui::{self, ButtonKind},
 };
-use futures::StreamExt;
+use futures::{
+    future::{self, Either},
+    StreamExt,
+};
 use gpui::{
     anchored, canvas, div, ease_in_out, prelude::*, px, relative, size, Animation, AnimationExt as _,
     AnyElement, AnyWindowHandle, App, Bounds, Context, CursorStyle, ElementInputHandler, Entity,
@@ -24,14 +27,15 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use termior_ai::{
     AttachmentSource, HttpProvider, InlineCompleter, KeyringSecretStore, ProviderConfig,
     SecretStore,
 };
 use termior_explorer::{
-    ContentMatch, ContentSearch, FileEntry, FileIndex, IconKind, TreeState, WorkspaceWatcher,
+    debounced_rescan_action, ContentMatch, ContentSearch, DebouncedRescanAction, FileEntry,
+    FileIndex, IconKind, TreeState, WorkspaceWatcher,
 };
 use termior_platform::{
     AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationContext,
@@ -56,6 +60,10 @@ use termior_ui_kit::{
 
 /// Short oneshot fade for sidebar / toast / menus. Never `.repeat()` — that would break idle zero-redraw.
 const UI_FADE_IN: Duration = Duration::from_millis(160);
+/// Merge filesystem events before scheduling an explorer rebuild.
+const EXPLORER_RESCAN_DEBOUNCE: Duration = Duration::from_millis(400);
+/// Soft cap for deep indexing; shallow/partial results stay visible after this.
+const EXPLORER_DEEP_SCAN_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Idle-redraw probe (`TERMIOR_IDLE_REDRAW_PROBE`): count `WorkspaceView::render` calls while armed.
 static IDLE_REDRAW_ARMED: AtomicBool = AtomicBool::new(false);
@@ -255,9 +263,18 @@ pub struct WorkspaceView {
     explorer_tree: TreeState,
     explorer_watcher: Option<WorkspaceWatcher>,
     explorer_requested_root: PathBuf,
-    explorer_loading: bool,
+    /// True while a deep index for the current generation is still outstanding.
+    explorer_deep_indexing: bool,
     explorer_scan_generation: u64,
+    /// True from scan start until deep completes/fails (or is superseded).
+    explorer_scan_in_progress: bool,
+    /// FS change arrived while a scan was running — rescan once when it finishes.
+    explorer_pending_rescan: bool,
+    /// Debounced deadline for a watch-triggered rescan.
+    explorer_rescan_after: Option<Instant>,
     explorer_error: Option<String>,
+    /// Deep index hit the soft timeout; partial results are still shown.
+    explorer_index_incomplete: bool,
     /// Whether the explorer footer listing skipped unreadable entries is expanded.
     explorer_skips_expanded: bool,
     _background_task: Option<Task<()>>,
@@ -483,9 +500,13 @@ impl WorkspaceView {
             explorer_tree,
             explorer_watcher: None,
             explorer_requested_root: root,
-            explorer_loading: true,
+            explorer_deep_indexing: true,
             explorer_scan_generation: 0,
+            explorer_scan_in_progress: false,
+            explorer_pending_rescan: false,
+            explorer_rescan_after: None,
             explorer_error: None,
+            explorer_index_incomplete: false,
             explorer_skips_expanded: false,
             _background_task: None,
             command_mode: CommandMode::Browse,
@@ -593,10 +614,27 @@ impl WorkspaceView {
                         .as_ref()
                         .is_some_and(|watcher| !watcher.try_changes().is_empty());
                     if changed {
-                        workspace
-                            .schedule_explorer_scan(workspace.explorer_requested_root.clone(), cx);
-                        workspace.refresh_vcs_data();
-                        cx.notify();
+                        workspace.explorer_rescan_after =
+                            Some(Instant::now() + EXPLORER_RESCAN_DEBOUNCE);
+                    }
+                    let due = workspace
+                        .explorer_rescan_after
+                        .is_some_and(|deadline| Instant::now() >= deadline);
+                    match debounced_rescan_action(due, workspace.explorer_scan_in_progress) {
+                        DebouncedRescanAction::Wait => {}
+                        DebouncedRescanAction::QueuePending => {
+                            workspace.explorer_rescan_after = None;
+                            workspace.explorer_pending_rescan = true;
+                        }
+                        DebouncedRescanAction::ScheduleNow => {
+                            workspace.explorer_rescan_after = None;
+                            workspace.schedule_explorer_scan(
+                                workspace.explorer_requested_root.clone(),
+                                cx,
+                            );
+                            workspace.refresh_vcs_data();
+                            cx.notify();
+                        }
                     }
                 })
                 .is_err()
@@ -693,67 +731,158 @@ impl WorkspaceView {
 
     fn schedule_explorer_scan(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         if !root.is_dir() {
-            self.explorer_loading = false;
+            self.explorer_deep_indexing = false;
+            self.explorer_scan_in_progress = false;
+            self.explorer_pending_rescan = false;
+            self.explorer_rescan_after = None;
+            self.explorer_index_incomplete = false;
             self.explorer = None;
             self.explorer_skips_expanded = false;
             self.explorer_error = Some(ui_text::explorer::ROOT_INVALID.into());
+            cx.notify();
             return;
         }
 
         self.explorer_requested_root = root.clone();
         self.explorer_tree.set_root(root.clone());
-        self.explorer_loading = true;
+        self.explorer_deep_indexing = true;
+        self.explorer_scan_in_progress = true;
+        self.explorer_pending_rescan = false;
+        self.explorer_rescan_after = None;
+        self.explorer_index_incomplete = false;
         self.explorer_error = None;
         self.explorer_skips_expanded = false;
         self.explorer_scan_generation = self.explorer_scan_generation.saturating_add(1);
         let generation = self.explorer_scan_generation;
         let show_dotfiles = self.settings.show_dotfiles;
-        let scan = cx
+
+        let shallow_root = root.clone();
+        let shallow = cx.background_executor().spawn(async move {
+            FileIndex::build_shallow(shallow_root, show_dotfiles)
+        });
+        let deep = cx
             .background_executor()
             .spawn(async move { FileIndex::build(root, show_dotfiles) });
+
         cx.spawn(async move |workspace, cx| {
-            let result = scan.await;
-            let _ = workspace.update(cx, |workspace, cx| {
-                if generation != workspace.explorer_scan_generation {
-                    return;
-                }
-                workspace.explorer_loading = false;
-                match result {
-                    Ok(index) if index.root() == workspace.explorer_requested_root => {
-                        let root_changed = workspace
-                            .explorer
-                            .as_ref()
-                            .map_or(true, |current| current.root() != index.root());
-                        if root_changed || workspace.explorer_watcher.is_none() {
-                            workspace.explorer_watcher = WorkspaceWatcher::watch(index.root()).ok();
+            let shallow_result = shallow.await;
+            let continue_deep = workspace
+                .update(cx, |workspace, cx| {
+                    if generation != workspace.explorer_scan_generation {
+                        return false;
+                    }
+                    match shallow_result {
+                        Ok(index) => {
+                            workspace.apply_explorer_index(index, cx);
+                            // Keep deep-indexing indicator on while the full walk runs.
+                            workspace.explorer_deep_indexing = true;
                         }
-                        let paths = index
-                            .entries()
-                            .iter()
-                            .filter(|entry| !entry.is_dir)
-                            .map(|entry| entry.relative.clone())
-                            .collect();
-                        workspace
-                            .composer
-                            .update(cx, |composer, _| composer.set_workspace_paths(paths));
-                        if index.skipped().is_empty() {
+                        Err(_) => {
+                            workspace.explorer = None;
                             workspace.explorer_skips_expanded = false;
+                            workspace.explorer_deep_indexing = false;
+                            workspace.explorer_error =
+                                Some(ui_text::explorer::ROOT_INVALID.into());
+                            workspace.finish_explorer_scan(cx);
                         }
-                        workspace.explorer = Some(index);
-                        workspace.explorer_error = None;
                     }
-                    Ok(_) => return,
-                    Err(_) => {
-                        workspace.explorer = None;
-                        workspace.explorer_skips_expanded = false;
-                        workspace.explorer_error =
-                            Some(ui_text::explorer::ROOT_INVALID.into());
-                    }
+                    cx.notify();
+                    generation == workspace.explorer_scan_generation
+                        && workspace.explorer_scan_in_progress
+                })
+                .unwrap_or(false);
+
+            if !continue_deep {
+                return;
+            }
+
+            let timeout = cx.background_executor().timer(EXPLORER_DEEP_SCAN_TIMEOUT);
+            match future::select(Box::pin(deep), Box::pin(timeout)).await {
+                Either::Left((deep_result, _)) => {
+                    let _ = workspace.update(cx, |workspace, cx| {
+                        if generation != workspace.explorer_scan_generation {
+                            return;
+                        }
+                        match deep_result {
+                            Ok(index) => {
+                                workspace.apply_explorer_index(index, cx);
+                                workspace.explorer_index_incomplete = false;
+                                workspace.explorer_deep_indexing = false;
+                                workspace.finish_explorer_scan(cx);
+                            }
+                            Err(_) => {
+                                // Keep any shallow results; only fail hard if we have none.
+                                if workspace.explorer.is_none() {
+                                    workspace.explorer_error =
+                                        Some(ui_text::explorer::ROOT_INVALID.into());
+                                }
+                                workspace.explorer_deep_indexing = false;
+                                workspace.finish_explorer_scan(cx);
+                            }
+                        }
+                        cx.notify();
+                    });
                 }
-                cx.notify();
-            });
+                Either::Right((_, deep_fut)) => {
+                    let _ = workspace.update(cx, |workspace, cx| {
+                        if generation != workspace.explorer_scan_generation {
+                            return;
+                        }
+                        // Soft timeout: keep visible results, stop blocking on indexing.
+                        workspace.explorer_deep_indexing = false;
+                        workspace.explorer_index_incomplete = workspace.explorer.is_some();
+                        cx.notify();
+                    });
+                    let deep_result = deep_fut.await;
+                    let _ = workspace.update(cx, |workspace, cx| {
+                        if generation != workspace.explorer_scan_generation {
+                            return;
+                        }
+                        if let Ok(index) = deep_result {
+                            workspace.apply_explorer_index(index, cx);
+                            workspace.explorer_index_incomplete = false;
+                        }
+                        workspace.explorer_deep_indexing = false;
+                        workspace.finish_explorer_scan(cx);
+                        cx.notify();
+                    });
+                }
+            }
         })
         .detach();
+    }
+
+    fn apply_explorer_index(&mut self, index: FileIndex, cx: &mut Context<Self>) {
+        let root_changed = self
+            .explorer
+            .as_ref()
+            .map_or(true, |current| current.root() != index.root());
+        if root_changed || self.explorer_watcher.is_none() {
+            self.explorer_watcher = WorkspaceWatcher::watch(index.root()).ok();
+        }
+        let paths = index
+            .entries()
+            .iter()
+            .filter(|entry| !entry.is_dir)
+            .map(|entry| entry.relative.clone())
+            .collect();
+        self.composer
+            .update(cx, |composer, _| composer.set_workspace_paths(paths));
+        if index.skipped().is_empty() {
+            self.explorer_skips_expanded = false;
+        }
+        self.explorer = Some(index);
+        self.explorer_error = None;
+    }
+
+    fn finish_explorer_scan(&mut self, cx: &mut Context<Self>) {
+        self.explorer_scan_in_progress = false;
+        if self.explorer_pending_rescan {
+            self.explorer_pending_rescan = false;
+            let root = self.explorer_requested_root.clone();
+            self.schedule_explorer_scan(root, cx);
+            self.refresh_vcs_data();
+        }
     }
 
     fn refresh_workspace_data(&mut self, cx: &mut Context<Self>) {
@@ -3639,8 +3768,10 @@ impl WorkspaceView {
                             .child(SharedString::from(format!(
                                 "{}{}",
                                 root_label,
-                                if self.explorer_loading {
+                                if self.explorer_deep_indexing {
                                     "  · indexing…"
+                                } else if self.explorer_index_incomplete {
+                                    "  · index incomplete"
                                 } else if visible_entry_count > 500 {
                                     "  · showing first 500"
                                 } else {
@@ -3656,6 +3787,20 @@ impl WorkspaceView {
                             .text_color(gpui_color(self.palette.status[3]))
                             .child(SharedString::from(error))
                     }))
+                    .children(
+                        (self.explorer_index_incomplete && self.explorer_error.is_none()).then(
+                            || {
+                                div()
+                                    .px_1()
+                                    .py_1()
+                                    .text_xs()
+                                    .text_color(ui::muted(&self.palette))
+                                    .child(SharedString::from(
+                                        ui_text::explorer::INDEX_INCOMPLETE,
+                                    ))
+                            },
+                        ),
+                    )
                     .child(
                         div()
                             .id("explorer-scroll")
@@ -3677,7 +3822,7 @@ impl WorkspaceView {
                             .children(rows)
                             .children(
                                 (self.explorer.is_some()
-                                    && !self.explorer_loading
+                                    && !self.explorer_deep_indexing
                                     && self
                                         .explorer
                                         .as_ref()
