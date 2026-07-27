@@ -28,6 +28,7 @@ use termior_terminal::{PtySessionConfig, TerminalBridge, TerminalEventProxy};
 use termior_terminal_core::{
     find_hyperlinks,
     osc::{AgentState, OscEvent},
+    shell_integration::{cd_command, ShellKind},
     TerminalSearch,
 };
 use termior_theme::{Color as ThemeColor, ResolvedPalette, TerminalPalette};
@@ -47,6 +48,10 @@ pub enum TerminalViewEvent {
 /// GPUI 终端视图。
 pub struct TerminalView {
     bridge: TerminalBridge,
+    /// spawn 时解析出的实际 shell 类型（cd 注入按此分派语法）。
+    shell_kind: ShellKind,
+    /// 是否为 WSL 会话（影响 cd 注入的路径形式）。
+    is_wsl: bool,
     term: Term<TerminalEventProxy>,
     vte_processor: VteProcessor<StdSyncHandler>,
     palette: ResolvedPalette,
@@ -193,8 +198,12 @@ impl TerminalView {
 
         let text_style = TerminalTextStyle::from_settings(&settings);
         let line_height_px = text_style.font_size * text_style.line_height;
+        let shell_kind = bridge.shell_kind();
+        let is_wsl = bridge.is_wsl();
         Self {
             bridge,
+            shell_kind,
+            is_wsl,
             term,
             vte_processor: VteProcessor::<StdSyncHandler>::default(),
             palette,
@@ -256,6 +265,12 @@ impl TerminalView {
 
     pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
         self.bridge.writer().write_all(bytes)
+    }
+
+    /// 生成把本会话 shell 切到 `dir` 的注入命令（含回车），按 spawn 时解析的
+    /// shell 类型与 WSL 状态选择语法（cmd 用 `cd /d`，WSL 转 `/mnt/<drive>` 路径）。
+    pub fn cd_command_to(&self, dir: &std::path::Path) -> String {
+        cd_command(self.shell_kind, self.is_wsl, dir)
     }
 
     fn handle_terminal_event(&mut self, event: AlacrittyEvent, cx: &mut Context<Self>) {

@@ -15,11 +15,12 @@ use futures::{
     StreamExt,
 };
 use gpui::{
-    anchored, canvas, div, ease_in_out, prelude::*, px, relative, size, Animation, AnimationExt as _,
-    AnyElement, AnyWindowHandle, App, Bounds, Context, CursorStyle, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, PromptButton, PromptLevel, Role, SharedString,
-    Task, UTF16Selection, Window, WindowAppearance, WindowBounds, WindowControlArea,
+    actions, anchored, canvas, div, ease_in_out, prelude::*, px, relative, size, Animation,
+    AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, Context, CursorStyle,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, PromptButton,
+    PromptLevel, Role, SharedString, Task, UTF16Selection, Window, WindowAppearance, WindowBounds,
+    WindowControlArea,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -57,6 +58,10 @@ use termior_ui_kit::{
     tokens::{self, icon_size},
     Icon, LayoutNode, PaneId, SplitDirection, Tooltip,
 };
+
+// 该代码库第一个 GPUI Action：`Cmd/Ctrl+O` 快捷键（在 `main.rs` 绑定）与
+// 状态栏按钮共用内核 `open_workspace`。
+actions!(termior, [OpenWorkspace]);
 
 /// Short oneshot fade for sidebar / toast / menus. Never `.repeat()` — that would break idle zero-redraw.
 const UI_FADE_IN: Duration = Duration::from_millis(160);
@@ -349,8 +354,11 @@ impl WorkspaceView {
             .as_ref()
             .and_then(|dir| std::fs::read_to_string(dir.join("Termior-workspaces.json")).ok())
             .and_then(|raw| serde_json::from_str::<WorkspaceState>(&raw).ok())
-            .filter(|state| state.root == root)
             .unwrap_or_else(|| WorkspaceState::new(root.clone()));
+        // 旧格式文件（Tab 无 project_dir）回填为全局 root，语义与旧版等价。
+        model.backfill_project_dirs();
+        // Tab 集合跨目录启动也恢复（不再按 root 相等过滤）；兜底根跟随本次启动目录。
+        model.root = root.clone();
         model.sidebar_width = model
             .sidebar_width
             .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
@@ -445,8 +453,16 @@ impl WorkspaceView {
         if model.tabs.is_empty() {
             model.active = None;
         }
-        let workspace_auth =
+        let mut workspace_auth =
             WorkspaceAuthRegistry::with_roots([root.to_string_lossy().replace('\\', "/")]);
+        // 恢复出的各 Tab 项目文件夹是此前会话显式授权的目录（打开文件夹即授权），
+        // 重启后继续授权，保证其 PTY spawn 的 cwd 不被 resolve_cwd 丢弃（多 root 并集）。
+        for tab in &model.tabs {
+            let dir = tab.project_dir.to_string_lossy().replace('\\', "/");
+            if !dir.is_empty() {
+                workspace_auth.authorize(&dir);
+            }
+        }
         let composer = cx.new(ComposerView::new);
         composer.update(cx, |composer, cx| {
             composer.configure(
@@ -486,8 +502,10 @@ impl WorkspaceView {
             status: AgentStatus::Finished,
             tab_id: None,
         });
-        let explorer_tree = TreeState::new(root.clone());
-        let (vcs_status, vcs_history, vcs_branch) = load_vcs(&root, &workspace_auth);
+        let initial_project_root = model.active_project_dir().to_path_buf();
+        let explorer_tree = TreeState::new(initial_project_root.clone());
+        let (vcs_status, vcs_history, vcs_branch) =
+            load_vcs(&initial_project_root, &workspace_auth);
         Self {
             model,
             tabs,
@@ -499,7 +517,7 @@ impl WorkspaceView {
             explorer: None,
             explorer_tree,
             explorer_watcher: None,
-            explorer_requested_root: root,
+            explorer_requested_root: initial_project_root,
             explorer_deep_indexing: true,
             explorer_scan_generation: 0,
             explorer_scan_in_progress: false,
@@ -757,9 +775,9 @@ impl WorkspaceView {
         let show_dotfiles = self.settings.show_dotfiles;
 
         let shallow_root = root.clone();
-        let shallow = cx.background_executor().spawn(async move {
-            FileIndex::build_shallow(shallow_root, show_dotfiles)
-        });
+        let shallow = cx
+            .background_executor()
+            .spawn(async move { FileIndex::build_shallow(shallow_root, show_dotfiles) });
         let deep = cx
             .background_executor()
             .spawn(async move { FileIndex::build(root, show_dotfiles) });
@@ -781,8 +799,7 @@ impl WorkspaceView {
                             workspace.explorer = None;
                             workspace.explorer_skips_expanded = false;
                             workspace.explorer_deep_indexing = false;
-                            workspace.explorer_error =
-                                Some(ui_text::explorer::ROOT_INVALID.into());
+                            workspace.explorer_error = Some(ui_text::explorer::ROOT_INVALID.into());
                             workspace.finish_explorer_scan(cx);
                         }
                     }
@@ -891,7 +908,8 @@ impl WorkspaceView {
     }
 
     fn refresh_vcs_data(&mut self) {
-        let (status, history, branch) = load_vcs(&self.model.root, &self.workspace_auth);
+        let root = self.model.active_project_dir().to_path_buf();
+        let (status, history, branch) = load_vcs(&root, &self.workspace_auth);
         self.vcs_status = status;
         self.vcs_history = history;
         self.vcs_branch = branch;
@@ -903,6 +921,13 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_workspace(window, cx);
+    }
+
+    /// 打开/切换项目文件夹：弹出异步文件夹选择框，选中后只重定向**活动 Tab**
+    /// （其他 Tab 的项目文件夹与运行时全部保留）。状态栏按钮、标题栏按钮与
+    /// `Cmd/Ctrl+O` 快捷键共用此逻辑。
+    fn open_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The blocking `rfd::FileDialog` must never run inside a GPUI event
         // handler: on Windows its modal message loop re-enters the foreground
         // executor while the `App` RefCell is still borrowed, aborting the
@@ -916,21 +941,63 @@ impl WorkspaceView {
                 return;
             };
             let root = folder.path().to_path_buf();
-            let _ = workspace.update_in(cx, |workspace, window, cx| {
-                if !root.is_dir() || root == workspace.model.root {
-                    return;
+            let _ = workspace.update_in(cx, |workspace, _window, cx| {
+                if root.is_dir() {
+                    workspace.retarget_active_project(root, cx);
                 }
-                let system_is_dark = matches!(
-                    window.appearance(),
-                    WindowAppearance::Dark | WindowAppearance::VibrantDark
-                );
-                *workspace = Self::new(root, system_is_dark, cx);
-                workspace.restore_or_create_runtime(window, cx);
-                workspace.start_background_services(cx);
-                cx.notify();
             });
         })
         .detach();
+    }
+
+    /// "打开文件夹"的 Tab 作用域语义：只重定向活动 Tab 的项目文件夹。
+    /// 运行中的终端 pane 注入 cd（会话不中断）；空工作区退回旧语义——设为兜底根。
+    fn retarget_active_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        if self.model.active.is_none() {
+            // Explorer 可能还停在已关闭 Tab 的项目根上——根相同但 Explorer 滞留时也要重扫。
+            if root == self.model.root && self.explorer_requested_root == root {
+                return;
+            }
+            self.model.root = root.clone();
+            self.workspace_auth
+                .authorize(&root.to_string_lossy().replace('\\', "/"));
+            self.schedule_explorer_scan(root, cx);
+            self.refresh_vcs_data();
+            self.persist_workspace();
+            cx.notify();
+            return;
+        }
+        if self.model.active_project_dir() == root.as_path() {
+            return;
+        }
+        // 文件对话框是用户的显式授权行为：直接加入注册表，不再二次弹窗。
+        self.workspace_auth
+            .authorize(&root.to_string_lossy().replace('\\', "/"));
+        // 先收集活动 Tab 的全部运行中终端 pane，重定向后向每个 shell 注入 cd。
+        let active_id = self.model.active;
+        let terminals: Vec<Entity<TerminalView>> = active_id
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .map(|tab| {
+                tab.panes
+                    .values()
+                    .filter_map(|pane| match pane {
+                        PaneContent::Terminal(entity) => Some(entity.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.model.set_active_project_dir(root.clone());
+        for terminal in terminals {
+            let command = terminal.read(cx).cd_command_to(&root);
+            if let Err(error) = terminal.read(cx).write_input(command.as_bytes()) {
+                log::warn!("failed to inject cd into terminal: {error}");
+            }
+        }
+        self.schedule_explorer_scan(root, cx);
+        self.refresh_vcs_data();
+        self.persist_workspace();
+        cx.notify();
     }
 
     fn create_terminal(&mut self, private: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1782,6 +1849,8 @@ impl WorkspaceView {
             };
             if let Some(active) = self.model.active {
                 self.activate_runtime(active, cx);
+            } else {
+                self.follow_active_tab_project(cx);
             }
         }
         cx.notify();
@@ -1809,15 +1878,29 @@ impl WorkspaceView {
             }
             if let Some(active) = self.model.active {
                 self.activate_runtime(active, cx);
+            } else {
+                self.follow_active_tab_project(cx);
             }
             cx.notify();
         }
     }
 
-    fn activate_runtime(&mut self, id: TabId, _cx: &mut Context<Self>) {
+    fn activate_runtime(&mut self, id: TabId, cx: &mut Context<Self>) {
         let _ = self.model.switch_to(id);
         // No per-pane activation hook is needed now that the embedded WebView is gone
         // (ADR 0002): preview tabs render a placeholder and have no surface to show/hide.
+        self.follow_active_tab_project(cx);
+    }
+
+    /// Explorer/Git 跟随活动 Tab 的项目文件夹；同根则不动，避免无意义重扫。
+    /// 切 Tab 重扫复用可取消/世代作废扫描，过期结果不会覆盖新根。
+    /// 无活动 Tab 时 `active_project_dir()` 回落兑底根，与状态栏 pill 保持一致。
+    fn follow_active_tab_project(&mut self, cx: &mut Context<Self>) {
+        let project_dir = self.model.active_project_dir().to_path_buf();
+        if project_dir.is_dir() && self.explorer_requested_root != project_dir {
+            self.schedule_explorer_scan(project_dir, cx);
+            self.refresh_vcs_data();
+        }
     }
 
     /// A terminal's shell exited: close its pane, and the whole tab when the pane
@@ -1872,6 +1955,8 @@ impl WorkspaceView {
                 self.tabs.retain(|tab| tab.id != tab_id);
                 if let Some(active) = self.model.active {
                     self.activate_runtime(active, cx);
+                } else {
+                    self.follow_active_tab_project(cx);
                 }
             }
         }
@@ -2152,10 +2237,7 @@ impl WorkspaceView {
         let count = skipped.len();
         let expanded = self.explorer_skips_expanded;
         let chevron = if expanded { "▾" } else { "▸" };
-        let summary = format!(
-            "{chevron} {}",
-            ui_text::explorer::skipped_summary(count)
-        );
+        let summary = format!("{chevron} {}", ui_text::explorer::skipped_summary(count));
         let details = expanded.then(|| {
             div()
                 .flex()
@@ -2472,7 +2554,7 @@ impl WorkspaceView {
                 }
                 match workspace.explorer_tree.delete(&relative) {
                     Ok(()) => {
-                        workspace.close_tabs_for_deleted_path(&path);
+                        workspace.close_tabs_for_deleted_path(&path, cx);
                         workspace.explorer_tree.clear_selection();
                         workspace.command_message = Some(format!("Deleted {}", path.display()));
                         workspace.refresh_workspace_data(cx);
@@ -2487,7 +2569,7 @@ impl WorkspaceView {
         .detach();
     }
 
-    fn close_tabs_for_deleted_path(&mut self, deleted: &Path) {
+    fn close_tabs_for_deleted_path(&mut self, deleted: &Path, cx: &mut Context<Self>) {
         let removed = self
             .model
             .tabs
@@ -2509,7 +2591,17 @@ impl WorkspaceView {
         self.tabs.retain(|tab| !removed.contains(&tab.id));
         if self.model.active.is_some_and(|id| removed.contains(&id)) {
             self.model.active = self.model.tabs.last().map(|tab| tab.id);
+            if let Some(active) = self.model.active {
+                self.activate_runtime(active, cx);
+            } else {
+                self.follow_active_tab_project(cx);
+            }
         }
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.model.sidebar_visible = !self.model.sidebar_visible;
+        cx.notify();
     }
 
     fn start_sidebar_resize(
@@ -3117,7 +3209,7 @@ impl WorkspaceView {
     }
 
     fn git_repository(&self) -> Result<GitRepository, String> {
-        GitRepository::open(&self.model.root, &self.workspace_auth)
+        GitRepository::open(self.model.active_project_dir(), &self.workspace_auth)
             .map_err(|error| error.to_string())
     }
 
@@ -3139,7 +3231,7 @@ impl WorkspaceView {
     }
 
     fn run_remote(&mut self, operation: RemoteOperation, cx: &mut Context<Self>) {
-        let root = self.model.root.clone();
+        let root = self.model.active_project_dir().to_path_buf();
         let auth = self.workspace_auth.clone();
         let task = cx.background_executor().spawn(async move {
             GitRepository::open(root, &auth).and_then(|repo| repo.remote(operation))
@@ -3295,9 +3387,7 @@ impl WorkspaceView {
                     terminal.update(cx, TerminalView::open_search);
                 }
             }
-            KeyAction::ToggleSidebar => {
-                self.model.sidebar_visible = !self.model.sidebar_visible;
-            }
+            KeyAction::ToggleSidebar => self.toggle_sidebar(cx),
             KeyAction::FocusExplorer => {
                 self.model.sidebar_panel = SidebarPanel::Explorer;
                 self.model.sidebar_visible = true;
@@ -3795,9 +3885,7 @@ impl WorkspaceView {
                                     .py_1()
                                     .text_xs()
                                     .text_color(ui::muted(&self.palette))
-                                    .child(SharedString::from(
-                                        ui_text::explorer::INDEX_INCOMPLETE,
-                                    ))
+                                    .child(SharedString::from(ui_text::explorer::INDEX_INCOMPLETE))
                             },
                         ),
                     )
@@ -3986,13 +4074,16 @@ impl WorkspaceView {
             .map(|terminal| terminal.read(cx).recent_text())
             .unwrap_or_default();
         if let Some(cwd) = &cwd {
+            // 只同步 shell 当前目录；Explorer/Git 跟随的是 project_dir，
+            // shell 的 cd 漂移不得拖动项目锚点。
             self.model.set_active_cwd(cwd);
-            let path = Path::new(cwd);
-            if path.is_dir() && self.explorer_requested_root != path {
-                self.schedule_explorer_scan(path.to_path_buf(), cx);
-            }
         }
-        let resolved_cwd = cwd.unwrap_or_else(|| self.model.root.to_string_lossy().into_owned());
+        let resolved_cwd = cwd.unwrap_or_else(|| {
+            self.model
+                .active_project_dir()
+                .to_string_lossy()
+                .into_owned()
+        });
         self.composer.update(cx, |composer, _| {
             composer.update_terminal_context(resolved_cwd.clone(), recent_output)
         });
@@ -4483,6 +4574,49 @@ impl gpui::Render for WorkspaceView {
                     ),
             );
 
+        let toggle_sidebar_button = {
+            let sidebar_visible = self.model.sidebar_visible;
+            let button_id = "titlebar-toggle-sidebar";
+            let tooltip_palette = p.clone();
+            let hover_bg = ui::hover_wash(&p);
+            let selected_bg = ui::selected_wash(&p);
+            let muted = ui::muted(&p);
+            let accent = gpui_color(p.accent);
+            let foreground = gpui_color(p.foreground);
+            div()
+                .id(button_id)
+                .group(button_id)
+                .aria_label("Toggle sidebar")
+                .tooltip(move |_window, cx| {
+                    Tooltip::view("Toggle Sidebar  (Ctrl+B)", &tooltip_palette, cx)
+                })
+                .size(px(tokens::height::REGULAR))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(tokens::radius::MD))
+                .cursor_pointer()
+                .when(sidebar_visible, |this| this.bg(selected_bg))
+                .when(!sidebar_visible, |this| {
+                    this.hover(move |style| style.bg(hover_bg))
+                })
+                .child(
+                    ui::icon(
+                        Icon::PanelLeft,
+                        icon_size::SM,
+                        if sidebar_visible { accent } else { muted },
+                    )
+                    .group_hover(button_id, move |style| style.text_color(foreground)),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.toggle_sidebar(cx);
+                    }),
+                )
+        };
+
         let active_content = active
             .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
             .map(|tab| {
@@ -4655,7 +4789,7 @@ impl gpui::Render for WorkspaceView {
         let status_left = self.status_context_label(&cwd, cx);
         let workspace_name = self
             .model
-            .root
+            .active_project_dir()
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("Workspace")
@@ -4758,41 +4892,42 @@ impl gpui::Render for WorkspaceView {
                     )
             })
             .collect::<Vec<_>>();
-        let explorer_context_menu = self.explorer_context_menu.clone().map(|menu| {
-            let target_kind = menu.target.kind();
-            anchored().position(menu.position).child(
-                menu_panel(&p)
-                    .id("explorer-context-menu")
-                    .w(px(220.0))
-                    .children(explorer_context_actions(target_kind).iter().copied().map(
-                        |action| {
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .text_xs()
-                                .cursor_pointer()
-                                .hover({
-                                    let wash = ui::hover_wash(&p);
-                                    move |style| style.bg(wash)
-                                })
-                                .child(explorer_context_action_label(action))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _event, window, cx| {
-                                        cx.stop_propagation();
-                                        this.handle_explorer_context_action(action, window, cx);
-                                    }),
-                                )
-                        },
-                    ))
-                    .with_animation(
-                        "explorer-menu-fade-in",
-                        Animation::new(UI_FADE_IN).with_easing(ease_in_out),
-                        |style, delta| style.opacity(delta),
-                    ),
-            )
-        });
+        let explorer_context_menu =
+            self.explorer_context_menu.clone().map(|menu| {
+                let target_kind = menu.target.kind();
+                anchored().position(menu.position).child(
+                    menu_panel(&p)
+                        .id("explorer-context-menu")
+                        .w(px(220.0))
+                        .children(explorer_context_actions(target_kind).iter().copied().map(
+                            |action| {
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .hover({
+                                        let wash = ui::hover_wash(&p);
+                                        move |style| style.bg(wash)
+                                    })
+                                    .child(explorer_context_action_label(action))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _event, window, cx| {
+                                            cx.stop_propagation();
+                                            this.handle_explorer_context_action(action, window, cx);
+                                        }),
+                                    )
+                            },
+                        ))
+                        .with_animation(
+                            "explorer-menu-fade-in",
+                            Animation::new(UI_FADE_IN).with_easing(ease_in_out),
+                            |style, delta| style.opacity(delta),
+                        ),
+                )
+            });
         let can_split_right = self.can_split_active(SplitDirection::Right, window);
         let can_split_down = self.can_split_active(SplitDirection::Down, window);
         let has_multiple_panes = self.active_pane_count() > 1;
@@ -4891,6 +5026,9 @@ impl gpui::Render for WorkspaceView {
             .id("workspace-root")
             .relative()
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &OpenWorkspace, window, cx| {
+                this.open_workspace(window, cx);
+            }))
             .on_key_down(cx.listener(Self::global_key))
             .on_mouse_move(cx.listener(Self::resize_sidebar))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::stop_sidebar_resize))
@@ -4941,6 +5079,7 @@ impl gpui::Render for WorkspaceView {
                     .bg(gpui_color(p.chrome))
                     // macOS 的红绿灯由系统画在左上角，内容得给它让位。
                     .pl(px(app_identity::titlebar_leading_inset()))
+                    .child(toggle_sidebar_button)
                     .child(
                         div()
                             .flex()
@@ -4964,7 +5103,7 @@ impl gpui::Render for WorkspaceView {
                             .window_control_area(WindowControlArea::Drag),
                     )
                     .child(
-                        // 标题栏操作区只保留通知与设置。
+                        // 标题栏操作区：打开工作区 + 通知 + 设置。
                         div()
                             .flex()
                             .flex_row()
@@ -4972,6 +5111,18 @@ impl gpui::Render for WorkspaceView {
                             .flex_shrink_0()
                             .gap_1()
                             .px_2()
+                            .child(
+                                ui::icon_button(
+                                    "titlebar-open-workspace",
+                                    Icon::FolderOpen,
+                                    "Open Workspace…  (Ctrl+O)",
+                                    &p,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(Self::open_workspace_picker),
+                                ),
+                            )
                             .child({
                                 // 需要注意时用状态色着色，而不是把整个按钮刷成实底 ——
                                 // 一个提醒不该盖过它旁边的所有东西。
@@ -5068,20 +5219,38 @@ impl gpui::Render for WorkspaceView {
                             .items_center()
                             .gap_3()
                             .flex_shrink_0()
-                            .child(
-                                ui::button(
-                                    "status-open-workspace",
-                                    SharedString::from(workspace_name),
-                                    ButtonKind::Ghost,
-                                    &p,
-                                )
-                                .text_xs()
-                                .text_color(ui::muted(&p))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(Self::open_workspace_picker),
-                                ),
-                            )
+                            .child({
+                                let wash = ui::hover_wash(&p);
+                                let tint = gpui_color_alpha(p.foreground, 0.72);
+                                div()
+                                    .id("status-open-workspace")
+                                    .aria_label("Open workspace")
+                                    .tooltip({
+                                        let palette = p.clone();
+                                        move |_window, cx| {
+                                            Tooltip::view("Open Workspace…  (Ctrl+O)", &palette, cx)
+                                        }
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(tokens::space::XS))
+                                    .h(px(tokens::height::REGULAR))
+                                    .px(px(tokens::space::SM))
+                                    .rounded(px(tokens::radius::MD))
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(wash))
+                                    .child(ui::icon(Icon::FolderOpen, icon_size::SM, tint))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(tint)
+                                            .child(SharedString::from(workspace_name)),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::open_workspace_picker),
+                                    )
+                            })
                             .child(
                                 div()
                                     .flex()

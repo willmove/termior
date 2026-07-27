@@ -11,6 +11,7 @@
 //! 本模块只生成**纯字符串**（注入脚本 + 启动参数），不触盘、不 spawn。
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// 支持的 shell 类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -244,6 +245,56 @@ pub fn snippets_for(kind: ShellKind) -> Option<ShellIntegrationSnippets> {
     }
 }
 
+/// 生成把 shell 当前目录切到 `dir` 的注入命令（含回车），按 shell 类型选择语法：
+///
+/// - cmd.exe：`cd /d "<path>"`（`/d` 处理跨盘符；双引号防空格）
+/// - PowerShell/pwsh：`cd '<path>'`（单引号防 `$` 展开；`'` 转义为 `''`）
+/// - POSIX shell（bash/zsh/fish）：`cd '<path>'`（`'` 转义为 `'\''`）；
+///   `wsl` 为 true 时先把 Windows 盘符路径转成 `/mnt/<drive>/...`，
+///   否则盘符路径统一为正斜杠（Git Bash/MSYS 语义，`D:\foo` → `D:/foo`）。
+pub fn cd_command(kind: ShellKind, wsl: bool, dir: &Path) -> String {
+    match kind {
+        ShellKind::Cmd => format!("cd /d \"{}\"\r", dir.display()),
+        ShellKind::Pwsh | ShellKind::PowerShell => {
+            format!("cd '{}'\r", dir.display().to_string().replace('\'', "''"))
+        }
+        ShellKind::Bash | ShellKind::Zsh | ShellKind::Fish => {
+            let path = if wsl {
+                windows_to_wsl_path(dir)
+            } else {
+                posix_display_path(dir)
+            };
+            format!("cd '{}'\r", path.replace('\'', "'\\''"))
+        }
+    }
+}
+
+/// 把 Windows 路径（`C:\Users\foo`）转成 WSL 内可见的 `/mnt/c/Users/foo`。
+/// 已是正斜杠或不可转换的路径原样返回（保守降级，不致失败）。
+/// 纯字符串变换，与编译目标平台无关（盘符前缀本身即代表 Windows 语义）。
+pub fn windows_to_wsl_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return s.into_owned();
+    }
+    let drive = (bytes[0] as char).to_ascii_lowercase();
+    let rest = &s[2..];
+    let rest = rest.replace('\\', "/");
+    format!("/mnt/{drive}{rest}")
+}
+
+/// POSIX shell 里的路径展示：盘符路径统一为正斜杠（MSYS/Git Bash 语义），其余原样。
+fn posix_display_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,7 +388,10 @@ mod tests {
             !prof.contains("-Key Tab"),
             "pwsh integration must not hijack the Tab key"
         );
-        assert!(prof.contains("-Key Enter"), "command mark should bind Enter");
+        assert!(
+            prof.contains("-Key Enter"),
+            "command mark should bind Enter"
+        );
         assert!(
             prof.contains("[Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()"),
             "Enter handler must chain to AcceptLine so the line still submits"
@@ -385,5 +439,59 @@ mod tests {
     fn shellkind_serialize() {
         let json = serde_json::to_string(&ShellKind::Zsh).unwrap();
         assert_eq!(json, "\"zsh\"");
+    }
+
+    #[test]
+    fn cd_command_cmd_uses_slash_d_and_double_quotes() {
+        let cmd = cd_command(ShellKind::Cmd, false, Path::new(r"D:\foo bar"));
+        assert_eq!(cmd, "cd /d \"D:\\foo bar\"\r");
+    }
+
+    #[test]
+    fn cd_command_powershell_single_quotes_and_escapes_quote() {
+        let cmd = cd_command(ShellKind::Pwsh, false, Path::new(r"D:\it's"));
+        assert_eq!(cmd, "cd 'D:\\it''s'\r");
+        // `$` 在单引号内不展开。
+        let cmd = cd_command(ShellKind::PowerShell, false, Path::new(r"C:\$recycle"));
+        assert_eq!(cmd, "cd 'C:\\$recycle'\r");
+    }
+
+    #[test]
+    fn cd_command_posix_native_path() {
+        let cmd = cd_command(ShellKind::Bash, false, Path::new("/home/u/proj a"));
+        assert_eq!(cmd, "cd '/home/u/proj a'\r");
+        let cmd = cd_command(ShellKind::Zsh, false, Path::new("/it's/me"));
+        assert_eq!(cmd, "cd '/it'\\''s/me'\r");
+    }
+
+    #[test]
+    fn cd_command_posix_on_windows_uses_forward_slashes() {
+        // Git Bash/MSYS：`cd` 内建不解析反斜杠盘符路径，统一为正斜杠。
+        let cmd = cd_command(ShellKind::Bash, false, Path::new(r"D:\foo\bar"));
+        assert_eq!(cmd, "cd 'D:/foo/bar'\r");
+    }
+
+    #[test]
+    fn cd_command_wsl_converts_to_mnt_path() {
+        let cmd = cd_command(ShellKind::Bash, true, Path::new(r"D:\proj a"));
+        assert_eq!(cmd, "cd '/mnt/d/proj a'\r");
+    }
+
+    #[test]
+    fn cd_command_unicode_path_passes_through() {
+        // Windows 中文路径：非引号字符原样透传，不被转义破坏。
+        let cmd = cd_command(ShellKind::Cmd, false, Path::new(r"D:\项目\测试 目录"));
+        assert_eq!(cmd, "cd /d \"D:\\项目\\测试 目录\"\r");
+        let cmd = cd_command(ShellKind::Pwsh, false, Path::new(r"D:\项目"));
+        assert_eq!(cmd, "cd 'D:\\项目'\r");
+    }
+
+    #[test]
+    fn windows_to_wsl_path_converts_drive_and_separators() {
+        let p = Path::new(r"C:\Users\foo\termior-bashrc.sh");
+        assert_eq!(windows_to_wsl_path(p), "/mnt/c/Users/foo/termior-bashrc.sh");
+        // 无盘符路径原样返回（保守降级）。
+        let rel = Path::new("relative/path");
+        assert_eq!(windows_to_wsl_path(rel), "relative/path");
     }
 }

@@ -165,11 +165,12 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | ID | 需求 | 优先级 |
 |---|---|---|
 | FR-WS-01 | 支持 8 种 tab 类型：`terminal` / `editor` / `preview` / `markdown` / `ai-diff` / `git-diff` / `git-history` / `git-commit-file` | P0（preview/git 类随对应模块里程碑落地） |
-| FR-WS-02 | tab 切换不销毁状态（见 INV-1）；新 tab 继承活动 tab 的 cwd | P0 |
+| FR-WS-02 | tab 切换不销毁状态（见 INV-1）；新 tab 继承活动 tab 的 cwd 与项目文件夹（`project_dir`） | P0 |
 | FR-WS-03 | 任意 tab 可分栏：`Cmd+D` 右分、`Cmd+Shift+D` 下分、`Cmd+[` / `Cmd+]` 切换焦点、`Cmd+W` 关闭焦点 pane（最后一个 pane 时关闭 tab）；pane 可拖拽调整尺寸、独立关闭 | P0 |
 | FR-WS-04 | sidebar 活动栏含三个面板：文件浏览器、源码管理、Git 历史；`Cmd+B` 折叠/展开，`Cmd+Shift+E` 聚焦浏览器 | P0 |
-| FR-WS-05 | 状态栏为上下文条：终端显示 cwd 面包屑（OSC 7），编辑器显示文件路径与行列；右侧含工作区名、git 分支、AI 状态（工具计数仅在 >0 时显示）、localhost 预览 pill | P0 |
+| FR-WS-05 | 状态栏为上下文条：终端显示 cwd 面包屑（OSC 7），编辑器显示文件路径与行列；右侧含工作区名（活动 tab 的项目文件夹名）、git 分支、AI 状态（工具计数仅在 >0 时显示）、localhost 预览 pill | P0 |
 | FR-WS-06 | 自绘标题栏：标签栏与窗口控制合并为一行；操作区仅通知铃铛与设置；分栏入口在 pane 上下文菜单；主题选择在设置窗；工作区切换（本地 + Windows WSL）在状态栏 | P0（WSL 为 P1） |
+| FR-WS-08 | 每个 tab 持有独立的项目文件夹（`project_dir`）：打开文件夹（标题栏/状态栏按钮、`Cmd/Ctrl+O`）只重定向**活动 tab**，其他 tab 不受影响；运行中的终端注入 `cd` 同步（会话不中断）；文件浏览器、Git 面板与状态栏工作区名跟随活动 tab 的 `project_dir`；`project_dir` 不随 shell `cd`（OSC 7）漂移；全局 `root` 降为兑底（新建 tab 无继承来源、private terminal 使用） | P0 |
 | FR-WS-07 | 设置为独立 GPUI 窗口（`Cmd+,`），左侧竖向导航六页：General / Models / Themes / Shortcuts / Agents / About；自动保存（敏感凭据仍显式确认） | P0 |
 
 **验收标准**：终端 tab 中运行 `npm run dev`，切走再切回，输出无丢帧无重启；分栏内两个 PTY 独立收发；关闭窗口时所有布局状态持久化并在下次启动恢复（P1）。
@@ -343,7 +344,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | FR-SEC-01 | 工具两级门控 + 审批卡片（同 FR-AGENT-09/10） | P0 |
 | FR-SEC-02 | AI edit diff：`write_file` 永不直接写盘，hunk 级审阅（同 FR-EDIT-04） | P0 |
 | FR-SEC-03 | secret deny-list：`.env`、`.env.*`、`.ssh/`、`credentials`、`.netrc`、`.aws/credentials`、钥匙串目录等，AI 工具读写双向禁止；在 Rust 工具层、路径 canonicalize 之后强制（INV-3）；扩充名单只能改代码，不提供运行时配置 | P0 |
-| FR-SEC-04 | workspace 授权注册表：AI 工具、git 命令、PTY spawn 共用同一注册表；新工作区首次提示授权一次；代理不可触达未显式打开的同级目录 | P0 |
+| FR-SEC-04 | workspace 授权注册表：AI 工具、git 命令、PTY spawn 共用同一注册表；注册表为多 root 并集——每个经打开文件夹对话框显式选定的目录即视为显式授权（不再二次弹窗），恢复的项目根在启动时重新播种；代理不可触达未显式打开的同级目录 | P0 |
 | FR-SEC-05 | SSRF guard（同 FR-PROV-05）：投毒提示词无法诱导代理经 Provider 调用打内网服务 | P0 |
 | FR-SEC-06 | 密钥永不落盘（同 FR-PROV-04、INV-5） | P0 |
 | FR-SEC-07 | 无遥测、无账号、无自动上报；崩溃报告仅本地留存 | P0 |

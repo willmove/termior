@@ -223,4 +223,32 @@ mod tests {
         let reg = WorkspaceAuthRegistry::with_roots(["/a/b/../c".to_string()]);
         assert_eq!(reg.roots(), vec!["/a/c".to_string()]);
     }
+
+    #[test]
+    fn late_authorize_accumulates_across_roots() {
+        // 多 root 并集（每 Tab 一个项目文件夹）：打开文件夹即 authorize，持续累积。
+        let mut reg = WorkspaceAuthRegistry::with_roots(["C:/proj-a".to_string()]);
+        reg.authorize("D:/proj-c");
+        assert_eq!(reg.check("C:/proj-a/src"), WorkspaceAuthStatus::Authorized);
+        assert_eq!(reg.check("D:/proj-c/deep"), WorkspaceAuthStatus::Authorized);
+        assert_eq!(
+            reg.check("E:/elsewhere"),
+            WorkspaceAuthStatus::NeedsAuthorization
+        );
+    }
+
+    #[test]
+    fn clone_is_a_point_in_time_snapshot() {
+        // 钉住当前克隆语义：克隆=快照。PTY spawn 时取快照、git 用活引用都正确；
+        // 但快照之后的 authorize 不回溯（AI ToolRegistry 的启动快照同理，
+        // 重启时由构造方用全量 project_dir 重新播种）。
+        let mut reg = WorkspaceAuthRegistry::with_roots(["/proj-a".to_string()]);
+        let snapshot = reg.clone();
+        reg.authorize("/proj-b");
+        assert_eq!(reg.check("/proj-b"), WorkspaceAuthStatus::Authorized);
+        assert_eq!(
+            snapshot.check("/proj-b"),
+            WorkspaceAuthStatus::NeedsAuthorization
+        );
+    }
 }

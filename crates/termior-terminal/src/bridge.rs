@@ -14,7 +14,7 @@ use futures::SinkExt;
 
 use crate::pty::{PtySession, PtySessionConfig, SpawnError};
 use termior_preview::LocalhostDetector;
-use termior_terminal_core::{OscEvent, OscStreamFilter};
+use termior_terminal_core::{shell_integration::ShellKind, OscEvent, OscStreamFilter};
 
 /// 从 PTY reader 线程流向消费方的一批数据。
 #[derive(Debug)]
@@ -140,6 +140,16 @@ impl TerminalBridge {
         WriterHandle {
             inner: self.session.writer(),
         }
+    }
+
+    /// 本会话实际使用的 shell 类型（spawn 时解析）。
+    pub fn shell_kind(&self) -> ShellKind {
+        self.session.shell_kind()
+    }
+
+    /// 是否为 WSL 会话（影响 cd 注入等命令的路径形式）。
+    pub fn is_wsl(&self) -> bool {
+        self.session.is_wsl()
     }
 }
 

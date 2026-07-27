@@ -8,6 +8,8 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
+#[cfg(windows)]
+use termior_terminal_core::shell_integration::windows_to_wsl_path;
 use termior_terminal_core::shell_integration::{ShellIntegrationSnippets, ShellKind};
 use thiserror::Error;
 
@@ -77,6 +79,10 @@ pub struct PtySession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    /// spawn 时解析出的实际 shell 类型（含 WSL 改写与平台默认探测）。
+    shell_kind: ShellKind,
+    /// 是否为 WSL 会话。
+    is_wsl: bool,
     /// 保持 shell integration 脚本文件存活；drop 时随会话清理。
     _integration_dir: Option<tempfile::TempDir>,
     #[cfg(windows)]
@@ -185,10 +191,22 @@ impl PtySession {
             writer: Arc::new(Mutex::new(writer)),
             killer,
             child: Some(child),
+            shell_kind: kind,
+            is_wsl: wsl.is_some(),
             _integration_dir: integration_dir,
             #[cfg(windows)]
             _job: job,
         })
+    }
+
+    /// 本会话实际使用的 shell 类型（spawn 时解析的终值）。
+    pub fn shell_kind(&self) -> ShellKind {
+        self.shell_kind
+    }
+
+    /// 是否为 WSL 会话。
+    pub fn is_wsl(&self) -> bool {
+        self.is_wsl
     }
 
     /// 克隆 reader（在调用方线程里 read PTY 输出）。可多次克隆。
@@ -460,21 +478,6 @@ fn apply_wsl_integration(
     for (k, v) in &snippets.env {
         cmd.env(k, v);
     }
-}
-
-/// 把 Windows 路径（`C:\Users\foo`）转成 WSL 内可见的 `/mnt/c/Users/foo`。
-/// 已是正斜杠或不可转换的路径原样返回（保守降级，不致 spawn 失败）。
-#[cfg(windows)]
-fn windows_to_wsl_path(path: &std::path::Path) -> String {
-    let s = path.to_string_lossy();
-    let bytes = s.as_bytes();
-    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
-        return s.into_owned();
-    }
-    let drive = (bytes[0] as char).to_ascii_lowercase();
-    let rest = &s[2..];
-    let rest = rest.replace('\\', "/");
-    format!("/mnt/{drive}{rest}")
 }
 
 /// 决定 spawn 实际使用的 cwd（FR-SEC-04）。
@@ -865,19 +868,6 @@ mod tests {
     fn parse_wsl_list_empty_output_yields_empty() {
         assert!(parse_wsl_list_output(&[]).is_empty());
         assert!(parse_wsl_list_output(b"\xFF\xFE").is_empty());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_to_wsl_path_converts_drive_and_separators() {
-        let p = std::path::PathBuf::from(r"C:\Users\foo\termior-bashrc.sh");
-        assert_eq!(
-            windows_to_wsl_path(&p),
-            "/mnt/c/Users/foo/termior-bashrc.sh"
-        );
-        // 无盘符路径原样返回（保守降级）。
-        let rel = std::path::PathBuf::from("relative/path");
-        assert_eq!(windows_to_wsl_path(&rel), "relative/path");
     }
 
     #[cfg(windows)]
