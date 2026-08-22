@@ -2604,6 +2604,20 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// 收起 / 展开底部 Agent（Composer）栏。由状态栏图标按钮与 `ToggleComposer`
+    /// 快捷键共用；收起时把焦点交还工作区，避免把键盘焦点留在已隐藏的输入框里。
+    fn set_composer_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.model.composer_visible = visible;
+        if !visible {
+            window.focus(&self.focus_handle, cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_composer(&mut self, _event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_composer_visible(!self.model.composer_visible, window, cx);
+    }
+
     fn start_sidebar_resize(
         &mut self,
         event: &MouseDownEvent,
@@ -3403,7 +3417,7 @@ impl WorkspaceView {
                 self.model.sidebar_visible = true;
             }
             KeyAction::ToggleComposer => {
-                self.model.composer_visible = !self.model.composer_visible;
+                self.set_composer_visible(!self.model.composer_visible, window, cx);
             }
             KeyAction::AskAiAboutSelection => self.attach_active_selection(cx),
             KeyAction::CommitStaged => {
@@ -5286,6 +5300,40 @@ impl gpui::Render for WorkspaceView {
                                         }),
                                     ),
                                 )
+                            })
+                            .child({
+                                // 收起/展开底部 Agent 栏。图标随状态切换，且常驻在状态栏，
+                                // 因此无论 Agent 栏收起还是展开都能再次点到。
+                                let wash = ui::hover_wash(&p);
+                                let tint = gpui_color_alpha(p.foreground, 0.72);
+                                let (composer_glyph, composer_label) =
+                                    if self.model.composer_visible {
+                                        (Icon::ChevronDown, "Collapse Agent Bar  (Ctrl+I)")
+                                    } else {
+                                        (Icon::ChevronUp, "Expand Agent Bar  (Ctrl+I)")
+                                    };
+                                div()
+                                    .id("composer-toggle")
+                                    .aria_label(composer_label)
+                                    .tooltip({
+                                        let palette = p.clone();
+                                        move |_window, cx| {
+                                            Tooltip::view(composer_label, &palette, cx)
+                                        }
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(tokens::space::XS))
+                                    .h(px(tokens::height::REGULAR))
+                                    .px(px(tokens::space::SM))
+                                    .rounded(px(tokens::radius::MD))
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(wash))
+                                    .child(ui::icon(composer_glyph, icon_size::SM, tint))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::toggle_composer),
+                                    )
                             }),
                     ),
             )

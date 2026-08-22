@@ -32,11 +32,15 @@ use termior_terminal_core::{
     TerminalSearch,
 };
 use termior_theme::{Color as ThemeColor, ResolvedPalette, TerminalPalette};
-use termior_ui_kit::SearchOverlay;
+use termior_ui_kit::{tokens, SearchOverlay};
 
 use crate::keystroke::{encode_paste, keystroke_to_pty_bytes};
 
 const MAX_PTY_BATCH_BYTES: usize = 256 * 1024;
+
+/// 终端网格四周与窗格边缘之间保留的间隙（像素）。避免文字紧贴窗格边框。
+/// 取 `space::MD`——终端字号由用户设置驱动，但内边距仍落在 4px 栅格上。
+const TERMINAL_PANE_PADDING: f32 = tokens::space::MD;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalViewEvent {
@@ -736,18 +740,25 @@ impl Render for TerminalView {
                 move |bounds, window, _cx| {
                     let line_height = px(text_style.font_size * text_style.line_height);
                     let cell_width = cell_advance_width(window, &text_style);
-                    let measured_cols =
-                        (bounds.size.width.as_f32() / cell_width.max(1.0)).floor() as usize;
-                    let measured_rows = (bounds.size.height.as_f32()
-                        / line_height.as_f32().max(1.0))
-                    .floor() as usize;
+                    // 网格原点内移固定间隙，且可用宽高扣除两侧间隙，文字不再紧贴窗格边缘。
+                    let origin = point(
+                        bounds.origin.x + px(TERMINAL_PANE_PADDING),
+                        bounds.origin.y + px(TERMINAL_PANE_PADDING),
+                    );
+                    let avail_width =
+                        (bounds.size.width.as_f32() - 2.0 * TERMINAL_PANE_PADDING).max(0.0);
+                    let avail_height =
+                        (bounds.size.height.as_f32() - 2.0 * TERMINAL_PANE_PADDING).max(0.0);
+                    let measured_cols = (avail_width / cell_width.max(1.0)).floor() as usize;
+                    let measured_rows =
+                        (avail_height / line_height.as_f32().max(1.0)).floor() as usize;
                     if measured_cols > 0
                         && measured_rows > 0
                         && (measured_cols != cols
                             || measured_rows != rows
                             || (current_cell_width - cell_width).abs() > f32::EPSILON
                             || (current_line_height - line_height.as_f32()).abs() > f32::EPSILON
-                            || current_origin != bounds.origin)
+                            || current_origin != origin)
                     {
                         let view = view.clone();
                         window.on_next_frame(move |_, cx| {
@@ -758,7 +769,7 @@ impl Render for TerminalView {
                                         measured_rows,
                                         cell_width,
                                         line_height.as_f32(),
-                                        bounds.origin,
+                                        origin,
                                         cx,
                                     );
                                 });
@@ -766,7 +777,7 @@ impl Render for TerminalView {
                         });
                     }
                     LayoutInfo {
-                        origin: bounds.origin,
+                        origin,
                         line_height,
                         cell_width,
                         cols: measured_cols.max(1),
@@ -797,8 +808,8 @@ impl Render for TerminalView {
                 element.child(
                     div()
                         .absolute()
-                        .left(px(marked_col as f32 * marked_cell_width + 2.0))
-                        .top(px(marked_row as f32 * marked_line_height + 1.0))
+                        .left(px(TERMINAL_PANE_PADDING + marked_col as f32 * marked_cell_width + 2.0))
+                        .top(px(TERMINAL_PANE_PADDING + marked_row as f32 * marked_line_height + 1.0))
                         .px_1()
                         .bg(crate::ui::alpha(self.palette.accent, 0.35))
                         .child(SharedString::from(marked_text)),

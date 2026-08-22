@@ -65,6 +65,7 @@ icon_set! {
     Refresh => "refresh-cw",
     ChevronRight => "chevron-right",
     ChevronDown => "chevron-down",
+    ChevronUp => "chevron-up",
     Terminal => "terminal",
     Inbox => "inbox",
     PanelLeft => "layout-panel-left",
