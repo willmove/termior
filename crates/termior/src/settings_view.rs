@@ -287,8 +287,7 @@ impl SettingsView {
                 } else {
                     self.pending_api_key = Some(value);
                     self.status =
-                        "API key ready — click Save API key to store it in the OS keychain"
-                            .into();
+                        "API key ready — click Save API key to store it in the OS keychain".into();
                     Ok(())
                 }
             }
@@ -360,9 +359,7 @@ impl SettingsView {
         self.save_generation = self.save_generation.wrapping_add(1);
         let generation = self.save_generation;
         let task = cx.spawn(async move |view, cx| {
-            cx.background_executor()
-                .timer(SETTINGS_SAVE_DEBOUNCE)
-                .await;
+            cx.background_executor().timer(SETTINGS_SAVE_DEBOUNCE).await;
             let _ = view.update(cx, |view, cx| {
                 if view.save_generation == generation {
                     view.persist(cx);
@@ -1158,65 +1155,67 @@ impl SettingsView {
                     ),
                 ],
             ))
-            .child(self.section(
-                "Editor & explorer",
-                "Cross-cutting preferences for editing and the file tree.",
-                [
-                    self.edit_row(
-                        "Custom instructions",
-                        "Optional guidance appended to built-in agent prompts.",
-                        EditField::Instructions,
-                        cx,
-                    ),
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(
-                            Self::button(
-                                format!("Autocomplete: {}", on_off(autocomplete)),
-                                "autocomplete",
-                                &self.palette,
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.settings.autocomplete_enabled =
-                                        !this.settings.autocomplete_enabled;
-                                    this.schedule_save(cx);
-                                    cx.notify();
-                                }),
-                            ),
-                        )
-                        .child(
-                            Self::button(format!("Vim: {}", on_off(vim)), "vim", &self.palette)
+            .child(
+                self.section(
+                    "Editor & explorer",
+                    "Cross-cutting preferences for editing and the file tree.",
+                    [
+                        self.edit_row(
+                            "Custom instructions",
+                            "Optional guidance appended to built-in agent prompts.",
+                            EditField::Instructions,
+                            cx,
+                        ),
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                Self::button(
+                                    format!("Autocomplete: {}", on_off(autocomplete)),
+                                    "autocomplete",
+                                    &self.palette,
+                                )
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
-                                        this.settings.vim_mode = !this.settings.vim_mode;
+                                        this.settings.autocomplete_enabled =
+                                            !this.settings.autocomplete_enabled;
                                         this.schedule_save(cx);
                                         cx.notify();
                                     }),
                                 ),
-                        )
-                        .child(
-                            Self::button(
-                                format!("Dotfiles: {}", on_off(dotfiles)),
-                                "dotfiles",
-                                &self.palette,
                             )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.settings.show_dotfiles = !this.settings.show_dotfiles;
-                                    this.schedule_save(cx);
-                                    cx.notify();
-                                }),
-                            ),
-                        )
-                        .into_any_element(),
-                ],
-            ))
+                            .child(
+                                Self::button(format!("Vim: {}", on_off(vim)), "vim", &self.palette)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.settings.vim_mode = !this.settings.vim_mode;
+                                            this.schedule_save(cx);
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                Self::button(
+                                    format!("Dotfiles: {}", on_off(dotfiles)),
+                                    "dotfiles",
+                                    &self.palette,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.settings.show_dotfiles = !this.settings.show_dotfiles;
+                                        this.schedule_save(cx);
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .into_any_element(),
+                    ],
+                ),
+            )
             .into_any_element()
     }
 
@@ -1231,33 +1230,35 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_6()
-            .child(self.section(
-                "Provider",
-                "Credentials stay in the OS keychain and are never written to settings JSON.",
-                [div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Self::button("‹", "previous-provider", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.cycle_profile(-1, cx)),
-                        ),
-                    )
-                    .child(div().flex_1().text_lg().child(SharedString::from(format!(
-                        "{}  ({}/{})",
-                        profile.display_name,
-                        self.profile_index + 1,
-                        self.settings.models.profiles.len()
-                    ))))
-                    .child(
-                        Self::button("›", "next-provider", &self.palette).on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.cycle_profile(1, cx)),
-                        ),
-                    )
-                    .into_any_element()],
-            ))
+            .child(
+                self.section(
+                    "Provider",
+                    "Credentials stay in the OS keychain and are never written to settings JSON.",
+                    [div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Self::button("‹", "previous-provider", &self.palette).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.cycle_profile(-1, cx)),
+                            ),
+                        )
+                        .child(div().flex_1().text_lg().child(SharedString::from(format!(
+                            "{}  ({}/{})",
+                            profile.display_name,
+                            self.profile_index + 1,
+                            self.settings.models.profiles.len()
+                        ))))
+                        .child(
+                            Self::button("›", "next-provider", &self.palette).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.cycle_profile(1, cx)),
+                            ),
+                        )
+                        .into_any_element()],
+                ),
+            )
             .child(self.section(
                 "Endpoint",
                 "Model id and base URL for the selected provider profile.",
@@ -1276,87 +1277,91 @@ impl SettingsView {
                     ),
                 ],
             ))
-            .child(self.section(
-                "Credentials",
-                "Saving an API key and testing connectivity require explicit actions.",
-                [
-                    self.edit_row(
-                        "API key",
-                        "Never written to settings files — stored only in the OS keychain.",
-                        EditField::ApiKey,
-                        cx,
-                    ),
-                    div()
+            .child(
+                self.section(
+                    "Credentials",
+                    "Saving an API key and testing connectivity require explicit actions.",
+                    [
+                        self.edit_row(
+                            "API key",
+                            "Never written to settings files — stored only in the OS keychain.",
+                            EditField::ApiKey,
+                            cx,
+                        ),
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                Self::button("Save API key", "save-api-key", &self.palette)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.save_api_key(cx)),
+                                    ),
+                            )
+                            .child(
+                                Self::button("Test connection", "ping-provider", &self.palette)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.ping_provider(cx)),
+                                    ),
+                            )
+                            .into_any_element(),
+                    ],
+                ),
+            )
+            .child(
+                self.section(
+                    "Defaults",
+                    "Which profile Composer and inline completion use.",
+                    [div()
                         .flex()
                         .flex_wrap()
                         .gap_2()
                         .child(
-                            Self::button("Save API key", "save-api-key", &self.palette)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| this.save_api_key(cx)),
-                                ),
+                            Self::button(
+                                format!("Enabled: {}", on_off(profile.enabled)),
+                                "provider-enabled",
+                                &self.palette,
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.toggle_provider(cx)),
+                            ),
                         )
                         .child(
-                            Self::button("Test connection", "ping-provider", &self.palette)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| this.ping_provider(cx)),
-                                ),
+                            Self::button(
+                                if active_chat {
+                                    "✓ Default chat"
+                                } else {
+                                    "Use for chat"
+                                },
+                                "active-chat",
+                                &self.palette,
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.make_active_chat(cx)),
+                            ),
                         )
-                        .into_any_element(),
-                ],
-            ))
-            .child(self.section(
-                "Defaults",
-                "Which profile Composer and inline completion use.",
-                [div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        Self::button(
-                            format!("Enabled: {}", on_off(profile.enabled)),
-                            "provider-enabled",
-                            &self.palette,
+                        .child(
+                            Self::button(
+                                if active_completion {
+                                    "✓ Default completion"
+                                } else {
+                                    "Use for completion"
+                                },
+                                "active-completion",
+                                &self.palette,
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.make_active_completion(cx)),
+                            ),
                         )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.toggle_provider(cx)),
-                        ),
-                    )
-                    .child(
-                        Self::button(
-                            if active_chat {
-                                "✓ Default chat"
-                            } else {
-                                "Use for chat"
-                            },
-                            "active-chat",
-                            &self.palette,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.make_active_chat(cx)),
-                        ),
-                    )
-                    .child(
-                        Self::button(
-                            if active_completion {
-                                "✓ Default completion"
-                            } else {
-                                "Use for completion"
-                            },
-                            "active-completion",
-                            &self.palette,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.make_active_completion(cx)),
-                        ),
-                    )
-                    .into_any_element()],
-            ))
+                        .into_any_element()],
+                ),
+            )
             .into_any_element()
     }
 
@@ -1738,13 +1743,7 @@ impl SettingsView {
         self.section(
             "Keymap",
             "Click a row, then press a new Cmd/Ctrl chord. Conflicting bindings are rejected.",
-            [
-                div()
-                    .flex()
-                    .flex_col()
-                    .children(rows)
-                    .into_any_element(),
-            ],
+            [div().flex().flex_col().children(rows).into_any_element()],
         )
     }
 
@@ -1834,68 +1833,74 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_6()
-            .child(self.section(
-                "Claude Code hooks",
-                "Install or remove Claude Code hooks that notify Termior about agent activity.",
-                [
-                    div()
-                        .text_sm()
-                        .child(SharedString::from(format!("Status: {hook_status}")))
-                        .into_any_element(),
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(
-                            Self::button("Install hooks", "install-hooks", &self.palette)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| this.install_hooks(cx)),
-                                ),
-                        )
-                        .child(
-                            Self::button("Uninstall hooks", "uninstall-hooks", &self.palette)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| this.uninstall_hooks(cx)),
-                                ),
-                        )
-                        .into_any_element(),
-                ],
-            ))
-            .child(self.section(
-                "Notifications",
-                "Desktop toasts when an agent finishes or needs attention.",
-                [Self::button(
-                    format!(
-                        "Agent notifications: {}",
-                        on_off(self.settings.agent_notifications)
-                    ),
-                    "agent-notifications",
-                    &self.palette,
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        this.settings.agent_notifications = !this.settings.agent_notifications;
-                        this.schedule_save(cx);
-                        cx.notify();
-                    }),
-                )
-                .into_any_element()],
-            ))
-            .child(self.section(
-                "Custom agents",
-                "Local agent profiles available in the Composer switcher.",
-                [
-                    Self::button("New custom agent", "new-agent", &self.palette)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.new_agent(cx)),
-                        )
-                        .into_any_element(),
-                    agent_controls,
-                ],
-            ))
+            .child(
+                self.section(
+                    "Claude Code hooks",
+                    "Install or remove Claude Code hooks that notify Termior about agent activity.",
+                    [
+                        div()
+                            .text_sm()
+                            .child(SharedString::from(format!("Status: {hook_status}")))
+                            .into_any_element(),
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Self::button("Install hooks", "install-hooks", &self.palette)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.install_hooks(cx)),
+                                    ),
+                            )
+                            .child(
+                                Self::button("Uninstall hooks", "uninstall-hooks", &self.palette)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.uninstall_hooks(cx)),
+                                    ),
+                            )
+                            .into_any_element(),
+                    ],
+                ),
+            )
+            .child(
+                self.section(
+                    "Notifications",
+                    "Desktop toasts when an agent finishes or needs attention.",
+                    [Self::button(
+                        format!(
+                            "Agent notifications: {}",
+                            on_off(self.settings.agent_notifications)
+                        ),
+                        "agent-notifications",
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.settings.agent_notifications = !this.settings.agent_notifications;
+                            this.schedule_save(cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element()],
+                ),
+            )
+            .child(
+                self.section(
+                    "Custom agents",
+                    "Local agent profiles available in the Composer switcher.",
+                    [
+                        Self::button("New custom agent", "new-agent", &self.palette)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.new_agent(cx)),
+                            )
+                            .into_any_element(),
+                        agent_controls,
+                    ],
+                ),
+            )
             .into_any_element()
     }
 
@@ -1917,7 +1922,9 @@ impl SettingsView {
                     div()
                         .text_sm()
                         .text_color(crate::ui::muted(&self.palette))
-                        .child("Apache-2.0 · No account · No telemetry · Offline with local providers")
+                        .child(
+                            "Apache-2.0 · No account · No telemetry · Offline with local providers",
+                        )
                         .into_any_element(),
                     div()
                         .text_xs()
@@ -2042,35 +2049,25 @@ impl gpui::Render for SettingsView {
                             .px_6()
                             .py_5()
                             .child(
-                                div()
-                                    .flex()
-                                    .justify_center()
-                                    .w_full()
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
-                                            .text_sm()
-                                            .child(self.page_body(cx)),
-                                    ),
+                                div().flex().justify_center().w_full().child(
+                                    div()
+                                        .w_full()
+                                        .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
+                                        .text_sm()
+                                        .child(self.page_body(cx)),
+                                ),
                             ),
                     )
                     .when(!self.status.is_empty(), |root| {
                         root.child(
-                            div()
-                                .flex()
-                                .justify_center()
-                                .w_full()
-                                .px_6()
-                                .pb_3()
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
-                                        .text_xs()
-                                        .text_color(crate::ui::muted(&p))
-                                        .child(SharedString::from(self.status.clone())),
-                                ),
+                            div().flex().justify_center().w_full().px_6().pb_3().child(
+                                div()
+                                    .w_full()
+                                    .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
+                                    .text_xs()
+                                    .text_color(crate::ui::muted(&p))
+                                    .child(SharedString::from(self.status.clone())),
+                            ),
                         )
                     }),
             )

@@ -48,9 +48,14 @@ fn assert_exit_ends_stream(config: PtySessionConfig) {
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
         }
     }
-    assert!(shell_is_ready(&acc), "shell did not become interactive: {acc:?}");
+    assert!(
+        shell_is_ready(&acc),
+        "shell did not become interactive: {acc:?}"
+    );
 
-    writer.write_all(b"exit\r\n").expect("write exit to the shell");
+    writer
+        .write_all(b"exit\r\n")
+        .expect("write exit to the shell");
 
     // 继续消费（同样喂模拟器，回复后续查询）直到流结束。
     let (done_tx, done_rx) = std::sync::mpsc::channel();

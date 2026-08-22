@@ -94,7 +94,10 @@ mod tests {
 
     #[test]
     fn access_events_are_not_rescan_worthy() {
-        assert_eq!(rescan_worthy_kind(&EventKind::Access(AccessKind::Any)), None);
+        assert_eq!(
+            rescan_worthy_kind(&EventKind::Access(AccessKind::Any)),
+            None
+        );
         assert_eq!(
             rescan_worthy_kind(&EventKind::Access(AccessKind::Read)),
             None

@@ -67,6 +67,7 @@ icon_set! {
     ChevronDown => "chevron-down",
     Terminal => "terminal",
     Inbox => "inbox",
+    PanelLeft => "layout-panel-left",
 }
 
 /// 内嵌图标的 GPUI 资源源。在 `Application::with_assets` 上安装一次即可。

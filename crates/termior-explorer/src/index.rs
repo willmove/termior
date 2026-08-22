@@ -382,11 +382,7 @@ mod tests {
         );
 
         let deep = FileIndex::build(dir.path(), true).unwrap();
-        let deep_paths: Vec<&str> = deep
-            .entries()
-            .iter()
-            .map(|e| e.relative.as_str())
-            .collect();
+        let deep_paths: Vec<&str> = deep.entries().iter().map(|e| e.relative.as_str()).collect();
         assert!(deep_paths.contains(&"src/main.rs"), "{deep_paths:?}");
         assert!(deep_paths.contains(&"src/nested/deep.rs"), "{deep_paths:?}");
     }
@@ -404,10 +400,7 @@ mod tests {
         index.refresh().unwrap();
         assert_eq!(index.root(), dir.path());
         assert!(
-            index
-                .entries()
-                .iter()
-                .any(|e| e.relative == "src/main.rs"),
+            index.entries().iter().any(|e| e.relative == "src/main.rs"),
             "deep refresh must replace shallow entries"
         );
     }

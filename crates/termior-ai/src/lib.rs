@@ -45,7 +45,7 @@ pub use context::{TerminalContext, TerminalContextProvider};
 pub use executor::{EditProposalSummary, ToolExecutor};
 pub use http_provider::{HttpProvider, ProviderConfig, ProviderTransportError};
 pub use inline_completion::{
-    completion_user_prompt, normalize_completion, InlineCompletionContext, InlineCompleter,
+    completion_user_prompt, normalize_completion, InlineCompleter, InlineCompletionContext,
     InlineCompletionResult, INLINE_COMPLETION_SYSTEM_PROMPT,
 };
 #[cfg(feature = "keyring-backend")]

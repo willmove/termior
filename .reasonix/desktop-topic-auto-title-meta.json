@@ -1,0 +1,20 @@
+{
+  "topic_20260726-065655_adadf7fef0b46d25": {
+    "stage": 1,
+    "userTurns": 1,
+    "basisHash": "02d85ac8aff57d07",
+    "updatedAt": 1785049042544
+  },
+  "topic_20260726-070130_9fcaece9c9a6dde6": {
+    "stage": 3,
+    "userTurns": 3,
+    "basisHash": "0aaac40031270cfb",
+    "updatedAt": 1785052249948
+  },
+  "topic_20260726-134230_44dd9b5c01aff802": {
+    "stage": 3,
+    "userTurns": 3,
+    "basisHash": "9b70cf19022eecae",
+    "updatedAt": 1785122552751
+  }
+}

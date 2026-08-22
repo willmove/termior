@@ -18,10 +18,12 @@ mod terminal_view;
 mod ui;
 mod workspace_view;
 
-use gpui::{px, size, App, AppContext, Bounds, Entity, Window, WindowAppearance, WindowBounds};
+use gpui::{
+    px, size, App, AppContext, Bounds, Entity, KeyBinding, Window, WindowAppearance, WindowBounds,
+};
 use gpui_platform::application;
 use std::{ffi::OsString, io::Write as _, path::PathBuf};
-use workspace_view::WorkspaceView;
+use workspace_view::{OpenWorkspace, WorkspaceView};
 
 fn main() {
     install_panic_log();
@@ -84,6 +86,13 @@ fn main() {
                 },
             )
             .expect("open Termior window");
+            // 跨平台：macOS 用 `cmd-o`，Windows/Linux 用 `ctrl-o`。两条显式绑定
+            // 与 Zed 自身 keymap 风格一致；action 挂在 `workspace-root` 上，
+            // 窗口焦点在 app 内任意位置都触发。
+            cx.bind_keys([
+                KeyBinding::new("cmd-o", OpenWorkspace, None),
+                KeyBinding::new("ctrl-o", OpenWorkspace, None),
+            ]);
             cx.activate(true);
         });
 }

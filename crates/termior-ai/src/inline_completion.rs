@@ -169,8 +169,8 @@ mod tests {
     use super::*;
     use crate::message::{Message, Role};
     use crate::provider::{MockProvider, ProviderRequest};
-    use futures::stream::BoxStream;
     use futures::executor::block_on;
+    use futures::stream::BoxStream;
 
     /// 一个始终返回 Error 事件的 Provider，用于验证错误归一。
     struct ErrorProvider;
