@@ -5,3 +5,4 @@
 
 # Agent tooling (not part of the project)
 /.zcode/
+/.reasonix/
