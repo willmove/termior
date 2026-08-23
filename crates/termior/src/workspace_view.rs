@@ -5342,6 +5342,7 @@ impl gpui::Render for WorkspaceView {
                     .flex()
                     .flex_row()
                     .flex_1()
+                    .min_h(px(0.0))
                     .w_full()
                     .child(sidebar)
                     .child(div().flex_1().size_full().child(active_content)),

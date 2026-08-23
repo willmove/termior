@@ -42,6 +42,13 @@ const MAX_PTY_BATCH_BYTES: usize = 256 * 1024;
 /// 取 `space::MD`——终端字号由用户设置驱动，但内边距仍落在 4px 栅格上。
 const TERMINAL_PANE_PADDING: f32 = tokens::space::MD;
 
+fn terminal_canvas<T: 'static>(
+    prepaint: impl 'static + FnOnce(Bounds<Pixels>, &mut Window, &mut App) -> T,
+    paint: impl 'static + FnOnce(Bounds<Pixels>, T, &mut Window, &mut App),
+) -> gpui::Canvas<T> {
+    canvas(prepaint, paint).size_full()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalViewEvent {
     TitleChanged(Option<String>),
@@ -736,7 +743,7 @@ impl Render for TerminalView {
             .size_full()
             .bg(bg)
             .text_color(fg)
-            .child(canvas(
+            .child(terminal_canvas(
                 move |bounds, window, _cx| {
                     let line_height = px(text_style.font_size * text_style.line_height);
                     let cell_width = cell_advance_width(window, &text_style);
@@ -1812,6 +1819,47 @@ impl Dimensions for TermSize {
 mod protocol_tests {
     use super::*;
     use alacritty_terminal::event::VoidListener;
+    use gpui::{size, AppContext as _, TestAppContext};
+    use termior_theme::default_theme;
+
+    #[test]
+    fn terminal_grid_columns_track_pane_width_across_window_resize() {
+        let mut cx = TestAppContext::single();
+        let bridge = TerminalBridge::spawn(&PtySessionConfig::default()).expect("PTY spawn");
+        let window = cx.open_window(size(px(640.0), px(480.0)), move |_, cx| {
+            TerminalView::from_bridge(
+                bridge,
+                default_theme().palette().clone(),
+                TerminalSettings::default(),
+                UserKeymap::default(),
+                cx,
+            )
+        });
+
+        let draw_and_read_columns = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |terminal, window, cx| {
+                window.draw(cx).clear();
+                window.simulate_next_frame(cx);
+                let terminal = terminal.downcast::<TerminalView>().expect("terminal root");
+                terminal.read(cx).cols
+            })
+            .unwrap()
+        };
+
+        let narrow_cols = draw_and_read_columns(&mut cx);
+        cx.simulate_window_resize(window.into(), size(px(1_280.0), px(480.0)));
+        let wide_cols = draw_and_read_columns(&mut cx);
+
+        assert!(
+            wide_cols > narrow_cols,
+            "terminal grid must grow with its pane: narrow={narrow_cols}, wide={wide_cols}"
+        );
+        cx.read_window(&window, |terminal, cx| {
+            let terminal = terminal.read(cx);
+            assert_eq!(terminal.term.columns(), wide_cols);
+        })
+        .unwrap();
+    }
 
     fn parsed_term(input: &str, columns: usize, screen_lines: usize) -> Term<VoidListener> {
         let size = TermSize {
