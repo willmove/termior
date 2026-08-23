@@ -9,4 +9,4 @@ pub use notification::{
     AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationContext,
     NotificationDecision, NotificationRouter, NotificationTarget, SystemNotifier,
 };
-pub use open::{open_external, PlatformError};
+pub use open::{open_external, open_local_file, PlatformError};

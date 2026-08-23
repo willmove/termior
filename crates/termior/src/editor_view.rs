@@ -2,12 +2,15 @@
 
 use gpui::{
     canvas, div, prelude::*, px, uniform_list, AnyElement, App, Bounds, Context, FocusHandle,
-    Focusable, InputHandler, KeyDownEvent, Pixels, Point, ScrollStrategy, SharedString, Task,
-    UTF16Selection, UniformListScrollHandle, WeakEntity, Window,
+    Focusable, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollStrategy, SharedString, Task, UTF16Selection,
+    UniformListScrollHandle, WeakEntity, Window,
 };
 use std::{
+    cell::RefCell,
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 use termior_ai::{InlineCompleter, InlineCompletionContext, InlineCompletionResult};
@@ -25,6 +28,18 @@ const COMPLETION_DEBOUNCE_MS: u64 = 300;
 /// 中止，避免拖住后续停顿触发的请求（聊天路径的 300s 超时对补全体验太长）。
 const COMPLETION_REQUEST_TIMEOUT_MS: u64 = 8_000;
 
+/// 编辑器右侧滚动条的布局与拖拽状态。由 render 里一个测量 canvas 在 prepaint 写入（容器高度 /
+/// 顶端坐标），供拖拽与滚动手柄定位使用；跨帧持久（GPUI 的 canvas 是一次性 FnOnce，不能只靠它
+/// 逐帧重绘，所以只用来测量）。
+#[derive(Default)]
+struct ScrollbarLayout {
+    /// 滚动条轨道顶端在窗口坐标系的 Y（用于把指针 Y 映射为本地 Y）。
+    track_top: f32,
+    /// 轨道/容器高度（即视口高度）。
+    viewport_height: f32,
+    dragging: bool,
+}
+
 pub struct EditorView {
     buffer: EditorBuffer,
     syntax: SyntaxDocument,
@@ -38,6 +53,7 @@ pub struct EditorView {
     vim: VimEngine,
     visual_anchor: Option<usize>,
     scroll_handle: UniformListScrollHandle,
+    scrollbar_layout: Rc<RefCell<ScrollbarLayout>>,
     completion: CompletionController,
     /// 已配置好的补全 Provider（来自 Settings → Models 的 completion profile）。
     /// 为 `None` 时（autocomplete 关闭或未配置补全模型）补全不触发。
@@ -62,6 +78,7 @@ impl EditorView {
             vim: VimEngine::default(),
             visual_anchor: None,
             scroll_handle: UniformListScrollHandle::default(),
+            scrollbar_layout: Rc::new(RefCell::new(ScrollbarLayout::default())),
             completion: CompletionController::new(false),
             completer: None,
             pending_completion: None,
@@ -95,6 +112,7 @@ impl EditorView {
             vim: VimEngine::default(),
             visual_anchor: None,
             scroll_handle: UniformListScrollHandle::default(),
+            scrollbar_layout: Rc::new(RefCell::new(ScrollbarLayout::default())),
             completion: CompletionController::new(false),
             completer: None,
             pending_completion: None,
@@ -427,6 +445,25 @@ impl EditorView {
             self.scroll_handle
                 .scroll_to_item(line, ScrollStrategy::Nearest);
         }
+    }
+
+    /// 把滚动条轨道上的指针 Y 映射为滚动偏移并写入 scroll handle（拖拽/点击跳转共用）。
+    fn set_scroll_from_pointer_y(&self, pointer_y: f32) {
+        let (viewport_height, track_top) = {
+            let l = self.scrollbar_layout.borrow();
+            (l.viewport_height, l.track_top)
+        };
+        let base = self.scroll_handle.0.borrow().base_handle.clone();
+        let max_y: f32 = base.max_offset().y.into();
+        if max_y <= 0.0 || viewport_height <= 0.0 {
+            return;
+        }
+        let content_h = viewport_height + max_y;
+        let thumb_h = (viewport_height * viewport_height / content_h).clamp(24.0, viewport_height);
+        let travel = (viewport_height - thumb_h).max(1.0);
+        let local_y = (pointer_y - track_top - thumb_h / 2.0).clamp(0.0, travel);
+        let offset_y = -(local_y / travel) * max_y;
+        base.set_offset(Point::new(px(0.0), px(offset_y)));
     }
 
     fn update_search(&mut self) {
@@ -790,11 +827,100 @@ impl Render for EditorView {
                 .child(SharedString::from(command))
         });
 
+        // 右侧竖向滚动条：轨道拖拽 + 滚动手柄。容器高度由内嵌 canvas 在 prepaint 测量写入
+        // scrollbar_layout（GPUI 的 canvas 是一次性 FnOnce，只作测量、不作逐帧重绘）。
+        let scrollbar = {
+            let layout = self.scrollbar_layout.clone();
+            let scroll = self.scroll_handle.clone();
+            let sb_layout = self.scrollbar_layout.clone();
+            let thumb_color = crate::ui::alpha(p.foreground, 0.5);
+            let track_color = crate::ui::alpha(p.foreground, 0.12);
+            let (thumb_h, thumb_top) = {
+                let l = layout.borrow();
+                let vh = l.viewport_height;
+                let base = scroll.0.borrow().base_handle.clone();
+                let max_y: f32 = base.max_offset().y.into();
+                let off_y: f32 = base.offset().y.into();
+                if max_y > 0.0 && vh > 0.0 {
+                    let content_h = vh + max_y;
+                    let th = (vh * vh / content_h).clamp(24.0, vh);
+                    let travel = (vh - th).max(1.0);
+                    (th, ((-off_y / max_y).clamp(0.0, 1.0)) * travel)
+                } else {
+                    (0.0, 0.0)
+                }
+            };
+            div()
+                .absolute()
+                .right_0()
+                .top_0()
+                .bottom_0()
+                .w(px(8.0))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        {
+                            let mut l = this.scrollbar_layout.borrow_mut();
+                            l.dragging = true;
+                        }
+                        this.set_scroll_from_pointer_y(event.position.y.into());
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                    let dragging = this.scrollbar_layout.borrow().dragging;
+                    if dragging {
+                        this.set_scroll_from_pointer_y(event.position.y.into());
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event: &MouseUpEvent, _window, _cx| {
+                        this.scrollbar_layout.borrow_mut().dragging = false;
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(1.0))
+                        .right(px(1.0))
+                        .top_0()
+                        .bottom_0()
+                        .rounded_full()
+                        .bg(track_color),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(1.5))
+                        .right(px(1.5))
+                        .top(px(thumb_top))
+                        .h(px(thumb_h))
+                        .rounded_full()
+                        .bg(thumb_color),
+                )
+                .child(
+                    canvas(
+                        move |bounds, _, _| bounds,
+                        move |_bounds, _prepaint, _window, _cx| {
+                            let mut l = sb_layout.borrow_mut();
+                            l.track_top = _bounds.origin.y.into();
+                            l.viewport_height = _bounds.size.height.into();
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+        };
+
         div()
             .id("editor-view")
             .relative()
             .track_focus(&focus)
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_scroll_wheel(cx.listener(|_this, _event, _window, cx| cx.notify()))
             .size_full()
             .bg(parse_hex(&self.theme.background))
             .text_color(parse_hex(&self.theme.foreground))
@@ -811,6 +937,7 @@ impl Render for EditorView {
                 .size_full(),
             )
             .child(lines)
+            .child(scrollbar)
             .children(search_overlay)
             .children(vim_status)
     }

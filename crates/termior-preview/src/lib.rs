@@ -12,7 +12,7 @@ use url::Url;
 
 mod markdown;
 
-pub use markdown::{is_markdown_path, MarkdownDocument, MarkdownNode};
+pub use markdown::{is_html_path, is_markdown_path, MarkdownDocument, MarkdownNode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreviewUrlError {

@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::{Command, Stdio};
 use url::Url;
 
@@ -11,11 +12,9 @@ pub enum PlatformError {
     Failed,
 }
 
-pub fn open_external(value: &str) -> Result<(), PlatformError> {
-    let url = Url::parse(value).map_err(|_| PlatformError::InvalidUrl(value.to_owned()))?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(PlatformError::InvalidUrl(value.to_owned()));
-    }
+/// Spawns the OS default handler without imposing a scheme boundary.
+/// Callers are responsible for validating the value before invoking this.
+fn launch_external(value: &str) -> Result<(), PlatformError> {
     #[cfg(target_os = "windows")]
     let mut command = {
         let mut command = Command::new("rundll32");
@@ -46,6 +45,26 @@ pub fn open_external(value: &str) -> Result<(), PlatformError> {
     }
 }
 
+/// Opens an http(s) URL in the default browser. Enforces the HTTP/HTTPS-only boundary so
+/// the system-browser opener never receives a non-web scheme.
+pub fn open_external(value: &str) -> Result<(), PlatformError> {
+    let url = Url::parse(value).map_err(|_| PlatformError::InvalidUrl(value.to_owned()))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(PlatformError::InvalidUrl(value.to_owned()));
+    }
+    launch_external(value)
+}
+
+/// Opens a local file with the OS default handler (e.g. the default browser for an .html
+/// document). The path originates from the user's own workspace, not an untrusted URL, so it
+/// is exempt from the http/https-only boundary enforced by open_external. Uses a file://
+/// URL so Windows never passes the raw path through cmd /c.
+pub fn open_local_file(path: &Path) -> Result<(), PlatformError> {
+    let url = Url::from_file_path(path)
+        .map_err(|_| PlatformError::InvalidUrl(path.display().to_string()))?;
+    launch_external(url.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,6 +77,14 @@ mod tests {
         ));
         assert!(matches!(
             open_external("not a url"),
+            Err(PlatformError::InvalidUrl(_))
+        ));
+    }
+
+    #[test]
+    fn local_file_needs_an_absolute_path() {
+        assert!(matches!(
+            open_local_file(Path::new("relative.html")),
             Err(PlatformError::InvalidUrl(_))
         ));
     }

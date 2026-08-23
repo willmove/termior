@@ -39,10 +39,10 @@ use termior_explorer::{
     FileIndex, IconKind, TreeState, WorkspaceWatcher,
 };
 use termior_platform::{
-    AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationContext,
+    open_local_file, AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationContext,
     NotificationDecision, NotificationRouter, NotificationTarget, SystemNotifier,
 };
-use termior_preview::{is_markdown_path, normalize_preview_url};
+use termior_preview::{is_html_path, is_markdown_path, normalize_preview_url};
 use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_store::{
     app_data_dir, atomic_write, default_settings, migrate, KeyAction, Settings, ShellDetection,
@@ -190,8 +190,6 @@ struct PaneContextMenu {
 enum NewTabAction {
     Terminal,
     Editor,
-    MarkdownPreview,
-    WebPreview,
 }
 
 #[derive(Debug, Clone)]
@@ -1346,6 +1344,45 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// 源码/预览 切换：Markdown 编辑器与其实时预览是同一份文档的两个视图。
+    /// 在编辑器上点“Preview”打开/聚焦预览标签；在预览上点“Source”回到对应编辑器标签。
+    fn toggle_markdown_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.model.active;
+        let active_kind = active
+            .and_then(|id| self.model.tabs.iter().find(|tab| tab.id == id))
+            .map(|tab| tab.kind);
+        match active_kind {
+            Some(TabKind::Markdown) => {
+                // 回到源文件：优先激活已有的编辑器标签，缺失时按路径重新打开。
+                let resource = active
+                    .and_then(|id| self.model.tabs.iter().find(|tab| tab.id == id))
+                    .and_then(|tab| tab.resource.clone());
+                let editor_id = resource.as_deref().and_then(|resource| {
+                    self.model
+                        .tabs
+                        .iter()
+                        .find(|tab| {
+                            tab.kind == TabKind::Editor
+                                && tab.resource.as_deref() == Some(resource)
+                        })
+                        .map(|tab| tab.id)
+                });
+                if let Some(editor_id) = editor_id {
+                    self.activate_runtime(editor_id, cx);
+                    self.focus_active_pane(window, cx);
+                    cx.notify();
+                } else if let Some(resource) = resource {
+                    self.open_editor(PathBuf::from(resource), cx);
+                }
+            }
+            Some(TabKind::Editor) => {
+                // 打开（或聚焦）当前 Markdown 文件的实时预览。
+                let _ = self.request_markdown_preview(cx);
+            }
+            _ => {}
+        }
+    }
+
     fn open_ai_diff(&mut self, summary: termior_ai::EditProposalSummary, cx: &mut Context<Self>) {
         if let Some(id) = self
             .model
@@ -2059,10 +2096,6 @@ impl WorkspaceView {
         match action {
             NewTabAction::Terminal => self.create_terminal(false, window, cx),
             NewTabAction::Editor => self.create_editor(cx),
-            NewTabAction::MarkdownPreview => {
-                let _ = self.request_markdown_preview(cx);
-            }
-            NewTabAction::WebPreview => self.request_web_preview(window, cx),
         }
     }
 
@@ -4394,10 +4427,21 @@ impl gpui::Render for WorkspaceView {
         self.process_agent_updates(window, cx);
         let (cwd, preview_url) = self.sync_terminal_context(cx);
         let p = self.palette.clone();
-        let markdown_preview_available = self
+        let active = self.model.active;
+        // 焦点 pane 是 Markdown 编辑器时才显示“预览”，与 request_markdown_preview 的判定一致
+        // （分栏时标签资源与焦点 pane 可能不同，避免出现点了没反应的按钮）。
+        let markdown_source_active = self
             .active_editor()
             .is_some_and(|editor| editor.read(cx).path().is_some_and(is_markdown_path));
-        let active = self.model.active;
+        let markdown_preview_active = active
+            .and_then(|id| self.model.tabs.iter().find(|tab| tab.id == id))
+            .is_some_and(|tab| tab.kind == TabKind::Markdown);
+        // 焦点 pane 是 HTML 文档时提供“在浏览器打开”入口（文件路径来自用户自己的工作区）。
+        let html_file_path = self
+            .active_editor()
+            .and_then(|editor| editor.read(cx).path())
+            .filter(|path| is_html_path(path))
+            .map(|path| path.to_path_buf());
         let tab_buttons = self
             .model
             .tabs
@@ -4629,6 +4673,121 @@ impl gpui::Render for WorkspaceView {
                         this.toggle_sidebar(cx);
                     }),
                 )
+        };
+
+        // 源码/预览上下文按钮：按当前文档类型出现在标题栏右上方，而非藏在“+”下拉里。
+        let preview_controls = {
+            let mut buttons: Vec<AnyElement> = Vec::new();
+            if markdown_source_active || markdown_preview_active {
+                let (glyph, label) = if markdown_source_active {
+                    (Icon::FileCode, "Preview")
+                } else {
+                    (Icon::FileText, "Source")
+                };
+                let hover_bg = ui::hover_wash(&p);
+                let id = "preview-toggle-markdown";
+                buttons.push(
+                    div()
+                        .id(id)
+                        .group(id)
+                        .aria_label(label)
+                        .h(px(tokens::height::REGULAR))
+                        .px(px(tokens::space::SM))
+                        .flex()
+                        .items_center()
+                        .gap(px(tokens::space::XS))
+                        .rounded(px(tokens::radius::MD))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(hover_bg))
+                        .child(ui::icon(
+                            glyph,
+                            icon_size::SM,
+                            gpui_color_alpha(p.foreground, 0.72),
+                        ))
+                        .child(SharedString::from(label))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, window, cx| {
+                                this.toggle_markdown_preview(window, cx);
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
+            if let Some(url) = preview_url.clone() {
+                let hover_bg = ui::hover_wash(&p);
+                let id = "preview-toggle-web";
+                buttons.push(
+                    div()
+                        .id(id)
+                        .group(id)
+                        .aria_label("Web preview")
+                        .h(px(tokens::height::REGULAR))
+                        .px(px(tokens::space::SM))
+                        .flex()
+                        .items_center()
+                        .gap(px(tokens::space::XS))
+                        .rounded(px(tokens::radius::MD))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(hover_bg))
+                        .child(ui::icon(
+                            Icon::FileText,
+                            icon_size::SM,
+                            gpui_color_alpha(p.foreground, 0.72),
+                        ))
+                        .child("Web preview")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, window, cx| {
+                                this.create_preview_url(url.clone(), window, cx);
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
+            if let Some(path) = html_file_path {
+                let hover_bg = ui::hover_wash(&p);
+                let id = "preview-toggle-browser";
+                buttons.push(
+                    div()
+                        .id(id)
+                        .group(id)
+                        .aria_label("Open in browser")
+                        .h(px(tokens::height::REGULAR))
+                        .px(px(tokens::space::SM))
+                        .flex()
+                        .items_center()
+                        .gap(px(tokens::space::XS))
+                        .rounded(px(tokens::radius::MD))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(hover_bg))
+                        .child(ui::icon(
+                            Icon::FileCode,
+                            icon_size::SM,
+                            gpui_color_alpha(p.foreground, 0.72),
+                        ))
+                        .child("Open in Browser")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |_this, _event, _window, _cx| {
+                                let _ = open_local_file(&path);
+                            }),
+                        )
+                        .into_any_element(),
+                );
+            }
+            if buttons.is_empty() {
+                None
+            } else {
+                Some(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .children(buttons)
+                        .into_any_element(),
+                )
+            }
         };
 
         let active_content = active
@@ -4966,22 +5125,6 @@ impl gpui::Render for WorkspaceView {
                         &p,
                         cx,
                     ))
-                    .child(new_tab_menu_item(
-                        "Markdown preview",
-                        "new-tab-markdown",
-                        markdown_preview_available,
-                        NewTabAction::MarkdownPreview,
-                        &p,
-                        cx,
-                    ))
-                    .child(new_tab_menu_item(
-                        "Web preview",
-                        "new-tab-web",
-                        true,
-                        NewTabAction::WebPreview,
-                        &p,
-                        cx,
-                    ))
                     .with_animation(
                         "new-tab-menu-fade-in",
                         Animation::new(UI_FADE_IN).with_easing(ease_in_out),
@@ -5125,6 +5268,9 @@ impl gpui::Render for WorkspaceView {
                             .flex_shrink_0()
                             .gap_1()
                             .px_2()
+                            .when_some(preview_controls, |area, controls| {
+                                area.child(controls)
+                            })
                             .child(
                                 ui::icon_button(
                                     "titlebar-open-workspace",

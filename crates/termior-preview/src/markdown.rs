@@ -347,6 +347,15 @@ pub fn is_markdown_path(path: &Path) -> bool {
         })
 }
 
+/// Hypertext Markup Language documents that can be opened in the system browser.
+pub fn is_html_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(extension.to_ascii_lowercase().as_str(), "html" | "htm")
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +366,14 @@ mod tests {
         assert!(is_markdown_path(Path::new("Guide.MARKDOWN")));
         assert!(!is_markdown_path(Path::new("component.mdx")));
         assert!(!is_markdown_path(Path::new("index.html")));
+    }
+
+    #[test]
+    fn recognizes_html_paths_case_insensitively() {
+        assert!(is_html_path(Path::new("index.html")));
+        assert!(is_html_path(Path::new("about.HTM")));
+        assert!(!is_html_path(Path::new("README.md")));
+        assert!(!is_html_path(Path::new("component.htmlx")));
     }
 
     #[test]
