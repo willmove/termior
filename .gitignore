@@ -6,3 +6,12 @@
 # Agent tooling (not part of the project)
 /.zcode/
 /.reasonix/
+/.vscode/
+/.cursor/
+/.claude/
+/.trae/
+/.qoder/
+/.kimi/
+/.kiro/
+/.workbuddy/
+/.codebuddy/
