@@ -687,7 +687,7 @@ impl WorkspaceView {
             } else {
                 eprintln!("TERMIOR_SETTINGS_CLOSE_SMOKE_FAILED: settings window already gone");
             }
-            let _ = cx.update(|cx| cx.quit());
+            cx.update(|cx| cx.quit());
         })
         .detach();
     }
@@ -2955,7 +2955,7 @@ impl WorkspaceView {
             IDLE_REDRAW_ARMED.store(false, Ordering::Relaxed);
             let frames = IDLE_REDRAW_FRAMES.load(Ordering::Relaxed);
             println!("TERMIOR_IDLE_REDRAW_FRAMES={frames}");
-            let _ = cx.update(|cx| cx.quit());
+            cx.update(|cx| cx.quit());
         })
         .detach();
     }

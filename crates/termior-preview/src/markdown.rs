@@ -351,9 +351,7 @@ pub fn is_markdown_path(path: &Path) -> bool {
 pub fn is_html_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(extension.to_ascii_lowercase().as_str(), "html" | "htm")
-        })
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "html" | "htm"))
 }
 
 #[cfg(test)]

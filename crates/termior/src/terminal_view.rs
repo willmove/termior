@@ -815,8 +815,12 @@ impl Render for TerminalView {
                 element.child(
                     div()
                         .absolute()
-                        .left(px(TERMINAL_PANE_PADDING + marked_col as f32 * marked_cell_width + 2.0))
-                        .top(px(TERMINAL_PANE_PADDING + marked_row as f32 * marked_line_height + 1.0))
+                        .left(px(TERMINAL_PANE_PADDING
+                            + marked_col as f32 * marked_cell_width
+                            + 2.0))
+                        .top(px(TERMINAL_PANE_PADDING
+                            + marked_row as f32 * marked_line_height
+                            + 1.0))
                         .px_1()
                         .bg(crate::ui::alpha(self.palette.accent, 0.35))
                         .child(SharedString::from(marked_text)),

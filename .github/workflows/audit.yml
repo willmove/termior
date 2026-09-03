@@ -20,7 +20,7 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          # 排除 termior：其 GPUI 依赖（zed 树）含 GPL-3.0 crate（zlog/ztracing），
+          # 排除桌面 UI 栈：其 GPUI 依赖（zed 树）含 GPL-3.0 crate（zlog/ztracing），
           # 属上游 zed 许可问题，不在本项目（Apache-2.0）纯逻辑层的许可范围内。
           # GPUI 上游许可单独核验；CI 仍在三平台编译 termior 桌面产物。
-          arguments: --exclude termior
+          arguments: --exclude termior --exclude termior-ui --exclude termior-ui-kit

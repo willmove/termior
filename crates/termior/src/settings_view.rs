@@ -1390,7 +1390,7 @@ impl SettingsView {
                 .border_color(crate::ui::border(&self.palette))
                 .bg(crate::ui::color(self.palette.overlay))
                 .shadow_md()
-                .children(app_themes.iter().cloned().map(|theme| {
+                .children(app_themes.iter().map(|theme| {
                     let theme_id = theme.id.clone();
                     let selected = theme.id == self.settings.theme_id;
                     let label = format!("{} · {}", theme.name, theme.native_appearance.as_str());

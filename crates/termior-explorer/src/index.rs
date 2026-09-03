@@ -320,6 +320,7 @@ fn icon_for(path: &Path, is_dir: bool) -> IconKind {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(windows)]
     use std::process::Command;
 
     #[test]

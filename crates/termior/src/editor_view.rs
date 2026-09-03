@@ -868,13 +868,15 @@ impl Render for EditorView {
                         cx.notify();
                     }),
                 )
-                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
-                    let dragging = this.scrollbar_layout.borrow().dragging;
-                    if dragging {
-                        this.set_scroll_from_pointer_y(event.position.y.into());
-                        cx.notify();
-                    }
-                }))
+                .on_mouse_move(
+                    cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                        let dragging = this.scrollbar_layout.borrow().dragging;
+                        if dragging {
+                            this.set_scroll_from_pointer_y(event.position.y.into());
+                            cx.notify();
+                        }
+                    }),
+                )
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |this, _event: &MouseUpEvent, _window, _cx| {
