@@ -112,10 +112,15 @@ jobs:
         shell: pwsh
         run: |
           $env:TERMIOR_SMOKE_TEST = "1"
-          $output = & ./target/release/termior.exe 2>&1
-          $exitCode = $LASTEXITCODE
+          $outFile = Join-Path $env:TEMP "termior-smoke-stdout.txt"
+          $errFile = Join-Path $env:TEMP "termior-smoke-stderr.txt"
+          Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
+          $proc = Start-Process -FilePath "./target/release/termior.exe" -Wait -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+          $output = @()
+          if (Test-Path $outFile) { $output += Get-Content $outFile }
+          if (Test-Path $errFile) { $output += Get-Content $errFile }
           $output | Write-Host
-          if ($exitCode -ne 0 -or ($output | Out-String) -notmatch "TERMIOR_SMOKE_OK") {
+          if ($proc.ExitCode -ne 0 -or (($output | Out-String) -notmatch "TERMIOR_SMOKE_OK")) {
             throw "Termior desktop smoke launch did not complete successfully"
           }
       - name: Windows split-pane smoke
@@ -123,10 +128,15 @@ jobs:
         shell: pwsh
         run: |
           $env:TERMIOR_SPLIT_PANE_SMOKE = "1"
-          $output = & ./target/release/termior.exe 2>&1
-          $exitCode = $LASTEXITCODE
+          $outFile = Join-Path $env:TEMP "termior-split-smoke-stdout.txt"
+          $errFile = Join-Path $env:TEMP "termior-split-smoke-stderr.txt"
+          Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
+          $proc = Start-Process -FilePath "./target/release/termior.exe" -Wait -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+          $output = @()
+          if (Test-Path $outFile) { $output += Get-Content $outFile }
+          if (Test-Path $errFile) { $output += Get-Content $errFile }
           $output | Write-Host
-          if ($exitCode -ne 0 -or ($output | Out-String) -notmatch "TERMIOR_SPLIT_PANE_SMOKE_OK") {
+          if ($proc.ExitCode -ne 0 -or (($output | Out-String) -notmatch "TERMIOR_SPLIT_PANE_SMOKE_OK")) {
             throw "Termior split-pane smoke did not complete successfully"
           }
       - name: NFR process-level gate (cold start / RSS / FPS)

@@ -620,6 +620,12 @@ impl WorkspaceView {
     }
 
     pub fn start_background_services(&mut self, cx: &mut Context<Self>) {
+        if skip_startup_workspace_scans() {
+            // Smoke/NFR/idle probes measure launch and frame timing; git status
+            // plus explorer indexing on a large checkout contend for CPU and
+            // can abort a GUI-subsystem process if a worker panics.
+            return;
+        }
         self.schedule_explorer_scan(self.explorer_requested_root.clone(), cx);
         self.refresh_vcs_data(cx);
         self._background_task = Some(cx.spawn(async move |workspace, cx| loop {
@@ -950,9 +956,16 @@ impl WorkspaceView {
         self.vcs_scan_generation = self.vcs_scan_generation.saturating_add(1);
         let generation = self.vcs_scan_generation;
         let auth = self.workspace_auth.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { load_vcs(&root, &auth) });
+        let root_for_task = root.clone();
+        let task = cx.background_executor().spawn(async move {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_vcs(&root, &auth)))
+                .unwrap_or_else(|_| VcsSnapshot {
+                    root: root_for_task,
+                    status: Vec::new(),
+                    history: Vec::new(),
+                    branch: None,
+                })
+        });
         cx.spawn(async move |workspace, cx| {
             let snapshot = task.await;
             let _ = workspace.update(cx, |workspace, cx| {
@@ -6021,6 +6034,19 @@ struct VcsSnapshot {
     status: Vec<ChangedFile>,
     history: Vec<CommitInfo>,
     branch: Option<BranchState>,
+}
+
+fn skip_startup_workspace_scans() -> bool {
+    [
+        "TERMIOR_SMOKE_TEST",
+        "TERMIOR_MARKDOWN_PREVIEW_SMOKE_TEST",
+        "TERMIOR_SETTINGS_CLOSE_SMOKE_TEST",
+        "TERMIOR_SPLIT_PANE_SMOKE",
+        "TERMIOR_NFR_MEASURE",
+        "TERMIOR_IDLE_REDRAW_PROBE",
+    ]
+    .iter()
+    .any(|key| std::env::var_os(key).is_some())
 }
 
 /// Git status/history/branch snapshot. Must not run on the GPUI thread: `status` plus

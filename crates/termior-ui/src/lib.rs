@@ -532,7 +532,7 @@ mod tests {
         assert!(restored
             .tabs
             .iter()
-            .all(|tab| tab.project_dir == PathBuf::from("/legacy-root")));
+            .all(|tab| tab.project_dir == Path::new("/legacy-root")));
         assert_eq!(restored.active_project_dir(), Path::new("/legacy-root"));
     }
 

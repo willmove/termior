@@ -179,6 +179,7 @@ fn schedule_smoke_exit(window: &mut Window) {
             window.refresh();
             window.on_next_frame(|_, cx| {
                 println!("TERMIOR_SMOKE_OK");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
                 cx.quit();
             });
         });
