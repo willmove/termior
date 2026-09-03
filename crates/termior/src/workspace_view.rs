@@ -724,7 +724,7 @@ impl WorkspaceView {
                     eprintln!("TERMIOR_SPLIT_PANE_SMOKE_FAILED: {error}");
                 }
             }
-            let _ = cx.update(|cx| cx.quit());
+            let _ = cx.update(|_, cx| cx.quit());
         })
         .detach();
     }
