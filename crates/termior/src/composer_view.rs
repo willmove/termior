@@ -1,7 +1,7 @@
 use futures::StreamExt;
 use gpui::{
-    canvas, div, prelude::*, px, App, Bounds, ClipboardEntry, Context, EventEmitter, FocusHandle,
-    Focusable, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
+    canvas, div, prelude::*, px, App, Bounds, ClipboardEntry, ClipboardItem, Context, EventEmitter,
+    FocusHandle, Focusable, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
     SharedString, UTF16Selection, WeakEntity, Window,
 };
 use std::{
@@ -476,10 +476,21 @@ impl ComposerView {
         cx.notify();
     }
 
-    fn attach_clipboard_items(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(item) = cx.read_from_clipboard() else {
-            return false;
-        };
+    /// 把剪贴板读取推迟到当前 entity 更新结束之后。Windows 上打开剪贴板会往
+    /// wndproc 回派 sent message，若此时 entity 的 RefCell 仍被借着就会重入崩溃。
+    fn schedule_attach_clipboard(&mut self, cx: &mut Context<Self>) {
+        let entity = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let Some(item) = cx.read_from_clipboard() else {
+                return;
+            };
+            let _ = entity.update(cx, |this, cx| {
+                this.apply_clipboard_item(item, cx);
+            });
+        });
+    }
+
+    fn apply_clipboard_item(&mut self, item: ClipboardItem, cx: &mut Context<Self>) {
         let mut attached = false;
         for entry in item.into_entries() {
             match entry {
@@ -507,7 +518,6 @@ impl ComposerView {
             self.status = "Clipboard attachment added".into();
             cx.notify();
         }
-        attached
     }
 
     pub fn update_terminal_context(&mut self, cwd: String, recent_output: String) {
@@ -817,10 +827,8 @@ impl ComposerView {
         } else {
             modifiers.control
         };
-        if primary
-            && event.keystroke.key.eq_ignore_ascii_case("v")
-            && self.attach_clipboard_items(cx)
-        {
+        if primary && event.keystroke.key.eq_ignore_ascii_case("v") {
+            self.schedule_attach_clipboard(cx);
             return;
         }
         if !self.path_suggestions.is_empty() {
