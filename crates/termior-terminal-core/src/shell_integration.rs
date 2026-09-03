@@ -6,6 +6,7 @@
 //!
 //! - zsh：经 `ZDOTDIR` 四件套（临时 ZDOTDIR + `.zshenv` + `.zshrc` 包装）。
 //! - bash：经 `--rcfile`。
+//! - fish：经临时 `XDG_CONFIG_HOME/fish/config.fish`（内部 source 用户真实配置）。
 //! - pwsh：经 `-File profile.ps1`（内部 source 用户真实 `$PROFILE`）。
 //!
 //! 本模块只生成**纯字符串**（注入脚本 + 启动参数），不触盘、不 spawn。
@@ -234,12 +235,77 @@ if (Get-Module -ListAvailable PSReadLine) {
     }
 }
 
+/// 生成 fish 的 shell integration（经临时 `XDG_CONFIG_HOME/fish/config.fish`）。
+///
+/// fish 启动时读 `$XDG_CONFIG_HOME/fish/config.fish`（未设则 `~/.config/fish`）。
+/// 把 `XDG_CONFIG_HOME` 指到临时目录，包装脚本先 source 用户真实配置，再挂 OSC 7 / 133。
+pub fn fish_snippets() -> ShellIntegrationSnippets {
+    let config = r#"# Termior shell integration (fish) — config.fish wrapper
+# Source the user's real config.fish if it exists.
+if set -q TERMior_REAL_XDG_CONFIG_HOME; and test -f "$TERMior_REAL_XDG_CONFIG_HOME/fish/config.fish"
+    source "$TERMior_REAL_XDG_CONFIG_HOME/fish/config.fish"
+else if test -f "$HOME/.config/fish/config.fish"
+    source "$HOME/.config/fish/config.fish"
+end
+
+# --- Termior integration (OSC 7 / 133) ---
+if not set -q TERMior_HOSTNAME
+    set -gx TERMior_HOSTNAME $hostname
+end
+
+function __termior_osc7
+    printf '\033]7;file://%s%s\007' "$TERMior_HOSTNAME" "$PWD"
+end
+function __termior_mark_prompt
+    printf '\033]133;A\007'
+end
+function __termior_mark_input
+    printf '\033]133;B\007'
+end
+function __termior_mark_cmd
+    printf '\033]133;C;%s\007' $argv[1]
+end
+function __termior_mark_exit
+    printf '\033]133;D;%s\007' $argv[1]
+end
+
+function __termior_on_preexec --on-event fish_preexec
+    __termior_mark_cmd $argv[1]
+end
+function __termior_on_postexec --on-event fish_postexec
+    __termior_mark_exit $status
+    __termior_osc7
+end
+function __termior_on_pwd --on-variable PWD
+    __termior_osc7
+end
+
+if functions -q fish_prompt
+    functions -c fish_prompt __termior_orig_fish_prompt
+end
+function fish_prompt
+    __termior_osc7
+    __termior_mark_prompt
+    if functions -q __termior_orig_fish_prompt
+        __termior_orig_fish_prompt
+    end
+    __termior_mark_input
+end
+"#;
+    ShellIntegrationSnippets {
+        kind: ShellKind::Fish,
+        args: vec![],
+        files: vec![("fish/config.fish".into(), config.into())],
+        env: vec![],
+    }
+}
+
 /// 按 shell 类型选择注入方案。
 pub fn snippets_for(kind: ShellKind) -> Option<ShellIntegrationSnippets> {
     match kind {
         ShellKind::Zsh => Some(zsh_snippets()),
         ShellKind::Bash => Some(bash_snippets()),
-        ShellKind::Fish => None,
+        ShellKind::Fish => Some(fish_snippets()),
         ShellKind::Pwsh | ShellKind::PowerShell => Some(pwsh_snippets()),
         ShellKind::Cmd => None, // cmd 不支持 shell integration
     }
@@ -404,8 +470,35 @@ mod tests {
     }
 
     #[test]
+    fn fish_uses_xdg_config_home_wrapper() {
+        let s = fish_snippets();
+        assert!(s.args.is_empty());
+        let config = s
+            .files
+            .iter()
+            .find(|(n, _)| n == "fish/config.fish")
+            .unwrap()
+            .1
+            .as_str();
+        assert!(config.contains("TERMior_REAL_XDG_CONFIG_HOME"));
+        assert!(config.contains("fish_preexec"));
+        assert!(config.contains("fish_postexec"));
+        assert!(config.contains("]7;"));
+        assert!(config.contains("133;"));
+        assert!(
+            snippets_for(ShellKind::Fish).is_some(),
+            "fish must participate in shell integration"
+        );
+    }
+
+    #[test]
     fn injection_emits_osc7_and_osc133() {
-        for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Pwsh] {
+        for kind in [
+            ShellKind::Zsh,
+            ShellKind::Bash,
+            ShellKind::Fish,
+            ShellKind::Pwsh,
+        ] {
             let s = snippets_for(kind).unwrap();
             let all = s.files.iter().map(|(_, c)| c.as_str()).collect::<String>();
             // 必须同时注入 OSC 7 与 OSC 133
@@ -417,7 +510,12 @@ mod tests {
     #[test]
     fn injection_sources_user_real_config() {
         // 关键：内部必须 source 用户真实配置，而非替换
-        for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Pwsh] {
+        for kind in [
+            ShellKind::Zsh,
+            ShellKind::Bash,
+            ShellKind::Fish,
+            ShellKind::Pwsh,
+        ] {
             let s = snippets_for(kind).unwrap();
             let all = s.files.iter().map(|(_, c)| c.as_str()).collect::<String>();
             assert!(

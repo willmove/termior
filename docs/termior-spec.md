@@ -188,7 +188,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | FR-TERM-03 | 后台 tab 持续消费 PTY 输出，回滚缓冲不丢 | P0 |
 | FR-TERM-04 | 行内搜索 `Cmd+F`：高亮、上一个/下一个、大小写切换；搜索 overlay 与编辑器复用 | P0 |
 | FR-TERM-05 | Shell 支持：Unix 跟随 `$SHELL`（zsh/bash/fish）；Windows 依次探测 pwsh → powershell → cmd | P0 |
-| FR-TERM-06 | shell integration 自动注入，用户无需改 rc 文件：zsh 经 `ZDOTDIR` 四件套、bash 经 `--rcfile`、pwsh 经 `-File profile.ps1`（内部 source 用户真实配置）；注入 OSC 7（cwd）与 OSC 133 A/B/C/D（提示符与命令边界） | P0 |
+| FR-TERM-06 | shell integration 自动注入，用户无需改 rc 文件：zsh 经 `ZDOTDIR` 四件套、bash 经 `--rcfile`、fish 经临时 `XDG_CONFIG_HOME/fish/config.fish`、pwsh 经 `-File profile.ps1`（内部 source 用户真实配置）；注入 OSC 7（cwd）与 OSC 133 A/B/C/D（提示符与命令边界） | P0 |
 | FR-TERM-07 | 进程生命周期：关 tab 杀 shell 直接子进程；Windows 上每会话绑定 Job Object（`KILL_ON_JOB_CLOSE`），宿主进程无论如何退出都级联杀死整棵子进程树；ConPTY spawn 加互斥锁串行化 | P0 |
 | FR-TERM-08 | 渲染：true color、超链接检测（可点击）、平滑滚动、调色板由中央主题引擎驱动 | P0 |
 | FR-TERM-09 | 设置项：字体族、字号（8–32，预设档位）、字距、回滚行数（200–50,000，预设档位） | P0 |

@@ -384,10 +384,7 @@ fn build_native_command(
         Some(snippets) => {
             let tempdir = tempfile::tempdir()
                 .map_err(|e| SpawnError::Integration(format!("shell integration tempdir: {e}")))?;
-            for (name, content) in &snippets.files {
-                let path = tempdir.path().join(name);
-                std::fs::write(&path, content)?;
-            }
+            write_snippet_files(tempdir.path(), &snippets)?;
             apply_integration(&mut cmd, &snippets, tempdir.path(), kind);
             Some(tempdir)
         }
@@ -427,10 +424,7 @@ fn build_wsl_command(
         Some(snippets) => {
             let tempdir = tempfile::tempdir()
                 .map_err(|e| SpawnError::Integration(format!("shell integration tempdir: {e}")))?;
-            for (name, content) in &snippets.files {
-                let path = tempdir.path().join(name);
-                std::fs::write(&path, content)?;
-            }
+            write_snippet_files(tempdir.path(), &snippets)?;
             apply_wsl_integration(&mut cmd, &snippets, tempdir.path(), kind);
             Some(tempdir)
         }
@@ -471,8 +465,9 @@ fn apply_wsl_integration(
             }
             cmd.env("ZDOTDIR", windows_to_wsl_path(tempdir));
         }
-        ShellKind::Pwsh | ShellKind::PowerShell | ShellKind::Fish | ShellKind::Cmd => {
-            // PowerShell/Cmd/Fish 在 WSL 里通常不适用，跳过 integration wrapper。
+        ShellKind::Fish => apply_fish_xdg_config(cmd, tempdir, true),
+        ShellKind::Pwsh | ShellKind::PowerShell | ShellKind::Cmd => {
+            // PowerShell/Cmd 在 WSL 里通常不适用，跳过 integration wrapper。
         }
     }
     for (k, v) in &snippets.env {
@@ -576,12 +571,56 @@ fn apply_integration(
             cmd.arg("-File");
             cmd.arg(profile);
         }
-        ShellKind::Fish | ShellKind::Cmd => {
-            // These shells currently have no integration wrapper.
+        ShellKind::Fish => apply_fish_xdg_config(cmd, tempdir, false),
+        ShellKind::Cmd => {
+            // cmd 不支持 shell integration。
         }
     }
     for (k, v) in &snippets.env {
         cmd.env(k, v);
+    }
+}
+
+/// 把注入脚本写到临时目录；`fish/config.fish` 等嵌套路径需要先建父目录。
+fn write_snippet_files(
+    tempdir: &std::path::Path,
+    snippets: &ShellIntegrationSnippets,
+) -> Result<(), SpawnError> {
+    for (name, content) in &snippets.files {
+        let path = tempdir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, content)?;
+    }
+    Ok(())
+}
+
+/// fish：把临时目录设为 `XDG_CONFIG_HOME`，真实用户配置经 `TERMior_REAL_XDG_CONFIG_HOME` 回退。
+fn apply_fish_xdg_config(cmd: &mut CommandBuilder, tempdir: &std::path::Path, wsl: bool) {
+    if let Some(real) = std::env::var_os("XDG_CONFIG_HOME") {
+        let value = if wsl {
+            wsl_visible_path(std::path::Path::new(&real))
+        } else {
+            real
+        };
+        cmd.env("TERMior_REAL_XDG_CONFIG_HOME", value);
+    }
+    if wsl {
+        cmd.env("XDG_CONFIG_HOME", wsl_visible_path(tempdir));
+    } else {
+        cmd.env("XDG_CONFIG_HOME", tempdir);
+    }
+}
+
+fn wsl_visible_path(path: &std::path::Path) -> std::ffi::OsString {
+    #[cfg(windows)]
+    {
+        windows_to_wsl_path(path).into()
+    }
+    #[cfg(not(windows))]
+    {
+        path.as_os_str().to_os_string()
     }
 }
 
@@ -756,6 +795,27 @@ mod tests {
     }
 
     #[test]
+    fn fish_integration_writes_nested_config_and_sets_xdg_config_home() {
+        let config = PtySessionConfig::default();
+        let (command, integration_dir) =
+            build_command(ShellKind::Fish, "fish", true, &config).unwrap();
+        assert_eq!(argv(&command), vec!["fish"]);
+        let dir = integration_dir.expect("fish integration tempdir");
+        let config_fish = dir.path().join("fish/config.fish");
+        assert!(
+            config_fish.is_file(),
+            "fish/config.fish must be created under XDG_CONFIG_HOME"
+        );
+        let contents = std::fs::read_to_string(&config_fish).unwrap();
+        assert!(contents.contains("]7;"));
+        assert!(contents.contains("133;"));
+        assert_eq!(
+            command.get_env("XDG_CONFIG_HOME"),
+            Some(dir.path().as_os_str())
+        );
+    }
+
+    #[test]
     fn unauthorized_cwd_is_dropped_not_fatal() {
         use termior_security::workspace::WorkspaceAuthRegistry;
         // 类似 Windows OSC 7 解析畸形产生的垃圾 cwd：不授权 → 丢弃，spawn 继续。
@@ -916,5 +976,27 @@ mod tests {
             "no rcfile when integration is off"
         );
         assert!(integration_dir.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_fish_integration_sets_xdg_config_home_to_mnt_path() {
+        let config = PtySessionConfig {
+            wsl_distribution: Some("Ubuntu".into()),
+            ..PtySessionConfig::default()
+        };
+        let (command, integration_dir) =
+            build_command(ShellKind::Fish, "fish", true, &config).unwrap();
+        let dir = integration_dir.expect("fish integration tempdir");
+        assert!(dir.path().join("fish/config.fish").is_file());
+        let xdg = command
+            .get_env("XDG_CONFIG_HOME")
+            .expect("XDG_CONFIG_HOME set for WSL fish")
+            .to_string_lossy();
+        assert!(
+            xdg.starts_with("/mnt/"),
+            "WSL fish XDG_CONFIG_HOME must be a Linux-visible path, got {xdg}"
+        );
+        assert!(argv(&command).iter().any(|arg| arg == "fish"));
     }
 }
