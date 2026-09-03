@@ -23,10 +23,10 @@ pub struct ProviderRequest {
 
 /// Provider 抽象（FR-PROV 技术要点）。
 ///
-/// `stream_chat` 返回 [`ChatEvent`] 增量流：HTTP/SSE 由 Provider 在独立线程读取，
-/// 每解析出一个事件（`TextDelta`/`ToolCall`/`Done`/`Error`）即经 channel 投递给
-/// 消费方。调用方逐事件 `await`；流自然结束时最后一个事件为 [`ChatEvent::Done`]
-/// 或 [`ChatEvent::Error`]。
+/// `stream_chat` 返回 [`ChatEvent`] 增量流：HTTP/SSE 由 Provider 在有界 worker
+/// 池里读取，每解析出一个事件（`TextDelta`/`ToolCall`/`Done`/`Error`）即经
+/// channel 投递给消费方。调用方逐事件 `await`；流自然结束时最后一个事件为
+/// [`ChatEvent::Done`] 或 [`ChatEvent::Error`]。
 pub trait Provider: Send + Sync {
     /// 执行一次流式聊天，返回有序事件增量流。
     fn stream_chat<'a>(&'a self, req: &'a ProviderRequest) -> BoxStream<'a, ChatEvent>;

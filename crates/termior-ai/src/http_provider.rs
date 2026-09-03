@@ -10,6 +10,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::net::ToSocketAddrs;
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use termior_security::ssrf::{check_ip, SsrfGuard};
@@ -196,15 +197,58 @@ impl Provider for HttpProvider {
             system_prompt_extra: req.system_prompt_extra.clone(),
         };
 
-        thread::Builder::new()
-            .name("termior-net-reader".into())
-            .spawn(move || {
-                run_net_reader(tx, ctx, owned_req);
-            })
-            .expect("spawn termior-net-reader");
+        let job_tx = tx.clone();
+        if let Err(error) = dispatch_net_job(Box::new(move || {
+            run_net_reader(tx, ctx, owned_req);
+        })) {
+            send_error_event(&job_tx, error);
+        }
 
         Box::pin(rx)
     }
+}
+
+/// 有界网络 worker 池：`stream_chat` 把 blocking HTTP/SSE 丢进队列，而不是每次
+/// `thread::spawn`。池大小固定，避免并发聊天把线程数打到无上限。
+const NET_POOL_SIZE: usize = 4;
+
+type NetJob = Box<dyn FnOnce() + Send + 'static>;
+
+static NET_POOL: OnceLock<std_mpsc::Sender<NetJob>> = OnceLock::new();
+
+fn net_pool_sender() -> &'static std_mpsc::Sender<NetJob> {
+    NET_POOL.get_or_init(|| {
+        let (tx, rx) = std_mpsc::channel::<NetJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for index in 0..NET_POOL_SIZE {
+            let rx = Arc::clone(&rx);
+            let _ = thread::Builder::new()
+                .name(format!("termior-net-{index}"))
+                .spawn(move || net_worker_loop(rx));
+        }
+        tx
+    })
+}
+
+fn net_worker_loop(rx: Arc<Mutex<std_mpsc::Receiver<NetJob>>>) {
+    loop {
+        let job = {
+            let Ok(guard) = rx.lock() else {
+                return;
+            };
+            match guard.recv() {
+                Ok(job) => job,
+                Err(_) => return,
+            }
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+    }
+}
+
+fn dispatch_net_job(job: NetJob) -> Result<(), String> {
+    net_pool_sender()
+        .send(job)
+        .map_err(|_| "network worker pool is unavailable".to_owned())
 }
 
 /// 网络 reader 线程主循环：构造请求、解析 SSE/NDJSON，把 [`ChatEvent`] 经 `tx` 推送。
@@ -849,5 +893,17 @@ mod tests {
         assert!(local
             .check_endpoint_for_ping("http://127.0.0.1:9999/v1/chat/completions")
             .is_ok());
+    }
+
+    #[test]
+    fn net_pool_runs_dispatched_jobs() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        dispatch_net_job(Box::new(move || {
+            let _ = done_tx.send(());
+        }))
+        .expect("dispatch onto the net pool");
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker ran the job");
     }
 }
