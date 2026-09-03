@@ -39,8 +39,9 @@ use termior_explorer::{
     FileIndex, IconKind, TreeState, WorkspaceWatcher,
 };
 use termior_platform::{
-    open_local_file, AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationContext,
-    NotificationDecision, NotificationRouter, NotificationTarget, SystemNotifier,
+    open_local_file, AgentIndicator, AgentStatus, NativeNotifier, Notification,
+    NotificationContext, NotificationDecision, NotificationRouter, NotificationTarget,
+    SystemNotifier,
 };
 use termior_preview::{is_html_path, is_markdown_path, normalize_preview_url};
 use termior_security::workspace::WorkspaceAuthRegistry;
@@ -299,6 +300,8 @@ pub struct WorkspaceView {
     vcs_status: Vec<ChangedFile>,
     vcs_history: Vec<CommitInfo>,
     vcs_branch: Option<BranchState>,
+    /// Bumped on every scheduled VCS refresh so stale background results are dropped.
+    vcs_scan_generation: u64,
     settings: Settings,
     data_dir: Option<PathBuf>,
     migration_error: Option<String>,
@@ -502,8 +505,6 @@ impl WorkspaceView {
         });
         let initial_project_root = model.active_project_dir().to_path_buf();
         let explorer_tree = TreeState::new(initial_project_root.clone());
-        let (vcs_status, vcs_history, vcs_branch) =
-            load_vcs(&initial_project_root, &workspace_auth);
         Self {
             model,
             tabs,
@@ -539,9 +540,10 @@ impl WorkspaceView {
             content_matches: Vec::new(),
             content_search_generation: 0,
             content_searching: false,
-            vcs_status,
-            vcs_history,
-            vcs_branch,
+            vcs_status: Vec::new(),
+            vcs_history: Vec::new(),
+            vcs_branch: None,
+            vcs_scan_generation: 0,
             settings,
             data_dir,
             migration_error,
@@ -619,6 +621,7 @@ impl WorkspaceView {
 
     pub fn start_background_services(&mut self, cx: &mut Context<Self>) {
         self.schedule_explorer_scan(self.explorer_requested_root.clone(), cx);
+        self.refresh_vcs_data(cx);
         self._background_task = Some(cx.spawn(async move |workspace, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
@@ -648,7 +651,7 @@ impl WorkspaceView {
                                 workspace.explorer_requested_root.clone(),
                                 cx,
                             );
-                            workspace.refresh_vcs_data();
+                            workspace.refresh_vcs_data(cx);
                             cx.notify();
                         }
                     }
@@ -896,21 +899,77 @@ impl WorkspaceView {
             self.explorer_pending_rescan = false;
             let root = self.explorer_requested_root.clone();
             self.schedule_explorer_scan(root, cx);
-            self.refresh_vcs_data();
+            self.refresh_vcs_data(cx);
         }
     }
 
     fn refresh_workspace_data(&mut self, cx: &mut Context<Self>) {
         self.schedule_explorer_scan(self.explorer_requested_root.clone(), cx);
-        self.refresh_vcs_data();
+        self.refresh_vcs_data(cx);
     }
 
-    fn refresh_vcs_data(&mut self) {
+    fn refresh_vcs_data(&mut self, cx: &mut Context<Self>) {
         let root = self.model.active_project_dir().to_path_buf();
-        let (status, history, branch) = load_vcs(&root, &self.workspace_auth);
-        self.vcs_status = status;
-        self.vcs_history = history;
-        self.vcs_branch = branch;
+        self.vcs_scan_generation = self.vcs_scan_generation.saturating_add(1);
+        let generation = self.vcs_scan_generation;
+        let auth = self.workspace_auth.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { load_vcs(&root, &auth) });
+        cx.spawn(async move |workspace, cx| {
+            let snapshot = task.await;
+            let _ = workspace.update(cx, |workspace, cx| {
+                if generation != workspace.vcs_scan_generation {
+                    return;
+                }
+                if snapshot.root != workspace.model.active_project_dir() {
+                    return;
+                }
+                workspace.apply_vcs_snapshot(snapshot, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_vcs_snapshot(&mut self, snapshot: VcsSnapshot, cx: &mut Context<Self>) {
+        self.vcs_status = snapshot.status;
+        self.vcs_history = snapshot.history;
+        self.vcs_branch = snapshot.branch;
+        let commits = self.vcs_history.clone();
+        for tab in &self.tabs {
+            for pane in tab.panes.values() {
+                if let PaneContent::GitHistory(history) = pane {
+                    history.update(cx, |history, cx| history.set_commits(commits.clone(), cx));
+                }
+            }
+        }
+    }
+
+    fn schedule_commit_files(
+        &mut self,
+        history: Entity<GitHistoryView>,
+        commit: String,
+        cx: &mut Context<Self>,
+    ) {
+        let root = self.model.active_project_dir().to_path_buf();
+        let auth = self.workspace_auth.clone();
+        let commit_id = commit.clone();
+        let task = cx.background_executor().spawn(async move {
+            GitRepository::open(&root, &auth)
+                .ok()
+                .and_then(|repo| repo.commit_files(&commit_id).ok())
+                .unwrap_or_default()
+        });
+        cx.spawn(async move |workspace, cx| {
+            let files = task.await;
+            let _ = workspace.update(cx, |_, cx| {
+                history.update(cx, |history, cx| {
+                    history.set_commit_files(commit, files, cx);
+                });
+            });
+        })
+        .detach();
     }
 
     fn open_workspace_picker(
@@ -960,7 +1019,7 @@ impl WorkspaceView {
             self.workspace_auth
                 .authorize(&root.to_string_lossy().replace('\\', "/"));
             self.schedule_explorer_scan(root, cx);
-            self.refresh_vcs_data();
+            self.refresh_vcs_data(cx);
             self.persist_workspace();
             cx.notify();
             return;
@@ -993,7 +1052,7 @@ impl WorkspaceView {
             }
         }
         self.schedule_explorer_scan(root, cx);
-        self.refresh_vcs_data();
+        self.refresh_vcs_data(cx);
         self.persist_workspace();
         cx.notify();
     }
@@ -1362,8 +1421,7 @@ impl WorkspaceView {
                         .tabs
                         .iter()
                         .find(|tab| {
-                            tab.kind == TabKind::Editor
-                                && tab.resource.as_deref() == Some(resource)
+                            tab.kind == TabKind::Editor && tab.resource.as_deref() == Some(resource)
                         })
                         .map(|tab| tab.id)
                 });
@@ -1525,22 +1583,41 @@ impl WorkspaceView {
             },
             Err(error) => (String::new(), ChangeGroup::Unstaged, Err(error)),
         };
-        self.refresh_vcs_data();
-        let group = self
-            .vcs_status
-            .iter()
-            .find(|file| file.path == path && file.group == preferred_group)
-            .or_else(|| self.vcs_status.iter().find(|file| file.path == path))
-            .map(|file| file.group);
-        let patch = group.and_then(|group| {
-            self.git_repository()
-                .ok()
-                .and_then(|repo| repo.diff_file(&path, group == ChangeGroup::Staged).ok())
+        let view = view.clone();
+        let root = self.model.active_project_dir().to_path_buf();
+        let auth = self.workspace_auth.clone();
+        self.vcs_scan_generation = self.vcs_scan_generation.saturating_add(1);
+        let generation = self.vcs_scan_generation;
+        let task = cx.background_executor().spawn(async move {
+            let snapshot = load_vcs(&root, &auth);
+            let group = snapshot
+                .status
+                .iter()
+                .find(|file| file.path == path && file.group == preferred_group)
+                .or_else(|| snapshot.status.iter().find(|file| file.path == path))
+                .map(|file| file.group);
+            let patch = group.and_then(|group| {
+                GitRepository::open(&root, &auth)
+                    .ok()
+                    .and_then(|repo| repo.diff_file(&path, group == ChangeGroup::Staged).ok())
+            });
+            (snapshot, group, patch)
         });
-        view.update(cx, |view, cx| {
-            view.update_after_action(result, patch, group, cx)
-        });
-        cx.notify();
+        cx.spawn(async move |workspace, cx| {
+            let (snapshot, group, patch) = task.await;
+            let _ = workspace.update(cx, |workspace, cx| {
+                if generation == workspace.vcs_scan_generation
+                    && snapshot.root == workspace.model.active_project_dir()
+                {
+                    workspace.apply_vcs_snapshot(snapshot, cx);
+                }
+                view.update(cx, |view, cx| {
+                    view.update_after_action(result, patch, group, cx)
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn open_git_history(&mut self, cx: &mut Context<Self>) {
@@ -1555,29 +1632,14 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
-        self.refresh_vcs_data();
         let commits = self.vcs_history.clone();
-        let files = commits
-            .first()
-            .and_then(|commit| {
-                self.git_repository()
-                    .ok()
-                    .and_then(|repo| repo.commit_files(&commit.id).ok())
-            })
-            .unwrap_or_default();
-        let entity = cx.new(|cx| GitHistoryView::new(commits, files, cx));
+        let first_commit = commits.first().map(|commit| commit.id.clone());
+        let entity = cx.new(|cx| GitHistoryView::new(commits, Vec::new(), cx));
         cx.subscribe(
             &entity,
             |workspace, history, action: &GitHistoryAction, cx| match action {
                 GitHistoryAction::SelectCommit(commit) => {
-                    let files = workspace
-                        .git_repository()
-                        .ok()
-                        .and_then(|repo| repo.commit_files(commit).ok())
-                        .unwrap_or_default();
-                    history.update(cx, |history, cx| {
-                        history.set_commit_files(commit.clone(), files, cx)
-                    });
+                    workspace.schedule_commit_files(history.clone(), commit.clone(), cx);
                 }
                 GitHistoryAction::OpenFile { commit, path } => {
                     workspace.open_git_commit_file(commit.clone(), path.clone(), cx)
@@ -1602,9 +1664,13 @@ impl WorkspaceView {
             .new_tab(TabKind::GitHistory, "Git History", false);
         self.tabs.push(AppTab {
             id,
-            panes: single_pane(PaneContent::GitHistory(entity)),
+            panes: single_pane(PaneContent::GitHistory(entity.clone())),
         });
         self.activate_runtime(id, cx);
+        if let Some(commit) = first_commit {
+            self.schedule_commit_files(entity, commit, cx);
+        }
+        self.refresh_vcs_data(cx);
         cx.notify();
     }
 
@@ -1936,7 +2002,7 @@ impl WorkspaceView {
         let project_dir = self.model.active_project_dir().to_path_buf();
         if project_dir.is_dir() && self.explorer_requested_root != project_dir {
             self.schedule_explorer_scan(project_dir, cx);
-            self.refresh_vcs_data();
+            self.refresh_vcs_data(cx);
         }
     }
 
@@ -2002,7 +2068,7 @@ impl WorkspaceView {
     fn active_pane_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
         let active = self.model.active?;
         let tab = self.tabs.iter().find(|tab| tab.id == active)?;
-        let model_tab = self.model.active_tab()?;
+        let model_tab = self.model.tab(active)?;
         match tab.panes.get(&model_tab.layout.focused)? {
             PaneContent::Terminal(terminal) => Some(terminal.read(cx).focus_handle(cx)),
             PaneContent::Editor(editor) => Some(editor.read(cx).focus_handle(cx)),
@@ -2024,7 +2090,7 @@ impl WorkspaceView {
     fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
         let active = self.model.active?;
         let tab = self.tabs.iter().find(|tab| tab.id == active)?;
-        let focused = self.model.active_tab()?.layout.focused;
+        let focused = self.model.tab(active)?.layout.focused;
         tab.panes
             .get(&focused)
             .and_then(|pane| match pane {
@@ -2042,7 +2108,7 @@ impl WorkspaceView {
     fn active_editor(&self) -> Option<&Entity<EditorView>> {
         let active = self.model.active?;
         let tab = self.tabs.iter().find(|tab| tab.id == active)?;
-        let focused = self.model.active_tab()?.layout.focused;
+        let focused = self.model.tab(active)?.layout.focused;
         tab.panes
             .get(&focused)
             .and_then(|pane| match pane {
@@ -2060,7 +2126,7 @@ impl WorkspaceView {
     fn focused_pane_content(&self) -> Option<&PaneContent> {
         let active = self.model.active?;
         let tab = self.tabs.iter().find(|tab| tab.id == active)?;
-        let focused = self.model.active_tab()?.layout.focused;
+        let focused = self.model.tab(active)?.layout.focused;
         tab.panes.get(&focused)
     }
 
@@ -2647,7 +2713,12 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn toggle_composer(&mut self, _event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_composer(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.set_composer_visible(!self.model.composer_visible, window, cx);
     }
 
@@ -4790,11 +4861,15 @@ impl gpui::Render for WorkspaceView {
             }
         };
 
-        let active_content = active
-            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
-            .map(|tab| {
-                let layout = &self.model.active_tab().expect("active tab exists").layout;
-                self.layout_element(&layout.root, &tab.panes, layout.focused, cx)
+        let active_layout = {
+            let runtime_ids: Vec<TabId> = self.tabs.iter().map(|tab| tab.id).collect();
+            paired_tab_layout(&self.model, &runtime_ids).cloned()
+        };
+        let active_content = active_layout
+            .and_then(|layout| {
+                let id = self.model.active?;
+                let tab = self.tabs.iter().find(|tab| tab.id == id)?;
+                Some(self.layout_element(&layout.root, &tab.panes, layout.focused, cx))
             })
             .unwrap_or_else(|| {
                 empty_state_message(
@@ -5268,9 +5343,7 @@ impl gpui::Render for WorkspaceView {
                             .flex_shrink_0()
                             .gap_1()
                             .px_2()
-                            .when_some(preview_controls, |area, controls| {
-                                area.child(controls)
-                            })
+                            .when_some(preview_controls, |area, controls| area.child(controls))
                             .child(
                                 ui::icon_button(
                                     "titlebar-open-workspace",
@@ -5906,18 +5979,43 @@ fn load_settings() -> (Settings, Option<PathBuf>, Option<String>) {
     }
 }
 
-fn load_vcs(
-    root: &Path,
-    workspace_auth: &WorkspaceAuthRegistry,
-) -> (Vec<ChangedFile>, Vec<CommitInfo>, Option<BranchState>) {
-    match GitRepository::open(root, workspace_auth) {
+struct VcsSnapshot {
+    root: PathBuf,
+    status: Vec<ChangedFile>,
+    history: Vec<CommitInfo>,
+    branch: Option<BranchState>,
+}
+
+/// Git status/history/branch snapshot. Must not run on the GPUI thread: `status` plus
+/// `history(100)` walk the object database and freeze the UI on large repositories.
+fn load_vcs(root: &Path, workspace_auth: &WorkspaceAuthRegistry) -> VcsSnapshot {
+    let (status, history, branch) = match GitRepository::open(root, workspace_auth) {
         Ok(repo) => (
             repo.status().unwrap_or_default(),
             repo.history(100, None).unwrap_or_default(),
             repo.branch_state().ok(),
         ),
         Err(_) => (Vec::new(), Vec::new(), None),
+    };
+    VcsSnapshot {
+        root: root.to_path_buf(),
+        status,
+        history,
+        branch,
     }
+}
+
+/// Model layout for the active tab only when a matching runtime tab still exists.
+/// Returns `None` instead of panicking if the two tab lists briefly diverge.
+fn paired_tab_layout<'a>(
+    model: &'a WorkspaceState,
+    runtime_ids: &[TabId],
+) -> Option<&'a termior_ui_kit::PaneLayout> {
+    let id = model.active?;
+    if !runtime_ids.contains(&id) {
+        return None;
+    }
+    model.tab(id).map(|tab| &tab.layout)
 }
 
 #[cfg(test)]
@@ -5945,5 +6043,28 @@ mod explorer_ui_tests {
         assert!(workspace.contains(&ExplorerContextAction::CreateFile));
         assert!(workspace.contains(&ExplorerContextAction::SearchContent));
         assert!(!workspace.contains(&ExplorerContextAction::Delete));
+    }
+
+    #[test]
+    fn paired_tab_layout_none_when_lists_diverge() {
+        let mut model = WorkspaceState::new("/workspace");
+        let id = model.new_tab(TabKind::Terminal, "terminal", false);
+
+        assert!(paired_tab_layout(&model, &[]).is_none());
+        assert!(paired_tab_layout(&model, &[id]).is_some());
+
+        model.active = Some(TabId(id.0.saturating_add(99)));
+        assert!(paired_tab_layout(&model, &[id]).is_none());
+    }
+
+    #[test]
+    fn load_vcs_returns_empty_snapshot_when_open_fails() {
+        let auth = WorkspaceAuthRegistry::new();
+        let root = PathBuf::from("/definitely-not-a-termior-git-workspace");
+        let snapshot = load_vcs(&root, &auth);
+        assert!(snapshot.status.is_empty());
+        assert!(snapshot.history.is_empty());
+        assert!(snapshot.branch.is_none());
+        assert_eq!(snapshot.root, root);
     }
 }

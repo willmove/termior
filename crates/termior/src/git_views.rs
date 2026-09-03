@@ -280,6 +280,22 @@ impl GitHistoryView {
         cx.notify();
     }
 
+    /// Replace the commit list after a background VCS refresh. Keep the current
+    /// selection when it still exists; otherwise select the newest commit.
+    pub fn set_commits(&mut self, commits: Vec<CommitInfo>, cx: &mut Context<Self>) {
+        let keep = self
+            .selected
+            .as_ref()
+            .filter(|id| commits.iter().any(|commit| &commit.id == *id))
+            .cloned();
+        if keep.is_none() {
+            self.files.clear();
+        }
+        self.selected = keep.or_else(|| commits.first().map(|commit| commit.id.clone()));
+        self.commits = commits;
+        cx.notify();
+    }
+
     fn select_commit(&mut self, commit: String, cx: &mut Context<Self>) {
         self.selected = Some(commit.clone());
         self.files.clear();

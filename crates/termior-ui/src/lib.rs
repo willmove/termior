@@ -102,14 +102,21 @@ impl WorkspaceState {
         }
     }
 
-    pub fn active_tab(&self) -> Option<&TabState> {
-        let id = self.active?;
+    pub fn tab(&self, id: TabId) -> Option<&TabState> {
         self.tabs.iter().find(|tab| tab.id == id)
+    }
+
+    pub fn tab_mut(&mut self, id: TabId) -> Option<&mut TabState> {
+        self.tabs.iter_mut().find(|tab| tab.id == id)
+    }
+
+    pub fn active_tab(&self) -> Option<&TabState> {
+        self.tab(self.active?)
     }
 
     pub fn active_tab_mut(&mut self) -> Option<&mut TabState> {
         let id = self.active?;
-        self.tabs.iter_mut().find(|tab| tab.id == id)
+        self.tab_mut(id)
     }
 
     pub fn new_tab(&mut self, kind: TabKind, title: impl Into<String>, private: bool) -> TabId {
@@ -179,11 +186,14 @@ impl WorkspaceState {
 
     pub fn close_active_pane_or_tab(&mut self) -> Result<Option<PaneId>, WorkspaceError> {
         let id = self.active.ok_or(WorkspaceError::TabNotFound(TabId(0)))?;
-        let tab = self.active_tab_mut().expect("active tab exists");
-        if tab.layout.panes().len() > 1 {
-            return Ok(Some(tab.layout.close_focused()?));
+        let index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == id)
+            .ok_or(WorkspaceError::TabNotFound(id))?;
+        if self.tabs[index].layout.panes().len() > 1 {
+            return Ok(Some(self.tabs[index].layout.close_focused()?));
         }
-        let index = self.tabs.iter().position(|tab| tab.id == id).unwrap();
         self.tabs.remove(index);
         self.active = if self.tabs.is_empty() {
             None
@@ -357,6 +367,29 @@ mod tests {
         assert_eq!(ws.tabs.len(), 1);
         ws.close_active_pane_or_tab().unwrap();
         assert!(ws.tabs.is_empty());
+    }
+
+    #[test]
+    fn close_active_with_stale_active_id_returns_error() {
+        let mut ws = WorkspaceState::new("/workspace");
+        let id = ws.new_tab(TabKind::Terminal, "terminal", false);
+        ws.active = Some(TabId(id.0.saturating_add(99)));
+        assert_eq!(
+            ws.close_active_pane_or_tab(),
+            Err(WorkspaceError::TabNotFound(TabId(id.0.saturating_add(99))))
+        );
+        assert_eq!(ws.tabs.len(), 1);
+        assert_eq!(ws.tabs[0].id, id);
+    }
+
+    #[test]
+    fn tab_lookup_is_independent_of_active() {
+        let mut ws = WorkspaceState::new("/workspace");
+        let first = ws.new_tab(TabKind::Terminal, "one", false);
+        let second = ws.new_tab(TabKind::Editor, "two", false);
+        assert_eq!(ws.active, Some(second));
+        assert_eq!(ws.tab(first).map(|tab| tab.title.as_str()), Some("one"));
+        assert!(ws.tab(TabId(999)).is_none());
     }
 
     #[test]
