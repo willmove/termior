@@ -144,8 +144,12 @@ jobs:
         shell: bash
         run: |
           # Build the run-harness binaries (nfr-run needs sysinfo; nfr-gate is pure).
+          BIN=./target/release/termior
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            BIN=./target/release/termior.exe
+          fi
           cargo build -p termior-bench --features run-harness --release --bins
-          ./target/release/nfr-run --binary ./target/release/termior --dwell-secs 6 > nfr-run-payload.json
+          ./target/release/nfr-run --binary "$BIN" --dwell-secs 6 > nfr-run-payload.json
           cat nfr-run-payload.json
           ./target/release/nfr-gate --platform ${{ matrix.platform }} \
             --payload nfr-run-payload.json \

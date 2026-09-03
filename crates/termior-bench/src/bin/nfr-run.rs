@@ -87,11 +87,21 @@ fn main() {
 
 fn run(args: &Args) -> Result<RunPayload, String> {
     if !args.binary.exists() {
+        #[cfg(windows)]
+        if args.binary.extension().is_none() {
+            let with_exe = args.binary.with_extension("exe");
+            if with_exe.exists() {
+                return run_with_binary(args, with_exe);
+            }
+        }
         return Err(format!("binary not found: {}", args.binary.display()));
     }
+    run_with_binary(args, args.binary.clone())
+}
 
+fn run_with_binary(args: &Args, binary: PathBuf) -> Result<RunPayload, String> {
     let launch = Instant::now();
-    let mut cmd = Command::new(&args.binary);
+    let mut cmd = Command::new(&binary);
     cmd.env("TERMIOR_NFR_MEASURE", "1");
     if let Some(ws) = &args.workspace {
         cmd.arg(ws);
