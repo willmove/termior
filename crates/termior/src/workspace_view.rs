@@ -692,6 +692,43 @@ impl WorkspaceView {
         .detach();
     }
 
+    /// Splits the active tab to the right, then quits. Used by CI to prove a
+    /// multi-pane layout can be created on Windows without crashing.
+    pub(crate) fn start_split_pane_smoke(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |workspace, cx| {
+            for _ in 0..20 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let ready = workspace
+                    .update_in(cx, |_, window, _| {
+                        f32::from(window.viewport_size().width) >= MIN_PANE_WIDTH * 2.0
+                    })
+                    .unwrap_or(false);
+                if ready {
+                    break;
+                }
+            }
+            let result = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.split_active(SplitDirection::Right, window, cx);
+                workspace.active_pane_count()
+            });
+            match result {
+                Ok(count) if count >= 2 => {
+                    println!("TERMIOR_SPLIT_PANE_SMOKE_OK panes={count}");
+                }
+                Ok(count) => {
+                    eprintln!("TERMIOR_SPLIT_PANE_SMOKE_FAILED: pane_count={count}");
+                }
+                Err(error) => {
+                    eprintln!("TERMIOR_SPLIT_PANE_SMOKE_FAILED: {error}");
+                }
+            }
+            let _ = cx.update(|cx| cx.quit());
+        })
+        .detach();
+    }
+
     /// Exercises the same request path as the header Preview button with an active Markdown file.
     /// Used by `scripts/markdown-preview-smoke.ps1`; normal launches never call this method.
     pub(crate) fn start_markdown_preview_smoke(

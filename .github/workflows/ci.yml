@@ -95,6 +95,8 @@ jobs:
         run: cargo check -p termior
       - name: Clippy desktop application
         run: cargo clippy -p termior --all-targets -- -D warnings
+      - name: Test desktop application
+        run: cargo test -p termior --all-targets
       - name: Build release desktop application
         run: cargo build -p termior --release
       - name: Enforce binary size and record dependency tree
@@ -115,6 +117,17 @@ jobs:
           $output | Write-Host
           if ($exitCode -ne 0 -or ($output | Out-String) -notmatch "TERMIOR_SMOKE_OK") {
             throw "Termior desktop smoke launch did not complete successfully"
+          }
+      - name: Windows split-pane smoke
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $env:TERMIOR_SPLIT_PANE_SMOKE = "1"
+          $output = & ./target/release/termior.exe 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | Write-Host
+          if ($exitCode -ne 0 -or ($output | Out-String) -notmatch "TERMIOR_SPLIT_PANE_SMOKE_OK") {
+            throw "Termior split-pane smoke did not complete successfully"
           }
       - name: NFR process-level gate (cold start / RSS / FPS)
         if: matrix.platform == 'windows' || matrix.platform == 'macos'

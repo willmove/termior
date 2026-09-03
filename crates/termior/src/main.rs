@@ -32,6 +32,7 @@ fn main() {
     let markdown_preview_smoke_test =
         std::env::var_os("TERMIOR_MARKDOWN_PREVIEW_SMOKE_TEST").is_some();
     let settings_close_smoke_test = std::env::var_os("TERMIOR_SETTINGS_CLOSE_SMOKE_TEST").is_some();
+    let split_pane_smoke_test = std::env::var_os("TERMIOR_SPLIT_PANE_SMOKE").is_some();
     let open_settings = std::env::var_os("TERMIOR_OPEN_SETTINGS").is_some();
     let nfr_measure = std::env::var_os("TERMIOR_NFR_MEASURE").is_some();
     let idle_redraw_probe_secs = std::env::var("TERMIOR_IDLE_REDRAW_PROBE")
@@ -40,6 +41,7 @@ fn main() {
     let headless = smoke_test
         || markdown_preview_smoke_test
         || settings_close_smoke_test
+        || split_pane_smoke_test
         || nfr_measure
         || idle_redraw_probe_secs.is_some();
     let root = resolve_workspace_root(headless);
@@ -66,6 +68,10 @@ fn main() {
                     if settings_close_smoke_test {
                         workspace.update(cx, |workspace, cx| {
                             workspace.start_settings_close_smoke(cx);
+                        });
+                    } else if split_pane_smoke_test {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.start_split_pane_smoke(window, cx);
                         });
                     } else if smoke_test && !markdown_preview_smoke_test {
                         schedule_smoke_exit(window);
