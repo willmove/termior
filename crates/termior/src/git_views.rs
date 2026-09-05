@@ -239,7 +239,7 @@ impl gpui::Render for GitDiffView {
                     .overflow_x_scroll()
                     .overflow_y_scroll()
                     .p_3()
-                    .font_family("monospace")
+                    .font_family(crate::monospace_font::default_family())
                     .text_sm()
                     .children(patch_lines),
             )
@@ -362,7 +362,7 @@ impl gpui::Render for GitHistoryView {
                     .py_2()
                     .child(
                         div()
-                            .font_family("monospace")
+                            .font_family(crate::monospace_font::default_family())
                             .text_color(ui::color(p.accent))
                             .child(SharedString::from(graph)),
                     )

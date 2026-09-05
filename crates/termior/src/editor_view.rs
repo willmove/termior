@@ -926,7 +926,7 @@ impl Render for EditorView {
             .size_full()
             .bg(parse_hex(&self.theme.background))
             .text_color(parse_hex(&self.theme.foreground))
-            .font_family("monospace")
+            .font_family(crate::monospace_font::default_family())
             .text_sm()
             .child(
                 canvas(

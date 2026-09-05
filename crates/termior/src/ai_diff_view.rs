@@ -221,7 +221,7 @@ impl gpui::Render for AiDiffView {
                     .overflow_x_scroll()
                     .overflow_y_scroll()
                     .p_3()
-                    .font_family("monospace")
+                    .font_family(crate::monospace_font::default_family())
                     .text_sm()
                     .children(patch_lines),
             )

@@ -195,7 +195,7 @@ fn render_block(node: &MarkdownNode, p: &ResolvedPalette) -> AnyElement {
                     .id(("markdown-code-block", node as *const MarkdownNode as usize))
                     .overflow_x_scroll()
                     .p_3()
-                    .font_family("monospace")
+                    .font_family(crate::monospace_font::default_family())
                     .text_sm()
                     .whitespace_nowrap()
                     .child(SharedString::from(code.clone())),
@@ -256,7 +256,7 @@ fn render_block(node: &MarkdownNode, p: &ResolvedPalette) -> AnyElement {
             .border_color(ui::border(p))
             .bg(ui::color(p.elevated))
             .p_3()
-            .font_family("monospace")
+            .font_family(crate::monospace_font::default_family())
             .text_xs()
             .text_color(ui::muted(p))
             .child(SharedString::from(html.clone()))
@@ -266,7 +266,7 @@ fn render_block(node: &MarkdownNode, p: &ResolvedPalette) -> AnyElement {
             .rounded_md()
             .bg(ui::color(p.elevated))
             .p_3()
-            .font_family("monospace")
+            .font_family(crate::monospace_font::default_family())
             .text_center()
             .child(SharedString::from(math.clone()))
             .into_any_element(),

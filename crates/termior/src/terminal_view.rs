@@ -719,7 +719,12 @@ impl Render for TerminalView {
         let palette = self.palette.clone();
         let cols = self.cols;
         let rows = self.rows;
-        let text_style = self.text_style.clone();
+        let mut text_style = self.text_style.clone();
+        // 配置里的 family 可能没装；GPUI 会静默回退到比例字体，导致 cell 宽与字形
+        // advance 差近一倍。解析结果按名字缓存，逐帧调用只是一次哈希查找。
+        text_style.font_family =
+            crate::monospace_font::resolve(cx.text_system().as_ref(), &text_style.font_family);
+        let text_style = text_style;
         let paint_style = text_style.clone();
         let view = cx.entity().downgrade();
         let marked_cell_width = self.cell_width;
@@ -1355,6 +1360,24 @@ fn paint_terminal(
             run_text.push_str(&cell.text);
         }
         run_next_col = col.saturating_add(cell_width);
+        // 宽字符占两列，而 force_width 只会把下一个基字形吸附到 +1 个 cell 宽，
+        // 表达不了这个跨度；就地 flush，让后面的字符从自己的真实列重新锚定。
+        if cell_width == 2 {
+            if let Some(wide_style) = run_style.take() {
+                flush_run(
+                    &mut run_text,
+                    &wide_style,
+                    run_start_col,
+                    cur_row,
+                    origin,
+                    lh,
+                    cw,
+                    text_style,
+                    window,
+                    cx,
+                );
+            }
+        }
     }
     if let Some(style) = run_style.as_ref() {
         flush_run(
@@ -1424,9 +1447,13 @@ fn flush_run(
         underline: style.underline,
         strikethrough: style.strikethrough,
     };
-    let line = window
-        .text_system()
-        .shape_line(shared, px(text_style.font_size), &[run], None);
+    // force_width 让 GPUI 把每个基字形吸附到 `i * cw`（组合符号仍跟随基字形），
+    // 这是终端网格该走的路径 —— 否则 fallback 字体里的字形（CJK、Nerd Font 图标）
+    // advance 和 cell 宽不一致，会把同一段 run 里后面的字符整体推歪。
+    let line =
+        window
+            .text_system()
+            .shape_line(shared, px(text_style.font_size), &[run], Some(px(cw)));
     let line_x = origin.x + px(start_col as f32 * cw);
     let baseline_y = origin.y + lh * row as f32;
     let _ = line.paint(

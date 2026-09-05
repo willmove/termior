@@ -12,6 +12,7 @@ mod editor_view;
 mod git_views;
 mod keystroke;
 mod markdown_preview_view;
+mod monospace_font;
 mod preview_view;
 mod settings_view;
 mod terminal_view;
@@ -48,6 +49,10 @@ fn main() {
     application()
         .with_assets(termior_ui_kit::IconAssets)
         .run(move |cx: &mut App| {
+            // 必须在建窗前解析：GPUI 找不到 family 时会静默回退到比例字体，
+            // 终端网格宽和字形 advance 就会对不上（见 monospace_font 模块注释）。
+            let text_system = cx.text_system().clone();
+            monospace_font::init_default(&text_system);
             let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
             cx.open_window(
                 app_identity::main_window_options(WindowBounds::Windowed(bounds)),
