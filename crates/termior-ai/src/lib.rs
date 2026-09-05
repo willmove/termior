@@ -28,6 +28,7 @@ pub mod inline_completion;
 #[cfg(feature = "keyring-backend")]
 pub mod keyring_store;
 pub mod message;
+pub mod mode;
 pub mod model_registry;
 pub mod plan;
 pub mod provider;
@@ -51,6 +52,7 @@ pub use inline_completion::{
 #[cfg(feature = "keyring-backend")]
 pub use keyring_store::KeyringSecretStore;
 pub use message::{ChatEvent, Message, Role, ToolCall, ToolResult};
+pub use mode::Mode;
 pub use model_registry::{ModelRegistry, ProviderKind};
 pub use plan::{
     run_subagent, AgentDefinition, AgentDefinitionStore, Plan, PlanError, PlanStep, PlanStepKind,

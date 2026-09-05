@@ -1,7 +1,7 @@
 use crate::{
     ai_diff_view::{AiDiffAction, AiDiffView},
     app_identity,
-    composer_view::{ComposerView, EditReviewRequested},
+    composer_view::{ComposerCollapse, ComposerDockToggle, ComposerView, EditReviewRequested},
     editor_view::EditorView,
     git_views::{GitDiffAction, GitDiffView, GitHistoryAction, GitHistoryView},
     markdown_preview_view::MarkdownPreviewView,
@@ -52,7 +52,11 @@ use termior_terminal_core::osc::AgentState;
 use termior_theme::{
     active_theme_id, resolve_active_palette, Appearance, ResolvedPalette, Theme, ThemeLibrary,
 };
-use termior_ui::{SidebarPanel, TabId, TabKind, WorkspaceState};
+use termior_ui::{
+    ComposerDock, SidebarPanel, TabId, TabKind, WorkspaceState, DEFAULT_COMPOSER_DOCK_WIDTH,
+    DEFAULT_COMPOSER_HEIGHT, MAX_COMPOSER_DOCK_WIDTH, MAX_COMPOSER_HEIGHT, MIN_COMPOSER_DOCK_WIDTH,
+    MIN_COMPOSER_HEIGHT,
+};
 use termior_ui_kit::{
     empty_hint, empty_state_message, icon, menu_panel, menu_separator, text as ui_text,
     titlebar::{draws_own_window_controls, window_controls},
@@ -86,8 +90,8 @@ const WORKSPACE_HEADER_HEIGHT: f32 = tokens::height::TITLE_BAR;
 /// 标题栏拖拽区的最小宽度。标签页再多也要留下能抓住窗口的地方。
 const TITLE_BAR_DRAG_MIN_WIDTH: f32 = 48.0;
 const STATUS_BAR_HEIGHT: f32 = 24.0;
-/// 有消息后 Composer 可增长到的上限（分栏尺寸预留与 Composer 自身 max 对齐）。
-const COMPOSER_MAX_HEIGHT: f32 = 280.0;
+/// Composer 拖拽手柄厚度，与 pane 分隔条一致。
+const COMPOSER_RESIZE_HANDLE_SIZE: f32 = 5.0;
 /// 多 pane 时非活动 pane 的不透明度——压暗可辨，终端文本仍可读。
 const INACTIVE_PANE_OPACITY: f32 = 0.78;
 const PANE_DIVIDER_SIZE: f32 = 5.0;
@@ -293,6 +297,8 @@ pub struct WorkspaceView {
     new_tab_menu: Option<Point<Pixels>>,
     pane_context_menu: Option<PaneContextMenu>,
     sidebar_resizing: bool,
+    /// Composer 面板拖拽调整尺寸进行中（方向取决于当前停靠位置）。
+    composer_resizing: bool,
     pane_resizing: Option<PaneResizeState>,
     content_matches: Vec<ContentMatch>,
     content_search_generation: u64,
@@ -363,6 +369,12 @@ impl WorkspaceView {
         model.sidebar_width = model
             .sidebar_width
             .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+        model.composer_height = model
+            .composer_height
+            .clamp(MIN_COMPOSER_HEIGHT, MAX_COMPOSER_HEIGHT);
+        model.composer_dock_width = model
+            .composer_dock_width
+            .clamp(MIN_COMPOSER_DOCK_WIDTH, MAX_COMPOSER_DOCK_WIDTH);
         // A restored model needs runtime view owners; terminal/preview are restored asynchronously.
         // Editor and Markdown tabs for the same file deliberately share one live buffer entity.
         let mut restored_editors = HashMap::<PathBuf, Entity<EditorView>>::new();
@@ -474,6 +486,11 @@ impl WorkspaceView {
                 cx,
             );
         });
+        // 恢复持久化的停靠位置与面板高度。
+        let (composer_dock, composer_height) = (model.composer_dock, model.composer_height);
+        composer.update(cx, |composer, cx| {
+            composer.set_layout(composer_dock, composer_height, cx);
+        });
         cx.subscribe(
             &composer,
             |workspace, _composer, status: &AgentStatus, cx| {
@@ -492,6 +509,23 @@ impl WorkspaceView {
             &composer,
             |workspace, _composer, request: &EditReviewRequested, cx| {
                 workspace.open_ai_diff(request.0.clone(), cx);
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &composer,
+            |workspace, _composer, _: &ComposerDockToggle, cx| {
+                workspace.toggle_composer_dock(cx);
+            },
+        )
+        .detach();
+        // 面板头「收起」按钮：与 Ctrl+I / 状态栏箭头同一入口。new() 里拿不到
+        // window，焦点归还交给 Ctrl+I / 状态栏路径，这里只做可见性切换。
+        cx.subscribe(
+            &composer,
+            |workspace, _composer, _: &ComposerCollapse, cx| {
+                workspace.model.composer_visible = false;
+                cx.notify();
             },
         )
         .detach();
@@ -536,6 +570,7 @@ impl WorkspaceView {
             new_tab_menu: None,
             pane_context_menu: None,
             sidebar_resizing: false,
+            composer_resizing: false,
             pane_resizing: None,
             content_matches: Vec::new(),
             content_search_generation: 0,
@@ -1772,14 +1807,23 @@ impl WorkspaceView {
         } else {
             0.0
         };
-        // 分栏可用性按 Composer 上限预留，略偏保守，避免内容增长后分栏过窄。
-        let composer_height = if self.model.composer_visible {
-            COMPOSER_MAX_HEIGHT
+        // Composer 按当前停靠位置的实际尺寸（含手柄）预留；拖动时随高度/宽度实时收缩。
+        let (composer_width, composer_height) = if self.model.composer_visible {
+            match self.model.composer_dock {
+                ComposerDock::Bottom => (
+                    0.0,
+                    self.model.composer_height + COMPOSER_RESIZE_HANDLE_SIZE,
+                ),
+                ComposerDock::Right => (
+                    self.model.composer_dock_width + COMPOSER_RESIZE_HANDLE_SIZE,
+                    0.0,
+                ),
+            }
         } else {
-            0.0
+            (0.0, 0.0)
         };
         (
-            (f32::from(viewport.width) - sidebar_width).max(0.0),
+            (f32::from(viewport.width) - sidebar_width - composer_width).max(0.0),
             (f32::from(viewport.height)
                 - WORKSPACE_HEADER_HEIGHT
                 - STATUS_BAR_HEIGHT
@@ -2772,6 +2816,42 @@ impl WorkspaceView {
         self.set_composer_visible(!self.model.composer_visible, window, cx);
     }
 
+    /// 底部/右侧停靠切换（Composer 面板内按钮触发）。切换后同步面板渲染并立即持久化。
+    fn toggle_composer_dock(&mut self, cx: &mut Context<Self>) {
+        self.model.composer_dock = self.model.composer_dock.toggled();
+        self.sync_composer_layout(cx);
+        self.persist_workspace();
+    }
+
+    /// 把停靠位置与底部停靠高度同步进 Composer 自身，驱动其根容器尺寸。
+    fn sync_composer_layout(&mut self, cx: &mut Context<Self>) {
+        let (dock, height) = (self.model.composer_dock, self.model.composer_height);
+        self.composer.update(cx, |composer, cx| {
+            composer.set_layout(dock, height, cx);
+        });
+        cx.notify();
+    }
+
+    fn start_composer_resize(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer_resizing = true;
+        self.explorer_context_menu = None;
+        // 双击手柄恢复默认尺寸，与 sidebar 手柄行为一致。
+        if event.click_count >= 2 {
+            match self.model.composer_dock {
+                ComposerDock::Bottom => self.model.composer_height = DEFAULT_COMPOSER_HEIGHT,
+                ComposerDock::Right => self.model.composer_dock_width = DEFAULT_COMPOSER_DOCK_WIDTH,
+            }
+            self.sync_composer_layout(cx);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn start_sidebar_resize(
         &mut self,
         event: &MouseDownEvent,
@@ -2787,16 +2867,39 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn resize_sidebar(
+    fn resize_panels(
         &mut self,
         event: &MouseMoveEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.sidebar_resizing {
             self.model.sidebar_width =
                 f32::from(event.position.x).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
             cx.notify();
+        }
+        if self.composer_resizing {
+            let viewport = window.viewport_size();
+            match self.model.composer_dock {
+                ComposerDock::Bottom => {
+                    // 光标落在手柄顶缘：面板总占用 = 手柄 + composer_height，
+                    // 两者都要计入，否则面板底边会超出光标一个手柄厚度。
+                    let height = f32::from(viewport.height)
+                        - STATUS_BAR_HEIGHT
+                        - COMPOSER_RESIZE_HANDLE_SIZE
+                        - f32::from(event.position.y);
+                    self.model.composer_height =
+                        height.clamp(MIN_COMPOSER_HEIGHT, MAX_COMPOSER_HEIGHT);
+                }
+                ComposerDock::Right => {
+                    let width = f32::from(viewport.width)
+                        - COMPOSER_RESIZE_HANDLE_SIZE
+                        - f32::from(event.position.x);
+                    self.model.composer_dock_width =
+                        width.clamp(MIN_COMPOSER_DOCK_WIDTH, MAX_COMPOSER_DOCK_WIDTH);
+                }
+            }
+            self.sync_composer_layout(cx);
         }
         if let Some(resize) = self.pane_resizing.clone() {
             let delta = match resize.direction {
@@ -2838,14 +2941,15 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn stop_sidebar_resize(
+    fn stop_panel_resizes(
         &mut self,
         _event: &MouseUpEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.sidebar_resizing || self.pane_resizing.is_some() {
+        if self.sidebar_resizing || self.composer_resizing || self.pane_resizing.is_some() {
             self.sidebar_resizing = false;
+            self.composer_resizing = false;
             self.pane_resizing = None;
             self.persist_workspace();
             cx.notify();
@@ -5304,6 +5408,65 @@ impl gpui::Render for WorkspaceView {
         });
         let input_focus = self.focus_handle.clone();
         let input_entity = cx.entity();
+        // Composer 停靠区：右侧停靠挂在内容行末尾，底部停靠排在内容行之下；
+        // 分隔线由拖拽手柄承担，手柄双击恢复默认尺寸。
+        let composer_section_right = (self.model.composer_visible
+            && self.model.composer_dock == ComposerDock::Right)
+            .then(|| {
+                let wash = ui::hover_wash(&p);
+                div()
+                    .flex()
+                    .flex_row()
+                    .h_full()
+                    .flex_shrink_0()
+                    .child(
+                        div()
+                            .id("composer-resize-handle")
+                            .w(px(COMPOSER_RESIZE_HANDLE_SIZE))
+                            .h_full()
+                            .flex_shrink_0()
+                            .border_l_1()
+                            .border_color(ui::border(&p))
+                            .cursor(CursorStyle::ResizeColumn)
+                            .hover(move |style| style.bg(wash))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::start_composer_resize),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(px(self.model.composer_dock_width))
+                            .h_full()
+                            .flex_shrink_0()
+                            .child(self.composer.clone()),
+                    )
+            });
+        let composer_section_bottom = (self.model.composer_visible
+            && self.model.composer_dock == ComposerDock::Bottom)
+            .then(|| {
+                let wash = ui::hover_wash(&p);
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .child(
+                        div()
+                            .id("composer-resize-handle")
+                            .w_full()
+                            .h(px(COMPOSER_RESIZE_HANDLE_SIZE))
+                            .flex_shrink_0()
+                            .border_t_1()
+                            .border_color(ui::border(&p))
+                            .cursor(CursorStyle::ResizeRow)
+                            .hover(move |style| style.bg(wash))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::start_composer_resize),
+                            ),
+                    )
+                    .child(self.composer.clone())
+            });
         div()
             .id("workspace-root")
             .relative()
@@ -5312,8 +5475,8 @@ impl gpui::Render for WorkspaceView {
                 this.open_workspace(window, cx);
             }))
             .on_key_down(cx.listener(Self::global_key))
-            .on_mouse_move(cx.listener(Self::resize_sidebar))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::stop_sidebar_resize))
+            .on_mouse_move(cx.listener(Self::resize_panels))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::stop_panel_resizes))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event, _window, cx| {
@@ -5468,11 +5631,16 @@ impl gpui::Render for WorkspaceView {
                     .min_h(px(0.0))
                     .w_full()
                     .child(sidebar)
-                    .child(div().flex_1().size_full().child(active_content)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .size_full()
+                            .child(active_content),
+                    )
+                    .children(composer_section_right),
             )
-            .when(self.model.composer_visible, |root| {
-                root.child(self.composer.clone())
-            })
+            .children(composer_section_bottom)
             .child(
                 div()
                     .flex()
@@ -5569,6 +5737,22 @@ impl gpui::Render for WorkspaceView {
                                             workspace.create_preview_url(url.clone(), window, cx)
                                         }),
                                     ),
+                                )
+                            })
+                            .child({
+                                // 停靠位置切换的第二入口（主入口在 Agent 面板头），图标指向将要停靠的一侧。
+                                let dock = self.model.composer_dock;
+                                ui::icon_button(
+                                    "composer-dock-status",
+                                    dock.toggle_icon(),
+                                    dock.toggle_label(),
+                                    &p,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|workspace, _event, _window, cx| {
+                                        workspace.toggle_composer_dock(cx);
+                                    }),
                                 )
                             })
                             .child({

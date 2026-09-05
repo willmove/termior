@@ -160,7 +160,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 
 ### 6.1 工作区与窗口布局（FR-WS）
 
-**概述**：单窗口应用，主区域为 tab + 分栏，左侧 sidebar（活动栏 + 可折叠面板），底部状态栏，顶部 header，底部停靠 AI Composer；设置为独立窗口。
+**概述**：单窗口应用，主区域为 tab + 分栏，左侧 sidebar（活动栏 + 可折叠面板），底部状态栏，顶部 header，AI Composer 默认停靠底部、可切换为右侧停靠，面板高/宽可拖拽调整并随工作区持久化；设置为独立窗口。
 
 | ID | 需求 | 优先级 |
 |---|---|---|
@@ -293,7 +293,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 
 | ID | 需求 | 优先级 |
 |---|---|---|
-| FR-AGENT-01 | Composer 停靠输入栏，`Cmd+I` 开关；应用根部常驻挂载，与选区附加、浏览器附加等入口共享状态 | P0 |
+| FR-AGENT-01 | Composer 停靠输入栏，`Cmd+I` 开关；应用根部常驻挂载，与选区附加、浏览器附加等入口共享状态；停靠位置支持底部/右侧切换，面板尺寸可拖拽调整（双击手柄复位）并随工作区持久化；会话消息完整多行渲染、可滚动回看（渲染最近 50 条），贴底时自动跟随新输出 | P0 |
 | FR-AGENT-02 | 三类附件：图片（粘贴/拖拽/选择）、文本文件（提交时包成 `<file path="...">` 块）、选区（`<selection source="terminal|editor">` 块）；选区与文件以 chip 呈现，不注入输入框文本 | P0 |
 | FR-AGENT-03 | `@path` 文件引用：输入 `@` 后对工作区 nucleo 模糊匹配插入 chip，提交时读取内容，**经 secret deny-list 过滤** | P0 |
 | FR-AGENT-04 | `#handle` 片段：可复用提示词片段库（`Termior-ai-snippets.json`） | P1 |
@@ -303,6 +303,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | FR-AGENT-08 | Agent 循环：流式响应、工具调用、步数上限（`MAX_AGENT_STEPS`）、系统提示词可配置；支持派生子代理（6.11） | P0 |
 | FR-AGENT-09 | 工具分两级 — 自动执行（只读）：`read_file`、`list_directory`、`fs_search`、`fs_grep`；审批门控：`write_file`、`create_directory`、`rename`、`delete`、`run_command`（一次性子 shell）、`shell_session_run`（持久代理 shell）、`shell_bg_spawn`（长驻后台进程） | P0 |
 | FR-AGENT-10 | 审批卡片在 Composer 内联渲染，展示精确参数；Agent 循环挂起等待接受/拒绝，接受后自动续跑 | P0 |
+| FR-AGENT-11 | 提交模式三档互斥（Composer 工具栏下拉）：`Auto`（默认，门控工具弹审批卡）/ `Plan`（先计划，确认前零写入）/ `Yolo`（门控工具含 shell 自动批准，首次启用弹一次确认）；模式随会话持久化；Yolo 仅跳过人工审批，安全护栏不变（ADR-0004） | P0 |
 
 **技术要点**：审批门实现为工具执行前的 `oneshot` channel 等待，UI 决议后 resolve；Agent 状态机（idle/busy/awaiting-approval/finished/error）作为 Entity 供通知路由与状态栏消费；工具全部经 `Termior-security` API（INV-2）。
 

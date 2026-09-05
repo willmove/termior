@@ -166,3 +166,30 @@ fn unknown_tool_rejected() {
     let err = tools().requires_approval("evil_tool").unwrap_err();
     assert!(matches!(err, termior_ai::ToolError::Unknown(_)));
 }
+
+// —— 场景 17：Yolo 模式仅跳过人工审批，护栏不变（ADR-0004）——
+// Yolo 的实现是审批门自动应答 approve，工具仍走 execute_approved 通道；
+// 该通道必须与人工批准一样被 deny-list / workspace 授权拦截。
+#[test]
+fn yolo_auto_approval_keeps_guards() {
+    use termior_ai::ToolExecutor;
+
+    let dir = tempfile::tempdir().unwrap();
+    // 与 executor.rs 单测同构：注册表授权的根就是临时工作区。
+    let registry = ToolRegistry::new(WorkspaceAuthRegistry::with_roots([dir
+        .path()
+        .display()
+        .to_string()]));
+    let executor = ToolExecutor::new(dir.path(), registry).unwrap();
+
+    // .env 写入：即使"已批准"（Yolo 语义），deny-list 仍拦截。
+    assert!(matches!(
+        executor.execute_approved("write_file", r#"{"path":".env","content":"LEAKED=1"}"#),
+        Err(termior_ai::ToolError::DenyList { .. })
+    ));
+
+    // 工作区外的路径同样被拒。
+    assert!(executor
+        .execute_approved("write_file", r#"{"path":"../outside.txt","content":"x"}"#)
+        .is_err());
+}

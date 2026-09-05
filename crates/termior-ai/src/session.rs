@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::message::Message;
+use crate::mode::Mode;
 
 /// 一个持久会话。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -19,6 +20,9 @@ pub struct Session {
     /// 创建时活动代理 id（FR-PLAN-03，P1；预留）。
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// 提交模式（FR-AGENT-11）：随会话记住，新会话回落 Auto。
+    #[serde(default)]
+    pub mode: Mode,
 }
 
 impl Session {
@@ -28,6 +32,7 @@ impl Session {
             title: "New session".into(),
             messages: vec![],
             agent_id: None,
+            mode: Mode::default(),
         }
     }
 
@@ -283,6 +288,28 @@ mod tests {
 
         let loaded = SessionStore::load(dir.path()).unwrap();
         assert_eq!(loaded, store);
+    }
+
+    #[test]
+    fn session_mode_roundtrips_and_legacy_json_defaults_to_auto() {
+        let dir = tempdir().unwrap();
+        let mut store = SessionStore::new();
+        let id = store.create("s1");
+        store.get_mut(&id).unwrap().mode = Mode::Yolo;
+        store.persist(dir.path()).unwrap();
+        assert_eq!(
+            SessionStore::load(dir.path())
+                .unwrap()
+                .get(&id)
+                .unwrap()
+                .mode,
+            Mode::Yolo
+        );
+
+        // 旧格式文件没有 mode 字段：恢复为 Auto。
+        let legacy = r#"{"sessions":[{"id":"s1","title":"t","messages":[]}],"active_id":"s1"}"#;
+        let restored: SessionStore = serde_json::from_str(legacy).unwrap();
+        assert_eq!(restored.get("s1").unwrap().mode, Mode::Auto);
     }
 
     #[test]

@@ -51,6 +51,52 @@ pub enum SidebarPanel {
     GitHistory,
 }
 
+/// Composer 的停靠位置：默认底部，可切换到右侧与终端并排。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerDock {
+    #[default]
+    Bottom,
+    Right,
+}
+
+impl ComposerDock {
+    /// 切换后的目标停靠位置。
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Bottom => Self::Right,
+            Self::Right => Self::Bottom,
+        }
+    }
+
+    /// 停靠切换按钮的图标：指向将要停靠的一侧（面板头与状态栏共用）。
+    pub fn toggle_icon(self) -> termior_ui_kit::Icon {
+        use termior_ui_kit::Icon;
+        match self {
+            Self::Bottom => Icon::PanelRight,
+            Self::Right => Icon::PanelBottom,
+        }
+    }
+
+    /// 停靠切换按钮的 tooltip 文案。
+    pub fn toggle_label(self) -> &'static str {
+        match self {
+            Self::Bottom => "Dock agent panel to the right",
+            Self::Right => "Dock agent panel to the bottom",
+        }
+    }
+}
+
+/// Composer 底部停靠时的默认高度与拖拽界限。下限须容纳面板头 + 两行输入区
+/// 并给消息区留下可见余量。
+pub const DEFAULT_COMPOSER_HEIGHT: f32 = 200.0;
+pub const MIN_COMPOSER_HEIGHT: f32 = 180.0;
+pub const MAX_COMPOSER_HEIGHT: f32 = 640.0;
+/// Composer 右侧停靠时的默认宽度与拖拽界限。
+pub const DEFAULT_COMPOSER_DOCK_WIDTH: f32 = 440.0;
+pub const MIN_COMPOSER_DOCK_WIDTH: f32 = 300.0;
+pub const MAX_COMPOSER_DOCK_WIDTH: f32 = 900.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SettingsPage {
     General,
@@ -73,6 +119,15 @@ pub struct WorkspaceState {
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
     pub composer_visible: bool,
+    /// 底部停靠时的面板高度（拖拽调整）。旧格式工作区文件无此字段，恢复时取产品默认。
+    #[serde(default = "default_composer_height")]
+    pub composer_height: f32,
+    /// Composer 停靠位置；旧格式文件按默认底部恢复。
+    #[serde(default)]
+    pub composer_dock: ComposerDock,
+    /// 右侧停靠时的面板宽度（拖拽调整）。
+    #[serde(default = "default_composer_dock_width")]
+    pub composer_dock_width: f32,
     pub localhost_preview: Option<String>,
     pub ai_tools_running: usize,
     next_tab_id: u64,
@@ -96,6 +151,9 @@ impl WorkspaceState {
             sidebar_panel: SidebarPanel::Explorer,
             sidebar_width: default_sidebar_width(),
             composer_visible: true,
+            composer_height: DEFAULT_COMPOSER_HEIGHT,
+            composer_dock: ComposerDock::Bottom,
+            composer_dock_width: DEFAULT_COMPOSER_DOCK_WIDTH,
             localhost_preview: None,
             ai_tools_running: 0,
             next_tab_id: 1,
@@ -306,6 +364,14 @@ fn default_sidebar_width() -> f32 {
     280.0
 }
 
+fn default_composer_height() -> f32 {
+    DEFAULT_COMPOSER_HEIGHT
+}
+
+fn default_composer_dock_width() -> f32 {
+    DEFAULT_COMPOSER_DOCK_WIDTH
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +512,38 @@ mod tests {
         let restored: WorkspaceState = serde_json::from_value(value).unwrap();
 
         assert_eq!(restored.sidebar_width, 280.0);
+    }
+
+    #[test]
+    fn legacy_workspace_json_restores_composer_layout_defaults() {
+        let mut ws = WorkspaceState::new("/workspace");
+        ws.new_tab(TabKind::Terminal, "terminal", false);
+        let mut value = serde_json::to_value(&ws).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("composer_height");
+        object.remove("composer_dock");
+        object.remove("composer_dock_width");
+
+        let restored: WorkspaceState = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.composer_height, DEFAULT_COMPOSER_HEIGHT);
+        assert_eq!(restored.composer_dock, ComposerDock::Bottom);
+        assert_eq!(restored.composer_dock_width, DEFAULT_COMPOSER_DOCK_WIDTH);
+    }
+
+    #[test]
+    fn composer_dock_layout_roundtrips_through_json() {
+        let mut ws = WorkspaceState::new("/workspace");
+        ws.composer_dock = ComposerDock::Right;
+        ws.composer_height = 442.0;
+        ws.composer_dock_width = 512.0;
+
+        let restored: WorkspaceState =
+            serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+
+        assert_eq!(restored.composer_dock, ComposerDock::Right);
+        assert_eq!(restored.composer_height, 442.0);
+        assert_eq!(restored.composer_dock_width, 512.0);
     }
 
     #[test]

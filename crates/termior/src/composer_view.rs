@@ -1,8 +1,8 @@
 use futures::StreamExt;
 use gpui::{
     canvas, div, prelude::*, px, App, Bounds, ClipboardEntry, ClipboardItem, Context, EventEmitter,
-    FocusHandle, Focusable, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point,
-    SharedString, UTF16Selection, WeakEntity, Window,
+    FocusHandle, Focusable, FontWeight, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent,
+    Pixels, Point, ScrollHandle, SharedString, UTF16Selection, WeakEntity, Window,
 };
 use std::{
     collections::HashMap,
@@ -13,13 +13,15 @@ use std::{
 use termior_ai::{
     Agent, AgentDefinition, AgentDefinitionStore, AgentOutcome, ApprovalDecision, ApprovalRequest,
     AttachmentSource, ComposerDraft, EditProposalSummary, HttpProvider, KeyringSecretStore,
-    Message, ProjectMemory, ProviderConfig, Role, SecretStore, SessionStore, SnippetStore,
+    Message, Mode, ProjectMemory, ProviderConfig, Role, SecretStore, SessionStore, SnippetStore,
     TerminalContext, TerminalContextProvider, ToolExecutor, ToolRegistry,
 };
 use termior_explorer_core::fuzzy::fuzzy_match;
 use termior_platform::AgentStatus;
 use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_store::{DataFiles, Settings};
+use termior_ui::{ComposerDock, MAX_COMPOSER_HEIGHT, MIN_COMPOSER_HEIGHT};
+use termior_ui_kit::{menu_panel, tokens::icon_size, Icon, Tooltip};
 
 #[derive(Clone)]
 struct AgentRuntime {
@@ -42,6 +44,14 @@ struct PendingEdit {
 #[derive(Debug, Clone)]
 pub struct EditReviewRequested(pub EditProposalSummary);
 
+/// 面板头图标按钮：请求在底部/右侧停靠间切换。
+#[derive(Debug, Clone)]
+pub struct ComposerDockToggle;
+
+/// 面板头「收起」按钮请求隐藏 Composer（等价 `Ctrl+I`）。
+#[derive(Debug, Clone)]
+pub struct ComposerCollapse;
+
 struct LiveTerminalContext {
     snapshot: Mutex<TerminalContext>,
 }
@@ -58,7 +68,12 @@ pub struct ComposerView {
     marked_text: String,
     focus_handle: FocusHandle,
     history: Vec<Message>,
-    plan_mode: bool,
+    /// 提交模式（Auto/Plan/Yolo）；随会话持久化，见 FR-AGENT-11。
+    mode: Mode,
+    /// 本次应用运行内是否已确认过 Yolo 提示；确认一次后不再打扰。
+    yolo_confirmed: bool,
+    /// 模式下拉菜单是否展开。
+    mode_menu_open: bool,
     plan_confirmed: bool,
     awaiting_plan_confirmation: bool,
     busy: bool,
@@ -78,7 +93,25 @@ pub struct ComposerView {
     workspace_paths: Vec<String>,
     path_suggestions: Vec<String>,
     selected_path_suggestion: usize,
+    /// 停靠位置与底部停靠高度，由 WorkspaceView 在恢复/拖拽/切换后同步。
+    dock: ComposerDock,
+    panel_height: f32,
+    /// 会话消息区的滚动容器；贴底时跟随新输出自动下滚。
+    scroll_handle: ScrollHandle,
 }
+
+/// 消息区最多渲染的最近消息条数，超出部分丢弃以约束流式期间的重排成本。
+const COMPOSER_RENDERED_MESSAGES: usize = 50;
+/// 面板头高度。
+const COMPOSER_HEADER_HEIGHT: f32 = 28.0;
+/// compact（空对话、底部停靠）时的最小面板高度：面板头 + 两行输入区 + 状态行。
+const COMPOSER_COMPACT_HEIGHT: f32 = 124.0;
+/// 模式下拉距面板左缘的偏移。
+const MODE_MENU_LEFT: f32 = 12.0;
+/// 模式下拉距面板底缘的偏移：约等于工具栏行高，让菜单贴着工具栏上沿。
+const MODE_MENU_BOTTOM: f32 = 68.0;
+/// 状态行显示时菜单再抬高一个状态行高度。
+const STATUS_ROW_HEIGHT: f32 = 24.0;
 
 impl ComposerView {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -88,7 +121,9 @@ impl ComposerView {
             marked_text: String::new(),
             focus_handle: cx.focus_handle(),
             history: Vec::new(),
-            plan_mode: false,
+            mode: Mode::Auto,
+            yolo_confirmed: false,
+            mode_menu_open: false,
             plan_confirmed: false,
             awaiting_plan_confirmation: false,
             busy: false,
@@ -114,6 +149,9 @@ impl ComposerView {
             workspace_paths: Vec::new(),
             path_suggestions: Vec::new(),
             selected_path_suggestion: 0,
+            dock: ComposerDock::Bottom,
+            panel_height: termior_ui::DEFAULT_COMPOSER_HEIGHT,
+            scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -151,7 +189,11 @@ impl ComposerView {
             .active_id
             .as_deref()
             .and_then(|id| self.sessions.get(id))
-            .map(|session| session.messages.clone())
+            .map(|session| {
+                // 模式随会话记住（FR-AGENT-11）。
+                self.mode = session.mode;
+                session.messages.clone()
+            })
             .unwrap_or_default();
 
         let profile = settings
@@ -373,22 +415,11 @@ impl ComposerView {
         Ok(self.status.clone())
     }
 
-    fn pick_attachment(&mut self, image_only: bool, cx: &mut Context<Self>) {
-        let mut dialog = rfd::AsyncFileDialog::new().set_title(if image_only {
-            "Attach an image to Composer"
-        } else {
-            "Attach a file to Composer"
-        });
+    /// 单一附件入口：一个无过滤对话框，按扩展名自动判型（图片 / 文本文件）。
+    fn pick_attachment(&mut self, cx: &mut Context<Self>) {
+        let mut dialog = rfd::AsyncFileDialog::new().set_title("Attach to Composer");
         if self.workspace_root.is_dir() {
             dialog = dialog.set_directory(&self.workspace_root);
-        }
-        if image_only {
-            dialog = dialog.add_filter(
-                "Images",
-                &[
-                    "png", "jpg", "jpeg", "webp", "gif", "svg", "bmp", "tif", "tiff",
-                ],
-            );
         }
         // Never run a blocking file dialog inside a GPUI event handler: on
         // Windows its modal message loop re-enters the foreground executor
@@ -399,10 +430,9 @@ impl ComposerView {
             };
             let path = handle.path().to_path_buf();
             let _ = view.update(cx, |view, cx| {
-                if image_only {
-                    match std::fs::read(&path) {
+                match image_mime(&path) {
+                    Some(mime) => match std::fs::read(&path) {
                         Ok(bytes) => {
-                            let mime = image_mime(&path);
                             let name = path
                                 .file_name()
                                 .and_then(|name| name.to_str())
@@ -412,10 +442,11 @@ impl ComposerView {
                             view.status = "Image attached".into();
                         }
                         Err(error) => view.status = format!("Could not attach image: {error}"),
+                    },
+                    None => {
+                        view.draft.attach_file(path);
+                        view.status = "File attached".into();
                     }
-                } else {
-                    view.draft.attach_file(path);
-                    view.status = "File attached".into();
                 }
                 cx.notify();
             });
@@ -569,7 +600,7 @@ impl ComposerView {
         self.persist_session();
 
         let history = self.history.clone();
-        let plan_request = self.plan_mode && !self.plan_confirmed;
+        let plan_request = self.mode == Mode::Plan && !self.plan_confirmed;
         cx.spawn(async move |view, cx| {
             // 增量事件 channel：run_agent 在后台线程逐条推 ChatEvent，主线程边收边渲染。
             let (event_tx, mut event_rx) =
@@ -613,11 +644,19 @@ impl ComposerView {
             Ok(outcome) => {
                 self.history = outcome.messages.clone();
                 if let Some(request) = outcome.pending_approval {
-                    self.status = format!("Approval required: {}", request.summary);
+                    let summary = request.summary.clone();
                     self.pending_approval = Some(PendingApproval {
                         request,
                         history: outcome.messages,
                     });
+                    if self.mode == Mode::Yolo {
+                        // ADR-0004：在审批门自动应答 approve，工具仍走 approved
+                        // 通道，安全护栏全部照常生效。
+                        self.status = format!("Yolo auto-approved: {summary}");
+                        self.approve_tool(cx);
+                        return;
+                    }
+                    self.status = format!("Approval required: {summary}");
                     cx.emit(AgentStatus::Attention);
                 } else {
                     self.status = "Agent finished".into();
@@ -757,6 +796,7 @@ impl ComposerView {
         if let Some(id) = self.sessions.active_id.clone() {
             if let Some(session) = self.sessions.get_mut(&id) {
                 session.messages = self.history.clone();
+                session.mode = self.mode;
                 if session.title == "New session" {
                     if let Some(first) = self
                         .history
@@ -776,15 +816,49 @@ impl ComposerView {
         }
     }
 
-    fn toggle_plan(
-        &mut self,
-        _event: &MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.plan_mode = !self.plan_mode;
+    /// 切换提交模式。Plan/挂起审批期间不允许切换，避免计划流状态错乱。
+    /// 首次切到 Yolo 弹一次确认（本次应用运行内不再重复）。
+    fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if self.busy || self.pending_approval.is_some() || self.pending_edit.is_some() {
+            return;
+        }
+        if mode == Mode::Yolo && !self.yolo_confirmed {
+            let entity = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                let confirmed = rfd::AsyncMessageDialog::new()
+                    .set_title("Enable Yolo mode")
+                    .set_description(
+                        "Gated tools (file writes, commands, background shells) will run \
+                         without asking for approval. Security guards (workspace bounds, \
+                         secret deny-list) stay active. Enable Yolo mode?",
+                    )
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    .await;
+                if confirmed == rfd::MessageDialogResult::Yes {
+                    let _ = entity.update(cx, |view, cx| {
+                        view.yolo_confirmed = true;
+                        view.apply_mode(Mode::Yolo, cx);
+                    });
+                }
+            })
+            .detach();
+            return;
+        }
+        self.apply_mode(mode, cx);
+    }
+
+    fn apply_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        self.mode = mode;
+        self.mode_menu_open = false;
         self.plan_confirmed = false;
         self.awaiting_plan_confirmation = false;
+        self.status = match mode {
+            Mode::Auto => "Mode: Auto · gated tools ask for approval".into(),
+            Mode::Plan => "Mode: Plan · zero writes until the plan is confirmed".into(),
+            Mode::Yolo => "Mode: Yolo · gated tools run without asking".into(),
+        };
+        self.persist_session();
         cx.notify();
     }
 
@@ -863,6 +937,7 @@ impl ComposerView {
             }
         }
         match event.keystroke.key.as_str() {
+            "escape" if self.mode_menu_open => self.mode_menu_open = false,
             "enter" | "return" if !event.keystroke.modifiers.shift => self.submit(cx),
             "backspace" if self.cursor > 0 => {
                 let start = char_to_byte(&self.draft.input, self.cursor - 1);
@@ -892,16 +967,28 @@ impl ComposerView {
         input
     }
 
-    /// 空对话且无审批/附件时收缩到输入行高度。
+    /// 底部停靠且空对话、无审批/附件时收缩到输入行高度；右侧停靠恒为整栏高度。
     pub fn is_compact(&self) -> bool {
-        self.history
-            .iter()
-            .all(|message| !matches!(message.role, Role::User | Role::Assistant))
+        self.dock == ComposerDock::Bottom
+            && self
+                .history
+                .iter()
+                .all(|message| !matches!(message.role, Role::User | Role::Assistant))
             && self.pending_approval.is_none()
             && self.pending_edit.is_none()
             && !self.awaiting_plan_confirmation
             && self.draft.attachments.is_empty()
             && self.path_suggestions.is_empty()
+    }
+
+    /// 工作区在恢复、拖拽或停靠切换后同步布局参数。
+    pub fn set_layout(&mut self, dock: ComposerDock, panel_height: f32, cx: &mut Context<Self>) {
+        let panel_height = panel_height.clamp(MIN_COMPOSER_HEIGHT, MAX_COMPOSER_HEIGHT);
+        if self.dock != dock || self.panel_height != panel_height {
+            self.dock = dock;
+            self.panel_height = panel_height;
+            cx.notify();
+        }
     }
 
     fn model_setup_placeholder(&self) -> Option<&str> {
@@ -919,6 +1006,8 @@ impl ComposerView {
 
 impl EventEmitter<AgentStatus> for ComposerView {}
 impl EventEmitter<EditReviewRequested> for ComposerView {}
+impl EventEmitter<ComposerDockToggle> for ComposerView {}
+impl EventEmitter<ComposerCollapse> for ComposerView {}
 
 async fn run_agent(
     runtime: AgentRuntime,
@@ -1015,7 +1104,7 @@ impl gpui::Render for ComposerView {
         let handler = ComposerInputHandler {
             view: cx.entity().downgrade(),
         };
-        let agent_label = format!("Agent: {}", self.active_agent_name());
+        let agent_name = self.active_agent_name().to_owned();
         let compact = self.is_compact();
         let placeholder = self.model_setup_placeholder();
         let show_status_row = placeholder.is_none() && !self.status.is_empty();
@@ -1028,25 +1117,40 @@ impl gpui::Render for ComposerView {
         } else {
             self.display_input()
         };
+        // 贴底时跟随新内容下滚；用户向上翻阅（离开底部）后不再强制滚动。
+        // offset/max 读取的是上一帧布局的值——判定略滞后一帧，对本场景足够。
+        let scroll_offset = self.scroll_handle.offset().y;
+        let scroll_max = self.scroll_handle.max_offset().y;
+        if scroll_max + scroll_offset <= px(8.0) {
+            self.scroll_handle.scroll_to_bottom();
+        }
         let messages = self
             .history
             .iter()
             .filter(|message| matches!(message.role, Role::User | Role::Assistant))
             .rev()
-            .take(5)
+            .take(COMPOSER_RENDERED_MESSAGES)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .map(|message| {
-                let role = if message.role == Role::User {
-                    "You"
+                let is_user = message.role == Role::User;
+                let label = if is_user { "You" } else { "Termior" };
+                let label_color = if is_user {
+                    crate::ui::muted(&p)
                 } else {
-                    "Termior"
+                    crate::ui::color(p.accent)
                 };
-                let text = message.content.lines().next().unwrap_or_default();
                 div()
-                    .text_xs()
-                    .child(SharedString::from(format!("{role}: {text}")))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(div().text_xs().text_color(label_color).child(label))
+                    .children(message.content.lines().map(|line| {
+                        // 空行用不断行空格占位，避免塌陷成零高度。
+                        let text = if line.is_empty() { "\u{00A0}" } else { line };
+                        div().text_xs().child(SharedString::from(text))
+                    }))
             });
         let chips = self
             .draft
@@ -1319,19 +1423,138 @@ impl gpui::Render for ComposerView {
                         ),
                 )
         });
+        // 模式下拉菜单：浮在工具栏上方（面板底部附近），最后挂载以便盖住下层内容。
+        // 锚定面板底缘而非光标位置——菜单向下展开会被 overflow_hidden 裁掉。
+        // 偏移 = 工具栏行高（+ 状态行高度），行高变化时需同步这两个值。
+        let mode_menu = {
+            let selected_mode = self.mode;
+            menu_panel(&p)
+                .absolute()
+                .left(px(MODE_MENU_LEFT))
+                .bottom(px(if show_status_row {
+                    MODE_MENU_BOTTOM + STATUS_ROW_HEIGHT
+                } else {
+                    MODE_MENU_BOTTOM
+                }))
+                .min_w(px(230.0))
+                .child(div().flex().flex_col().gap(px(2.0)).children(
+                    [Mode::Auto, Mode::Plan, Mode::Yolo].map(|mode| {
+                        let selected = mode == selected_mode;
+                        let hover = crate::ui::hover_wash(&p);
+                        div()
+                            .id(SharedString::from(format!(
+                                "composer-mode-{}",
+                                mode.label().to_lowercase()
+                            )))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .when(selected, |item| item.bg(crate::ui::selected_wash(&p)))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(hover))
+                            .child(mode.label())
+                            .child(
+                                div()
+                                    .text_color(crate::ui::muted(&p))
+                                    .child(mode.description()),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.set_mode(mode, cx);
+                                }),
+                            )
+                    }),
+                ))
+        };
         div()
             .flex()
             .flex_col()
             .relative()
-            .w_full()
-            .when(compact, |root| root.min_h(px(72.0)))
-            .when(!compact, |root| root.min_h(px(120.0)).max_h(px(280.0)))
-            .border_t_1()
-            .border_color(crate::ui::border(&p))
+            .overflow_hidden()
+            .when(self.dock == ComposerDock::Right, |root| {
+                root.w_full().h_full()
+            })
+            .when(self.dock == ComposerDock::Bottom, |root| {
+                root.w_full()
+                    .when(compact, |root| root.min_h(px(COMPOSER_COMPACT_HEIGHT)))
+                    .when(!compact, |root| root.h(px(self.panel_height)))
+            })
+            // 分隔线由工作区在面板外沿绘制的拖拽手柄承担。
             .bg(crate::ui::color(p.elevated))
             .text_color(crate::ui::color(p.foreground))
             .track_focus(&focus)
             .on_key_down(cx.listener(Self::handle_key_down))
+            // 面板空白处点击收起模式下拉；chip 与菜单项各自 stop_propagation。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.mode_menu_open {
+                        this.mode_menu_open = false;
+                        cx.notify();
+                    }
+                }),
+            )
+            // 面板头：面板级动作的常驻入口（切换停靠 / 收起），取代埋在输入行里的文字按钮。
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .h(px(COMPOSER_HEADER_HEIGHT))
+                    .px_2()
+                    .flex_none()
+                    .border_b_1()
+                    .border_color(crate::ui::border(&p))
+                    .child(
+                        div()
+                            .px_1()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Agent"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                crate::ui::icon_button(
+                                    "composer-dock",
+                                    self.dock.toggle_icon(),
+                                    self.dock.toggle_label(),
+                                    &p,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, _, cx| {
+                                        cx.emit(ComposerDockToggle);
+                                    }),
+                                ),
+                            )
+                            .child(
+                                crate::ui::icon_button(
+                                    "composer-collapse",
+                                    Icon::ChevronDown,
+                                    "Hide agent panel (Ctrl+I)",
+                                    &p,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, _, cx| {
+                                        cx.emit(ComposerCollapse);
+                                    }),
+                                ),
+                            ),
+                    ),
+            )
             .child(
                 canvas(
                     |bounds, _, _| bounds,
@@ -1343,127 +1566,156 @@ impl gpui::Render for ComposerView {
                 .size_full(),
             )
             .when(!compact, |root| {
+                // 消息与审批/评审卡片同属对话流，共享滚动区：面板调矮后
+                // Approve/Reject 等操作滚动可达，而不是被固定高度裁掉。
                 root.child(
                     div()
+                        .id("composer-messages")
                         .flex()
                         .flex_col()
                         .flex_1()
                         .min_h(px(0.0))
-                        .overflow_hidden()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll_handle)
                         .px_3()
                         .pt_2()
-                        .gap_1()
-                        .children(messages),
+                        .pb_1()
+                        .gap_2()
+                        .children(messages)
+                        .children(approval)
+                        .children(edit_review)
+                        .children(plan_review),
                 )
             })
-            .children(approval)
-            .children(edit_review)
-            .children(plan_review)
             .child(div().flex().flex_row().px_3().gap_1().children(chips))
             .children(path_suggestions)
             .child(
+                // 第 1 行：输入文本独占整行宽度，右侧停靠窄面板下长提示词仍完整可见。
                 termior_ui_kit::input_field(&p, self.focus_handle.is_focused(window))
                     .flex()
                     .items_center()
-                    .gap_2()
                     .mx_3()
                     .mt_2()
-                    .mb_2()
+                    .min_w(px(0.0))
                     .child(
                         div()
                             .flex_1()
+                            .min_w(px(0.0))
                             .text_sm()
                             .when(
                                 self.draft.input.is_empty() && placeholder.is_some(),
                                 |text| text.text_color(crate::ui::muted(&p)),
                             )
                             .child(SharedString::from(input_display)),
-                    )
+                    ),
+            )
+            .child(
+                // 第 2 行：动作工具栏。图标/短 chip + 弹性空白，Send 恒在最右不被裁掉。
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .mx_3()
+                    .mt_1()
+                    .mb_2()
+                    .min_w(px(0.0))
                     .child(
+                        crate::ui::icon_button(
+                            "composer-attach",
+                            Icon::Paperclip,
+                            "Attach file or image",
+                            &p,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.pick_attachment(cx)),
+                        ),
+                    )
+                    .child({
+                        let mode_palette = p.clone();
                         div()
-                            .id("composer-attach-file")
+                            .id("composer-mode")
                             .px_2()
                             .py_1()
                             .rounded_md()
-                            .bg(crate::ui::color(p.elevated))
+                            .border_1()
+                            .border_color(crate::ui::border(&p))
+                            .bg(if self.mode_menu_open {
+                                crate::ui::selected_wash(&p)
+                            } else {
+                                crate::ui::color(p.elevated)
+                            })
+                            .text_color(if self.mode == Mode::Yolo {
+                                crate::ui::color(p.accent)
+                            } else {
+                                crate::ui::color(p.foreground)
+                            })
                             .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap(px(3.0))
+                            .flex_none()
                             .text_xs()
-                            .child("+ File")
+                            .tooltip(move |_window, cx| {
+                                Tooltip::view(
+                                    "Approval mode: Auto / Plan / Yolo",
+                                    &mode_palette,
+                                    cx,
+                                )
+                            })
+                            .child(self.mode.label())
+                            .child(crate::ui::icon(
+                                Icon::ChevronDown,
+                                icon_size::XS,
+                                crate::ui::muted(&p),
+                            ))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.pick_attachment(false, cx)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("composer-attach-image")
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(crate::ui::color(p.elevated))
-                            .cursor_pointer()
-                            .text_xs()
-                            .child("+ Image")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.pick_attachment(true, cx)),
-                            ),
-                    )
-                    .child(
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.mode_menu_open = !this.mode_menu_open;
+                                    cx.notify();
+                                }),
+                            )
+                    })
+                    .child({
+                        let agent_palette = p.clone();
                         div()
                             .id("composer-agent")
                             .px_2()
                             .py_1()
                             .rounded_md()
+                            .border_1()
+                            .border_color(crate::ui::border(&p))
                             .bg(crate::ui::color(p.elevated))
                             .cursor_pointer()
+                            .flex_none()
+                            .max_w(px(160.0))
+                            .overflow_hidden()
                             .text_xs()
-                            .child(SharedString::from(agent_label))
+                            .tooltip(move |_window, cx| {
+                                Tooltip::view("Agent — click to switch", &agent_palette, cx)
+                            })
+                            .child(SharedString::from(agent_name))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.cycle_custom_agent(cx)),
-                            ),
-                    )
+                            )
+                    })
+                    .child(div().flex_1().min_w(px(0.0)))
                     .child(
-                        div()
-                            .id("plan-mode")
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(if self.plan_mode {
-                                crate::ui::color(p.accent)
+                        crate::ui::icon_button(
+                            "composer-send",
+                            if self.busy { Icon::Loader } else { Icon::Send },
+                            if self.busy {
+                                "Agent is working…"
                             } else {
-                                crate::ui::color(p.elevated)
-                            })
-                            .text_color(if self.plan_mode {
-                                crate::ui::on_color(p.accent)
-                            } else {
-                                crate::ui::color(p.foreground)
-                            })
-                            .cursor_pointer()
-                            .text_xs()
-                            .child("Plan")
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::toggle_plan)),
-                    )
-                    .child(
-                        div()
-                            .id("send-composer")
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .bg(if self.busy {
-                                crate::ui::alpha(p.foreground, 0.25)
-                            } else {
-                                crate::ui::color(p.accent)
-                            })
-                            .text_color(if self.busy {
-                                crate::ui::color(p.foreground)
-                            } else {
-                                crate::ui::on_color(p.accent)
-                            })
-                            .cursor_pointer()
-                            .child(if self.busy { "Working…" } else { "Send" })
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::send)),
+                                "Send (Enter)"
+                            },
+                            &p,
+                        )
+                        .on_mouse_down(MouseButton::Left, cx.listener(Self::send)),
                     ),
             )
             .when(show_status_row, |root| {
@@ -1476,6 +1728,8 @@ impl gpui::Render for ComposerView {
                         .child(SharedString::from(self.status.clone())),
                 )
             })
+            // 模式下拉最后挂载：绘制顺序在输入区之后，能盖住下层内容。
+            .when(self.mode_menu_open, |root| root.child(mode_menu))
     }
 }
 
@@ -1594,20 +1848,22 @@ fn char_to_byte(text: &str, index: usize) -> usize {
         .unwrap_or(text.len())
 }
 
-fn image_mime(path: &Path) -> &'static str {
-    match path
+/// 附件单入口的判型映射：认得的扩展名返回 MIME（图片附件），`None` 走文本文件附件。
+/// svg 归图片。判型与 MIME 用同一张表，避免两份清单漂移。
+fn image_mime(path: &Path) -> Option<&'static str> {
+    let extension = path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
+        .to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         "gif" => "image/gif",
         "svg" => "image/svg+xml",
         "bmp" => "image/bmp",
         "tif" | "tiff" => "image/tiff",
-        _ => "image/png",
-    }
+        _ => return None,
+    })
 }

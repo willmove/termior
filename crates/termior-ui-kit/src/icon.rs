@@ -69,6 +69,11 @@ icon_set! {
     Terminal => "terminal",
     Inbox => "inbox",
     PanelLeft => "layout-panel-left",
+    PanelBottom => "layout-panel-bottom",
+    PanelRight => "layout-panel-right",
+    Paperclip => "paperclip",
+    Send => "send",
+    Loader => "loader-circle",
 }
 
 /// 内嵌图标的 GPUI 资源源。在 `Application::with_assets` 上安装一次即可。
