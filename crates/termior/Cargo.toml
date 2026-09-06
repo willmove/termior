@@ -73,7 +73,7 @@ combines a native terminal, editor, Git integration, live preview, \
 and a locally controlled coding agent in a single desktop application.
 """
 assets = [
-    ["../../target/release/termior", "usr/bin/", "755"],
+    ["target/release/termior", "usr/bin/", "755"],
     ["../../packaging/linux/app.termior.Termior.desktop", "usr/share/applications/", "644"],
-    ["../../assets/icons/hicolor", "usr/share/icons/hicolor/", "644"],
+    ["../../assets/icons/hicolor/*/apps/*", "usr/share/icons/hicolor/", "644"],
 ]
