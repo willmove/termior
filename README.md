@@ -88,7 +88,7 @@ npm run icons:check
 cargo run -p termior
 ```
 
-发布 tag（`v<workspace-version>`）会触发三平台 release 构建，产出 portable ZIP/TAR 与 SHA-256 校验文件。流水线按 Spec NFR-05 将单二进制限制为 60 MiB，并将压缩包限制为 100 MiB；本地可用 `scripts/check-release-binary.ps1` 和 `scripts/package-release.ps1` 复现检查与打包。
+发布 tag（`v<workspace-version>`）会触发三平台 release 构建，产出 portable ZIP/TAR 与 SHA-256 校验文件，并附带各平台安装包：Windows 为 Inno Setup 安装器 `*-setup.exe`，macOS 为拖拽安装的 `.dmg`，Linux 为 `cargo-deb` 生成的 `.deb`。流水线按 Spec NFR-05 将单二进制限制为 60 MiB，并将压缩包/安装包限制为 100 MiB；本地可用 `scripts/check-release-binary.ps1` 和 `scripts/package-release.ps1` 复现检查与打包（Windows 安装器需本机装有 Inno Setup 6）。
 
 Release 体积主要来自 GPUI 原生渲染栈、终端/VTE、按语言引入的 tree-sitter grammar，以及 TLS、钥匙串和 Provider 客户端。Web 预览统一交系统浏览器打开、不内嵌 WebView（ADR 0002），三平台依赖面一致；PNG 解码和 tree-sitter 语言均采用显式最小 feature，新增 UI、预览或语法能力时须结合 CI 的依赖树和体积报告评估增量。
 

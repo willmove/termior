@@ -16,6 +16,32 @@ $stage = Join-Path $distRoot $artifactName
 $binaryName = if ($Platform -eq "windows") { "termior.exe" } else { "termior" }
 $binary = Join-Path $repoRoot "target/release/$binaryName"
 
+function Find-Iscc {
+    $cmd = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    foreach ($candidate in @(
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        "C:\Program Files\Inno Setup 6\ISCC.exe",
+        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+    )) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    return $null
+}
+
+function Assert-SizeAndChecksum {
+    param([string]$Path, [int]$MaxMiB)
+    $info = Get-Item -LiteralPath $Path
+    $mib = $info.Length / 1MB
+    if ($mib -gt $MaxMiB) {
+        throw ("{0} is {1:N2} MiB, above the {2} MiB release limit" -f $info.Name, $mib, $MaxMiB)
+    }
+    $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    Set-Content -LiteralPath "$Path.sha256" -Value "$hash  $($info.Name)" -Encoding ascii
+    Write-Output ("Packaged {0} ({1:N2} MiB)" -f $info.FullName, $mib)
+    Write-Output $hash
+}
+
 if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
     throw "Release binary not found: $binary"
 }
@@ -46,6 +72,14 @@ switch ($Platform) {
         $archive = Join-Path $distRoot "$artifactName.zip"
         if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
         Compress-Archive -LiteralPath $stage -DestinationPath $archive -CompressionLevel Optimal
+        Assert-SizeAndChecksum -Path $archive -MaxMiB $MaxArchiveMiB
+        $iscc = Find-Iscc
+        if (-not $iscc) {
+            throw "Inno Setup 6 (ISCC.exe) not found; install it or add it to PATH (winget install JRSoftware.InnoSetup)"
+        }
+        & $iscc "/DAppVersion=$Version" (Join-Path $repoRoot "packaging/windows/termior.iss")
+        if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+        Assert-SizeAndChecksum -Path (Join-Path $distRoot "$artifactName-setup.exe") -MaxMiB $MaxArchiveMiB
     }
     "macos" {
         $app = Join-Path $stage "Termior.app"
@@ -76,6 +110,18 @@ switch ($Platform) {
         if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
         & tar -C $distRoot -czf $archive $artifactName
         if ($LASTEXITCODE -ne 0) { throw "tar failed with exit code $LASTEXITCODE" }
+        Assert-SizeAndChecksum -Path $archive -MaxMiB $MaxArchiveMiB
+        $dmgStage = Join-Path $distRoot "$artifactName-dmg"
+        if (Test-Path -LiteralPath $dmgStage) { Remove-Item -LiteralPath $dmgStage -Recurse -Force }
+        New-Item -ItemType Directory -Path $dmgStage | Out-Null
+        Copy-Item -Recurse -LiteralPath $app -Destination (Join-Path $dmgStage "Termior.app")
+        & ln -s /Applications (Join-Path $dmgStage "Applications")
+        $dmg = Join-Path $distRoot "$artifactName.dmg"
+        if (Test-Path -LiteralPath $dmg) { Remove-Item -LiteralPath $dmg -Force }
+        & hdiutil create -volname "Termior $Version" -srcfolder $dmgStage -ov -format UDZO $dmg
+        if ($LASTEXITCODE -ne 0) { throw "hdiutil failed with exit code $LASTEXITCODE" }
+        Remove-Item -LiteralPath $dmgStage -Recurse -Force
+        Assert-SizeAndChecksum -Path $dmg -MaxMiB $MaxArchiveMiB
     }
     "linux" {
         $binDir = Join-Path $stage "bin"
@@ -90,16 +136,7 @@ switch ($Platform) {
         if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
         & tar -C $distRoot -czf $archive $artifactName
         if ($LASTEXITCODE -ne 0) { throw "tar failed with exit code $LASTEXITCODE" }
+        Assert-SizeAndChecksum -Path $archive -MaxMiB $MaxArchiveMiB
     }
 }
 
-$archiveInfo = Get-Item -LiteralPath $archive
-$archiveMiB = $archiveInfo.Length / 1MB
-if ($archiveMiB -gt $MaxArchiveMiB) {
-    throw ("Archive is {0:N2} MiB, above the {1} MiB release limit" -f $archiveMiB, $MaxArchiveMiB)
-}
-$hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-$checksum = "$hash  $($archiveInfo.Name)"
-Set-Content -LiteralPath "$archive.sha256" -Value $checksum -Encoding ascii
-Write-Output ("Packaged {0} ({1:N2} MiB)" -f $archiveInfo.FullName, $archiveMiB)
-Write-Output $checksum

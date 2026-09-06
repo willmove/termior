@@ -51,7 +51,16 @@ jobs:
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libdbus-1-dev libfontconfig-dev libfreetype-dev libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev libudev-dev
+          sudo apt-get install -y libasound2-dev libdbus-1-dev libfontconfig-dev libfreetype-dev libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev libudev-dev dpkg-dev
+      - name: Ensure Inno Setup
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ISCC.exe -ErrorAction SilentlyContinue) -and `
+              -not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe") -and `
+              -not (Test-Path "C:\Program Files\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -61,12 +70,27 @@ jobs:
       - name: Package with binary and archive size gates
         shell: pwsh
         run: ./scripts/package-release.ps1 -Version ${{ steps.version.outputs.version }} -Platform ${{ matrix.platform }} -MaxBinaryMiB 60 -MaxArchiveMiB 100
+      - name: Build Linux .deb installer
+        if: matrix.platform == 'linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - name: Package .deb with checksum
+        if: matrix.platform == 'linux'
+        run: |
+          deb="dist/termior-${{ steps.version.outputs.version }}-linux-x86_64.deb"
+          cargo deb -p termior --no-build --no-strip --output "$deb"
+          hash=$(sha256sum "$deb" | cut -d' ' -f1)
+          echo "$hash  $(basename "$deb")" > "$deb.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
           path: |
             dist/*.zip
             dist/*.tar.gz
+            dist/*.exe
+            dist/*.dmg
+            dist/*.deb
             dist/*.sha256
           if-no-files-found: error
 
@@ -88,4 +112,7 @@ jobs:
           files: |
             dist/*.zip
             dist/*.tar.gz
+            dist/*.exe
+            dist/*.dmg
+            dist/*.deb
             dist/*.sha256
