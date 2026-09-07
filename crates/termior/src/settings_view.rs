@@ -1567,57 +1567,58 @@ impl SettingsView {
         // 下拉菜单里直接标注每个 profile 的状态，不必逐个翻看就能找到
         // Agent 面板当前用的是哪一个。
         let profile_menu_open = self.select_menu == Some(SelectMenu::ProviderProfile);
-        let profile_menu = profile_menu_open.then(|| {
-            div()
-                .w(px(360.0))
-                .p_1()
-                .rounded_md()
-                .border_1()
-                .border_color(crate::ui::border(&self.palette))
-                .bg(crate::ui::color(self.palette.overlay))
-                .shadow_md()
-                .children(self.settings.models.profiles.iter().enumerate().map(
-                    |(index, entry)| {
-                        let mut tags = Vec::new();
-                        if self.settings.models.active_chat_profile.as_deref()
-                            == Some(entry.id.as_str())
-                        {
-                            tags.push("chat ✓");
-                        }
-                        if self.settings.models.active_completion_profile.as_deref()
-                            == Some(entry.id.as_str())
-                        {
-                            tags.push("completion ✓");
-                        }
-                        if !entry.enabled {
-                            tags.push("disabled");
-                        }
-                        let label = if tags.is_empty() {
-                            format!("{} · {}", entry.display_name, entry.model)
-                        } else {
-                            format!(
-                                "{} · {} · {}",
-                                entry.display_name,
-                                entry.model,
-                                tags.join(" · ")
+        let profile_menu =
+            profile_menu_open.then(|| {
+                div()
+                    .w(px(360.0))
+                    .p_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(crate::ui::border(&self.palette))
+                    .bg(crate::ui::color(self.palette.overlay))
+                    .shadow_md()
+                    .children(self.settings.models.profiles.iter().enumerate().map(
+                        |(index, entry)| {
+                            let mut tags = Vec::new();
+                            if self.settings.models.active_chat_profile.as_deref()
+                                == Some(entry.id.as_str())
+                            {
+                                tags.push("chat ✓");
+                            }
+                            if self.settings.models.active_completion_profile.as_deref()
+                                == Some(entry.id.as_str())
+                            {
+                                tags.push("completion ✓");
+                            }
+                            if !entry.enabled {
+                                tags.push("disabled");
+                            }
+                            let label = if tags.is_empty() {
+                                format!("{} · {}", entry.display_name, entry.model)
+                            } else {
+                                format!(
+                                    "{} · {} · {}",
+                                    entry.display_name,
+                                    entry.model,
+                                    tags.join(" · ")
+                                )
+                            };
+                            Self::select_option(
+                                SharedString::from(label),
+                                SharedString::from(format!("provider-option-{}", entry.id)),
+                                index == self.profile_index,
+                                &self.palette,
                             )
-                        };
-                        Self::select_option(
-                            SharedString::from(label),
-                            SharedString::from(format!("provider-option-{}", entry.id)),
-                            index == self.profile_index,
-                            &self.palette,
-                        )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.select_profile(index, cx);
-                            }),
-                        )
-                    },
-                ))
-        });
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.select_profile(index, cx);
+                                }),
+                            )
+                        },
+                    ))
+            });
         let chat_profile_label = self
             .settings
             .models
@@ -2753,9 +2754,7 @@ mod edit_tests {
     #[test]
     fn make_active_chat_enables_profile() {
         let mut cx = TestAppContext::single();
-        let view = cx.new(|cx| {
-            SettingsView::new(Settings::default(), None, None, None, None, cx)
-        });
+        let view = cx.new(|cx| SettingsView::new(Settings::default(), None, None, None, None, cx));
         view.update(&mut cx, |view, cx| {
             assert!(!view.settings.models.profiles[0].enabled);
             view.make_active_chat(cx);
@@ -2770,9 +2769,7 @@ mod edit_tests {
     #[test]
     fn select_profile_switches_index_and_clamps() {
         let mut cx = TestAppContext::single();
-        let view = cx.new(|cx| {
-            SettingsView::new(Settings::default(), None, None, None, None, cx)
-        });
+        let view = cx.new(|cx| SettingsView::new(Settings::default(), None, None, None, None, cx));
         view.update(&mut cx, |view, cx| {
             view.select_profile(7, cx); // DeepSeek
             assert_eq!(view.profile().map(|p| p.id.as_str()), Some("deepseek"));
