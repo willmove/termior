@@ -32,8 +32,10 @@ pub mod mode;
 pub mod model_registry;
 pub mod plan;
 pub mod provider;
+pub mod runtime;
 pub mod secret_store;
 pub mod session;
+pub mod task;
 pub mod tools;
 
 pub use agent::{Agent, AgentError, AgentOutcome, AgentState, MAX_AGENT_STEPS};
@@ -59,6 +61,20 @@ pub use plan::{
     PlanStepStatus, SubagentResult,
 };
 pub use provider::{MockProvider, Provider, ProviderRequest};
+pub use runtime::{
+    CancellationToken, ChangeReviewExecution, RuntimeError, RuntimeToolExecutor, TaskRuntime,
+    ToolExecution,
+};
 pub use secret_store::{InMemorySecretStore, SecretStore, SecretStoreError};
 pub use session::{ProjectMemory, Session, SessionStore};
-pub use tools::{ToolError, ToolRegistry};
+pub use task::{
+    AcceptanceCheck, AcceptanceCriterion, AcceptanceReport, AcceptanceStatus, ApprovalPolicy,
+    BudgetDimension, ChangeSetId, DecisionSource, RuntimeBudgets, RuntimeUsage, Task, TaskCommand,
+    TaskConfig, TaskEvent, TaskEventKind, TaskId, TaskState, TaskStateTransitionError, TaskSummary,
+    TaskSummaryStore, ToolAttempt, ToolDecision, ToolInvocation, ToolState, Turn, TurnId,
+    WaitingReason, TASK_EVENT_SCHEMA_VERSION,
+};
+pub use tools::{
+    ApprovalClass, Idempotency, SideEffectClass, ToolContract, ToolDescriptor, ToolError,
+    ToolLevelSerde, ToolRegistry,
+};

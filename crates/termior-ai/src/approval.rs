@@ -18,6 +18,9 @@ pub struct ApprovalRequest {
     pub arguments: String,
     /// 人类可读摘要（UI 用）。
     pub summary: String,
+    /// Task-scoped model step count at the suspension point.
+    #[serde(default)]
+    pub steps: usize,
 }
 
 /// 用户决议。
@@ -38,6 +41,7 @@ mod tests {
             tool_name: "write_file".into(),
             arguments: r#"{"path":"/proj/a.txt","content":"hi"}"#.into(),
             summary: "write /proj/a.txt".into(),
+            steps: 1,
         }
     }
 

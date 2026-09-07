@@ -79,6 +79,29 @@ impl Session {
             })
             .sum()
     }
+
+    /// Map legacy chat history into a historical summary without inventing runtime events.
+    pub fn as_task_summary(&self, project_dir: impl Into<PathBuf>) -> crate::task::TaskSummary {
+        crate::task::TaskSummary {
+            schema_version: crate::task::TASK_EVENT_SCHEMA_VERSION,
+            id: crate::task::TaskId(format!("legacy-session-{}", self.id)),
+            title: self.title.clone(),
+            goal: self
+                .messages
+                .iter()
+                .find(|message| message.role == crate::message::Role::User)
+                .map(|message| message.content.clone())
+                .unwrap_or_else(|| self.title.clone()),
+            project_dir: project_dir.into(),
+            backend_id: "legacy-session".into(),
+            environment_id: "unknown".into(),
+            state: crate::task::TaskState::CompletedUnverified,
+            acceptance_report: crate::task::AcceptanceReport::new(Vec::new()),
+            updated_at_ms: crate::task::now_ms(),
+            last_event_sequence: None,
+            legacy_session_id: Some(self.id.clone()),
+        }
+    }
 }
 
 /// 会话内消息历史膨胀策略（Q3）。
@@ -310,6 +333,28 @@ mod tests {
         let legacy = r#"{"sessions":[{"id":"s1","title":"t","messages":[]}],"active_id":"s1"}"#;
         let restored: SessionStore = serde_json::from_str(legacy).unwrap();
         assert_eq!(restored.get("s1").unwrap().mode, Mode::Auto);
+    }
+
+    #[test]
+    fn legacy_session_maps_to_an_unverified_summary_without_runtime_events() {
+        let session = Session::new("legacy-1");
+        let summary = session.as_task_summary("/project");
+        assert_eq!(summary.legacy_session_id.as_deref(), Some("legacy-1"));
+        assert_eq!(summary.state, crate::task::TaskState::CompletedUnverified);
+        assert_eq!(summary.last_event_sequence, None);
+        assert!(summary.acceptance_report.checks.is_empty());
+    }
+
+    #[test]
+    fn task_summary_store_persists_to_versioned_agent_tasks_index() {
+        let dir = tempdir().unwrap();
+        let mut store = crate::task::TaskSummaryStore::default();
+        store
+            .tasks
+            .push(Session::new("legacy-1").as_task_summary(dir.path()));
+        let path = store.persist(dir.path()).unwrap();
+        assert!(path.ends_with("agent-tasks/index.json"));
+        assert_eq!(crate::task::TaskSummaryStore::load(dir.path()).unwrap(), store);
     }
 
     #[test]

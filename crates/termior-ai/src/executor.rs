@@ -1,6 +1,10 @@
 //! Concrete, workspace-confined tool execution (FR-AGENT-07/09, FR-EDIT-04, FR-SEC).
 
 use crate::context::TerminalContextProvider;
+use crate::runtime::{
+    CancellationToken, ChangeReviewExecution, RuntimeToolExecutor, ToolExecution,
+};
+use crate::task::ChangeSetId;
 use crate::tools::{ToolError, ToolRegistry};
 use futures::channel::mpsc::Receiver;
 use serde::{Deserialize, Serialize};
@@ -24,10 +28,12 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct EditProposalSummary {
     pub id: String,
     pub path: String,
+    pub baseline_digest: String,
     pub hunk_ids: Vec<usize>,
     pub patch: String,
 }
 
+#[derive(Clone)]
 struct EditProposal {
     path: PathBuf,
     old: String,
@@ -91,13 +97,15 @@ impl ToolExecutor {
         if self.registry.requires_approval(tool)? {
             return Err(ToolError::ApprovalRequired(tool.to_owned()));
         }
-        self.execute_inner(tool, arguments)
+        let arguments = self.registry.validate_and_normalize(tool, arguments)?;
+        self.execute_inner(tool, &arguments)
     }
 
     /// Execute a tool after the UI has recorded explicit user approval.
     pub fn execute_approved(&self, tool: &str, arguments: &str) -> Result<String, ToolError> {
         self.registry.requires_approval(tool)?;
-        self.execute_inner(tool, arguments)
+        let arguments = self.registry.validate_and_normalize(tool, arguments)?;
+        self.execute_inner(tool, &arguments)
     }
 
     /// Materialize only the hunks accepted in the AI diff UI.
@@ -110,15 +118,40 @@ impl ToolExecutor {
             .proposals
             .lock()
             .map_err(|_| ToolError::Io("edit proposal lock poisoned".into()))?
-            .remove(proposal_id)
+            .get(proposal_id)
+            .cloned()
             .ok_or_else(|| ToolError::ProposalNotFound(proposal_id.to_owned()))?;
         self.check_path("write_file", &proposal.path, Direction::Write)?;
-        let result = apply_acceptances(&proposal.old, &proposal.hunks, accepted_hunks);
+        let current = match std::fs::read_to_string(&proposal.path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(io_error(error)),
+        };
+        let expected = termior_diff::content_digest(&proposal.old);
+        let actual = termior_diff::content_digest(&current);
+        if expected != actual {
+            return Err(ToolError::EditConflict(format!(
+                "{} expected {expected}, found {actual}",
+                proposal.path.display()
+            )));
+        }
+        let result = apply_acceptances(&current, &proposal.hunks, accepted_hunks);
         termior_store::atomic_write(&proposal.path, &result)
             .map_err(|error| ToolError::Io(error.to_string()))?;
+        self.proposals
+            .lock()
+            .map_err(|_| ToolError::Io("edit proposal lock poisoned".into()))?
+            .remove(proposal_id);
+        let accepted: std::collections::HashSet<usize> = accepted_hunks.iter().copied().collect();
+        let rejected = proposal
+            .hunks
+            .iter()
+            .filter(|hunk| !accepted.contains(&hunk.id))
+            .count();
         Ok(format!(
-            "wrote {} accepted hunk(s) to {}",
+            "applied={} rejected={} conflicted=0 path={}",
             accepted_hunks.len(),
+            rejected,
             proposal.path.display()
         ))
     }
@@ -252,6 +285,7 @@ impl ToolExecutor {
         let summary = EditProposalSummary {
             id: id.clone(),
             path: path.display().to_string(),
+            baseline_digest: termior_diff::content_digest(&old),
             hunk_ids: hunks.iter().map(|hunk| hunk.id).collect(),
             patch: render_unified(&old, &hunks),
         };
@@ -402,6 +436,73 @@ impl ToolExecutor {
     fn check_path(&self, tool: &str, path: &Path, direction: Direction) -> Result<(), ToolError> {
         self.registry
             .check_path_access(tool, &path.to_string_lossy(), direction)
+    }
+}
+
+impl RuntimeToolExecutor for ToolExecutor {
+    fn execute(
+        &self,
+        _call_id: &str,
+        tool: &str,
+        normalized_arguments: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolExecution, String> {
+        if cancellation.is_cancelled() {
+            return Err("tool call cancelled before execution".into());
+        }
+        let output = self
+            .execute_inner(tool, normalized_arguments)
+            .map_err(|error| error.to_string())?;
+        if tool == "write_file" {
+            let summary: EditProposalSummary =
+                serde_json::from_str(&output).map_err(|error| error.to_string())?;
+            Ok(ToolExecution::ChangeProposed {
+                change_set_id: ChangeSetId(summary.id),
+                summary: output,
+            })
+        } else {
+            Ok(ToolExecution::Completed(output))
+        }
+    }
+
+    fn review_change(
+        &self,
+        change_set_id: &ChangeSetId,
+        accepted_hunks: &[usize],
+        cancellation: &CancellationToken,
+    ) -> Result<ChangeReviewExecution, String> {
+        if cancellation.is_cancelled() {
+            return Ok(ChangeReviewExecution::Unknown(
+                "change review cancelled before the disk result was confirmed".into(),
+            ));
+        }
+        match self.accept_edit(&change_set_id.0, accepted_hunks) {
+            Ok(output) => Ok(ChangeReviewExecution::Applied(output)),
+            Err(ToolError::EditConflict(conflict)) => {
+                Ok(ChangeReviewExecution::Conflict(conflict))
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn cancel_active(&self) -> bool {
+        let mut confirmed = true;
+        if let Ok(mut processes) = self.background.lock() {
+            for child in processes.values_mut() {
+                if child.kill().is_err() || child.wait().is_err() {
+                    confirmed = false;
+                }
+            }
+            processes.clear();
+        } else {
+            confirmed = false;
+        }
+        if let Ok(mut shell) = self.shell.lock() {
+            shell.take();
+        } else {
+            confirmed = false;
+        }
+        confirmed
     }
 }
 
@@ -560,6 +661,27 @@ mod tests {
             .accept_edit(&summary.id, &summary.hunk_ids)
             .unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn edit_review_detects_a_changed_disk_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let executor = executor(dir.path());
+        let summary: EditProposalSummary = serde_json::from_str(
+            &executor
+                .execute_approved("write_file", r#"{"path":"a.txt","content":"new\n"}"#)
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&path, "user edit\n").unwrap();
+
+        let error = executor
+            .accept_edit(&summary.id, &summary.hunk_ids)
+            .unwrap_err();
+        assert!(matches!(error, ToolError::EditConflict(_)));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "user edit\n");
     }
 
     #[test]

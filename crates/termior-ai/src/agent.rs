@@ -95,7 +95,7 @@ impl Agent {
     where
         F: Fn(&str, &str) -> Result<String, String> + Sync,
     {
-        self.drive(history, exec_tool, None, on_event).await
+        self.drive(history, exec_tool, 0, false, on_event).await
     }
 
     /// 审批决议后续跑。
@@ -110,58 +110,57 @@ impl Agent {
     where
         F: Fn(&str, &str) -> Result<String, String> + Sync,
     {
-        match decision {
-            ApprovalDecision::Approve => {
-                let mut messages = history.to_vec();
-                // 执行被批准的工具，回填 tool_result
-                match exec_tool(&pending.tool_name, &pending.arguments) {
-                    Ok(out) => messages.push(Message {
-                        role: Role::Tool,
-                        content: String::new(),
-                        tool_calls: vec![],
-                        tool_result: Some(crate::message::ToolResult::success(
-                            &pending.call_id,
-                            out,
-                        )),
-                    }),
-                    Err(e) => messages.push(Message {
-                        role: Role::Tool,
-                        content: String::new(),
-                        tool_calls: vec![],
-                        tool_result: Some(crate::message::ToolResult::failure(&pending.call_id, e)),
-                    }),
+        let mut messages = history.to_vec();
+        let result = match decision {
+            ApprovalDecision::Approve => match self
+                .tools
+                .validate_and_normalize(&pending.tool_name, &pending.arguments)
+            {
+                Ok(arguments) => match exec_tool(&pending.tool_name, &arguments) {
+                    Ok(output) => crate::message::ToolResult::success(&pending.call_id, output),
+                    Err(error) => crate::message::ToolResult::failure(&pending.call_id, error),
+                },
+                Err(error) => {
+                    crate::message::ToolResult::failure(&pending.call_id, error.to_string())
                 }
-                self.drive(&messages, exec_tool, None, on_event).await
+            },
+            ApprovalDecision::Reject => {
+                crate::message::ToolResult::failure(&pending.call_id, "tool call denied by user")
             }
-            ApprovalDecision::Reject => Err(AgentError::Rejected),
-        }
+        };
+        messages.push(tool_result_message(result));
+        self.drive(&messages, exec_tool, pending.steps, true, on_event)
+            .await
     }
 
     async fn drive<F>(
         &self,
         history: &[Message],
         exec_tool: &F,
-        _resume_from: Option<&ApprovalRequest>,
+        mut steps: usize,
+        resume_existing_calls: bool,
         on_event: &mut (dyn FnMut(&ChatEvent) + Send),
     ) -> Result<AgentOutcome, AgentError>
     where
         F: Fn(&str, &str) -> Result<String, String> + Sync,
     {
         let mut messages: Vec<Message> = history.to_vec();
-        // 注入 system prompt（每轮前置）
-        let mut with_system: Vec<Message> = Vec::new();
-        if let Some(sp) = &self.system_prompt {
-            with_system.push(Message::system(sp));
+        if resume_existing_calls {
+            if let Some(pending) = self.process_current_calls(&mut messages, exec_tool, steps)? {
+                return Ok(AgentOutcome {
+                    state: AgentState::AwaitingApproval,
+                    messages,
+                    pending_approval: Some(pending),
+                    steps,
+                });
+            }
         }
-        with_system.extend(messages.clone());
-
-        let mut steps = 0usize;
         loop {
             if steps >= self.max_steps {
                 return Err(AgentError::MaxStepsExceeded(self.max_steps));
             }
             let req = ProviderRequest {
-                messages: with_system.clone(),
+                messages: self.provider_messages(&messages),
                 model: "default".into(),
                 tools: self.tools.clone(),
                 system_prompt_extra: None,
@@ -205,44 +204,96 @@ impl Agent {
                 });
             }
 
-            // 处理每个工具调用
-            for tc in &assistant.tool_calls {
-                let needs_approval = self.tools.requires_approval(&tc.name).unwrap_or(false);
-                if needs_approval {
-                    // 挂起：构造审批请求（assistant 消息已 push 进 history）
-                    let req = ApprovalRequest {
-                        call_id: tc.id.clone(),
-                        tool_name: tc.name.clone(),
-                        arguments: tc.arguments.clone(),
-                        summary: summarize(&tc.name, &tc.arguments),
-                    };
-                    return Ok(AgentOutcome {
-                        state: AgentState::AwaitingApproval,
-                        messages,
-                        pending_approval: Some(req),
-                        steps,
-                    });
-                }
-                // 自动工具：直接执行
-                let result = match exec_tool(&tc.name, &tc.arguments) {
-                    Ok(out) => crate::message::ToolResult::success(&tc.id, out),
-                    Err(e) => crate::message::ToolResult::failure(&tc.id, e),
-                };
-                messages.push(Message {
-                    role: Role::Tool,
-                    content: String::new(),
-                    tool_calls: vec![],
-                    tool_result: Some(result),
+            if let Some(pending) = self.process_current_calls(&mut messages, exec_tool, steps)? {
+                return Ok(AgentOutcome {
+                    state: AgentState::AwaitingApproval,
+                    messages,
+                    pending_approval: Some(pending),
+                    steps,
                 });
             }
-
-            // 重建下一轮请求的 messages
-            with_system.clear();
-            if let Some(sp) = &self.system_prompt {
-                with_system.push(Message::system(sp));
-            }
-            with_system.extend(messages.clone());
         }
+    }
+
+    fn provider_messages(&self, messages: &[Message]) -> Vec<Message> {
+        let mut request = Vec::with_capacity(messages.len() + usize::from(self.system_prompt.is_some()));
+        if let Some(prompt) = &self.system_prompt {
+            request.push(Message::system(prompt));
+        }
+        request.extend_from_slice(messages);
+        request
+    }
+
+    fn process_current_calls<F>(
+        &self,
+        messages: &mut Vec<Message>,
+        exec_tool: &F,
+        steps: usize,
+    ) -> Result<Option<ApprovalRequest>, AgentError>
+    where
+        F: Fn(&str, &str) -> Result<String, String> + Sync,
+    {
+        let Some((assistant_index, calls)) = messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, message)| message.role == Role::Assistant && !message.tool_calls.is_empty())
+            .map(|(index, message)| (index, message.tool_calls.clone()))
+        else {
+            return Ok(None);
+        };
+        let completed = messages[assistant_index + 1..]
+            .iter()
+            .filter_map(|message| message.tool_result.as_ref())
+            .map(|result| result.call_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+
+        for call in calls {
+            if completed.contains(&call.id) {
+                continue;
+            }
+            let arguments = match self.tools.validate_and_normalize(&call.name, &call.arguments) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    messages.push(tool_result_message(crate::message::ToolResult::failure(
+                        &call.id,
+                        error.to_string(),
+                    )));
+                    continue;
+                }
+            };
+            match self.tools.requires_approval(&call.name) {
+                Ok(true) => {
+                    return Ok(Some(ApprovalRequest {
+                        call_id: call.id,
+                        tool_name: call.name.clone(),
+                        summary: summarize(&call.name, &arguments),
+                        arguments,
+                        steps,
+                    }));
+                }
+                Ok(false) => {
+                    let result = match exec_tool(&call.name, &arguments) {
+                        Ok(output) => crate::message::ToolResult::success(&call.id, output),
+                        Err(error) => crate::message::ToolResult::failure(&call.id, error),
+                    };
+                    messages.push(tool_result_message(result));
+                }
+                Err(error) => messages.push(tool_result_message(
+                    crate::message::ToolResult::failure(&call.id, error.to_string()),
+                )),
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn tool_result_message(result: crate::message::ToolResult) -> Message {
+    Message {
+        role: Role::Tool,
+        content: String::new(),
+        tool_calls: Vec::new(),
+        tool_result: Some(result),
     }
 }
 
@@ -352,14 +403,14 @@ mod tests {
     }
 
     #[test]
-    fn approval_rejected_errors() {
+    fn approval_rejection_becomes_a_tool_result() {
         let provider = MockProvider::single(vec![ChatEvent::Done(Message {
             role: Role::Assistant,
             content: "writing".into(),
             tool_calls: vec![crate::message::ToolCall {
                 id: "c1".into(),
                 name: "write_file".into(),
-                arguments: r#"{"path":"/proj/a"}"#.into(),
+                arguments: r#"{"path":"/proj/a","content":"x"}"#.into(),
             }],
             tool_result: None,
         })]);
@@ -371,7 +422,7 @@ mod tests {
         })
         .unwrap();
         let pending = outcome.pending_approval.unwrap();
-        let err = block_on(async {
+        let resumed = block_on(async {
             agent
                 .resume(
                     &outcome.messages,
@@ -382,8 +433,14 @@ mod tests {
                 )
                 .await
         })
-        .unwrap_err();
-        assert!(matches!(err, AgentError::Rejected));
+        .unwrap();
+        assert_eq!(resumed.state, AgentState::Finished);
+        assert!(resumed.messages.iter().any(|message| {
+            message
+                .tool_result
+                .as_ref()
+                .is_some_and(|result| result.call_id == "c1" && !result.ok)
+        }));
     }
 
     #[test]
@@ -396,7 +453,7 @@ mod tests {
                 tool_calls: vec![crate::message::ToolCall {
                     id: "c1".into(),
                     name: "write_file".into(),
-                    arguments: r#"{"path":"/proj/a"}"#.into(),
+                    arguments: r#"{"path":"/proj/a","content":"x"}"#.into(),
                 }],
                 tool_result: None,
             })],

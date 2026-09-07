@@ -9,9 +9,10 @@
 #![forbid(unsafe_code)]
 
 use similar::{ChangeTag, TextDiff};
+use serde::{Deserialize, Serialize};
 
 /// 单个 hunk。`id` 用于在 UI 中逐 hunk 接受/拒绝时稳定引用。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hunk {
     pub id: usize,
     /// 原文件中的起始行号（0-based）。
@@ -142,6 +143,130 @@ pub fn apply_acceptances(old: &str, hunks: &[Hunk], accepted_ids: &[usize]) -> S
         old_idx += 1;
     }
     out
+}
+
+/// A reviewable candidate for one file, bound to the content seen when it was proposed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub baseline_digest: String,
+    pub baseline_content: String,
+    pub candidate_content: String,
+    pub hunks: Vec<Hunk>,
+}
+
+impl FileChange {
+    pub fn new(
+        path: impl Into<String>,
+        baseline_content: impl Into<String>,
+        candidate_content: impl Into<String>,
+        context: usize,
+    ) -> Self {
+        let baseline_content = baseline_content.into();
+        let candidate_content = candidate_content.into();
+        Self {
+            path: path.into(),
+            baseline_digest: content_digest(&baseline_content),
+            hunks: diff_hunks(&baseline_content, &candidate_content, context),
+            baseline_content,
+            candidate_content,
+        }
+    }
+
+    pub fn hunk_ids(&self) -> Vec<usize> {
+        self.hunks.iter().map(|hunk| hunk.id).collect()
+    }
+}
+
+/// A Turn-scoped group of file edits and the model calls that proposed them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeSet {
+    pub id: String,
+    pub source_call_ids: Vec<String>,
+    pub files: Vec<FileChange>,
+}
+
+impl ChangeSet {
+    pub fn new(
+        id: impl Into<String>,
+        source_call_ids: Vec<String>,
+        files: Vec<FileChange>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            source_call_ids,
+            files,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileApplyResult {
+    pub path: String,
+    pub content: String,
+    pub applied_hunks: Vec<usize>,
+    pub rejected_hunks: Vec<usize>,
+    pub resulting_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FileChangeError {
+    #[error(
+        "baseline conflict for {path}: expected {expected_digest}, found {actual_digest}"
+    )]
+    BaselineConflict {
+        path: String,
+        expected_digest: String,
+        actual_digest: String,
+    },
+}
+
+/// Apply a hunk decision only when the current content still matches the proposal baseline.
+pub fn apply_file_change(
+    current_content: &str,
+    change: &FileChange,
+    accepted_hunks: &[usize],
+) -> Result<FileApplyResult, FileChangeError> {
+    let actual_digest = content_digest(current_content);
+    if actual_digest != change.baseline_digest {
+        return Err(FileChangeError::BaselineConflict {
+            path: change.path.clone(),
+            expected_digest: change.baseline_digest.clone(),
+            actual_digest,
+        });
+    }
+    let accepted: std::collections::HashSet<usize> =
+        accepted_hunks.iter().copied().collect();
+    let applied_hunks = change
+        .hunks
+        .iter()
+        .filter(|hunk| accepted.contains(&hunk.id))
+        .map(|hunk| hunk.id)
+        .collect::<Vec<_>>();
+    let rejected_hunks = change
+        .hunks
+        .iter()
+        .filter(|hunk| !accepted.contains(&hunk.id))
+        .map(|hunk| hunk.id)
+        .collect::<Vec<_>>();
+    let content = apply_acceptances(current_content, &change.hunks, &applied_hunks);
+    Ok(FileApplyResult {
+        path: change.path.clone(),
+        resulting_digest: content_digest(&content),
+        content,
+        applied_hunks,
+        rejected_hunks,
+    })
+}
+
+/// Stable non-cryptographic digest used solely for optimistic baseline comparison.
+pub fn content_digest(content: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in content.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fnv1a64:{hash:016x}")
 }
 
 /// 把文本按行切分，**保留尾换行**（便于无损重组）。

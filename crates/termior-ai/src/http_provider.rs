@@ -470,7 +470,7 @@ fn openai_tools(req: &ProviderRequest) -> Vec<Value> {
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": {"type": "object", "additionalProperties": true}
+                    "parameters": tool.parameters
                 }
             })
         })
@@ -518,7 +518,7 @@ fn anthropic_tools(req: &ProviderRequest) -> Vec<Value> {
     req.tools
         .descriptors()
         .into_iter()
-        .map(|tool| json!({"name": tool.name, "description": tool.description, "input_schema": {"type": "object", "additionalProperties": true}}))
+        .map(|tool| json!({"name": tool.name, "description": tool.description, "input_schema": tool.parameters}))
         .collect()
 }
 
@@ -543,7 +543,7 @@ fn google_body(req: &ProviderRequest) -> Value {
     json!({
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": contents,
-        "tools": [{"functionDeclarations": req.tools.descriptors().into_iter().map(|tool| json!({"name": tool.name, "description": tool.description, "parameters": {"type": "object"}})).collect::<Vec<_>>()}]
+        "tools": [{"functionDeclarations": req.tools.descriptors().into_iter().map(|tool| json!({"name": tool.name, "description": tool.description, "parameters": tool.parameters})).collect::<Vec<_>>()}]
     })
 }
 
@@ -832,6 +832,7 @@ impl StreamAccumulator for OllamaAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ToolRegistry;
     use std::io::Cursor;
 
     #[test]
@@ -841,6 +842,28 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("sk-secret-value"));
         assert!(debug.contains("redacted"));
+    }
+
+    #[test]
+    fn provider_adapters_emit_the_same_closed_tool_contract() {
+        let request = ProviderRequest {
+            messages: vec![],
+            model: "test".into(),
+            tools: ToolRegistry::default().subset(["write_file"]).unwrap(),
+            system_prompt_extra: None,
+        };
+        let openai = openai_tools(&request);
+        let anthropic = anthropic_tools(&request);
+        let google = google_body(&request);
+        let expected = request.tools.contract("write_file").unwrap().parameters;
+        assert_eq!(openai[0]["function"]["parameters"], expected);
+        assert_eq!(anthropic[0]["input_schema"], expected);
+        assert_eq!(
+            google["tools"][0]["functionDeclarations"][0]["parameters"],
+            expected
+        );
+        assert_eq!(expected["additionalProperties"], false);
+        assert_eq!(expected["required"], json!(["path", "content"]));
     }
 
     #[test]

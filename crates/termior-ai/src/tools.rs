@@ -9,6 +9,7 @@
 //! `@path` 引用读取内容前也经此过滤（FR-AGENT-03）。
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use termior_security::deny_list::{canonicalize_logical, check_path, DenyReason, Direction};
 use termior_security::workspace::WorkspaceAuthRegistry;
@@ -34,15 +35,52 @@ pub enum ToolError {
     Timeout(String),
     #[error("edit proposal not found: {0}")]
     ProposalNotFound(String),
+    #[error("edit proposal conflicts with current disk content: {0}")]
+    EditConflict(String),
 }
 
-/// 一条工具的描述（供模型与 UI 展示）。
+/// Tool effects and approval are separate policy dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SideEffectClass {
+    Read,
+    LocalWrite,
+    Process,
+    Network,
+    External,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalClass {
+    Automatic,
+    User,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Idempotency {
+    Idempotent,
+    NonIdempotent,
+    Unknown,
+}
+
+/// The single source of truth for Provider declarations, validation and UI disclosure.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolDescriptor {
+pub struct ToolContract {
     pub name: String,
     pub level: ToolLevelSerde,
     pub description: String,
+    pub parameters: Value,
+    pub side_effect: SideEffectClass,
+    pub approval: ApprovalClass,
+    pub default_timeout_ms: u64,
+    pub max_output_bytes: u64,
+    pub idempotency: Idempotency,
+    pub parallel_safe: bool,
 }
+
+pub type ToolDescriptor = ToolContract;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,21 +144,65 @@ impl ToolRegistry {
         }
     }
 
-    /// 列出全部工具描述（FR-AGENT-09）。
-    pub fn descriptors(&self) -> Vec<ToolDescriptor> {
+    /// Return enabled contracts. Every built-in contract has a closed object schema.
+    pub fn contracts(&self) -> Vec<ToolContract> {
         use termior_security::gating::{ToolLevel, ALL_TOOLS};
         ALL_TOOLS
             .iter()
             .filter(|tool| self.allows(tool.name()))
-            .map(|t| ToolDescriptor {
-                name: t.name().to_string(),
-                level: match t.level() {
+            .map(|tool| {
+                let level = match tool.level() {
                     ToolLevel::Auto => ToolLevelSerde::Auto,
                     ToolLevel::Approval => ToolLevelSerde::Approval,
-                },
-                description: description_for(*t).to_string(),
+                };
+                ToolContract {
+                    name: tool.name().to_string(),
+                    level,
+                    description: description_for(*tool).to_string(),
+                    parameters: parameters_for(*tool),
+                    side_effect: side_effect_for(*tool),
+                    approval: match level {
+                        ToolLevelSerde::Auto => ApprovalClass::Automatic,
+                        ToolLevelSerde::Approval => ApprovalClass::User,
+                    },
+                    default_timeout_ms: timeout_for(*tool),
+                    max_output_bytes: output_limit_for(*tool),
+                    idempotency: idempotency_for(*tool),
+                    parallel_safe: false,
+                }
             })
             .collect()
+    }
+
+    /// Backwards-compatible name used by Provider adapters.
+    pub fn descriptors(&self) -> Vec<ToolDescriptor> {
+        self.contracts()
+    }
+
+    pub fn contract(&self, tool_name: &str) -> Result<ToolContract, ToolError> {
+        self.ensure_allowed(tool_name)?;
+        let tool = termior_security::gating::ToolId::from_name(tool_name)
+            .ok_or_else(|| ToolError::Unknown(tool_name.to_owned()))?;
+        self.contracts()
+            .into_iter()
+            .find(|contract| contract.name == tool.name())
+            .ok_or_else(|| ToolError::Unknown(tool_name.to_owned()))
+    }
+
+    /// Parse, validate and canonicalize arguments using the Provider-visible contract.
+    pub fn validate_and_normalize(
+        &self,
+        tool_name: &str,
+        arguments: &str,
+    ) -> Result<String, ToolError> {
+        let contract = self.contract(tool_name)?;
+        let value: Value = serde_json::from_str(arguments).map_err(|error| {
+            invalid_arguments(tool_name, "$", &format!("invalid JSON: {error}"))
+        })?;
+        validate_value(tool_name, "$", &value, &contract.parameters)?;
+        serde_json::to_string(&value).map_err(|error| {
+            invalid_arguments(tool_name, "$", &format!("normalization failed: {error}"))
+        })
     }
 
     /// 判定工具是否需要审批（FR-SEC-01）。
@@ -191,6 +273,224 @@ fn description_for(t: termior_security::gating::ToolId) -> &'static str {
             "Delegate a bounded task to a restricted child agent (approval-gated)."
         }
     }
+}
+
+fn string_schema(max_length: u64) -> Value {
+    json!({"type": "string", "minLength": 1, "maxLength": max_length})
+}
+
+fn object_schema(
+    required: &[&str],
+    properties: impl IntoIterator<Item = (&'static str, Value)>,
+) -> Value {
+    let properties = properties
+        .into_iter()
+        .map(|(name, schema)| (name.to_owned(), schema))
+        .collect::<Map<String, Value>>();
+    json!({
+        "type": "object",
+        "required": required,
+        "properties": properties,
+        "additionalProperties": false
+    })
+}
+
+fn parameters_for(tool: termior_security::gating::ToolId) -> Value {
+    use termior_security::gating::ToolId;
+    match tool {
+        ToolId::ReadFile | ToolId::ListDirectory | ToolId::CreateDirectory | ToolId::Delete => {
+            object_schema(&["path"], [("path", string_schema(32_768))])
+        }
+        ToolId::FsSearch | ToolId::FsGrep => {
+            object_schema(&["query"], [("query", string_schema(4_096))])
+        }
+        ToolId::GetTerminalContext => object_schema(&[], []),
+        ToolId::WriteFile => object_schema(
+            &["path", "content"],
+            [
+                ("path", string_schema(32_768)),
+                (
+                    "content",
+                    json!({"type": "string", "maxLength": 8_388_608u64}),
+                ),
+            ],
+        ),
+        ToolId::Rename => object_schema(
+            &["source", "destination"],
+            [
+                ("source", string_schema(32_768)),
+                ("destination", string_schema(32_768)),
+            ],
+        ),
+        ToolId::RunCommand | ToolId::ShellBgSpawn => object_schema(
+            &["command"],
+            [
+                ("command", string_schema(262_144)),
+                ("cwd", string_schema(32_768)),
+            ],
+        ),
+        ToolId::ShellSessionRun => {
+            object_schema(&["command"], [("command", string_schema(262_144))])
+        }
+        ToolId::RunSubagent => object_schema(
+            &["agent_id", "task"],
+            [
+                ("agent_id", string_schema(256)),
+                ("task", string_schema(262_144)),
+                (
+                    "max_steps",
+                    json!({"type": "integer", "minimum": 1, "maximum": 50}),
+                ),
+            ],
+        ),
+    }
+}
+
+fn side_effect_for(tool: termior_security::gating::ToolId) -> SideEffectClass {
+    use termior_security::gating::ToolId;
+    match tool {
+        ToolId::ReadFile
+        | ToolId::ListDirectory
+        | ToolId::FsSearch
+        | ToolId::FsGrep
+        | ToolId::GetTerminalContext => SideEffectClass::Read,
+        ToolId::WriteFile | ToolId::CreateDirectory | ToolId::Rename | ToolId::Delete => {
+            SideEffectClass::LocalWrite
+        }
+        ToolId::RunCommand
+        | ToolId::ShellSessionRun
+        | ToolId::ShellBgSpawn
+        | ToolId::RunSubagent => SideEffectClass::Process,
+    }
+}
+
+fn timeout_for(tool: termior_security::gating::ToolId) -> u64 {
+    use termior_security::gating::ToolId;
+    match tool {
+        ToolId::RunCommand | ToolId::ShellSessionRun => 30_000,
+        ToolId::ShellBgSpawn | ToolId::RunSubagent => 60_000,
+        _ => 10_000,
+    }
+}
+
+fn output_limit_for(tool: termior_security::gating::ToolId) -> u64 {
+    use termior_security::gating::ToolId;
+    match tool {
+        ToolId::ReadFile => 2 * 1024 * 1024,
+        ToolId::RunCommand | ToolId::ShellSessionRun => 1024 * 1024,
+        _ => 512 * 1024,
+    }
+}
+
+fn idempotency_for(tool: termior_security::gating::ToolId) -> Idempotency {
+    use termior_security::gating::ToolId;
+    match tool {
+        ToolId::ReadFile
+        | ToolId::ListDirectory
+        | ToolId::FsSearch
+        | ToolId::FsGrep
+        | ToolId::GetTerminalContext
+        | ToolId::WriteFile
+        | ToolId::CreateDirectory => Idempotency::Idempotent,
+        ToolId::Rename
+        | ToolId::Delete
+        | ToolId::RunCommand
+        | ToolId::ShellSessionRun
+        | ToolId::ShellBgSpawn
+        | ToolId::RunSubagent => Idempotency::NonIdempotent,
+    }
+}
+
+fn invalid_arguments(tool: &str, path: &str, message: &str) -> ToolError {
+    ToolError::InvalidArguments(format!("{tool} at {path}: {message}"))
+}
+
+fn validate_value(tool: &str, path: &str, value: &Value, schema: &Value) -> Result<(), ToolError> {
+    let expected = schema.get("type").and_then(Value::as_str).unwrap_or("object");
+    let type_matches = match expected {
+        "object" => value.is_object(),
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        _ => false,
+    };
+    if !type_matches {
+        return Err(invalid_arguments(
+            tool,
+            path,
+            &format!("expected {expected}"),
+        ));
+    }
+
+    if let Some(text) = value.as_str() {
+        let length = text.chars().count() as u64;
+        if schema
+            .get("minLength")
+            .and_then(Value::as_u64)
+            .is_some_and(|minimum| length < minimum)
+        {
+            return Err(invalid_arguments(tool, path, "string is too short"));
+        }
+        if schema
+            .get("maxLength")
+            .and_then(Value::as_u64)
+            .is_some_and(|maximum| length > maximum)
+        {
+            return Err(invalid_arguments(tool, path, "string is too long"));
+        }
+    }
+
+    if let Some(number) = value.as_i64() {
+        if schema
+            .get("minimum")
+            .and_then(Value::as_i64)
+            .is_some_and(|minimum| number < minimum)
+        {
+            return Err(invalid_arguments(tool, path, "number is below minimum"));
+        }
+        if schema
+            .get("maximum")
+            .and_then(Value::as_i64)
+            .is_some_and(|maximum| number > maximum)
+        {
+            return Err(invalid_arguments(tool, path, "number exceeds maximum"));
+        }
+    }
+
+    if let Some(object) = value.as_object() {
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid_arguments(tool, path, "contract has no properties"))?;
+        if let Some(required) = schema.get("required").and_then(Value::as_array) {
+            for field in required.iter().filter_map(Value::as_str) {
+                if !object.contains_key(field) {
+                    return Err(invalid_arguments(
+                        tool,
+                        &format!("{path}.{field}"),
+                        "missing required field",
+                    ));
+                }
+            }
+        }
+        for (field, child) in object {
+            let child_path = format!("{path}.{field}");
+            let child_schema = properties.get(field).ok_or_else(|| {
+                invalid_arguments(tool, &child_path, "additional field is not allowed")
+            })?;
+            validate_value(tool, &child_path, child, child_schema)?;
+        }
+    }
+
+    if let Some(array) = value.as_array() {
+        if let Some(item_schema) = schema.get("items") {
+            for (index, item) in array.iter().enumerate() {
+                validate_value(tool, &format!("{path}[{index}]"), item, item_schema)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
