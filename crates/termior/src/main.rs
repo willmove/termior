@@ -12,6 +12,7 @@ mod editor_view;
 mod git_views;
 mod keystroke;
 mod markdown_preview_view;
+mod markdown_render;
 mod monospace_font;
 mod preview_view;
 mod settings_view;

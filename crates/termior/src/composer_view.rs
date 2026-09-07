@@ -1,8 +1,8 @@
 use futures::StreamExt;
 use gpui::{
-    canvas, div, prelude::*, px, App, Bounds, ClipboardEntry, ClipboardItem, Context, EventEmitter,
-    FocusHandle, Focusable, FontWeight, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent,
-    Pixels, Point, ScrollHandle, SharedString, UTF16Selection, WeakEntity, Window,
+    canvas, div, prelude::*, px, relative, App, Bounds, ClipboardEntry, ClipboardItem, Context,
+    EventEmitter, FocusHandle, Focusable, FontWeight, InputHandler, KeyDownEvent, MouseButton,
+    MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, UTF16Selection, WeakEntity, Window,
 };
 use std::{
     collections::HashMap,
@@ -18,6 +18,7 @@ use termior_ai::{
 };
 use termior_explorer_core::fuzzy::fuzzy_match;
 use termior_platform::AgentStatus;
+use termior_preview::MarkdownDocument;
 use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_store::{DataFiles, Settings};
 use termior_ui::{ComposerDock, MAX_COMPOSER_HEIGHT, MIN_COMPOSER_HEIGHT};
@@ -1136,7 +1137,8 @@ impl gpui::Render for ComposerView {
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
-            .map(|message| {
+            .enumerate()
+            .map(|(index, message)| {
                 let is_user = message.role == Role::User;
                 let label = if is_user { "You" } else { "Termior" };
                 let label_color = if is_user {
@@ -1144,16 +1146,48 @@ impl gpui::Render for ComposerView {
                 } else {
                     crate::ui::color(p.accent)
                 };
+                // Agent 回复按 Markdown 渲染（复用预览的 pulldown-cmark + GPUI
+                // 管线，见 SDD 依赖决策）；用户消息保持原样，避免输入里的
+                // *、# 等字符被误解析成格式。
+                let body = if is_user {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .text_xs()
+                        .children(message.content.lines().map(|line| {
+                            // 空行用不断行空格占位，避免塌陷成零高度。
+                            let text = if line.is_empty() { "\u{00A0}" } else { line };
+                            div().child(SharedString::from(text))
+                        }))
+                } else {
+                    // 流式期间每个增量都会重渲染并重新解析；消息量已被
+                    // COMPOSER_RENDERED_MESSAGES 截断，解析成本可接受。
+                    let document = MarkdownDocument::parse(&message.content);
+                    let blocks = crate::markdown_render::render_blocks(
+                        &document,
+                        crate::markdown_render::Density::CHAT,
+                        &format!("composer-md-{index}"),
+                        &p,
+                    );
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w(px(0.0))
+                        .text_size(px(crate::markdown_render::Density::CHAT.base))
+                        .line_height(relative(1.5))
+                        // 首个增量到达前内容为空，用占位空行维持行高。
+                        .when(blocks.is_empty(), |body| {
+                            body.child(SharedString::from("\u{00A0}"))
+                        })
+                        .children(blocks)
+                };
                 div()
                     .flex()
                     .flex_col()
+                    .min_w(px(0.0))
                     .gap(px(2.0))
                     .child(div().text_xs().text_color(label_color).child(label))
-                    .children(message.content.lines().map(|line| {
-                        // 空行用不断行空格占位，避免塌陷成零高度。
-                        let text = if line.is_empty() { "\u{00A0}" } else { line };
-                        div().text_xs().child(SharedString::from(text))
-                    }))
+                    .child(body)
             });
         let chips = self
             .draft
