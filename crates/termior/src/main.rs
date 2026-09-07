@@ -205,7 +205,7 @@ fn resolve_workspace_root(smoke_test: bool) -> PathBuf {
             || current.join("package.json").is_file()
             || current.join("pyproject.toml").is_file();
         if looks_like_project || smoke_test {
-            return current.canonicalize().unwrap_or(current);
+            return normal_path(current.canonicalize().unwrap_or(current));
         }
     }
 
@@ -243,7 +243,24 @@ fn workspace_from_args(args: impl IntoIterator<Item = OsString>) -> Option<PathB
 }
 
 fn valid_workspace(path: PathBuf) -> Option<PathBuf> {
-    path.is_dir().then(|| path.canonicalize().unwrap_or(path))
+    path.is_dir()
+        .then(|| path.canonicalize().unwrap_or(path))
+        .map(normal_path)
+}
+
+/// Windows 的 `canonicalize` 返回 `\\?\` 扩展长度（verbatim）路径。这种形态若作为
+/// workspace root 存盘并传给 PTY 当 cwd，PowerShell 提示符会显示成
+/// `Microsoft.PowerShell.Core\Filesystem::\\?\C:\...`。这里统一剥掉前缀，
+/// 恢复普通 Win32 路径形态；非 Windows 平台原样返回。
+fn normal_path(path: PathBuf) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path
+    }
 }
 
 fn last_workspace_root() -> Option<PathBuf> {
@@ -293,6 +310,22 @@ mod tests {
         assert_eq!(
             workspace_from_args([OsString::from("demo")]),
             Some(PathBuf::from("demo"))
+        );
+    }
+
+    #[test]
+    fn normal_path_strips_windows_verbatim_prefix() {
+        assert_eq!(
+            normal_path(PathBuf::from(r"\\?\C:\Coding\ToolsProjects\termior")),
+            PathBuf::from(r"C:\Coding\ToolsProjects\termior")
+        );
+        assert_eq!(
+            normal_path(PathBuf::from(r"\\?\UNC\server\share\dir")),
+            PathBuf::from(r"\\server\share\dir")
+        );
+        assert_eq!(
+            normal_path(PathBuf::from("/home/user/project")),
+            PathBuf::from("/home/user/project")
         );
     }
 }

@@ -139,10 +139,10 @@ impl HttpProvider {
     pub fn ping(&self) -> Result<Duration, ProviderTransportError> {
         self.check_endpoint_for_ping(&self.config.base_url)?;
         let started = std::time::Instant::now();
-        self.client
-            .get(&self.config.base_url)
-            .send()?
-            .error_for_status()?;
+        let response = self.client.get(&self.config.base_url).send()?;
+        // 任意 HTTP 应答（含 401/404）都证明网络可达；多数 Provider 的根路径
+        // 本就没有匿名 GET 页面，若按状态码判失败会误导用户以为配置有误。
+        let _ = response.status();
         Ok(started.elapsed())
     }
 

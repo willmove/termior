@@ -3893,7 +3893,7 @@ impl WorkspaceView {
                 .bg(gpui_color(self.palette.elevated))
                 .text_xs()
                 .child(SharedString::from(format!(
-                    "{}: {}{}▏",
+                    "{}: {}{}|",
                     self.command_mode.label(),
                     self.command_input,
                     if self.command_marked_text.is_empty() {

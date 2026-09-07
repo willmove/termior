@@ -434,7 +434,7 @@ impl gpui::Render for GitHistoryView {
                     .border_color(ui::color(p.accent))
                     .bg(ui::color(p.elevated))
                     .child(SharedString::from(format!(
-                        "Search history: {}▏",
+                        "Search history: {}|",
                         self.query
                     ))),
             )

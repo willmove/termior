@@ -20,8 +20,8 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight, Hsla,
     InputHandler, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    ScrollWheelEvent, SharedString, StrikethroughStyle, Styled, Subscription, Task, TextAlign,
-    TextRun, UTF16Selection, UnderlineStyle, WeakEntity, Window,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled,
+    Subscription, Task, TextAlign, TextRun, UTF16Selection, UnderlineStyle, WeakEntity, Window,
 };
 use termior_store::{TerminalSettings, UserKeymap};
 use termior_terminal::{PtySessionConfig, TerminalBridge, TerminalEventProxy};
@@ -84,6 +84,15 @@ pub struct TerminalView {
     search_overlay: SearchOverlay,
     search: TerminalSearch,
     snapshot_text: String,
+    /// 可视区每行的文本与在 snapshot_text 中的起始字节偏移（每帧渲染时刷新），
+    /// 用于把鼠标位置换算成 snapshot_text 字节偏移做链接命中。
+    snapshot_rows: std::collections::BTreeMap<i32, SnapshotRow>,
+    /// snapshot_text 中链接的字节区间与 URL（每帧渲染时刷新）。
+    link_spans: Vec<(std::ops::Range<usize>, String)>,
+    /// 指针当前悬停命中的链接；仅悬停期间显示提示条，不再常驻遮挡底部行。
+    hovered_link: Option<String>,
+    /// 左键按下位置，用于区分"点击打开链接"与"拖拽框选"。
+    mouse_down_position: Option<Point<Pixels>>,
     buffer_text: String,
     text_style: TerminalTextStyle,
     cell_width: f32,
@@ -233,6 +242,10 @@ impl TerminalView {
             search_overlay: SearchOverlay::default(),
             search: TerminalSearch::default(),
             snapshot_text: String::new(),
+            snapshot_rows: std::collections::BTreeMap::new(),
+            link_spans: Vec::new(),
+            hovered_link: None,
+            mouse_down_position: None,
             buffer_text: String::new(),
             cell_width: text_style.font_size * 0.6 + text_style.letter_spacing,
             line_height_px,
@@ -602,6 +615,7 @@ impl TerminalView {
                 _ => SelectionType::Simple,
             };
             self.term.selection = Some(Selection::new(selection_type, point, side));
+            self.mouse_down_position = Some(event.position);
             cx.notify();
         }
     }
@@ -629,10 +643,18 @@ impl TerminalView {
                     }
                 }
             }
-        } else if event.pressed_button == Some(MouseButton::Left) {
-            if let Some(selection) = self.term.selection.as_mut() {
-                selection.update(point, side);
+        } else {
+            // 悬停链接检测：位置变化即刷新提示条与指针形状。
+            let link = self.link_at_position(event.position);
+            if link != self.hovered_link {
+                self.hovered_link = link;
                 cx.notify();
+            }
+            if event.pressed_button == Some(MouseButton::Left) {
+                if let Some(selection) = self.term.selection.as_mut() {
+                    selection.update(point, side);
+                    cx.notify();
+                }
             }
         }
     }
@@ -653,8 +675,48 @@ impl TerminalView {
                 }
             }
         } else if event.button == MouseButton::Left {
+            let clicked_link = self
+                .mouse_down_position
+                .take()
+                .is_some_and(|down| {
+                    (down.x - event.position.x).abs() + (down.y - event.position.y).abs() < px(4.0)
+                })
+                .then(|| self.link_at_position(event.position))
+                .flatten();
+            if let Some(url) = clicked_link {
+                // 点击（非拖选）落在链接上：打开并清掉按下时创建的空选区。
+                if event.click_count == 1 {
+                    self.term.selection = None;
+                    let _ = termior_platform::open_external(&url);
+                }
+            }
             cx.notify();
         }
+    }
+
+    /// 把窗口坐标映射到 snapshot_text 的字节偏移，命中则返回链接 URL。
+    ///
+    /// 列→字节的换算按"一列一字符"近似：行内 URL 之前若有宽字符（占两列、
+    /// 文本里一个字符）命中会偏移若干列，属可接受的边界。
+    fn link_at_position(&self, position: Point<Pixels>) -> Option<String> {
+        if self.link_spans.is_empty() {
+            return None;
+        }
+        let (point, _) = self.terminal_point_for_position(position);
+        let display_offset = self.term.grid().display_offset().min(i32::MAX as usize) as i32;
+        let viewport_row = point.line.0 + display_offset;
+        let row = self.snapshot_rows.get(&viewport_row)?;
+        let column = point.column.0;
+        if column >= row.text.chars().count() {
+            return None;
+        }
+        let mut byte = row.start + row.text.chars().take(column).collect::<String>().len();
+        // 命中行尾换行符等边界时回退到行内。
+        byte = byte.min(row.start + row.text.len());
+        self.link_spans
+            .iter()
+            .find(|(range, _)| range.contains(&byte))
+            .map(|(_, url)| url.clone())
     }
 
     fn terminal_point_for_position(&self, position: Point<Pixels>) -> (TerminalPoint, Side) {
@@ -705,14 +767,22 @@ impl Render for TerminalView {
         // 提前把 renderable content 收集成 owned 数据，避免 'static paint 闭包借用 &self.term。
         let content = self.term.renderable_content();
         let snapshot: RenderSnapshot = collect_snapshot(content);
-        self.snapshot_text = snapshot_to_text(&snapshot);
+        let (snapshot_text, snapshot_rows) = snapshot_to_text(&snapshot);
+        self.snapshot_text = snapshot_text;
+        self.snapshot_rows = snapshot_rows;
         self.buffer_text = terminal_buffer_tail_to_text(&self.term, 300);
         self.update_search();
         let search = self.search.clone();
-        let links = find_hyperlinks(&self.snapshot_text)
+        // 链接区间缓存到状态里，鼠标悬停/点击时按行列换算字节偏移命中。
+        self.link_spans = find_hyperlinks(&self.snapshot_text)
             .into_iter()
-            .filter_map(|range| self.snapshot_text.get(range).map(str::to_owned))
-            .collect::<Vec<_>>();
+            .filter_map(|range| {
+                self.snapshot_text
+                    .get(range.clone())
+                    .map(|url| (range, url.to_owned()))
+            })
+            .collect();
+        let hovered_link = self.hovered_link.clone();
         let marked_text = self.marked_text.clone();
         let marked_col = snapshot.cursor.col;
         let marked_row = snapshot.cursor.row.max(0) as usize;
@@ -745,6 +815,15 @@ impl Render for TerminalView {
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_scroll_wheel(cx.listener(Self::handle_scroll))
+            // 指针离开终端时清掉悬停链接，避免提示条滞留。
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if !*hovered && this.hovered_link.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .when(self.hovered_link.is_some(), |element| {
+                element.cursor_pointer()
+            })
             .size_full()
             .bg(bg)
             .text_color(fg)
@@ -848,7 +927,7 @@ impl Render for TerminalView {
                         .text_color(crate::ui::color(self.palette.foreground))
                         .shadow_md()
                         .child(SharedString::from(format!(
-                            "Find: {}▏",
+                            "Find: {}|",
                             self.search_overlay.query
                         )))
                         .child(SharedString::from(format!(
@@ -867,7 +946,10 @@ impl Render for TerminalView {
                         ))),
                 )
             })
-            .when(!links.is_empty(), |element| {
+            .when_some(hovered_link, |element, url| {
+                // 悬停提示条：仅在指针悬停于链接上时短暂出现（点击也可打开），
+                // 不再常驻遮挡终端底部行。
+                let target = url.clone();
                 element.child(
                     div()
                         .absolute()
@@ -875,10 +957,9 @@ impl Render for TerminalView {
                         .left(px(6.0))
                         .flex()
                         .gap_1()
-                        .children(links.into_iter().take(3).enumerate().map(|(index, url)| {
-                            let target = url.clone();
+                        .child(
                             div()
-                                .id(SharedString::from(format!("terminal-link-{index}")))
+                                .id("terminal-link-hover")
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
@@ -891,8 +972,8 @@ impl Render for TerminalView {
                                 .child(SharedString::from(url))
                                 .on_mouse_down(gpui::MouseButton::Left, move |_, _, _| {
                                     let _ = termior_platform::open_external(&target);
-                                })
-                        })),
+                                }),
+                        ),
                 )
             })
     }
@@ -1084,7 +1165,18 @@ fn collect_snapshot(content: RenderableContent<'_>) -> RenderSnapshot {
     }
 }
 
-fn snapshot_to_text(snapshot: &RenderSnapshot) -> String {
+/// 可视区一行的文本与它在 snapshot_text 中的起始字节偏移。
+#[derive(Debug, Clone)]
+struct SnapshotRow {
+    start: usize,
+    text: String,
+}
+
+/// 把可视区 snapshot 拼成多行文本（行间以 `\n` 连接、行尾空白裁剪），
+/// 并返回每行的文本与起始偏移，供鼠标命中测试换算。
+fn snapshot_to_text(
+    snapshot: &RenderSnapshot,
+) -> (String, std::collections::BTreeMap<i32, SnapshotRow>) {
     let mut rows = std::collections::BTreeMap::<i32, Vec<String>>::new();
     for (row, column, cell) in &snapshot.cells {
         let line = rows.entry(*row).or_default();
@@ -1100,10 +1192,23 @@ fn snapshot_to_text(snapshot: &RenderSnapshot) -> String {
             line[*column].clone_from(&cell.text);
         }
     }
-    rows.into_values()
-        .map(|line| line.concat().trim_end().to_owned())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut text = String::new();
+    let mut row_map = std::collections::BTreeMap::new();
+    for (row, line) in rows {
+        let line_text = line.concat().trim_end().to_owned();
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        row_map.insert(
+            row,
+            SnapshotRow {
+                start: text.len(),
+                text: line_text.clone(),
+            },
+        );
+        text.push_str(&line_text);
+    }
+    (text, row_map)
 }
 
 fn terminal_buffer_tail_to_text<T>(term: &Term<T>, max_lines: usize) -> String {
@@ -2014,7 +2119,7 @@ mod protocol_tests {
             .cells
             .iter()
             .any(|(_, _, cell)| cell.flags.contains(Flags::INVERSE)));
-        let text = snapshot_to_text(&snapshot);
+        let text = snapshot_to_text(&snapshot).0;
         assert!(text.starts_with("中e\u{301}IUR"), "snapshot text: {text:?}");
     }
 
@@ -2029,7 +2134,25 @@ mod protocol_tests {
             .cells
             .iter()
             .all(|(row, _, _)| (0..2).contains(row)));
-        assert!(snapshot_to_text(&snapshot).starts_with("one\ntwo"));
+        assert!(snapshot_to_text(&snapshot).0.starts_with("one\ntwo"));
+    }
+
+    #[test]
+    fn snapshot_rows_map_viewport_rows_to_byte_offsets() {
+        let term = parsed_term("see https://example.com/x now\r\nplain", 40, 3);
+        let snapshot = collect_snapshot(term.renderable_content());
+        let (text, rows) = snapshot_to_text(&snapshot);
+
+        let row0 = &rows[&0];
+        assert_eq!(row0.text, "see https://example.com/x now");
+        assert_eq!(row0.start, 0);
+        // 列 4 恰好是 URL 起始；换算出的字节偏移应落在 URL 上。
+        let byte = row0.start + row0.text.chars().take(4).collect::<String>().len();
+        assert!(&text[byte..].starts_with("https://example.com/x"));
+
+        let row1 = &rows[&1];
+        assert_eq!(row1.text, "plain");
+        assert_eq!(row1.start, "see https://example.com/x now".len() + 1);
     }
 
     #[test]

@@ -211,7 +211,8 @@ impl ComposerView {
             .cloned();
         let Some(profile) = profile else {
             self.runtime = None;
-            self.status = "Choose and enable a default chat model in Settings → Models".into();
+            self.status =
+                "Settings → Models: pick a provider, click \"Use for chat\", and enable it".into();
             cx.notify();
             return;
         };
@@ -953,15 +954,19 @@ impl ComposerView {
         cx.notify();
     }
 
+    /// 输入草稿 + 光标。光标用 ASCII `|` 字符而不是 `▏`（U+258F）：后者在
+    /// Windows 上经字体回退渲染成一个很宽的空白。`|` 在任何 UI 字体里都是
+    /// 窄竖线，且随文本流布局，无独立元素参与 flex 分配（曾因文本拆段 +
+    /// flex 子项被压成逐字换行的竖排回归）。
     fn display_input(&self) -> String {
         let mut input = self.draft.input.clone();
         let byte = char_to_byte(&input, self.cursor);
         input.insert_str(
             byte,
             if self.marked_text.is_empty() {
-                "▏"
+                "|"
             } else {
-                "▏…"
+                "|…"
             },
         );
         input
@@ -1108,12 +1113,10 @@ impl gpui::Render for ComposerView {
         let compact = self.is_compact();
         let placeholder = self.model_setup_placeholder();
         let show_status_row = placeholder.is_none() && !self.status.is_empty();
-        let input_display = if self.draft.input.is_empty() {
-            if let Some(hint) = placeholder {
-                format!("{hint}▏")
-            } else {
-                self.display_input()
-            }
+        let placeholder_active = self.draft.input.is_empty() && placeholder.is_some();
+        // 占位态显示引导文案 + 光标；光标是文本内的 `|` 字符，随文本流布局。
+        let input_display = if placeholder_active {
+            format!("{}|", placeholder.unwrap_or_default())
         } else {
             self.display_input()
         };
@@ -1591,6 +1594,8 @@ impl gpui::Render for ComposerView {
             .children(path_suggestions)
             .child(
                 // 第 1 行：输入文本独占整行宽度，右侧停靠窄面板下长提示词仍完整可见。
+                // 光标是文本内的 `|` 字符；文本保持单一文本子节点，不做 flex 拆段
+                // （拆段曾在真实字体下被压成逐字换行的竖排）。
                 termior_ui_kit::input_field(&p, self.focus_handle.is_focused(window))
                     .flex()
                     .items_center()
@@ -1602,10 +1607,10 @@ impl gpui::Render for ComposerView {
                             .flex_1()
                             .min_w(px(0.0))
                             .text_sm()
-                            .when(
-                                self.draft.input.is_empty() && placeholder.is_some(),
-                                |text| text.text_color(crate::ui::muted(&p)),
-                            )
+                            .when(placeholder_active, |text| {
+                                text.text_color(crate::ui::muted(&p))
+                            })
+                            .debug_selector(|| "composer-input-text".into())
                             .child(SharedString::from(input_display)),
                     ),
             )
@@ -1866,4 +1871,38 @@ fn image_mime(path: &Path) -> Option<&'static str> {
         "tif" | "tiff" => "image/tiff",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// 用真实 ComposerView 渲染，防止输入行结构改动把文本压成逐字换行（竖排）。
+    /// CJK 输入 + 光标在开头是用户踩过的状态；断言输入文本保持单行高度。
+    #[test]
+    fn composer_input_text_stays_on_one_line() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        let input = "你现在是什么模型为什么这样显示输入内容测试";
+        composer.update(vcx, |view, _| {
+            view.draft.input = input.into();
+            view.cursor = 0;
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let text = vcx
+            .debug_bounds("composer-input-text")
+            .expect("input text rendered");
+        assert!(
+            text.size.height < px(30.0),
+            "composer input wrapped to multiple lines: {text:?}"
+        );
+        assert!(
+            text.size.width > px(150.0),
+            "composer input collapsed: {text:?}"
+        );
+    }
 }

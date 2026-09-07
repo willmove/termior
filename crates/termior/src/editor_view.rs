@@ -790,7 +790,7 @@ impl Render for EditorView {
                 .bg(crate::ui::color(p.overlay))
                 .text_color(crate::ui::color(p.foreground))
                 .shadow_md()
-                .child(SharedString::from(format!("Find: {}▏", self.search.query)))
+                .child(SharedString::from(format!("Find: {}|", self.search.query)))
                 .child(SharedString::from(format!(
                     "{}/{} · {}",
                     if self.search.total == 0 {
@@ -1135,12 +1135,14 @@ fn highlighted_segments(
 ) -> Vec<AnyElement> {
     let ghost_color = parse_hex_alpha(&theme.foreground, 0x55);
     let ghost = ghost_text.filter(|ghost| !ghost.is_empty());
-    // 光标标记块：竖线 + IME 预编辑串，其后内联渲染 ghost text（FR-EDIT-05）。
+    // 光标标记块：ASCII `|` 竖线字符 + IME 预编辑串，其后内联渲染 ghost text
+    // （FR-EDIT-05）。不用 `▏`（字体回退会渲染成宽空白），也不拆成独立
+    // flex 光标元素（真实字体下文本段有被压成逐字换行的先例）。
     let push_cursor_block = |elements: &mut Vec<AnyElement>| {
         elements.push(
             div()
                 .text_color(parse_hex(&theme.cursor))
-                .child(SharedString::from(format!("▏{marked_text}")))
+                .child(SharedString::from(format!("|{marked_text}")))
                 .into_any_element(),
         );
         if let Some(ghost) = ghost {

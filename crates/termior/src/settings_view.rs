@@ -1,7 +1,8 @@
 use gpui::{
-    canvas, div, prelude::*, px, AnyElement, App, Bounds, Context, FocusHandle, Focusable,
-    InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, SharedString,
-    StatefulInteractiveElement, UTF16Selection, WeakEntity, Window,
+    canvas, div, prelude::*, px, AnyElement, App, Bounds, ClipboardItem, Context, FocusHandle,
+    Focusable, Font, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, SharedString, StatefulInteractiveElement, TextRun, UTF16Selection,
+    WeakEntity, Window,
 };
 use std::{ops::Range, path::PathBuf, time::Duration};
 
@@ -51,6 +52,7 @@ enum SelectMenu {
     DarkTheme,
     EditorTheme,
     Appearance,
+    ProviderProfile,
 }
 
 pub struct SettingsView {
@@ -63,6 +65,16 @@ pub struct SettingsView {
     edit_field: Option<EditField>,
     draft: String,
     cursor: usize,
+    /// 选区锚点（字符下标）。`None` 或与 cursor 重合时视为无选区；
+    /// 有值时选区为 anchor..cursor，方向由二者大小决定。
+    anchor: Option<usize>,
+    /// 鼠标拖拽划选的固定端（字符下标）；仅在按住左键拖拽期间有效。
+    drag_anchor: Option<usize>,
+    /// 当前编辑字段文本内容区的 bounds（paint 期由 canvas 记录，供鼠标命中测试）。
+    edit_bounds: Option<Bounds<Pixels>>,
+    /// 测量编辑文本用的字体；render 期从窗口环境样式捕获，
+    /// 保证与输入框实际渲染继承的字体一致。
+    edit_font: Font,
     marked_text: String,
     credential_present: bool,
     /// 已输入但尚未写入钥匙串的 API key（需显式 Save API key）。
@@ -115,6 +127,10 @@ impl SettingsView {
             edit_field: None,
             draft: String::new(),
             cursor: 0,
+            anchor: None,
+            drag_anchor: None,
+            edit_bounds: None,
+            edit_font: Font::default(),
             marked_text: String::new(),
             credential_present: false,
             pending_api_key: None,
@@ -197,8 +213,179 @@ impl SettingsView {
             self.draft.clear();
         }
         self.cursor = self.draft.chars().count();
+        self.anchor = None;
+        self.drag_anchor = None;
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    /// 当前选区（字符区间，start <= end）；无选区时返回 None。
+    fn selection(&self) -> Option<Range<usize>> {
+        let anchor = self.anchor?;
+        (anchor != self.cursor).then(|| anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    /// 删除选区并把光标折叠到选区起点；返回是否确有选区被删除。
+    fn delete_selection(&mut self) -> bool {
+        let Some(range) = self.selection() else {
+            return false;
+        };
+        let start = char_to_byte(&self.draft, range.start);
+        let end = char_to_byte(&self.draft, range.end);
+        self.draft.replace_range(start..end, "");
+        self.cursor = range.start;
+        self.anchor = None;
+        true
+    }
+
+    /// 在光标处插入文本（替换当前选区）。单行字段丢弃换行符。
+    fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.edit_field.is_none() {
+            return;
+        }
+        let text = text.replace(['\r', '\n'], "");
+        if text.is_empty() {
+            return;
+        }
+        self.delete_selection();
+        self.anchor = None;
+        let byte = char_to_byte(&self.draft, self.cursor);
+        self.draft.insert_str(byte, &text);
+        self.cursor += text.chars().count();
+        self.marked_text.clear();
+        cx.notify();
+    }
+
+    /// 读取剪贴板并把文本粘贴进当前编辑字段。Windows 上打开剪贴板会向
+    /// wndproc 回派 sent message，若在 entity 更新中直接读会重入崩溃，
+    /// 因此推迟到更新结束之后（与 Composer 的 schedule_attach_clipboard 相同）。
+    fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        let entity = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+                return;
+            };
+            let _ = entity.update(cx, |this, cx| this.insert_text(&text, cx));
+        });
+    }
+
+    /// 把当前选区复制到剪贴板；`cut` 为真时同时删除选区。
+    fn copy_selection(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let Some(range) = self.selection() else {
+            return;
+        };
+        let text: String = self
+            .draft
+            .chars()
+            .skip(range.start)
+            .take(range.end - range.start)
+            .collect();
+        if text.is_empty() {
+            return;
+        }
+        if cut && self.delete_selection() {
+            cx.notify();
+        }
+        cx.defer(move |cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
+    }
+
+    /// 鼠标按下编辑字段：进入编辑并把光标/选区落到点击处。
+    /// 单击定位光标，双击选词，三击全选；随后按住拖拽从对应端划选。
+    fn begin_mouse_edit(
+        &mut self,
+        field: EditField,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_edit(field, window, cx);
+        let index = self.char_index_at(event.position, window);
+        match event.click_count {
+            2 => {
+                let range = self.word_range_at(index);
+                self.anchor = Some(range.start);
+                self.cursor = range.end;
+                self.drag_anchor = Some(range.start);
+            }
+            3.. => {
+                self.anchor = Some(0);
+                self.cursor = self.draft.chars().count();
+                self.drag_anchor = Some(0);
+            }
+            _ => {
+                self.cursor = index;
+                self.anchor = None;
+                self.drag_anchor = Some(index);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 拖拽划选：固定端停在按下处，游标端跟随指针。
+    fn drag_edit_to(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.char_index_at(position, window);
+        if self.cursor != index || self.anchor.is_none() {
+            self.cursor = index;
+            self.anchor = Some(self.drag_anchor.unwrap_or(index));
+            cx.notify();
+        }
+    }
+
+    /// 把窗口坐标换算成编辑草稿的字符下标。API key 按掩码测量，与实际渲染一致。
+    fn char_index_at(&self, position: Point<Pixels>, window: &mut Window) -> usize {
+        let Some(field) = self.edit_field else {
+            return 0;
+        };
+        let Some(bounds) = self.edit_bounds else {
+            return self.draft.chars().count();
+        };
+        let text: String = if field == EditField::ApiKey {
+            "•".repeat(self.draft.chars().count())
+        } else {
+            self.draft.clone()
+        };
+        if text.is_empty() {
+            return 0;
+        }
+        let run = TextRun {
+            len: text.len(),
+            font: self.edit_font.clone(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = window.text_system().layout_line(
+            &text,
+            px(termior_ui_kit::tokens::font_size::BODY),
+            &[run],
+            None,
+        );
+        let local = position - bounds.origin;
+        // 单行文本：只用 x 命中最接近的字符边界。
+        let byte = line.closest_index_for_x(local.x).min(text.len());
+        text[..byte].chars().count()
+    }
+
+    /// 双击选词的词边界：字母数字以及 URL/型号里常见的符号算词内字符。
+    fn word_range_at(&self, index: usize) -> Range<usize> {
+        let chars: Vec<char> = self.draft.chars().collect();
+        let is_word =
+            |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '+' | '=');
+        let mut start = index.min(chars.len());
+        while start > 0 && is_word(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = index.min(chars.len());
+        while end < chars.len() && is_word(chars[end]) {
+            end += 1;
+        }
+        start..end
     }
 
     fn value_for(&self, field: EditField) -> String {
@@ -344,6 +531,8 @@ impl SettingsView {
         }
         self.draft.clear();
         self.cursor = 0;
+        self.anchor = None;
+        self.drag_anchor = None;
         self.marked_text.clear();
     }
 
@@ -485,14 +674,13 @@ impl SettingsView {
         Ok(())
     }
 
-    fn cycle_profile(&mut self, delta: isize, cx: &mut Context<Self>) {
+    fn select_profile(&mut self, index: usize, cx: &mut Context<Self>) {
         self.commit_edit();
         self.schedule_save_if_dirty(cx);
-        let len = self.settings.models.profiles.len();
-        if len > 0 {
-            self.profile_index =
-                (self.profile_index as isize + delta).rem_euclid(len as isize) as usize;
+        if index < self.settings.models.profiles.len() {
+            self.profile_index = index;
         }
+        self.select_menu = None;
         self.refresh_credential_state();
         self.status.clear();
         cx.notify();
@@ -506,14 +694,29 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// 设为默认聊天模型（Agent 面板使用）。Composer 只会选用已启用的 profile，
+    /// 因此设默认时自动启用，避免「设了默认却仍不可用」的静默失效。
     fn make_active_chat(&mut self, cx: &mut Context<Self>) {
-        self.settings.models.active_chat_profile = self.profile().map(|p| p.id.clone());
+        let Some(id) = self.profile().map(|p| p.id.clone()) else {
+            return;
+        };
+        if let Some(profile) = self.profile_mut() {
+            profile.enabled = true;
+        }
+        self.settings.models.active_chat_profile = Some(id);
         self.schedule_save(cx);
         cx.notify();
     }
 
+    /// 设为默认补全模型（内联补全使用）。与聊天默认同理，设默认时自动启用。
     fn make_active_completion(&mut self, cx: &mut Context<Self>) {
-        self.settings.models.active_completion_profile = self.profile().map(|p| p.id.clone());
+        let Some(id) = self.profile().map(|p| p.id.clone()) else {
+            return;
+        };
+        if let Some(profile) = self.profile_mut() {
+            profile.enabled = true;
+        }
+        self.settings.models.active_completion_profile = Some(id);
         self.schedule_save(cx);
         cx.notify();
     }
@@ -875,6 +1078,32 @@ impl SettingsView {
         if self.edit_field.is_none() {
             return;
         }
+        let modifiers = event.keystroke.modifiers;
+        let primary = if cfg!(target_os = "macos") {
+            modifiers.platform
+        } else {
+            modifiers.control
+        };
+        if primary && !modifiers.shift && !modifiers.alt {
+            match event.keystroke.key.as_str() {
+                "v" => self.paste_from_clipboard(cx),
+                "a" => {
+                    self.anchor = Some(0);
+                    self.cursor = self.draft.chars().count();
+                    cx.notify();
+                }
+                "c" => self.copy_selection(false, cx),
+                "x" => self.copy_selection(true, cx),
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        let shift = modifiers.shift;
+        let extend = |this: &mut Self, target: usize| {
+            this.anchor.get_or_insert(this.cursor);
+            this.cursor = target;
+        };
         match event.keystroke.key.as_str() {
             "enter" | "return" => {
                 self.commit_edit();
@@ -883,27 +1112,58 @@ impl SettingsView {
             "escape" => {
                 self.edit_field = None;
                 self.draft.clear();
+                self.anchor = None;
             }
-            "backspace" if self.cursor > 0 => {
-                let start = char_to_byte(&self.draft, self.cursor - 1);
-                let end = char_to_byte(&self.draft, self.cursor);
-                self.draft.replace_range(start..end, "");
-                self.cursor -= 1;
+            "backspace" if self.selection().is_some() || self.cursor > 0 => {
+                if !self.delete_selection() {
+                    let start = char_to_byte(&self.draft, self.cursor - 1);
+                    let end = char_to_byte(&self.draft, self.cursor);
+                    self.draft.replace_range(start..end, "");
+                    self.cursor -= 1;
+                }
+                self.anchor = None;
             }
-            "delete" if self.cursor < self.draft.chars().count() => {
-                let start = char_to_byte(&self.draft, self.cursor);
-                let end = char_to_byte(&self.draft, self.cursor + 1);
-                self.draft.replace_range(start..end, "");
+            "delete" if self.selection().is_some() || self.cursor < self.draft.chars().count() => {
+                if !self.delete_selection() {
+                    let start = char_to_byte(&self.draft, self.cursor);
+                    let end = char_to_byte(&self.draft, self.cursor + 1);
+                    self.draft.replace_range(start..end, "");
+                }
+                self.anchor = None;
             }
-            "left" => self.cursor = self.cursor.saturating_sub(1),
-            "right" => self.cursor = (self.cursor + 1).min(self.draft.chars().count()),
-            "home" => self.cursor = 0,
-            "end" => self.cursor = self.draft.chars().count(),
+            "left" if shift => extend(self, self.cursor.saturating_sub(1)),
+            "right" if shift => extend(self, (self.cursor + 1).min(self.draft.chars().count())),
+            "home" if shift => extend(self, 0),
+            "end" if shift => extend(self, self.draft.chars().count()),
+            "left" => {
+                self.cursor = self
+                    .selection()
+                    .map_or_else(|| self.cursor.saturating_sub(1), |range| range.start);
+                self.anchor = None;
+            }
+            "right" => {
+                self.cursor = self.selection().map_or_else(
+                    || (self.cursor + 1).min(self.draft.chars().count()),
+                    |range| range.end,
+                );
+                self.anchor = None;
+            }
+            "home" => {
+                self.cursor = 0;
+                self.anchor = None;
+            }
+            "end" => {
+                self.cursor = self.draft.chars().count();
+                self.anchor = None;
+            }
             _ => return,
         }
         cx.notify();
     }
 
+    /// 编辑中的输入框内容 + 光标。光标用 ASCII `|` 字符而不是 `▏`（U+258F）：
+    /// 后者在 Windows 上经字体回退渲染成一个很宽的空白，还让鼠标命中测试
+    /// 产生偏差。`|` 在任何 UI 字体里都是窄竖线，随文本流布局。
     fn display_edit(&self, field: EditField) -> String {
         if self.edit_field == Some(field) {
             let mut value = if field == EditField::ApiKey {
@@ -915,9 +1175,9 @@ impl SettingsView {
             value.insert_str(
                 byte,
                 if self.marked_text.is_empty() {
-                    "▏"
+                    "|"
                 } else {
-                    "▏…"
+                    "|…"
                 },
             );
             value
@@ -932,6 +1192,67 @@ impl SettingsView {
         self.status = format!("Press the new Cmd/Ctrl shortcut for {action:?}");
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    /// 编辑中的输入框内容：无选区时整段文本加光标；有选区时高亮选中部分。
+    /// 编辑期间在文本区铺一层透明 canvas，paint 时记录内容 bounds，供鼠标命中测试。
+    fn edit_display(&self, field: EditField, cx: &Context<Self>) -> AnyElement {
+        if self.edit_field != Some(field) {
+            return div()
+                .child(SharedString::from(self.value_for(field)))
+                .into_any_element();
+        }
+        let bounds_probe = {
+            let view = cx.entity().downgrade();
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, _, cx| {
+                    let _ = view.update(cx, |view, _| view.edit_bounds = Some(bounds));
+                },
+            )
+            .absolute()
+            .size_full()
+        };
+        let chars: Vec<char> = if field == EditField::ApiKey {
+            "•".repeat(self.draft.chars().count()).chars().collect()
+        } else {
+            self.draft.chars().collect()
+        };
+        let p = &self.palette;
+        let run = |text: String, highlighted: bool| -> Option<AnyElement> {
+            if text.is_empty() {
+                return None;
+            }
+            let mut element = div();
+            if highlighted {
+                element = element
+                    .bg(crate::ui::selected_wash(p))
+                    .rounded_sm()
+                    .text_color(crate::ui::color(p.foreground));
+            }
+            Some(element.child(SharedString::from(text)).into_any_element())
+        };
+        if let Some(range) = self.selection() {
+            let prefix = chars[..range.start].iter().collect();
+            let selected = chars[range.start..range.end].iter().collect();
+            let suffix = chars[range.end..].iter().collect();
+            div()
+                .flex()
+                .flex_row()
+                .items_baseline()
+                .children(run(prefix, false))
+                .children(run(selected, true))
+                .children(run(suffix, false))
+                .child(bounds_probe)
+                .into_any_element()
+        } else {
+            // 无选区：单一文本子节点（含 `|` 光标字符）。不做 flex 拆段加
+            // 独立光标元素——拆段曾在真实字体下被压成逐字换行的竖排。
+            div()
+                .child(SharedString::from(self.display_edit(field)))
+                .child(bounds_probe)
+                .into_any_element()
+        }
     }
 
     fn edit_row(
@@ -956,11 +1277,28 @@ impl SettingsView {
             .child(
                 termior_ui_kit::input_field(&p, self.edit_field == Some(field))
                     .id(SharedString::from(format!("edit-{field:?}")))
-                    .child(SharedString::from(self.display_edit(field)))
+                    .child(self.edit_display(field, cx))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
-                            this.begin_edit(field, window, cx)
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.begin_mouse_edit(field, event, window, cx)
+                        }),
+                    )
+                    .on_mouse_move(
+                        cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                            if this.edit_field == Some(field)
+                                && event.pressed_button == Some(MouseButton::Left)
+                            {
+                                this.drag_edit_to(event.position, window, cx);
+                            }
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event: &MouseUpEvent, _window, cx| {
+                            if this.drag_anchor.take().is_some() {
+                                cx.notify();
+                            }
                         }),
                     ),
             )
@@ -1226,6 +1564,84 @@ impl SettingsView {
         let active_chat = self.settings.models.active_chat_profile.as_deref() == Some(&profile.id);
         let active_completion =
             self.settings.models.active_completion_profile.as_deref() == Some(&profile.id);
+        // 下拉菜单里直接标注每个 profile 的状态，不必逐个翻看就能找到
+        // Agent 面板当前用的是哪一个。
+        let profile_menu_open = self.select_menu == Some(SelectMenu::ProviderProfile);
+        let profile_menu = profile_menu_open.then(|| {
+            div()
+                .w(px(360.0))
+                .p_1()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&self.palette))
+                .bg(crate::ui::color(self.palette.overlay))
+                .shadow_md()
+                .children(self.settings.models.profiles.iter().enumerate().map(
+                    |(index, entry)| {
+                        let mut tags = Vec::new();
+                        if self.settings.models.active_chat_profile.as_deref()
+                            == Some(entry.id.as_str())
+                        {
+                            tags.push("chat ✓");
+                        }
+                        if self.settings.models.active_completion_profile.as_deref()
+                            == Some(entry.id.as_str())
+                        {
+                            tags.push("completion ✓");
+                        }
+                        if !entry.enabled {
+                            tags.push("disabled");
+                        }
+                        let label = if tags.is_empty() {
+                            format!("{} · {}", entry.display_name, entry.model)
+                        } else {
+                            format!(
+                                "{} · {} · {}",
+                                entry.display_name,
+                                entry.model,
+                                tags.join(" · ")
+                            )
+                        };
+                        Self::select_option(
+                            SharedString::from(label),
+                            SharedString::from(format!("provider-option-{}", entry.id)),
+                            index == self.profile_index,
+                            &self.palette,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.select_profile(index, cx);
+                            }),
+                        )
+                    },
+                ))
+        });
+        let chat_profile_label = self
+            .settings
+            .models
+            .active_chat_profile
+            .as_deref()
+            .and_then(|id| self.settings.models.profiles.iter().find(|p| p.id == id))
+            .map(|p| {
+                format!(
+                    "{} · {}{}",
+                    p.display_name,
+                    p.model,
+                    // Composer 只选启用的 profile；标注禁用态，提示为何 Agent 面板没生效。
+                    if p.enabled { "" } else { " (disabled)" }
+                )
+            })
+            .unwrap_or_else(|| "Not set — the Agent panel cannot run".into());
+        let completion_profile_label = self
+            .settings
+            .models
+            .active_completion_profile
+            .as_deref()
+            .and_then(|id| self.settings.models.profiles.iter().find(|p| p.id == id))
+            .map(|p| format!("{} · {}", p.display_name, p.model))
+            .unwrap_or_else(|| "Not set".into());
         div()
             .flex()
             .flex_col()
@@ -1233,30 +1649,105 @@ impl SettingsView {
             .child(
                 self.section(
                     "Provider",
-                    "Credentials stay in the OS keychain and are never written to settings JSON.",
+                    "Pick a profile to edit below. Credentials stay in the OS keychain and are never written to settings JSON.",
                     [div()
                         .flex()
-                        .items_center()
-                        .gap_2()
+                        .flex_col()
+                        .gap_1()
                         .child(
-                            Self::button("‹", "previous-provider", &self.palette).on_mouse_down(
+                            Self::select_button(
+                                "Provider",
+                                SharedString::from(format!(
+                                    "{} ({}/{})",
+                                    profile.display_name,
+                                    self.profile_index + 1,
+                                    self.settings.models.profiles.len()
+                                )),
+                                "provider-select",
+                                profile_menu_open,
+                                &self.palette,
+                            )
+                            .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.cycle_profile(-1, cx)),
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_select_menu(SelectMenu::ProviderProfile, cx);
+                                }),
                             ),
                         )
-                        .child(div().flex_1().text_lg().child(SharedString::from(format!(
-                            "{}  ({}/{})",
-                            profile.display_name,
-                            self.profile_index + 1,
-                            self.settings.models.profiles.len()
-                        ))))
-                        .child(
-                            Self::button("›", "next-provider", &self.palette).on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.cycle_profile(1, cx)),
-                            ),
-                        )
+                        .when_some(profile_menu, |select, menu| select.child(menu))
                         .into_any_element()],
+                ),
+            )
+            .child(
+                self.section(
+                    "Default models",
+                    "Which profile the Agent panel (chat) and inline completion use. Setting a default also enables the profile.",
+                    [
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div().text_sm().child(SharedString::from(format!(
+                                    "Chat (Agent panel): {chat_profile_label}"
+                                ))),
+                            )
+                            .child(
+                                div().text_sm().child(SharedString::from(format!(
+                                    "Completion: {completion_profile_label}"
+                                ))),
+                            )
+                            .into_any_element(),
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                Self::button(
+                                    format!("Enabled: {}", on_off(profile.enabled)),
+                                    "provider-enabled",
+                                    &self.palette,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.toggle_provider(cx)),
+                                ),
+                            )
+                            .child(
+                                Self::button(
+                                    if active_chat {
+                                        "✓ Use for chat"
+                                    } else {
+                                        "Use for chat"
+                                    },
+                                    "active-chat",
+                                    &self.palette,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.make_active_chat(cx)),
+                                ),
+                            )
+                            .child(
+                                Self::button(
+                                    if active_completion {
+                                        "✓ Use for completion"
+                                    } else {
+                                        "Use for completion"
+                                    },
+                                    "active-completion",
+                                    &self.palette,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.make_active_completion(cx)
+                                    }),
+                                ),
+                            )
+                            .into_any_element(),
+                    ],
                 ),
             )
             .child(self.section(
@@ -1308,58 +1799,6 @@ impl SettingsView {
                             )
                             .into_any_element(),
                     ],
-                ),
-            )
-            .child(
-                self.section(
-                    "Defaults",
-                    "Which profile Composer and inline completion use.",
-                    [div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(
-                            Self::button(
-                                format!("Enabled: {}", on_off(profile.enabled)),
-                                "provider-enabled",
-                                &self.palette,
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.toggle_provider(cx)),
-                            ),
-                        )
-                        .child(
-                            Self::button(
-                                if active_chat {
-                                    "✓ Default chat"
-                                } else {
-                                    "Use for chat"
-                                },
-                                "active-chat",
-                                &self.palette,
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.make_active_chat(cx)),
-                            ),
-                        )
-                        .child(
-                            Self::button(
-                                if active_completion {
-                                    "✓ Default completion"
-                                } else {
-                                    "Use for completion"
-                                },
-                                "active-completion",
-                                &self.palette,
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.make_active_completion(cx)),
-                            ),
-                        )
-                        .into_any_element()],
                 ),
             )
             .into_any_element()
@@ -1954,8 +2393,17 @@ impl Focusable for SettingsView {
 }
 
 impl gpui::Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.palette = crate::ui::palette(cx);
+        // 捕获环境文本样式里的字体，鼠标命中测试用它做与渲染一致的文本测量。
+        let style = window.text_style();
+        self.edit_font = Font {
+            family: style.font_family.clone(),
+            weight: style.font_weight,
+            style: style.font_style,
+            features: style.font_features.clone(),
+            fallbacks: style.font_fallbacks.clone(),
+        };
         let p = self.palette.clone();
         let focus = self.focus_handle.clone();
         let input_focus = focus.clone();
@@ -2088,17 +2536,27 @@ impl InputHandler for SettingsInputHandler {
     ) -> Option<UTF16Selection> {
         let view = self.view.upgrade()?;
         let view = view.read(cx);
-        let position = view
-            .draft
-            .chars()
-            .take(view.cursor)
-            .collect::<String>()
-            .encode_utf16()
-            .count();
-        Some(UTF16Selection {
-            range: position..position,
-            reversed: false,
-        })
+        let utf16 = |char_index: usize| {
+            view.draft
+                .chars()
+                .take(char_index)
+                .collect::<String>()
+                .encode_utf16()
+                .count()
+        };
+        match view.selection() {
+            Some(range) => Some(UTF16Selection {
+                range: utf16(range.start)..utf16(range.end),
+                reversed: view.anchor.is_some_and(|anchor| anchor > view.cursor),
+            }),
+            None => {
+                let position = utf16(view.cursor);
+                Some(UTF16Selection {
+                    range: position..position,
+                    reversed: false,
+                })
+            }
+        }
     }
     fn marked_text_range(&mut self, _: &mut Window, cx: &mut App) -> Option<Range<usize>> {
         let view = self.view.upgrade()?;
@@ -2124,11 +2582,7 @@ impl InputHandler for SettingsInputHandler {
         if let Some(view) = self.view.upgrade() {
             view.update(cx, |view, cx| {
                 if view.edit_field.is_some() {
-                    let byte = char_to_byte(&view.draft, view.cursor);
-                    view.draft.insert_str(byte, text);
-                    view.cursor += text.chars().count();
-                    view.marked_text.clear();
-                    cx.notify();
+                    view.insert_text(text, cx);
                 }
             });
         }
@@ -2187,4 +2641,144 @@ fn char_to_byte(text: &str, index: usize) -> usize {
         .nth(index)
         .map(|(byte, _)| byte)
         .unwrap_or(text.len())
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn view_with_draft(cx: &mut TestAppContext, draft: &str) -> gpui::Entity<SettingsView> {
+        cx.new(|cx| {
+            let mut view = SettingsView::new(Settings::default(), None, None, None, None, cx);
+            view.edit_field = Some(EditField::Model);
+            view.draft = draft.to_owned();
+            view.cursor = draft.chars().count();
+            view
+        })
+    }
+
+    #[test]
+    fn paste_replaces_selection() {
+        let mut cx = TestAppContext::single();
+        let view = view_with_draft(&mut cx, "abcdef");
+        view.update(&mut cx, |view, cx| {
+            view.cursor = 2;
+            view.anchor = Some(4);
+            view.insert_text("XY", cx);
+            assert_eq!(view.draft, "abXYef");
+            assert_eq!(view.cursor, 4);
+            assert_eq!(view.anchor, None);
+        });
+    }
+
+    #[test]
+    fn paste_inserts_at_cursor_without_selection() {
+        let mut cx = TestAppContext::single();
+        let view = view_with_draft(&mut cx, "abc");
+        view.update(&mut cx, |view, cx| {
+            view.cursor = 1;
+            view.insert_text("XY", cx);
+            assert_eq!(view.draft, "aXYbc");
+            assert_eq!(view.cursor, 3);
+            assert_eq!(view.anchor, None);
+        });
+    }
+
+    #[test]
+    fn paste_strips_line_breaks_for_single_line_fields() {
+        let mut cx = TestAppContext::single();
+        let view = view_with_draft(&mut cx, "");
+        view.update(&mut cx, |view, cx| {
+            view.insert_text("sk-\r\n123\n", cx);
+            assert_eq!(view.draft, "sk-123");
+        });
+    }
+
+    #[test]
+    fn collapsed_anchor_does_not_resurrect_selection_after_paste() {
+        let mut cx = TestAppContext::single();
+        let view = view_with_draft(&mut cx, "ab");
+        view.update(&mut cx, |view, cx| {
+            // Shift+Left 再 Shift+Right 会留下 anchor == cursor 的折叠态。
+            view.anchor = Some(1);
+            view.cursor = 1;
+            view.insert_text("X", cx);
+            assert_eq!(view.draft, "aXb");
+            assert_eq!(view.selection(), None);
+        });
+    }
+
+    #[test]
+    fn delete_selection_collapses_cursor_to_start() {
+        let mut cx = TestAppContext::single();
+        let view = view_with_draft(&mut cx, "abcdef");
+        view.update(&mut cx, |view, _cx| {
+            view.cursor = 2;
+            view.anchor = Some(5);
+            assert_eq!(view.selection(), Some(2..5));
+            assert!(view.delete_selection());
+            assert_eq!(view.draft, "abf");
+            assert_eq!(view.cursor, 2);
+            assert_eq!(view.anchor, None);
+        });
+    }
+
+    #[test]
+    fn select_all_spans_whole_draft() {
+        let mut cx = TestAppContext::single();
+        let view = view_with_draft(&mut cx, "gpt-4o");
+        view.update(&mut cx, |view, _cx| {
+            view.anchor = Some(0);
+            assert_eq!(view.selection(), Some(0..6));
+        });
+    }
+
+    #[test]
+    fn double_click_word_range_covers_urls_and_symbols() {
+        let mut cx = TestAppContext::single();
+        let view = view_with_draft(&mut cx, "https://example.com/a b");
+        view.update(&mut cx, |view, _cx| {
+            // 点击 URL 内部：整段 URL 算一个词。
+            assert_eq!(view.word_range_at(5), 0..21);
+            // 点击 URL 与后续单词之间的空格边界：向左扩展到 URL 结尾。
+            assert_eq!(view.word_range_at(21), 0..21);
+            // 点击最后一个单词：只选中它。
+            assert_eq!(view.word_range_at(22), 22..23);
+        });
+    }
+
+    /// Composer 只选用已启用的 profile；设默认时必须连带启用，
+    /// 否则「设了默认聊天模型但 Agent 面板仍不可用」会静默失效。
+    #[test]
+    fn make_active_chat_enables_profile() {
+        let mut cx = TestAppContext::single();
+        let view = cx.new(|cx| {
+            SettingsView::new(Settings::default(), None, None, None, None, cx)
+        });
+        view.update(&mut cx, |view, cx| {
+            assert!(!view.settings.models.profiles[0].enabled);
+            view.make_active_chat(cx);
+            assert!(view.settings.models.profiles[0].enabled);
+            assert_eq!(
+                view.settings.models.active_chat_profile.as_deref(),
+                Some("anthropic")
+            );
+        });
+    }
+
+    #[test]
+    fn select_profile_switches_index_and_clamps() {
+        let mut cx = TestAppContext::single();
+        let view = cx.new(|cx| {
+            SettingsView::new(Settings::default(), None, None, None, None, cx)
+        });
+        view.update(&mut cx, |view, cx| {
+            view.select_profile(7, cx); // DeepSeek
+            assert_eq!(view.profile().map(|p| p.id.as_str()), Some("deepseek"));
+            assert_eq!(view.select_menu, None);
+            view.select_profile(usize::MAX, cx); // 越界时保持原索引
+            assert_eq!(view.profile().map(|p| p.id.as_str()), Some("deepseek"));
+        });
+    }
 }
