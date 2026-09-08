@@ -1,7 +1,12 @@
 //! Plan mode, custom agents and restricted sub-agent execution (FR-PLAN).
 
-use crate::{Agent, AgentError, ChatEvent, Message, Provider, ToolRegistry};
+use crate::{
+    ApprovalPolicy, CancellationToken, ChatEvent, Message, Provider, RuntimeBudgets,
+    RuntimeToolExecutor, TaskCommand, TaskConfig, TaskRuntime, TaskState, ToolExecution,
+    ToolRegistry,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -175,9 +180,11 @@ impl AgentDefinitionStore {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubagentResult {
+    pub task_id: String,
     pub agent_id: String,
     pub answer: String,
     pub messages: Vec<Message>,
+    pub state: TaskState,
 }
 
 pub async fn run_subagent<P, F>(
@@ -191,28 +198,112 @@ where
     P: Provider + 'static,
     F: Fn(&str, &str) -> Result<String, String> + Sync,
 {
+    let workspace = std::env::current_dir().unwrap_or_default();
+    let spec = crate::ChildTaskSpec {
+        task_id: format!("child-{}", definition.id),
+        parent_task_id: "legacy-parent".into(),
+        agent_id: definition.id.clone(),
+        goal: task.into(),
+        input_refs: Vec::new(),
+        output_schema: serde_json::json!({"type":"string"}),
+        tools: definition.tools.iter().cloned().collect(),
+        budgets: RuntimeBudgets::default(),
+        environment_id: "direct".into(),
+        provider_id: "native-child".into(),
+        workspace_id: workspace.display().to_string(),
+        project_dir: workspace,
+        dependencies: Vec::new(),
+        depth: crate::TaskDepth(1),
+        writes: definition.tools.iter().any(|tool| {
+            tools
+                .contract(tool)
+                .is_ok_and(|contract| contract.side_effect != crate::SideEffectClass::Read)
+        }),
+        snapshot: crate::SnapshotVersion(0),
+    };
+    run_child_task(definition, provider, tools, &spec, exec_tool).await
+}
+
+pub async fn run_child_task<P, F>(
+    definition: &AgentDefinition,
+    provider: P,
+    tools: ToolRegistry,
+    spec: &crate::ChildTaskSpec,
+    exec_tool: &F,
+) -> Result<SubagentResult, PlanError>
+where
+    P: Provider + 'static,
+    F: Fn(&str, &str) -> Result<String, String> + Sync,
+{
     definition.validate(&tools)?;
+    if spec.agent_id != definition.id {
+        return Err(PlanError::InvalidAgent(format!(
+            "child spec selects {}, definition is {}",
+            spec.agent_id, definition.id
+        )));
+    }
+    let definition_tools = definition.tools.iter().cloned().collect::<BTreeSet<_>>();
+    if !spec.tools.is_subset(&definition_tools) {
+        return Err(PlanError::InvalidAgent(
+            "child spec expands the selected agent tool set".into(),
+        ));
+    }
     let restricted = tools
-        .subset(definition.tools.clone())
+        .subset(spec.tools.iter().cloned())
         .map_err(|error| PlanError::InvalidAgent(error.to_string()))?;
-    let agent =
-        Agent::new(Box::new(provider), restricted).with_system_prompt(&definition.system_prompt);
-    // subagent 的流式增量不回传 UI（子代理后台执行，仅取最终消息）。
-    let outcome = agent
-        .run(&[Message::user(task)], exec_tool, &mut |_: &ChatEvent| {})
+    struct ClosureExecutor<'a, F>(&'a F);
+    impl<F> RuntimeToolExecutor for ClosureExecutor<'_, F>
+    where
+        F: Fn(&str, &str) -> Result<String, String> + Sync,
+    {
+        fn execute(
+            &self,
+            _call_id: &str,
+            tool: &str,
+            arguments: &str,
+            _cancellation: &CancellationToken,
+        ) -> Result<ToolExecution, String> {
+            (self.0)(tool, arguments).map(ToolExecution::Completed)
+        }
+    }
+    let mut runtime = TaskRuntime::new(
+        TaskConfig::new(
+            spec.goal.clone(),
+            &spec.project_dir,
+            spec.provider_id.clone(),
+            spec.environment_id.clone(),
+        ),
+        spec.budgets.clone(),
+        ApprovalPolicy::Prompt,
+    )
+    .with_tools(restricted)
+    .with_system_prompt(&definition.system_prompt)
+    .with_task_id(spec.task_id.clone())
+    .map_err(PlanError::Subagent)?;
+    runtime
+        .handle(
+            TaskCommand::Start {
+                user_input: spec.goal.clone(),
+            },
+            &provider,
+            &ClosureExecutor(exec_tool),
+            &mut |_: &ChatEvent| {},
+        )
         .await
-        .map_err(|error: AgentError| PlanError::Subagent(error.to_string()))?;
-    let answer = outcome
-        .messages
+        .map_err(|error| PlanError::Subagent(error.to_string()))?;
+    let answer = runtime
+        .history()
         .iter()
         .rev()
         .find(|message| message.role == crate::Role::Assistant)
         .map(|message| message.content.clone())
         .unwrap_or_default();
     Ok(SubagentResult {
+        task_id: runtime.task().id.0.clone(),
         agent_id: definition.id.clone(),
         answer,
-        messages: outcome.messages,
+        messages: runtime.history().to_vec(),
+        state: runtime.task().state,
     })
 }
 

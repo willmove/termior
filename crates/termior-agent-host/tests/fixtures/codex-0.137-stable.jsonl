@@ -1,0 +1,6 @@
+{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_fixture"}}}
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_fixture","turn":{"id":"turn_fixture","status":"inProgress","items":[]}}}
+{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr_fixture","turnId":"turn_fixture","itemId":"item_fixture","delta":"fixture text"}}
+{"jsonrpc":"2.0","id":17,"method":"item/commandExecution/requestApproval","params":{"threadId":"thr_fixture","turnId":"turn_fixture","itemId":"command_fixture","command":"cargo test","cwd":"<WORKSPACE>"}}
+{"jsonrpc":"2.0","method":"future/nonCritical","params":{"threadId":"thr_fixture","value":"preserved"}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_fixture","turn":{"id":"turn_fixture","status":"completed","items":[]}}}

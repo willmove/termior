@@ -1,7 +1,7 @@
 //! Command/event driven reliable single-agent runtime (FR-ARUN / FR-ACHG).
 
-use crate::message::{ChatEvent, Message, Role, ToolResult};
 use crate::approval::ApprovalRequest;
+use crate::message::{ChatEvent, Message, Role, ToolResult};
 use crate::provider::{Provider, ProviderRequest};
 use crate::task::{
     now_ms, AcceptanceCheck, AcceptanceReport, AcceptanceStatus, ApprovalPolicy, BudgetDimension,
@@ -11,19 +11,59 @@ use crate::task::{
 };
 use crate::tools::ToolRegistry;
 use futures::StreamExt;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedRuntimeState {
+    task: Task,
+    history: Vec<Message>,
+    invocations: Vec<ToolInvocation>,
+}
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    waker: futures::task::AtomicWaker,
+}
 
 #[derive(Debug, Clone, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken(Arc<CancellationState>);
 
 impl CancellationToken {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.cancelled.store(true, Ordering::Release);
+        self.0.waker.wake();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn cancelled(&self) -> CancellationFuture {
+        CancellationFuture(self.clone())
+    }
+}
+
+pub struct CancellationFuture(CancellationToken);
+
+impl Future for CancellationFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.0.is_cancelled() {
+            return Poll::Ready(());
+        }
+        self.0 .0.waker.register(context.waker());
+        if self.0.is_cancelled() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -44,6 +84,15 @@ pub enum ChangeReviewExecution {
 }
 
 pub trait RuntimeToolExecutor: Send + Sync {
+    fn prepare(
+        &self,
+        _call_id: &str,
+        _tool: &str,
+        _normalized_arguments: &str,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     fn execute(
         &self,
         call_id: &str,
@@ -51,6 +100,17 @@ pub trait RuntimeToolExecutor: Send + Sync {
         normalized_arguments: &str,
         cancellation: &CancellationToken,
     ) -> Result<ToolExecution, String>;
+
+    fn execute_change_batch(
+        &self,
+        calls: &[(String, String)],
+        cancellation: &CancellationToken,
+    ) -> Result<ToolExecution, String> {
+        if calls.len() != 1 {
+            return Err("executor does not support multi-file change sets".into());
+        }
+        self.execute(&calls[0].0, "write_file", &calls[0].1, cancellation)
+    }
 
     fn review_change(
         &self,
@@ -78,12 +138,16 @@ pub enum RuntimeError {
     Provider(String),
     #[error("runtime invariant failed: {0}")]
     Invariant(String),
+    #[error("task cancelled")]
+    Cancelled,
 }
 
 pub struct TaskRuntime {
     task: Task,
     approval_policy: ApprovalPolicy,
     tools: ToolRegistry,
+    system_prompt: Option<String>,
+    model: String,
     history: Vec<Message>,
     invocations: Vec<ToolInvocation>,
     events: Vec<TaskEvent>,
@@ -91,6 +155,13 @@ pub struct TaskRuntime {
     started_at_ms: Option<u64>,
     active_turn_id: Option<TurnId>,
     verification_started: bool,
+    output_store_root: Option<PathBuf>,
+    output_inline_limit: usize,
+    context_soft_limit_tokens: u64,
+    consecutive_compactions: u32,
+    max_consecutive_compactions: u32,
+    journal_data_root: Option<PathBuf>,
+    persistence_error: Option<String>,
 }
 
 impl TaskRuntime {
@@ -119,6 +190,8 @@ impl TaskRuntime {
             },
             approval_policy,
             tools: ToolRegistry::default(),
+            system_prompt: None,
+            model: "default".into(),
             history: Vec::new(),
             invocations: Vec::new(),
             events: Vec::new(),
@@ -126,12 +199,218 @@ impl TaskRuntime {
             started_at_ms: None,
             active_turn_id: None,
             verification_started: false,
+            output_store_root: None,
+            output_inline_limit: 32 * 1024,
+            context_soft_limit_tokens: 96_000,
+            consecutive_compactions: 0,
+            max_consecutive_compactions: 2,
+            journal_data_root: None,
+            persistence_error: None,
         }
     }
 
     pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = tools;
         self
+    }
+
+    pub fn with_history(mut self, history: Vec<Message>) -> Self {
+        self.history = history;
+        self
+    }
+
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    pub fn with_task_id(mut self, task_id: impl Into<String>) -> Result<Self, String> {
+        if self.task.state != TaskState::Idle
+            || !self.events.is_empty()
+            || !self.task.turns.is_empty()
+        {
+            return Err("task identity can only be fixed before execution".into());
+        }
+        self.task.id = TaskId(task_id.into());
+        Ok(self)
+    }
+
+    pub fn with_output_store(mut self, root: impl Into<PathBuf>, inline_limit: usize) -> Self {
+        self.output_store_root = Some(root.into());
+        self.output_inline_limit = inline_limit.max(256);
+        self
+    }
+
+    pub fn with_context_compaction(mut self, soft_limit_tokens: u64, max_consecutive: u32) -> Self {
+        self.context_soft_limit_tokens = soft_limit_tokens.max(64);
+        self.max_consecutive_compactions = max_consecutive.max(1);
+        self
+    }
+
+    pub fn try_with_journal(mut self, data_root: impl Into<PathBuf>) -> Result<Self, String> {
+        self.journal_data_root = Some(data_root.into());
+        self.persist_journal(
+            self.journal_data_root
+                .as_deref()
+                .expect("journal root was assigned"),
+        )?;
+        Ok(self)
+    }
+
+    pub fn recover_journal(
+        data_root: &Path,
+        task_id: &str,
+        approval_policy: ApprovalPolicy,
+        tools: ToolRegistry,
+    ) -> Result<Self, String> {
+        let tasks_root = data_root.join("agent-tasks");
+        let recovery = termior_store::TaskJournal::recover(&tasks_root, task_id, &[])
+            .map_err(|error| error.to_string())?;
+        let snapshot = termior_store::TaskJournal::load_snapshot(&tasks_root, task_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "task snapshot is missing".to_owned())?;
+        let (mut task, mut history, mut invocations) =
+            match serde_json::from_value::<PersistedRuntimeState>(snapshot.state.clone()) {
+                Ok(state) => (state.task, state.history, state.invocations),
+                Err(_) => (
+                    serde_json::from_value::<Task>(snapshot.state)
+                        .map_err(|error| format!("task snapshot is invalid: {error}"))?,
+                    vec![],
+                    vec![],
+                ),
+            };
+        let mut events = Vec::with_capacity(recovery.events.len());
+        for record in recovery.events {
+            let kind: TaskEventKind = serde_json::from_value(record.payload)
+                .map_err(|error| format!("task event {} is invalid: {error}", record.sequence))?;
+            let event = TaskEvent {
+                schema_version: TASK_EVENT_SCHEMA_VERSION,
+                sequence: record.sequence,
+                task_id: TaskId(task_id.into()),
+                turn_id: None,
+                occurred_at_ms: record.timestamp_ms,
+                kind,
+            };
+            if event.sequence > snapshot.last_sequence {
+                reduce_recovered_event(&mut task, &mut history, &mut invocations, &event);
+            }
+            events.push(event);
+        }
+        let had_incomplete_task = matches!(task.state, TaskState::Running | TaskState::Cancelling);
+        if had_incomplete_task {
+            task.state = TaskState::Unknown;
+            task.waiting_reason = None;
+        }
+        for invocation in &mut invocations {
+            if invocation.state == ToolState::Running {
+                invocation.state = ToolState::Unknown;
+                invocation.state_changed_at_ms = now_ms();
+            }
+        }
+        let active_turn_id = task
+            .turns
+            .last()
+            .filter(|turn| turn.finished_at_ms.is_none())
+            .map(|turn| turn.id.clone());
+        Ok(Self {
+            task,
+            approval_policy,
+            tools,
+            system_prompt: None,
+            model: "default".into(),
+            history,
+            invocations,
+            events,
+            cancellation: CancellationToken::default(),
+            started_at_ms: None,
+            active_turn_id,
+            verification_started: false,
+            output_store_root: None,
+            output_inline_limit: 32 * 1024,
+            context_soft_limit_tokens: 96_000,
+            consecutive_compactions: 0,
+            max_consecutive_compactions: 2,
+            journal_data_root: Some(data_root.to_path_buf()),
+            persistence_error: None,
+        })
+    }
+
+    pub fn task_brief(&self) -> crate::context_engine::TaskBrief {
+        use crate::context_engine::{PendingInvariant, TaskBrief};
+        let pending = |invocation: &ToolInvocation| PendingInvariant {
+            id: invocation.call_id.clone(),
+            detail: format!(
+                "{} {}",
+                invocation.tool_name,
+                invocation
+                    .normalized_arguments
+                    .as_deref()
+                    .unwrap_or(&invocation.raw_arguments)
+            ),
+        };
+        TaskBrief {
+            schema_version: 1,
+            goal: self.task.goal.clone(),
+            acceptance: self
+                .task
+                .acceptance_report
+                .criteria
+                .iter()
+                .map(|criterion| criterion.description.clone())
+                .collect(),
+            user_constraints: vec![],
+            decisions: self
+                .invocations
+                .iter()
+                .filter_map(|invocation| {
+                    invocation.decision.as_ref().map(|decision| {
+                        format!(
+                            "{} approved={} source={:?}",
+                            invocation.call_id, decision.approved, decision.source
+                        )
+                    })
+                })
+                .collect(),
+            completed_actions: self
+                .invocations
+                .iter()
+                .filter(|invocation| invocation.state == ToolState::Succeeded)
+                .map(|invocation| format!("{}: {}", invocation.call_id, invocation.tool_name))
+                .collect(),
+            pending_approvals: self
+                .invocations
+                .iter()
+                .filter(|invocation| invocation.state == ToolState::AwaitingApproval)
+                .map(pending)
+                .collect(),
+            pending_changes: self
+                .invocations
+                .iter()
+                .filter(|invocation| invocation.state == ToolState::AwaitingChangeReview)
+                .map(pending)
+                .collect(),
+            unknown_side_effects: self
+                .invocations
+                .iter()
+                .filter(|invocation| invocation.state == ToolState::Unknown)
+                .map(pending)
+                .collect(),
+            failure_evidence: self
+                .invocations
+                .iter()
+                .filter(|invocation| invocation.state == ToolState::Failed)
+                .filter_map(|invocation| invocation.result.as_ref())
+                .map(|result| truncate_utf8(&result.output, 1024).to_owned())
+                .collect(),
+            next_steps: vec![],
+            covered_event_range: (1, self.events.len() as u64),
+            summary_model: None,
+        }
     }
 
     pub fn task(&self) -> &Task {
@@ -154,15 +433,51 @@ impl TaskRuntime {
         self.cancellation.clone()
     }
 
+    /// Append event deltas to the hash-chained journal and atomically snapshot the reduced task.
+    /// Calling this after every handled command is idempotent by event sequence.
+    pub fn persist_journal(&self, data_root: &Path) -> Result<(), String> {
+        let tasks_root = data_root.join("agent-tasks");
+        let mut journal = termior_store::TaskJournal::create(&tasks_root, &self.task.id.0)
+            .map_err(|error| error.to_string())?;
+        let persisted = journal.last_sequence();
+        for event in self
+            .events
+            .iter()
+            .filter(|event| event.sequence > persisted)
+        {
+            let payload = serde_json::to_value(&event.kind).map_err(|error| error.to_string())?;
+            let kind = payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            journal
+                .append(&kind, payload, task_event_is_critical(&event.kind))
+                .map_err(|error| error.to_string())?;
+        }
+        journal
+            .write_snapshot(
+                serde_json::to_value(PersistedRuntimeState {
+                    task: self.task.clone(),
+                    history: self.history.clone(),
+                    invocations: self.invocations.clone(),
+                })
+                .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub fn pending_approval(&self) -> Option<ApprovalRequest> {
         let invocation = self
             .invocations
             .iter()
             .find(|invocation| invocation.state == ToolState::AwaitingApproval)?;
-        let arguments = invocation
+        let exact_arguments = invocation
             .normalized_arguments
             .clone()
             .unwrap_or_else(|| invocation.raw_arguments.clone());
+        let arguments = self.tools.redact_arguments_for_display(&exact_arguments);
         Some(ApprovalRequest {
             call_id: invocation.call_id.clone(),
             tool_name: invocation.tool_name.clone(),
@@ -234,6 +549,11 @@ impl TaskRuntime {
                     source,
                     decided_at_ms: now_ms(),
                 });
+                self.emit(TaskEventKind::ToolDecisionRecorded {
+                    call_id: call_id.clone(),
+                    approved,
+                    source,
+                });
                 if approved {
                     self.transition_tool(index, ToolState::Approved)?;
                 } else {
@@ -249,14 +569,8 @@ impl TaskRuntime {
                 change_set_id,
                 accepted_hunks,
             } => {
-                self.review_change(
-                    change_set_id,
-                    &accepted_hunks,
-                    provider,
-                    executor,
-                    on_event,
-                )
-                .await
+                self.review_change(change_set_id, &accepted_hunks, provider, executor, on_event)
+                    .await
             }
             TaskCommand::RecordAcceptance { check } => {
                 self.task.acceptance_report.checks.push(check);
@@ -273,6 +587,25 @@ impl TaskRuntime {
                 }
                 Ok(())
             }
+            TaskCommand::WaitForUser { message } => {
+                if self.task.state != TaskState::Running {
+                    return Err(self.invalid_command("wait_for_user"));
+                }
+                self.set_state(
+                    TaskState::WaitingUser,
+                    Some(WaitingReason::User { message }),
+                );
+                Ok(())
+            }
+            TaskCommand::ContinueAfterUser => {
+                if self.task.state != TaskState::WaitingUser
+                    || !matches!(self.task.waiting_reason, Some(WaitingReason::User { .. }))
+                {
+                    return Err(self.invalid_command("continue_after_user"));
+                }
+                self.set_state(TaskState::Running, None);
+                self.drive(provider, executor, on_event).await
+            }
             TaskCommand::Cancel => {
                 self.cancel(executor);
                 Ok(())
@@ -287,6 +620,7 @@ impl TaskRuntime {
         on_event: &mut (dyn FnMut(&ChatEvent) + Send),
     ) -> Result<(), RuntimeError> {
         loop {
+            self.ensure_persistence()?;
             if self.cancellation.is_cancelled() {
                 self.cancel(executor);
                 return Ok(());
@@ -332,7 +666,21 @@ impl TaskRuntime {
                 return Ok(());
             }
 
-            let assistant = self.request_assistant(provider, on_event).await?;
+            if let Err(message) = self.compact_history_if_needed() {
+                self.set_state(
+                    TaskState::WaitingUser,
+                    Some(WaitingReason::User { message }),
+                );
+                return Ok(());
+            }
+            let assistant = match self.request_assistant(provider, on_event).await {
+                Ok(assistant) => assistant,
+                Err(RuntimeError::Cancelled) => {
+                    self.cancel(executor);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             let has_calls = !assistant.tool_calls.is_empty();
             self.add_message(assistant.clone());
             if !has_calls {
@@ -357,8 +705,8 @@ impl TaskRuntime {
     ) -> Result<Message, RuntimeError> {
         for attempt in 1..=3u32 {
             let request = ProviderRequest {
-                messages: self.history.clone(),
-                model: "default".into(),
+                messages: self.provider_messages(),
+                model: self.model.clone(),
                 tools: self.tools.clone(),
                 system_prompt_extra: None,
             };
@@ -368,7 +716,17 @@ impl TaskRuntime {
             let mut final_message = None;
             let mut error = None;
             let mut saw_progress = false;
-            while let Some(event) = stream.next().await {
+            loop {
+                let next = stream.next();
+                let cancelled = self.cancellation.cancelled();
+                futures::pin_mut!(next, cancelled);
+                let event = match futures::future::select(next, cancelled).await {
+                    futures::future::Either::Left((event, _)) => event,
+                    futures::future::Either::Right(((), _)) => return Err(RuntimeError::Cancelled),
+                };
+                let Some(event) = event else {
+                    break;
+                };
                 on_event(&event);
                 match event {
                     ChatEvent::TextDelta(delta) => {
@@ -393,9 +751,7 @@ impl TaskRuntime {
                             "provider attempt {attempt} failed before response progress; retrying"
                         ),
                     });
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        10 * u64::from(attempt),
-                    ));
+                    std::thread::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)));
                     continue;
                 }
                 if saw_progress {
@@ -434,7 +790,8 @@ impl TaskRuntime {
                     call.name
                 )))
             } else {
-                self.tools.validate_and_normalize(&call.name, &call.arguments)
+                self.tools
+                    .validate_and_normalize(&call.name, &call.arguments)
             };
             self.invocations.push(ToolInvocation {
                 call_id: call.id.clone(),
@@ -450,19 +807,115 @@ impl TaskRuntime {
                 change_set_id: None,
                 change_summary: None,
                 acceptance_criterion_id: None,
+                prepared: false,
             });
             self.emit(TaskEventKind::ToolQueued {
                 call_id: call.id.clone(),
                 tool_name: call.name.clone(),
+                raw_arguments: call.arguments.clone(),
+                normalized_arguments: normalized.as_ref().ok().cloned(),
             });
             if let Err(error) = normalized {
                 let index = self.invocations.len() - 1;
-                let _ = self.transition_tool(index, ToolState::Failed);
+                let policy_denied = matches!(
+                    error,
+                    crate::tools::ToolError::Unknown(_) | crate::tools::ToolError::NotAllowed(_)
+                );
+                let terminal = if policy_denied {
+                    self.invocations[index].decision = Some(ToolDecision {
+                        approved: false,
+                        source: DecisionSource::PolicyDeny,
+                        decided_at_ms: now_ms(),
+                    });
+                    self.emit(TaskEventKind::ToolDecisionRecorded {
+                        call_id: self.invocations[index].call_id.clone(),
+                        approved: false,
+                        source: DecisionSource::PolicyDeny,
+                    });
+                    ToolState::Denied
+                } else {
+                    ToolState::Failed
+                };
+                let _ = self.transition_tool(index, terminal);
                 let result = ToolResult::failure(call.id.clone(), error.to_string());
                 self.invocations[index].result = Some(result.clone());
                 self.add_tool_result(result);
             }
         }
+    }
+
+    fn provider_messages(&self) -> Vec<Message> {
+        let mut messages =
+            Vec::with_capacity(self.history.len() + usize::from(self.system_prompt.is_some()));
+        if let Some(prompt) = &self.system_prompt {
+            messages.push(Message::system(prompt));
+        }
+        messages.extend(self.history.clone());
+        messages
+    }
+
+    fn compact_history_if_needed(&mut self) -> Result<(), String> {
+        let tokens = estimate_message_tokens(self.system_prompt.as_deref(), &self.history);
+        if tokens <= self.context_soft_limit_tokens {
+            self.consecutive_compactions = 0;
+            return Ok(());
+        }
+        let current_user = self
+            .history
+            .iter()
+            .rposition(|message| message.role == Role::User)
+            .unwrap_or(0);
+        let required_tokens = estimate_message_tokens(None, &self.history[current_user..]);
+        if required_tokens > self.context_soft_limit_tokens
+            && self.history.len().saturating_sub(current_user) <= 2
+        {
+            return Err(format!(
+                "Current required input needs about {required_tokens} tokens, above the {} token context threshold",
+                self.context_soft_limit_tokens
+            ));
+        }
+        if self.consecutive_compactions >= self.max_consecutive_compactions {
+            return Err(format!(
+                "Context compaction repeated {} times without freeing enough space",
+                self.consecutive_compactions
+            ));
+        }
+        let keep_from = current_user.max(self.history.len().saturating_sub(8));
+        let removed = self.history[..keep_from].to_vec();
+        if removed.is_empty() {
+            return Err(format!(
+                "Active turn context needs about {tokens} tokens and cannot be compacted safely"
+            ));
+        }
+        let narrative = removed
+            .iter()
+            .rev()
+            .filter(|message| !message.content.trim().is_empty())
+            .take(4)
+            .map(|message| truncate_utf8(&message.content, 1024))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let brief = self.task_brief();
+        let compacted = crate::context_engine::Compactor::new(self.max_consecutive_compactions)
+            .compact(&brief, &narrative, self.consecutive_compactions)
+            .map_err(|error| error.to_string())?;
+        let summary = serde_json::to_string(&compacted)
+            .map_err(|error| format!("could not serialize task brief: {error}"))?;
+        let mut history = vec![Message::system(format!(
+            "TaskBrief reconstructed by Termior; preserve every pending invariant:\n{summary}"
+        ))];
+        history.extend_from_slice(&self.history[keep_from..]);
+        self.history = history;
+        self.consecutive_compactions = compacted.version;
+        self.emit(TaskEventKind::ContextCompacted {
+            covered_start: brief.covered_event_range.0,
+            covered_end: brief.covered_event_range.1,
+            version: compacted.version,
+        });
+        Ok(())
     }
 
     /// Returns true when processing must pause for external input.
@@ -473,6 +926,9 @@ impl TaskRuntime {
     ) -> Result<bool, RuntimeError> {
         let state = self.invocations[index].state;
         if state == ToolState::Proposed {
+            if !self.prepare_invocation(index, executor)? {
+                return Ok(false);
+            }
             let tool_name = self.invocations[index].tool_name.clone();
             match self.tools.requires_approval(&tool_name) {
                 Ok(true) if self.approval_policy == ApprovalPolicy::Prompt => {
@@ -490,6 +946,11 @@ impl TaskRuntime {
                         source: DecisionSource::Yolo,
                         decided_at_ms: now_ms(),
                     });
+                    self.emit(TaskEventKind::ToolDecisionRecorded {
+                        call_id: self.invocations[index].call_id.clone(),
+                        approved: true,
+                        source: DecisionSource::Yolo,
+                    });
                     self.transition_tool(index, ToolState::Approved)?;
                 }
                 Ok(false) => {
@@ -497,6 +958,11 @@ impl TaskRuntime {
                         approved: true,
                         source: DecisionSource::PolicyAuto,
                         decided_at_ms: now_ms(),
+                    });
+                    self.emit(TaskEventKind::ToolDecisionRecorded {
+                        call_id: self.invocations[index].call_id.clone(),
+                        approved: true,
+                        source: DecisionSource::PolicyAuto,
                     });
                     self.transition_tool(index, ToolState::Approved)?;
                 }
@@ -513,7 +979,11 @@ impl TaskRuntime {
             }
         }
         if self.invocations[index].state == ToolState::Approved {
+            if self.invocations[index].tool_name == "write_file" {
+                return self.process_change_batch(index, executor);
+            }
             self.transition_tool(index, ToolState::Running)?;
+            self.ensure_persistence()?;
             let attempt = ToolAttempt {
                 number: self.invocations[index].attempts.len() as u32 + 1,
                 started_at_ms: now_ms(),
@@ -540,10 +1010,8 @@ impl TaskRuntime {
                     self.record_output_bytes(output.len() as u64);
                     self.transition_tool(index, ToolState::Succeeded)?;
                     self.record_acceptance_output(index, &output, AcceptanceStatus::Passed);
-                    let result = ToolResult::success(
-                        self.invocations[index].call_id.clone(),
-                        output,
-                    );
+                    let result =
+                        ToolResult::success(self.invocations[index].call_id.clone(), output);
                     self.invocations[index].result = Some(result.clone());
                     self.add_tool_result(result);
                 }
@@ -568,16 +1036,152 @@ impl TaskRuntime {
                 Err(error) => {
                     self.transition_tool(index, ToolState::Failed)?;
                     self.record_acceptance_output(index, &error, AcceptanceStatus::Failed);
-                    let result = ToolResult::failure(
-                        self.invocations[index].call_id.clone(),
-                        error,
-                    );
+                    let result =
+                        ToolResult::failure(self.invocations[index].call_id.clone(), error);
                     self.invocations[index].result = Some(result.clone());
                     self.add_tool_result(result);
                 }
             }
         }
         Ok(false)
+    }
+
+    fn process_change_batch(
+        &mut self,
+        first: usize,
+        executor: &dyn RuntimeToolExecutor,
+    ) -> Result<bool, RuntimeError> {
+        let mut indices = Vec::new();
+        for index in first..self.invocations.len() {
+            if self.invocations[index].tool_name != "write_file" {
+                break;
+            }
+            if self.invocations[index].state != ToolState::Failed {
+                indices.push(index);
+            }
+        }
+
+        for &index in &indices {
+            if self.invocations[index].state == ToolState::Proposed
+                && !self.prepare_invocation(index, executor)?
+            {
+                continue;
+            }
+            match self.invocations[index].state {
+                ToolState::Proposed if self.approval_policy == ApprovalPolicy::Prompt => {
+                    self.transition_tool(index, ToolState::AwaitingApproval)?;
+                    let call_id = self.invocations[index].call_id.clone();
+                    self.set_state(
+                        TaskState::WaitingApproval,
+                        Some(WaitingReason::Approval { call_id }),
+                    );
+                    return Ok(true);
+                }
+                ToolState::Proposed => {
+                    self.invocations[index].decision = Some(ToolDecision {
+                        approved: true,
+                        source: DecisionSource::Yolo,
+                        decided_at_ms: now_ms(),
+                    });
+                    self.emit(TaskEventKind::ToolDecisionRecorded {
+                        call_id: self.invocations[index].call_id.clone(),
+                        approved: true,
+                        source: DecisionSource::Yolo,
+                    });
+                    self.transition_tool(index, ToolState::Approved)?;
+                }
+                ToolState::AwaitingApproval => {
+                    let call_id = self.invocations[index].call_id.clone();
+                    self.set_state(
+                        TaskState::WaitingApproval,
+                        Some(WaitingReason::Approval { call_id }),
+                    );
+                    return Ok(true);
+                }
+                _ => {}
+            }
+        }
+
+        let approved = indices
+            .into_iter()
+            .filter(|index| self.invocations[*index].state == ToolState::Approved)
+            .collect::<Vec<_>>();
+        if approved.is_empty() {
+            return Ok(false);
+        }
+        let mut calls = Vec::with_capacity(approved.len());
+        for &index in &approved {
+            self.transition_tool(index, ToolState::Running)?;
+            let attempt_number = self.invocations[index].attempts.len() as u32 + 1;
+            self.invocations[index].attempts.push(ToolAttempt {
+                number: attempt_number,
+                started_at_ms: now_ms(),
+                finished_at_ms: None,
+                error: None,
+            });
+            calls.push((
+                self.invocations[index].call_id.clone(),
+                self.invocations[index]
+                    .normalized_arguments
+                    .clone()
+                    .unwrap_or_else(|| self.invocations[index].raw_arguments.clone()),
+            ));
+        }
+        self.ensure_persistence()?;
+        let result = executor.execute_change_batch(&calls, &self.cancellation);
+        let finished = now_ms();
+        for &index in &approved {
+            if let Some(attempt) = self.invocations[index].attempts.last_mut() {
+                attempt.finished_at_ms = Some(finished);
+                if let Err(error) = &result {
+                    attempt.error = Some(error.clone());
+                }
+            }
+        }
+        match result {
+            Ok(ToolExecution::ChangeProposed {
+                change_set_id,
+                summary,
+            }) => {
+                for &index in &approved {
+                    self.invocations[index].change_set_id = Some(change_set_id.clone());
+                    self.invocations[index].change_summary = Some(summary.clone());
+                    self.transition_tool(index, ToolState::AwaitingChangeReview)?;
+                }
+                let call_id = self.invocations[approved[0]].call_id.clone();
+                self.set_state(
+                    TaskState::WaitingChangeReview,
+                    Some(WaitingReason::ChangeReview {
+                        call_id,
+                        change_set_id,
+                        conflict: None,
+                    }),
+                );
+                Ok(true)
+            }
+            Ok(ToolExecution::Completed(output)) => {
+                for &index in &approved {
+                    self.transition_tool(index, ToolState::Succeeded)?;
+                    let result = ToolResult::success(
+                        self.invocations[index].call_id.clone(),
+                        output.clone(),
+                    );
+                    self.invocations[index].result = Some(result.clone());
+                    self.add_tool_result(result);
+                }
+                Ok(false)
+            }
+            Err(error) => {
+                for &index in &approved {
+                    self.transition_tool(index, ToolState::Failed)?;
+                    let result =
+                        ToolResult::failure(self.invocations[index].call_id.clone(), error.clone());
+                    self.invocations[index].result = Some(result.clone());
+                    self.add_tool_result(result);
+                }
+                Ok(false)
+            }
+        }
     }
 
     async fn review_change(
@@ -599,19 +1203,32 @@ impl TaskRuntime {
                     && invocation.change_set_id.as_ref() == Some(&change_set_id)
             })
             .ok_or_else(|| RuntimeError::ChangeReviewNotPending(change_set_id.to_string()))?;
+        self.ensure_persistence()?;
         match executor
             .review_change(&change_set_id, accepted_hunks, &self.cancellation)
             .map_err(RuntimeError::Invariant)?
         {
             ChangeReviewExecution::Applied(output) => {
                 self.record_output_bytes(output.len() as u64);
-                self.transition_tool(index, ToolState::Succeeded)?;
-                let result = ToolResult::success(
-                    self.invocations[index].call_id.clone(),
-                    output,
-                );
-                self.invocations[index].result = Some(result.clone());
-                self.add_tool_result(result);
+                let indices = self
+                    .invocations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, invocation)| {
+                        invocation.state == ToolState::AwaitingChangeReview
+                            && invocation.change_set_id.as_ref() == Some(&change_set_id)
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                for index in indices {
+                    self.transition_tool(index, ToolState::Succeeded)?;
+                    let result = ToolResult::success(
+                        self.invocations[index].call_id.clone(),
+                        output.clone(),
+                    );
+                    self.invocations[index].result = Some(result.clone());
+                    self.add_tool_result(result);
+                }
                 self.set_state(TaskState::Running, None);
                 self.drive(provider, executor, on_event).await
             }
@@ -628,7 +1245,19 @@ impl TaskRuntime {
                 Ok(())
             }
             ChangeReviewExecution::Unknown(message) => {
-                self.transition_tool(index, ToolState::Unknown)?;
+                let indices = self
+                    .invocations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, invocation)| {
+                        invocation.state == ToolState::AwaitingChangeReview
+                            && invocation.change_set_id.as_ref() == Some(&change_set_id)
+                    })
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                for index in indices {
+                    self.transition_tool(index, ToolState::Unknown)?;
+                }
                 self.set_state(TaskState::Unknown, None);
                 self.emit(TaskEventKind::Diagnostic { message });
                 Ok(())
@@ -673,6 +1302,55 @@ impl TaskRuntime {
             .position(|invocation| !invocation.state.is_terminal())
     }
 
+    fn prepare_invocation(
+        &mut self,
+        index: usize,
+        executor: &dyn RuntimeToolExecutor,
+    ) -> Result<bool, RuntimeError> {
+        if self.invocations[index].prepared {
+            return Ok(true);
+        }
+        let arguments = self.invocations[index]
+            .normalized_arguments
+            .clone()
+            .unwrap_or_else(|| self.invocations[index].raw_arguments.clone());
+        match executor.prepare(
+            &self.invocations[index].call_id,
+            &self.invocations[index].tool_name,
+            &arguments,
+        ) {
+            Ok(replacement) => {
+                if let Some(replacement) = replacement {
+                    let normalized = self
+                        .tools
+                        .validate_and_normalize(&self.invocations[index].tool_name, &replacement)
+                        .map_err(|error| RuntimeError::Invariant(error.to_string()))?;
+                    self.invocations[index].normalized_arguments = Some(normalized);
+                    self.invocations[index].decision = None;
+                    let call_id = self.invocations[index].call_id.clone();
+                    self.emit(TaskEventKind::Diagnostic {
+                        message: format!(
+                            "pre-tool hook changed arguments for {call_id}; approval was recalculated"
+                        ),
+                    });
+                }
+                self.invocations[index].prepared = true;
+                Ok(true)
+            }
+            Err(error) => {
+                self.invocations[index].prepared = true;
+                self.transition_tool(index, ToolState::Failed)?;
+                let result = ToolResult::failure(
+                    self.invocations[index].call_id.clone(),
+                    format!("pre-tool policy rejected call: {error}"),
+                );
+                self.invocations[index].result = Some(result.clone());
+                self.add_tool_result(result);
+                Ok(false)
+            }
+        }
+    }
+
     fn transition_tool(&mut self, index: usize, next: ToolState) -> Result<(), RuntimeError> {
         let from = self.invocations[index].state;
         self.invocations[index]
@@ -692,7 +1370,23 @@ impl TaskRuntime {
         self.emit(TaskEventKind::MessageAdded { message });
     }
 
-    fn add_tool_result(&mut self, result: ToolResult) {
+    fn add_tool_result(&mut self, mut result: ToolResult) {
+        if result.output.len() > self.output_inline_limit {
+            if let Some(root) = self.output_store_root.as_ref() {
+                let store =
+                    crate::context_engine::ContextContentStore::new(root, Vec::<String>::new());
+                if let Ok(reference) =
+                    store.put_tool_output(&self.task.id.0, &result.call_id, &result.output)
+                {
+                    let original = result.output.len();
+                    let preview = truncate_utf8(&result.output, self.output_inline_limit.min(4096));
+                    result.output = format!(
+                        "[tool output externalized: {original} bytes; complete body is available through content_ref]\n{preview}"
+                    );
+                    result.content_ref = Some(reference);
+                }
+            }
+        }
         self.add_message(Message {
             role: Role::Tool,
             content: String::new(),
@@ -727,6 +1421,66 @@ impl TaskRuntime {
             turn.event_sequences.push(sequence);
         }
         self.events.push(event);
+        self.persist_latest_event();
+    }
+
+    fn persist_latest_event(&mut self) {
+        let Some(data_root) = self.journal_data_root.clone() else {
+            return;
+        };
+        let Some(event) = self.events.last().cloned() else {
+            return;
+        };
+        let result = (|| -> Result<(), String> {
+            let tasks_root = data_root.join("agent-tasks");
+            let mut journal = termior_store::TaskJournal::create(&tasks_root, &self.task.id.0)
+                .map_err(|error| error.to_string())?;
+            if journal.last_sequence() >= event.sequence {
+                return Ok(());
+            }
+            if journal.last_sequence() + 1 != event.sequence {
+                return Err(format!(
+                    "journal sequence gap: persisted {}, next runtime event {}",
+                    journal.last_sequence(),
+                    event.sequence
+                ));
+            }
+            let payload = serde_json::to_value(&event.kind).map_err(|error| error.to_string())?;
+            let kind = payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            journal
+                .append(&kind, payload, task_event_is_critical(&event.kind))
+                .map_err(|error| error.to_string())?;
+            if task_event_is_critical(&event.kind) {
+                journal
+                    .write_snapshot(
+                        serde_json::to_value(PersistedRuntimeState {
+                            task: self.task.clone(),
+                            history: self.history.clone(),
+                            invocations: self.invocations.clone(),
+                        })
+                        .map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.persistence_error = Some(error);
+        }
+    }
+
+    fn ensure_persistence(&self) -> Result<(), RuntimeError> {
+        if let Some(error) = self.persistence_error.as_ref() {
+            Err(RuntimeError::Invariant(format!(
+                "task persistence failed before side effect: {error}"
+            )))
+        } else {
+            Ok(())
+        }
     }
 
     fn finish_turn(&mut self) {
@@ -762,20 +1516,21 @@ impl TaskRuntime {
                 used,
                 limit,
             });
-        fixed.or_else(|| {
-            optional_budget_reason(
-                BudgetDimension::InputTokens,
-                self.task.usage.input_tokens,
-                self.task.budgets.max_input_tokens,
-            )
-        })
-        .or_else(|| {
-            optional_budget_reason(
-                BudgetDimension::OutputTokens,
-                self.task.usage.output_tokens,
-                self.task.budgets.max_output_tokens,
-            )
-        })
+        fixed
+            .or_else(|| {
+                optional_budget_reason(
+                    BudgetDimension::InputTokens,
+                    self.task.usage.input_tokens,
+                    self.task.budgets.max_input_tokens,
+                )
+            })
+            .or_else(|| {
+                optional_budget_reason(
+                    BudgetDimension::OutputTokens,
+                    self.task.usage.output_tokens,
+                    self.task.budgets.max_output_tokens,
+                )
+            })
     }
 
     fn exhausted_model_budget(&self) -> Option<WaitingReason> {
@@ -789,8 +1544,7 @@ impl TaskRuntime {
     }
 
     fn record_output_bytes(&mut self, bytes: u64) {
-        self.task.usage.tool_output_bytes =
-            self.task.usage.tool_output_bytes.saturating_add(bytes);
+        self.task.usage.tool_output_bytes = self.task.usage.tool_output_bytes.saturating_add(bytes);
         self.emit(TaskEventKind::BudgetUpdated {
             usage: self.task.usage.clone(),
         });
@@ -806,12 +1560,13 @@ impl TaskRuntime {
             return output;
         }
         let original = output.len();
-        let mut boundary = limit;
+        let notice = format!("\n[tool output truncated: {original} bytes total]");
+        let mut boundary = limit.saturating_sub(notice.len());
         while !output.is_char_boundary(boundary) {
             boundary = boundary.saturating_sub(1);
         }
         output.truncate(boundary);
-        output.push_str(&format!("\n[tool output truncated: {original} bytes total]"));
+        output.push_str(&notice);
         output
     }
 
@@ -830,7 +1585,7 @@ impl TaskRuntime {
                         .iter()
                         .rev()
                         .find(|check| check.criterion_id == criterion.id)
-                        .is_none_or(|check| check.status != AcceptanceStatus::Passed)
+                        .map_or(true, |check| check.status != AcceptanceStatus::Passed)
             })
             .cloned();
         let Some(criterion) = criterion else {
@@ -886,14 +1641,11 @@ impl TaskRuntime {
             .iter()
             .find(|criterion| criterion.id == criterion_id)
             .and_then(|criterion| criterion.command.clone());
-        let duration_ms = self.invocations[index]
-            .attempts
-            .last()
-            .and_then(|attempt| {
-                attempt
-                    .finished_at_ms
-                    .map(|finished| finished.saturating_sub(attempt.started_at_ms))
-            });
+        let duration_ms = self.invocations[index].attempts.last().and_then(|attempt| {
+            attempt
+                .finished_at_ms
+                .map(|finished| finished.saturating_sub(attempt.started_at_ms))
+        });
         self.task.acceptance_report.checks.push(AcceptanceCheck {
             criterion_id,
             status,
@@ -915,6 +1667,96 @@ impl TaskRuntime {
     }
 }
 
+fn truncate_utf8(value: &str, limit: usize) -> &str {
+    let mut boundary = value.len().min(limit);
+    while !value.is_char_boundary(boundary) {
+        boundary = boundary.saturating_sub(1);
+    }
+    &value[..boundary]
+}
+
+fn estimate_message_tokens(system: Option<&str>, messages: &[Message]) -> u64 {
+    let characters = system.map_or(0, |value| value.chars().count())
+        + messages
+            .iter()
+            .map(|message| {
+                message.content.chars().count()
+                    + message
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.arguments.chars().count() + call.name.chars().count())
+                        .sum::<usize>()
+                    + message
+                        .tool_result
+                        .as_ref()
+                        .map_or(0, |result| result.output.chars().count())
+            })
+            .sum::<usize>();
+    (characters as u64).div_ceil(4)
+}
+
+fn reduce_recovered_event(
+    task: &mut Task,
+    history: &mut Vec<Message>,
+    invocations: &mut Vec<ToolInvocation>,
+    event: &TaskEvent,
+) {
+    match &event.kind {
+        TaskEventKind::StateChanged { to, .. } => task.state = *to,
+        TaskEventKind::Waiting { reason } => task.waiting_reason = Some(reason.clone()),
+        TaskEventKind::MessageAdded { message } => history.push(message.clone()),
+        TaskEventKind::ToolQueued {
+            call_id,
+            tool_name,
+            raw_arguments,
+            normalized_arguments,
+        } => invocations.push(ToolInvocation {
+            call_id: call_id.clone(),
+            tool_name: tool_name.clone(),
+            raw_arguments: raw_arguments.clone(),
+            normalized_arguments: normalized_arguments.clone(),
+            state: ToolState::Proposed,
+            decision: None,
+            proposed_at_ms: event.occurred_at_ms,
+            state_changed_at_ms: event.occurred_at_ms,
+            attempts: vec![],
+            result: None,
+            change_set_id: None,
+            change_summary: None,
+            acceptance_criterion_id: None,
+            prepared: false,
+        }),
+        TaskEventKind::ToolStateChanged { call_id, to, .. } => {
+            if let Some(invocation) = invocations
+                .iter_mut()
+                .find(|invocation| &invocation.call_id == call_id)
+            {
+                invocation.state = *to;
+                invocation.state_changed_at_ms = event.occurred_at_ms;
+            }
+        }
+        TaskEventKind::ToolDecisionRecorded {
+            call_id,
+            approved,
+            source,
+        } => {
+            if let Some(invocation) = invocations
+                .iter_mut()
+                .find(|invocation| &invocation.call_id == call_id)
+            {
+                invocation.decision = Some(ToolDecision {
+                    approved: *approved,
+                    source: *source,
+                    decided_at_ms: event.occurred_at_ms,
+                });
+            }
+        }
+        TaskEventKind::BudgetUpdated { usage } => task.usage = usage.clone(),
+        TaskEventKind::AcceptanceUpdated { report } => task.acceptance_report = report.clone(),
+        TaskEventKind::ContextCompacted { .. } | TaskEventKind::Diagnostic { .. } => {}
+    }
+}
+
 fn optional_budget_reason(
     dimension: BudgetDimension,
     used: Option<u64>,
@@ -928,6 +1770,27 @@ fn optional_budget_reason(
         }),
         _ => None,
     }
+}
+
+fn task_event_is_critical(kind: &TaskEventKind) -> bool {
+    matches!(
+        kind,
+        TaskEventKind::StateChanged { .. }
+            | TaskEventKind::Waiting { .. }
+            | TaskEventKind::ToolQueued { .. }
+            | TaskEventKind::ToolDecisionRecorded { .. }
+            | TaskEventKind::AcceptanceUpdated { .. }
+            | TaskEventKind::ToolStateChanged {
+                to: ToolState::Running
+                    | ToolState::Succeeded
+                    | ToolState::Failed
+                    | ToolState::Denied
+                    | ToolState::Cancelled
+                    | ToolState::Unknown
+                    | ToolState::AwaitingChangeReview,
+                ..
+            }
+    )
 }
 
 fn parse_exit_code(output: &str) -> Option<i32> {

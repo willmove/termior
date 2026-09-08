@@ -11,3 +11,4 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
 termior-store = { workspace = true }
+wait-timeout = { workspace = true }

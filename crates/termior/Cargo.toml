@@ -27,6 +27,7 @@ termior-ui = { workspace = true }
 termior-ui-kit = { workspace = true }
 termior-security = { workspace = true }
 termior-ai = { workspace = true, features = ["keyring-backend"] }
+termior-agent-host = { workspace = true }
 termior-hooks = { workspace = true }
 alacritty_terminal = { workspace = true }
 futures = { workspace = true }

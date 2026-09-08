@@ -70,6 +70,9 @@ pub struct ToolResult {
     /// 是否执行成功。
     pub ok: bool,
     pub output: String,
+    /// Handle for the complete retained body when `output` is a bounded summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_ref: Option<crate::context_engine::ContentRef>,
 }
 
 impl ToolResult {
@@ -78,6 +81,7 @@ impl ToolResult {
             call_id: call_id.into(),
             ok: true,
             output: output.into(),
+            content_ref: None,
         }
     }
     pub fn failure(call_id: impl Into<String>, output: impl Into<String>) -> Self {
@@ -85,7 +89,13 @@ impl ToolResult {
             call_id: call_id.into(),
             ok: false,
             output: output.into(),
+            content_ref: None,
         }
+    }
+
+    pub fn with_content_ref(mut self, content_ref: crate::context_engine::ContentRef) -> Self {
+        self.content_ref = Some(content_ref);
+        self
     }
 }
 

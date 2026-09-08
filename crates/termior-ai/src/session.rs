@@ -354,7 +354,10 @@ mod tests {
             .push(Session::new("legacy-1").as_task_summary(dir.path()));
         let path = store.persist(dir.path()).unwrap();
         assert!(path.ends_with("agent-tasks/index.json"));
-        assert_eq!(crate::task::TaskSummaryStore::load(dir.path()).unwrap(), store);
+        assert_eq!(
+            crate::task::TaskSummaryStore::load(dir.path()).unwrap(),
+            store
+        );
     }
 
     #[test]

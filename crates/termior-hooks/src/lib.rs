@@ -23,6 +23,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub mod runner;
+
+pub use runner::{
+    FailurePolicy, HookConfig, HookDecision, HookError, HookEvent, HookPipeline,
+    HookPipelineResult, HookPoint, HookRun, HookRunRecord, HookRunner, HOOK_SCHEMA_VERSION,
+};
+
 /// 我们写入的 hook 事件名（Claude Code 的 hook key）。
 pub const HOOK_EVENTS: &[&str] = &["UserPromptSubmit", "Notification", "Stop"];
 

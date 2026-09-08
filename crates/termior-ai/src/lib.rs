@@ -20,8 +20,11 @@
 
 pub mod agent;
 pub mod approval;
+pub mod automation;
 pub mod composer;
 pub mod context;
+pub mod context_engine;
+pub mod evaluation;
 pub mod executor;
 pub mod http_provider;
 pub mod inline_completion;
@@ -30,6 +33,7 @@ pub mod keyring_store;
 pub mod message;
 pub mod mode;
 pub mod model_registry;
+pub mod orchestration;
 pub mod plan;
 pub mod provider;
 pub mod runtime;
@@ -45,7 +49,10 @@ pub use composer::{
     SnippetStore, TodoItem, TodoStore,
 };
 pub use context::{TerminalContext, TerminalContextProvider};
-pub use executor::{EditProposalSummary, ToolExecutor};
+pub use evaluation::{
+    EvaluationMetrics, EvaluationSuiteReport, ScenarioReport, EVALUATION_SCHEMA_VERSION,
+};
+pub use executor::{EditProposalSummary, ExternalToolHandler, ToolExecutor};
 pub use http_provider::{HttpProvider, ProviderConfig, ProviderTransportError};
 pub use inline_completion::{
     completion_user_prompt, normalize_completion, InlineCompleter, InlineCompletionContext,
@@ -56,9 +63,13 @@ pub use keyring_store::KeyringSecretStore;
 pub use message::{ChatEvent, Message, Role, ToolCall, ToolResult};
 pub use mode::Mode;
 pub use model_registry::{ModelRegistry, ProviderKind};
+pub use orchestration::{
+    ChildTaskLaunchContext, ChildTaskSpec, SnapshotVersion, TaskDepth, TaskTreeNode,
+    TaskTreeSnapshot,
+};
 pub use plan::{
-    run_subagent, AgentDefinition, AgentDefinitionStore, Plan, PlanError, PlanStep, PlanStepKind,
-    PlanStepStatus, SubagentResult,
+    run_child_task, run_subagent, AgentDefinition, AgentDefinitionStore, Plan, PlanError, PlanStep,
+    PlanStepKind, PlanStepStatus, SubagentResult,
 };
 pub use provider::{MockProvider, Provider, ProviderRequest};
 pub use runtime::{

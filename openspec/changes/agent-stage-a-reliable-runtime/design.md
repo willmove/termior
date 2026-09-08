@@ -85,3 +85,10 @@ M6 保留现有 SessionStore 用于消息历史，新增 task summary 的 versio
 2. Composer 改订阅 TaskRuntime；迁移后删除 UI 自有的 pending/busy 状态
 3. 现有 session JSON 读取后映射为无运行事件的历史任务摘要；写出保持 schema version
 4. 默认关闭新的自动验证，只在任务有明确 acceptance command 时启用；完成 UI 稳定后再默认开启
+
+## Implementation Notes
+
+- `TaskRuntime` 已成为 Composer 的语义状态来源；Composer 仍保留一个短生命周期的 `busy` 字段，只表示 GPUI 后台命令正在传递，审批、审阅、预算、取消和完成语义全部读取 `TaskState` / `WaitingReason`。
+- 同一 Turn 的多个文件提案在 runtime 中汇总为一个 `ChangeSet`。hunk ID 在该变更集内展平为全局序号，UI 仍按 `FileChange` 保留文件边界；应用前对所有文件做基线预检，任一冲突都会阻止整组落盘。
+- 验收命令由任务显式配置，并作为普通 `run_command` 调用进入同一 schema、审批、安全和输出限制链路。失败结果返回模型，后续修正可以再次执行检查；只有 `AcceptanceReport` 能产生 `completed-verified`。
+- 评测采用离线脚本 Provider 和 fake/real executor 组合，JSON 指标只写本地。自动化与手工复核步骤记录在 `docs/ai-agent-stage-a-validation.md`。

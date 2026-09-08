@@ -8,9 +8,18 @@
 
 pub mod bridge;
 pub mod pty;
+pub mod service;
 
 pub use bridge::{PtyData, TerminalBridge, TerminalEventProxy, WriterHandle};
 pub use pty::{
     list_wsl_distributions, parse_wsl_list_output, PtySession, PtySessionConfig, SpawnError,
 };
+pub use service::shared_terminal_service;
+pub use service::LocalTerminalService;
+pub use termior_terminal_core::command::{
+    CommandCapabilities, CommandCreate, CommandOwner, CommandSession, CommandSessionId,
+    CommandState, Controller, OutputChunk, OutputCursor, OutputRead, OutputStream, TerminalService,
+    TerminalServiceError, WaitResult,
+};
 pub use termior_terminal_core::shell_integration::ShellKind;
+pub use termior_terminal_core::{TerminalCommandRecord, TerminalContextReference};

@@ -167,14 +167,20 @@ impl TaskState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitingReason {
-    Approval { call_id: String },
-    Plan { turn_id: TurnId },
+    Approval {
+        call_id: String,
+    },
+    Plan {
+        turn_id: TurnId,
+    },
     ChangeReview {
         call_id: String,
         change_set_id: ChangeSetId,
         conflict: Option<String>,
     },
-    User { message: String },
+    User {
+        message: String,
+    },
     BudgetExhausted {
         dimension: BudgetDimension,
         used: u64,
@@ -381,11 +387,25 @@ impl ToolState {
     pub fn allows(self, next: Self) -> bool {
         matches!(
             (self, next),
-            (Self::Proposed, Self::AwaitingApproval | Self::Approved | Self::Denied | Self::Failed | Self::Cancelled)
-                | (Self::AwaitingApproval, Self::Approved | Self::Denied | Self::Cancelled)
-                | (Self::Approved, Self::Running | Self::Cancelled)
-                | (Self::Running, Self::AwaitingChangeReview | Self::Succeeded | Self::Failed | Self::Unknown)
-                | (Self::AwaitingChangeReview, Self::Succeeded | Self::Failed | Self::Cancelled | Self::Unknown)
+            (
+                Self::Proposed,
+                Self::AwaitingApproval
+                    | Self::Approved
+                    | Self::Denied
+                    | Self::Failed
+                    | Self::Cancelled
+            ) | (
+                Self::AwaitingApproval,
+                Self::Approved | Self::Denied | Self::Cancelled
+            ) | (Self::Approved, Self::Running | Self::Cancelled)
+                | (
+                    Self::Running,
+                    Self::AwaitingChangeReview | Self::Succeeded | Self::Failed | Self::Unknown
+                )
+                | (
+                    Self::AwaitingChangeReview,
+                    Self::Succeeded | Self::Failed | Self::Cancelled | Self::Unknown
+                )
         )
     }
 }
@@ -432,6 +452,8 @@ pub struct ToolInvocation {
     pub change_summary: Option<String>,
     #[serde(default)]
     pub acceptance_criterion_id: Option<String>,
+    #[serde(default)]
+    pub prepared: bool,
 }
 
 impl ToolInvocation {
@@ -554,30 +576,73 @@ pub struct TaskEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaskEventKind {
-    StateChanged { from: TaskState, to: TaskState },
-    Waiting { reason: WaitingReason },
-    MessageAdded { message: crate::message::Message },
-    ToolQueued { call_id: String, tool_name: String },
+    StateChanged {
+        from: TaskState,
+        to: TaskState,
+    },
+    Waiting {
+        reason: WaitingReason,
+    },
+    MessageAdded {
+        message: crate::message::Message,
+    },
+    ToolQueued {
+        call_id: String,
+        tool_name: String,
+        #[serde(default)]
+        raw_arguments: String,
+        #[serde(default)]
+        normalized_arguments: Option<String>,
+    },
     ToolStateChanged {
         call_id: String,
         from: ToolState,
         to: ToolState,
     },
-    BudgetUpdated { usage: RuntimeUsage },
-    AcceptanceUpdated { report: AcceptanceReport },
-    Diagnostic { message: String },
+    ToolDecisionRecorded {
+        call_id: String,
+        approved: bool,
+        source: DecisionSource,
+    },
+    BudgetUpdated {
+        usage: RuntimeUsage,
+    },
+    AcceptanceUpdated {
+        report: AcceptanceReport,
+    },
+    ContextCompacted {
+        covered_start: u64,
+        covered_end: u64,
+        version: u32,
+    },
+    Diagnostic {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum TaskCommand {
-    Start { user_input: String },
-    ResolveApproval { call_id: String, approved: bool },
+    Start {
+        user_input: String,
+    },
+    ResolveApproval {
+        call_id: String,
+        approved: bool,
+    },
     ReviewChange {
         change_set_id: ChangeSetId,
         accepted_hunks: Vec<usize>,
     },
-    RecordAcceptance { check: AcceptanceCheck },
-    IncreaseBudgets { budgets: RuntimeBudgets },
+    RecordAcceptance {
+        check: AcceptanceCheck,
+    },
+    IncreaseBudgets {
+        budgets: RuntimeBudgets,
+    },
+    WaitForUser {
+        message: String,
+    },
+    ContinueAfterUser,
     Cancel,
 }

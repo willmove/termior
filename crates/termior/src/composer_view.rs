@@ -5,22 +5,35 @@ use gpui::{
     MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, UTF16Selection, WeakEntity, Window,
 };
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+use termior_agent_host::{
+    BackendEvent, CodexBackend, ManagedAgentSession, PumpOutcome, TaskLaunch,
+};
+use termior_ai::automation::{next_run_after, AutomationManager, AutomationStore};
+use termior_ai::context_engine::{
+    ContextAssembler, ContextCategory, ContextItem, ContextPlan, ContextSource, MemoryStatus,
+    MemoryStore, RuleResolver, SkillIndex, SkillMetadata,
+};
 use termior_ai::{
-    Agent, AgentDefinition, AgentDefinitionStore, AgentOutcome, ApprovalDecision, ApprovalRequest,
-    AttachmentSource, ComposerDraft, EditProposalSummary, HttpProvider, KeyringSecretStore,
-    Message, Mode, ProjectMemory, ProviderConfig, Role, SecretStore, SessionStore, SnippetStore,
-    TerminalContext, TerminalContextProvider, ToolExecutor, ToolRegistry,
+    AgentDefinition, AgentDefinitionStore, ApprovalPolicy, ApprovalRequest, Attachment,
+    AttachmentSource, CancellationToken, ChangeSetId, ComposerDraft, EditProposalSummary,
+    HttpProvider, KeyringSecretStore, Message, Mode, ProviderConfig, Role, RuntimeBudgets,
+    SecretStore, SessionStore, SnippetStore, TaskCommand, TaskConfig, TaskRuntime, TaskState,
+    TaskSummary, TaskSummaryStore, TerminalContext, TerminalContextProvider, ToolContract,
+    ToolExecutor, ToolRegistry, WaitingReason,
 };
 use termior_explorer_core::fuzzy::fuzzy_match;
 use termior_platform::AgentStatus;
 use termior_preview::MarkdownDocument;
 use termior_security::workspace::WorkspaceAuthRegistry;
-use termior_store::{DataFiles, Settings};
+use termior_store::{
+    CheckpointManifest, CheckpointStore, DataFiles, RecoveryCenter, RecoveryCommand,
+    RecoveryTaskSummary, RestoreAction, Settings,
+};
 use termior_ui::{ComposerDock, MAX_COMPOSER_HEIGHT, MIN_COMPOSER_HEIGHT};
 use termior_ui_kit::{menu_panel, tokens::icon_size, Icon, Tooltip};
 
@@ -34,12 +47,49 @@ struct AgentRuntime {
 
 struct PendingApproval {
     request: ApprovalRequest,
-    history: Vec<Message>,
+    contract: ToolContract,
 }
 
 struct PendingEdit {
     summary: EditProposalSummary,
     decisions: HashMap<usize, bool>,
+}
+
+struct TaskRunResult {
+    task: TaskRuntime,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentBackendChoice {
+    BuiltIn,
+    CodexAppServer,
+}
+
+struct ExternalPendingApproval {
+    backend_request_id: String,
+    tool_call_id: String,
+    request_kind: String,
+    arguments: String,
+}
+
+enum ExternalCommand {
+    Start { task_id: String, text: String },
+    Respond { approved: bool },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MemoryAction {
+    Accept,
+    Reject,
+    TogglePause,
+    Delete,
+}
+
+struct ExternalRunResult {
+    session: Option<Arc<Mutex<ManagedAgentSession>>>,
+    outcome: Option<PumpOutcome>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,7 +130,11 @@ pub struct ComposerView {
     busy: bool,
     status: String,
     runtime: Option<AgentRuntime>,
+    active_task: Option<TaskRuntime>,
+    active_cancellation: Option<CancellationToken>,
+    active_plan_request: bool,
     pending_approval: Option<PendingApproval>,
+    external_pending_approval: Option<ExternalPendingApproval>,
     pending_edit: Option<PendingEdit>,
     sessions: SessionStore,
     snippets: SnippetStore,
@@ -99,6 +153,23 @@ pub struct ComposerView {
     panel_height: f32,
     /// 会话消息区的滚动容器；贴底时跟随新输出自动下滚。
     scroll_handle: ScrollHandle,
+    last_context_plan: Option<ContextPlan>,
+    context_inspector_open: bool,
+    recovery_tasks: Vec<RecoveryTaskSummary>,
+    recovery_center_open: bool,
+    automations: AutomationStore,
+    automation_center_open: bool,
+    checkpoints: Vec<CheckpointManifest>,
+    checkpoint_center_open: bool,
+    skills: Vec<SkillMetadata>,
+    skill_scan_error: Option<String>,
+    active_skills: Vec<String>,
+    skill_center_open: bool,
+    memory: MemoryStore,
+    memory_center_open: bool,
+    backend_choice: AgentBackendChoice,
+    backend_capability_summary: Option<String>,
+    external_session: Option<Arc<Mutex<ManagedAgentSession>>>,
 }
 
 /// 消息区最多渲染的最近消息条数，超出部分丢弃以约束流式期间的重排成本。
@@ -130,7 +201,11 @@ impl ComposerView {
             busy: false,
             status: "Choose a default chat model in Settings → Models".into(),
             runtime: None,
+            active_task: None,
+            active_cancellation: None,
+            active_plan_request: false,
             pending_approval: None,
+            external_pending_approval: None,
             pending_edit: None,
             sessions: SessionStore::default(),
             snippets: SnippetStore::default(),
@@ -144,6 +219,7 @@ impl ComposerView {
                     cwd: String::new(),
                     recent_output: String::new(),
                     captured_at_unix_ms: 0,
+                    command_reference: None,
                 }),
             }),
             workspace_root: PathBuf::new(),
@@ -153,6 +229,23 @@ impl ComposerView {
             dock: ComposerDock::Bottom,
             panel_height: termior_ui::DEFAULT_COMPOSER_HEIGHT,
             scroll_handle: ScrollHandle::new(),
+            last_context_plan: None,
+            context_inspector_open: false,
+            recovery_tasks: Vec::new(),
+            recovery_center_open: false,
+            automations: AutomationStore::default(),
+            automation_center_open: false,
+            checkpoints: Vec::new(),
+            checkpoint_center_open: false,
+            skills: Vec::new(),
+            skill_scan_error: None,
+            active_skills: Vec::new(),
+            skill_center_open: false,
+            memory: MemoryStore::default(),
+            memory_center_open: false,
+            backend_choice: AgentBackendChoice::BuiltIn,
+            backend_capability_summary: None,
+            external_session: None,
         }
     }
 
@@ -175,11 +268,29 @@ impl ComposerView {
                 .load()
                 .unwrap_or_default()
                 .agents;
+            self.recovery_tasks =
+                RecoveryCenter::scan(&dir.join("agent-tasks")).unwrap_or_default();
+            self.automations = AutomationStore::load(dir).unwrap_or_default();
+            self.checkpoints = CheckpointStore::new(dir.join("agent-checkpoints"))
+                .list_manifests()
+                .unwrap_or_default();
+            self.memory = MemoryStore::load(&dir.join("agent-memory.json")).unwrap_or_default();
             if self
                 .active_custom_agent
                 .is_some_and(|index| index >= self.custom_agents.len())
             {
                 self.active_custom_agent = None;
+            }
+        }
+        let user_skills_root = user_home_dir().map(|home| home.join(".agents").join("skills"));
+        match SkillIndex::scan_sources(root, user_skills_root.as_deref()) {
+            Ok(index) => {
+                self.skills = index.metadata();
+                self.skill_scan_error = None;
+            }
+            Err(error) => {
+                self.skills.clear();
+                self.skill_scan_error = Some(error.to_string());
             }
         }
         if self.sessions.sessions.is_empty() {
@@ -197,6 +308,11 @@ impl ComposerView {
             })
             .unwrap_or_default();
 
+        // External backends use their own authentication/model source, but attachments still go
+        // through Termior's workspace-confined registry.
+        let full_tools = ToolRegistry::new(workspace_auth);
+        self.full_tools = Some(full_tools.clone());
+
         let profile = settings
             .models
             .active_chat_profile
@@ -212,8 +328,11 @@ impl ComposerView {
             .cloned();
         let Some(profile) = profile else {
             self.runtime = None;
-            self.status =
-                "Settings → Models: pick a provider, click \"Use for chat\", and enable it".into();
+            self.status = if self.backend_choice == AgentBackendChoice::CodexAppServer {
+                "Ready · Codex app-server · authentication and model managed by Codex".into()
+            } else {
+                "Settings → Models: pick a provider, click \"Use for chat\", and enable it".into()
+            };
             cx.notify();
             return;
         };
@@ -221,10 +340,14 @@ impl ComposerView {
         let api_key = KeyringSecretStore::new().get(&key_name).ok().flatten();
         if !profile.local && api_key.is_none() {
             self.runtime = None;
-            self.status = format!(
-                "Add an API key for {} in Settings → Models",
-                profile.display_name
-            );
+            self.status = if self.backend_choice == AgentBackendChoice::CodexAppServer {
+                "Ready · Codex app-server · authentication and model managed by Codex".into()
+            } else {
+                format!(
+                    "Add an API key for {} in Settings → Models",
+                    profile.display_name
+                )
+            };
             cx.notify();
             return;
         }
@@ -237,9 +360,16 @@ impl ComposerView {
                 return;
             }
         };
-        let full_tools = ToolRegistry::new(workspace_auth);
         let executor = match ToolExecutor::new(root, full_tools.clone()) {
-            Ok(executor) => Arc::new(executor.with_terminal_context(self.terminal_context.clone())),
+            Ok(executor) => {
+                let executor = executor.with_terminal_context(self.terminal_context.clone());
+                let executor = if let Some(data_dir) = self.data_dir.as_ref() {
+                    executor.with_checkpoint_store(data_dir.join("agent-checkpoints"))
+                } else {
+                    executor
+                };
+                Arc::new(executor)
+            }
             Err(error) => {
                 self.runtime = None;
                 self.status = error.to_string();
@@ -247,22 +377,13 @@ impl ComposerView {
                 return;
             }
         };
-        let memory = ProjectMemory::load_from(root)
-            .map(|memory| {
-                format!(
-                    "\n\nProject memory ({}):\n{}",
-                    memory.source, memory.content
-                )
-            })
-            .unwrap_or_default();
         let base_system_prompt = format!(
-            "You are Termior's coding agent. Work only inside the authorized workspace. Read before editing, use tools when needed, and never claim an action succeeded without its tool result.{}{}",
+            "You are Termior's coding agent. Work only inside the authorized workspace. Read before editing, use tools when needed, and never claim an action succeeded without its tool result.{}",
             if settings.custom_instructions.trim().is_empty() {
                 String::new()
             } else {
                 format!("\n\nGlobal instructions:\n{}", settings.custom_instructions)
-            },
-            memory
+            }
         );
         let (tools, system_prompt) =
             match self.selected_agent_runtime(&full_tools, &base_system_prompt) {
@@ -317,6 +438,9 @@ impl ComposerView {
     }
 
     fn active_agent_name(&self) -> &str {
+        if self.backend_choice == AgentBackendChoice::CodexAppServer {
+            return "Codex app-server";
+        }
         self.active_custom_agent
             .and_then(|index| self.custom_agents.get(index))
             .map(|agent| agent.name.as_str())
@@ -324,14 +448,31 @@ impl ComposerView {
     }
 
     fn cycle_custom_agent(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.custom_agents.is_empty() {
+        if self.busy
+            || self.pending_approval.is_some()
+            || self.external_pending_approval.is_some()
+            || self.pending_edit.is_some()
+        {
             return;
         }
-        self.active_custom_agent = match self.active_custom_agent {
-            None => Some(0),
-            Some(index) if index + 1 < self.custom_agents.len() => Some(index + 1),
-            Some(_) => None,
-        };
+        match (self.backend_choice, self.active_custom_agent) {
+            (AgentBackendChoice::CodexAppServer, _) => {
+                self.backend_choice = AgentBackendChoice::BuiltIn;
+                self.active_custom_agent = None;
+                self.external_session = None;
+                self.backend_capability_summary = None;
+            }
+            (AgentBackendChoice::BuiltIn, None) if !self.custom_agents.is_empty() => {
+                self.active_custom_agent = Some(0);
+            }
+            (AgentBackendChoice::BuiltIn, Some(index)) if index + 1 < self.custom_agents.len() => {
+                self.active_custom_agent = Some(index + 1);
+            }
+            (AgentBackendChoice::BuiltIn, _) => {
+                self.backend_choice = AgentBackendChoice::CodexAppServer;
+                self.active_custom_agent = None;
+            }
+        }
         if let Some(full_tools) = self.full_tools.clone() {
             match self.selected_agent_runtime(&full_tools, &self.base_system_prompt) {
                 Ok((tools, prompt)) => {
@@ -339,7 +480,11 @@ impl ComposerView {
                         runtime.tools = tools;
                         runtime.system_prompt = prompt;
                     }
-                    self.status = format!("Active agent: {}", self.active_agent_name());
+                    self.status = if self.backend_choice == AgentBackendChoice::CodexAppServer {
+                        "Active agent: Codex app-server · auth/model managed by Codex".into()
+                    } else {
+                        format!("Active agent: {}", self.active_agent_name())
+                    };
                 }
                 Err(error) => self.status = error,
             }
@@ -353,6 +498,135 @@ impl ComposerView {
 
     pub fn attach_file(&mut self, path: PathBuf) {
         self.draft.attach_file(path);
+    }
+
+    fn apply_recovery_command(
+        &mut self,
+        task_id: &str,
+        command: RecoveryCommand,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(data_dir) = self.data_dir.as_ref() else {
+            self.status = "Recovery storage is unavailable".into();
+            cx.notify();
+            return;
+        };
+        let tasks_root = data_dir.join("agent-tasks");
+        match RecoveryCenter::apply(&tasks_root, task_id, command) {
+            Ok(operation) => {
+                self.status = format!(
+                    "Recovery {} is now {:?}",
+                    operation.attempt_id, operation.state
+                );
+                self.recovery_tasks = RecoveryCenter::scan(&tasks_root).unwrap_or_default();
+            }
+            Err(error) => self.status = format!("Recovery action failed: {error}"),
+        }
+        cx.notify();
+    }
+
+    fn restore_checkpoint(&mut self, checkpoint_id: &str, cx: &mut Context<Self>) {
+        let Some(data_dir) = self.data_dir.as_ref() else {
+            self.status = "Checkpoint storage is unavailable".into();
+            cx.notify();
+            return;
+        };
+        let store = CheckpointStore::new(data_dir.join("agent-checkpoints"));
+        let result = (|| {
+            let manifest = store.load_manifest(checkpoint_id)?;
+            let plan = store.plan_restore(&self.workspace_root, &manifest)?;
+            let restored = plan
+                .actions
+                .iter()
+                .filter(|action| {
+                    matches!(
+                        action,
+                        RestoreAction::Restore { .. } | RestoreAction::DeleteCreated { .. }
+                    )
+                })
+                .count();
+            let conflicts = plan
+                .actions
+                .iter()
+                .filter(|action| matches!(action, RestoreAction::SkipConflict { .. }))
+                .count();
+            store.apply_restore(&self.workspace_root, &plan)?;
+            Ok::<_, termior_store::CheckpointError>((restored, conflicts))
+        })();
+        self.status = match result {
+            Ok((restored, conflicts)) => format!(
+                "Checkpoint {checkpoint_id}: restored {restored} file(s), skipped {conflicts} conflict(s)"
+            ),
+            Err(error) => format!("Checkpoint restore failed: {error}"),
+        };
+        cx.notify();
+    }
+
+    fn trigger_automation(&mut self, automation_id: &str, cx: &mut Context<Self>) {
+        let Some(data_dir) = self.data_dir.as_ref() else {
+            self.status = "Automation storage is unavailable".into();
+            cx.notify();
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let result = (|| {
+            let mut manager = AutomationManager::load(data_dir)?;
+            let run = manager.trigger_manual(automation_id, now)?;
+            let task = run
+                .create_task(&self.workspace_root, Some(data_dir))
+                .map_err(std::io::Error::other)?;
+            task.persist_journal(data_dir)
+                .map_err(std::io::Error::other)?;
+            self.automations = manager.store;
+            Ok::<_, std::io::Error>(run)
+        })();
+        self.status = match result {
+            Ok(run) => format!(
+                "Automation {} queued as {} (task {})",
+                automation_id, run.run_id, run.task_id
+            ),
+            Err(error) => format!("Automation trigger failed: {error}"),
+        };
+        cx.notify();
+    }
+
+    fn apply_memory_action(&mut self, id: &str, action: MemoryAction, cx: &mut Context<Self>) {
+        let result = match action {
+            MemoryAction::Accept => self.memory.accept(id),
+            MemoryAction::Reject => {
+                self.memory.reject(id);
+                Ok(())
+            }
+            MemoryAction::TogglePause => {
+                let paused = self
+                    .memory
+                    .entries
+                    .get(id)
+                    .is_some_and(|entry| entry.enabled);
+                self.memory.pause(id, paused)
+            }
+            MemoryAction::Delete => {
+                self.memory.delete(id);
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            self.status = format!("Memory action failed: {error}");
+            cx.notify();
+            return;
+        }
+        if let Some(data_dir) = self.data_dir.as_ref() {
+            if let Err(error) = self.memory.persist(&data_dir.join("agent-memory.json")) {
+                self.status = format!("Memory persistence failed: {error}");
+                cx.notify();
+                return;
+            }
+        }
+        self.status = format!("Memory {id} updated");
+        cx.notify();
     }
 
     pub fn set_workspace_paths(&mut self, paths: Vec<String>) {
@@ -373,26 +647,16 @@ impl ComposerView {
         {
             return Err("This AI edit is no longer pending".into());
         }
-        let Some(runtime) = self.runtime.as_ref() else {
-            return Err("No active edit executor".into());
-        };
-        let result = runtime
-            .executor
-            .accept_edit(proposal_id, accepted)
-            .map_err(|error| error.to_string());
         self.pending_edit = None;
-        match &result {
-            Ok(message) => {
-                self.status = message.clone();
-                cx.emit(AgentStatus::Finished);
-            }
-            Err(error) => {
-                self.status = format!("Edit failed: {error}");
-                cx.emit(AgentStatus::Error);
-            }
-        }
-        cx.notify();
-        result
+        self.dispatch_task_command(
+            TaskCommand::ReviewChange {
+                change_set_id: ChangeSetId(proposal_id.to_owned()),
+                accepted_hunks: accepted.to_vec(),
+            },
+            "Applying reviewed hunks and continuing verification…",
+            cx,
+        );
+        Ok("Review submitted; Agent verification is running".into())
     }
 
     pub fn reject_reviewed_edit(
@@ -407,14 +671,16 @@ impl ComposerView {
         {
             return Err("This AI edit is no longer pending".into());
         }
-        if let Some(runtime) = &self.runtime {
-            runtime.executor.reject_edit(proposal_id);
-        }
         self.pending_edit = None;
-        self.status = "AI edit rejected; disk was not changed".into();
-        cx.emit(AgentStatus::Finished);
-        cx.notify();
-        Ok(self.status.clone())
+        self.dispatch_task_command(
+            TaskCommand::ReviewChange {
+                change_set_id: ChangeSetId(proposal_id.to_owned()),
+                accepted_hunks: Vec::new(),
+            },
+            "Returning the rejected change to the Agent…",
+            cx,
+        );
+        Ok("Change rejected; Agent is continuing with the review result".into())
     }
 
     /// 单一附件入口：一个无过滤对话框，按扩展名自动判型（图片 / 文本文件）。
@@ -553,7 +819,12 @@ impl ComposerView {
         }
     }
 
-    pub fn update_terminal_context(&mut self, cwd: String, recent_output: String) {
+    pub fn update_terminal_context(
+        &mut self,
+        cwd: String,
+        recent_output: String,
+        command_reference: Option<termior_terminal::TerminalCommandRecord>,
+    ) {
         let captured_at_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -562,11 +833,24 @@ impl ComposerView {
             cwd,
             recent_output,
             captured_at_unix_ms,
+            command_reference,
         };
     }
 
+    pub fn context_plan(&self) -> Option<&ContextPlan> {
+        self.last_context_plan.as_ref()
+    }
+
     fn submit(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.pending_approval.is_some() || self.pending_edit.is_some() {
+        if self.backend_choice == AgentBackendChoice::CodexAppServer {
+            self.submit_external(cx);
+            return;
+        }
+        if self.busy
+            || self.pending_approval.is_some()
+            || self.external_pending_approval.is_some()
+            || self.pending_edit.is_some()
+        {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
@@ -574,6 +858,18 @@ impl ComposerView {
             cx.notify();
             return;
         };
+        let mut rule_targets = self
+            .draft
+            .attachments
+            .iter()
+            .filter_map(|attachment| match attachment {
+                Attachment::File { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if rule_targets.is_empty() {
+            rule_targets.push(self.workspace_root.clone());
+        }
         let mut payload = match self.draft.build_payload(&runtime.tools) {
             Ok(payload) => payload,
             Err(error) => {
@@ -592,25 +888,423 @@ impl ComposerView {
         if payload.text.trim().is_empty() {
             return;
         }
-        self.history.push(Message::user(payload.text));
+        let user_input = payload.text;
+        let terminal_snapshot = self.terminal_context.snapshot();
+        let redactor = termior_store::StreamingRedactor::new(Vec::<String>::new());
+        let mut goal_item = ContextItem::inline(
+            "turn-user-input",
+            ContextCategory::Invariant,
+            ContextSource::User,
+            user_input.clone(),
+            u16::MAX,
+        );
+        goal_item.required = true;
+        let mut context_items = vec![
+            goal_item,
+            ContextItem::inline(
+                "system-and-rules",
+                ContextCategory::Invariant,
+                ContextSource::System,
+                redactor.redact(&runtime.system_prompt).text,
+                u16::MAX - 1,
+            ),
+            ContextItem::inline(
+                "active-terminal-evidence",
+                ContextCategory::Evidence,
+                ContextSource::Terminal(
+                    terminal_snapshot
+                        .command_reference
+                        .as_ref()
+                        .map(|record| record.terminal_id.clone())
+                        .unwrap_or_else(|| "active".into()),
+                ),
+                redactor.redact(&terminal_snapshot.recent_output).text,
+                100,
+            ),
+        ];
+        let rules = match RuleResolver::new(&self.workspace_root).and_then(|resolver| {
+            let mut unique = BTreeMap::new();
+            for target in &rule_targets {
+                for rule in resolver.for_path(target)? {
+                    unique.insert(rule.path.clone(), rule);
+                }
+            }
+            Ok(unique.into_values().collect::<Vec<_>>())
+        }) {
+            Ok(rules) => rules,
+            Err(error) => {
+                self.status = format!("Could not resolve scoped AGENTS.md rules: {error}");
+                cx.emit(AgentStatus::Error);
+                cx.notify();
+                return;
+            }
+        };
+        for (index, rule) in rules.into_iter().enumerate() {
+            let mut item = ContextItem::inline(
+                format!("rule-{index}-{}", rule.digest),
+                ContextCategory::Rules,
+                ContextSource::Workspace(rule.path.clone()),
+                redactor.redact(&rule.content).text,
+                u16::MAX - 2,
+            );
+            item.required = true;
+            context_items.push(item);
+        }
+        let requested_skills = requested_skill_names(&user_input, &self.skills);
+        self.active_skills.clear();
+        if !requested_skills.is_empty() {
+            let user_skills_root = user_home_dir().map(|home| home.join(".agents").join("skills"));
+            let index =
+                match SkillIndex::scan_sources(&self.workspace_root, user_skills_root.as_deref()) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        self.status = format!("Could not activate Agent Skill: {error}");
+                        cx.emit(AgentStatus::Error);
+                        cx.notify();
+                        return;
+                    }
+                };
+            let task_tools = runtime
+                .tools
+                .contracts()
+                .into_iter()
+                .map(|contract| contract.name)
+                .collect();
+            for name in requested_skills {
+                let activated = match index.activate(&name, &task_tools) {
+                    Ok(activated) => activated,
+                    Err(error) => {
+                        self.status = format!("Could not activate Agent Skill ${name}: {error}");
+                        cx.emit(AgentStatus::Error);
+                        cx.notify();
+                        return;
+                    }
+                };
+                let mut item = ContextItem::inline(
+                    format!("skill:{}", activated.metadata.name),
+                    ContextCategory::Skill,
+                    ContextSource::Skill(activated.metadata.name.clone()),
+                    format!(
+                        "Allowed tool ceiling for this skill: {}\n\n{}",
+                        activated
+                            .effective_tools
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        redactor.redact(&activated.body).text
+                    ),
+                    u16::MAX - 3,
+                );
+                item.required = true;
+                context_items.push(item);
+                self.active_skills.push(name);
+            }
+        }
+        let assembler = ContextAssembler::new(
+            128_000,
+            BTreeMap::from([
+                (ContextCategory::Invariant, 96_000),
+                (ContextCategory::Rules, 24_000),
+                (ContextCategory::Skill, 24_000),
+                (ContextCategory::Evidence, 16_000),
+            ]),
+        );
+        let plan = match assembler.plan(&context_items) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.status = format!("Context limit: {error}");
+                cx.emit(AgentStatus::Attention);
+                cx.notify();
+                return;
+            }
+        };
+        let mut prompt = String::new();
+        for item in plan.materialize_inline(&context_items) {
+            if item.item_id == "turn-user-input" {
+                continue;
+            }
+            if item.item_id == "system-and-rules" {
+                prompt.push_str(&item.content);
+            } else {
+                prompt.push_str(&format!(
+                    "\n\nContext item `{}` from {:?}:\n{}",
+                    item.item_id, item.source, item.content
+                ));
+            }
+        }
+        self.last_context_plan = Some(plan);
+        let history_before = self.history.clone();
+        self.history.push(Message::user(user_input.clone()));
         self.draft.input.clear();
         self.draft.attachments.clear();
         self.cursor = 0;
-        self.busy = true;
-        self.status = "Agent is working…".into();
-        cx.emit(AgentStatus::Working);
         self.persist_session();
 
-        let history = self.history.clone();
         let plan_request = self.mode == Mode::Plan && !self.plan_confirmed;
+        let tools = if plan_request {
+            prompt.push_str("\n\nPLAN MODE: First return an explicit numbered plan with file paths and approximate ranges. Do not invoke any approval-level tool until the user confirms the plan.");
+            match runtime.tools.clone().subset([
+                "read_file",
+                "list_directory",
+                "fs_search",
+                "fs_grep",
+                "get_terminal_context",
+            ]) {
+                Ok(tools) => tools,
+                Err(error) => {
+                    self.status = error.to_string();
+                    cx.emit(AgentStatus::Error);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            runtime.tools.clone()
+        };
+        let policy = if self.mode == Mode::Yolo {
+            ApprovalPolicy::Yolo
+        } else {
+            ApprovalPolicy::Prompt
+        };
+        let task = TaskRuntime::new(
+            TaskConfig::new(
+                user_input.clone(),
+                self.workspace_root.clone(),
+                "native",
+                "direct",
+            ),
+            RuntimeBudgets::default(),
+            policy,
+        )
+        .with_tools(tools)
+        .with_history(history_before)
+        .with_system_prompt(prompt)
+        .with_model(runtime.config.model.clone());
+        let task = if let Some(data_dir) = self.data_dir.as_ref() {
+            task.with_output_store(data_dir.join("agent-artifacts"), 32 * 1024)
+        } else {
+            task
+        };
+        let task = if let Some(data_dir) = self.data_dir.as_ref() {
+            match task.try_with_journal(data_dir) {
+                Ok(task) => task,
+                Err(error) => {
+                    self.status = format!("Could not initialize task journal: {error}");
+                    cx.emit(AgentStatus::Error);
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            task
+        };
+        runtime.executor.set_task_owner(task.task().id.0.clone());
+        self.active_cancellation = Some(task.cancellation_token());
+        self.active_task = Some(task);
+        self.active_plan_request = plan_request;
+        self.dispatch_task_command(TaskCommand::Start { user_input }, "Agent is working…", cx);
+    }
+
+    fn submit_external(&mut self, cx: &mut Context<Self>) {
+        if self.busy
+            || self.pending_approval.is_some()
+            || self.external_pending_approval.is_some()
+            || self.pending_edit.is_some()
+        {
+            return;
+        }
+        let Some(tools) = self.full_tools.as_ref() else {
+            self.status = "Codex backend is not configured for this workspace".into();
+            cx.emit(AgentStatus::Error);
+            cx.notify();
+            return;
+        };
+        let mut payload = match self.draft.build_payload(tools) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.status = format!("Attachment rejected: {error}");
+                cx.notify();
+                return;
+            }
+        };
+        payload.text = self.snippets.expand(&payload.text);
+        if !payload.images.is_empty() {
+            payload.text.push_str(&format!(
+                "\n\n[{} image attachment(s) are available in Termior]",
+                payload.images.len()
+            ));
+        }
+        if payload.text.trim().is_empty() {
+            return;
+        }
+        let user_input = payload.text;
+        self.history.push(Message::user(user_input.clone()));
+        self.draft.input.clear();
+        self.draft.attachments.clear();
+        self.cursor = 0;
+        self.persist_session();
+        self.dispatch_external_command(
+            ExternalCommand::Start {
+                task_id: new_session_id(),
+                text: user_input,
+            },
+            "Codex app-server is working…",
+            cx,
+        );
+    }
+
+    fn dispatch_external_command(
+        &mut self,
+        command: ExternalCommand,
+        status: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy {
+            return;
+        }
+        let session = self.external_session.clone();
+        let project_dir = self.workspace_root.clone();
+        let cancellation = CancellationToken::default();
+        self.active_cancellation = Some(cancellation.clone());
+        self.busy = true;
+        self.status = status.into();
+        cx.emit(AgentStatus::Working);
         cx.spawn(async move |view, cx| {
-            // 增量事件 channel：run_agent 在后台线程逐条推 ChatEvent，主线程边收边渲染。
+            let (event_tx, mut event_rx) = futures::channel::mpsc::unbounded::<BackendEvent>();
+            let task = cx.background_executor().spawn(async move {
+                run_external_command(session, command, project_dir, cancellation, event_tx)
+            });
+            while let Some(event) = event_rx.next().await {
+                let _ = view.update(cx, |view, cx| {
+                    match event {
+                        BackendEvent::AgentMessageDelta { text, .. } => {
+                            view.append_text_delta(text)
+                        }
+                        BackendEvent::ItemStarted { .. } => {
+                            view.status = "Codex is running a structured item…".into()
+                        }
+                        _ => {}
+                    }
+                    cx.notify();
+                });
+            }
+            let result = task.await;
+            let _ = view.update(cx, |view, cx| {
+                view.apply_external_result(result, cx);
+                view.persist_session();
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_external_result(&mut self, result: ExternalRunResult, cx: &mut Context<Self>) {
+        self.busy = false;
+        self.active_cancellation = None;
+        if let Some(session) = result.session.as_ref() {
+            if let Ok(session) = session.lock() {
+                let capabilities = &session.info().capabilities;
+                self.backend_capability_summary = Some(format!(
+                    "{} {} · auth={} · model={} · resume={:?} · fork={:?} · steer={:?} · cancel={:?} · approvals={:?} · terminal={:?}",
+                    session.info().display_name,
+                    session.info().version,
+                    session.info().authentication_source,
+                    session.info().model_source,
+                    capabilities.session_resume,
+                    capabilities.session_fork,
+                    capabilities.mid_turn_steer,
+                    capabilities.cancel,
+                    capabilities.approval_requests,
+                    capabilities.host_terminal,
+                ));
+            }
+        }
+        if let Some(session) = result.session {
+            self.external_session = Some(session);
+        }
+        if let Some(error) = result.error {
+            self.status = format!("Codex backend error: {error}");
+            cx.emit(AgentStatus::Error);
+            return;
+        }
+        match result.outcome {
+            Some(PumpOutcome::WaitingApproval {
+                backend_request_id,
+                tool_call_id,
+                request_kind,
+                raw,
+            }) => {
+                let arguments = termior_store::StreamingRedactor::new(Vec::<String>::new())
+                    .redact(&raw.to_string())
+                    .text;
+                self.external_pending_approval = Some(ExternalPendingApproval {
+                    backend_request_id,
+                    tool_call_id: tool_call_id.clone(),
+                    request_kind,
+                    arguments,
+                });
+                self.status = format!("Codex approval required: {tool_call_id}");
+                cx.emit(AgentStatus::Attention);
+            }
+            Some(PumpOutcome::Completed { success, status }) => {
+                self.external_pending_approval = None;
+                self.status = format!("Codex turn {status}");
+                cx.emit(if success {
+                    AgentStatus::Finished
+                } else {
+                    AgentStatus::Error
+                });
+            }
+            Some(PumpOutcome::Unknown { reason }) => {
+                self.external_pending_approval = None;
+                self.status = format!("Codex result is unknown: {reason}");
+                cx.emit(AgentStatus::Attention);
+            }
+            Some(PumpOutcome::Pending) => {
+                self.status = "Codex turn is still running".into();
+                cx.emit(AgentStatus::Attention);
+            }
+            None => {
+                self.status = "Codex backend returned no outcome".into();
+                cx.emit(AgentStatus::Error);
+            }
+        }
+    }
+
+    fn dispatch_task_command(
+        &mut self,
+        command: TaskCommand,
+        status: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy {
+            return;
+        }
+        let Some(task_runtime) = self.active_task.take() else {
+            self.status = "No active Agent task".into();
+            cx.emit(AgentStatus::Error);
+            cx.notify();
+            return;
+        };
+        let Some(runtime) = self.runtime.clone() else {
+            self.active_task = Some(task_runtime);
+            self.status = "No configured Agent runtime".into();
+            cx.emit(AgentStatus::Error);
+            cx.notify();
+            return;
+        };
+        self.active_cancellation = Some(task_runtime.cancellation_token());
+        self.busy = true;
+        self.status = status.into();
+        cx.emit(AgentStatus::Working);
+        cx.spawn(async move |view, cx| {
             let (event_tx, mut event_rx) =
                 futures::channel::mpsc::unbounded::<termior_ai::ChatEvent>();
-            let task = cx
-                .background_executor()
-                .spawn(async move { run_agent(runtime, history, plan_request, event_tx).await });
-            // 主线程消费增量：每收到一个 TextDelta 就追加到当前 assistant 草稿并重绘。
+            let task = cx.background_executor().spawn(async move {
+                run_task_command(runtime, task_runtime, command, event_tx).await
+            });
             while let Some(event) = event_rx.next().await {
                 if let termior_ai::ChatEvent::TextDelta(delta) = event {
                     let _ = view.update(cx, |view, cx| {
@@ -621,18 +1315,7 @@ impl ComposerView {
             }
             let result = task.await;
             let _ = view.update(cx, |view, cx| {
-                view.busy = false;
-                view.apply_agent_result(result, cx);
-                if plan_request && view.pending_approval.is_none() {
-                    view.awaiting_plan_confirmation = true;
-                    view.status =
-                        "Plan ready · confirm or reject before any write-capable tool is exposed"
-                            .into();
-                    cx.emit(AgentStatus::Attention);
-                } else if !plan_request {
-                    view.plan_confirmed = false;
-                    view.awaiting_plan_confirmation = false;
-                }
+                view.apply_task_result(result, cx);
                 view.persist_session();
                 cx.notify();
             });
@@ -641,106 +1324,185 @@ impl ComposerView {
         cx.notify();
     }
 
-    fn apply_agent_result(&mut self, result: Result<AgentOutcome, String>, cx: &mut Context<Self>) {
-        match result {
-            Ok(outcome) => {
-                self.history = outcome.messages.clone();
-                if let Some(request) = outcome.pending_approval {
-                    let summary = request.summary.clone();
-                    self.pending_approval = Some(PendingApproval {
-                        request,
-                        history: outcome.messages,
-                    });
-                    if self.mode == Mode::Yolo {
-                        // ADR-0004：在审批门自动应答 approve，工具仍走 approved
-                        // 通道，安全护栏全部照常生效。
-                        self.status = format!("Yolo auto-approved: {summary}");
-                        self.approve_tool(cx);
-                        return;
-                    }
-                    self.status = format!("Approval required: {summary}");
-                    cx.emit(AgentStatus::Attention);
-                } else {
-                    self.status = "Agent finished".into();
-                    cx.emit(AgentStatus::Finished);
-                }
-            }
-            Err(error) => {
-                self.status = format!("Agent error: {error}");
+    fn apply_task_result(&mut self, result: TaskRunResult, cx: &mut Context<Self>) {
+        self.busy = false;
+        self.active_cancellation = None;
+        self.pending_approval = None;
+        self.pending_edit = None;
+        self.history = result.task.history().to_vec();
+        self.persist_task_summary(&result.task);
+        if let Some(dir) = self.data_dir.as_deref() {
+            if let Err(error) = result.task.persist_journal(dir) {
+                self.status = format!("Agent journal error: {error}");
+                self.active_task = Some(result.task);
                 cx.emit(AgentStatus::Error);
+                return;
             }
         }
+
+        if let Some(error) = result.error {
+            self.status = format!("Agent error: {error}");
+            cx.emit(AgentStatus::Error);
+            return;
+        }
+
+        match result.task.task().state {
+            TaskState::WaitingApproval => {
+                let Some(request) = result.task.pending_approval() else {
+                    self.status = "Agent runtime lost its pending approval".into();
+                    cx.emit(AgentStatus::Error);
+                    return;
+                };
+                let Some(contract) = result.task.pending_contract() else {
+                    self.status = "Agent runtime lost the pending tool contract".into();
+                    cx.emit(AgentStatus::Error);
+                    return;
+                };
+                self.status = format!("Approval required: {}", request.summary);
+                self.pending_approval = Some(PendingApproval { request, contract });
+                self.active_task = Some(result.task);
+                cx.emit(AgentStatus::Attention);
+            }
+            TaskState::WaitingChangeReview => {
+                let summary = result
+                    .task
+                    .pending_change_summary()
+                    .and_then(|summary| serde_json::from_str::<EditProposalSummary>(summary).ok());
+                let Some(summary) = summary else {
+                    self.status = "Agent runtime returned an invalid change summary".into();
+                    cx.emit(AgentStatus::Error);
+                    return;
+                };
+                let review_request = EditReviewRequested(summary.clone());
+                self.pending_edit = Some(PendingEdit {
+                    summary,
+                    decisions: HashMap::new(),
+                });
+                self.status = "Review every proposed hunk before verification".into();
+                self.active_task = Some(result.task);
+                cx.emit(AgentStatus::Attention);
+                cx.emit(review_request);
+            }
+            TaskState::WaitingUser => {
+                self.status = match result.task.task().waiting_reason.as_ref() {
+                    Some(WaitingReason::BudgetExhausted {
+                        dimension,
+                        used,
+                        limit,
+                    }) => format!("Agent paused: {dimension:?} budget exhausted ({used}/{limit})"),
+                    Some(reason) => format!("Agent needs input: {reason:?}"),
+                    None => "Agent needs input".into(),
+                };
+                self.active_task = Some(result.task);
+                cx.emit(AgentStatus::Attention);
+            }
+            TaskState::CompletedVerified => {
+                if self.active_plan_request {
+                    self.awaiting_plan_confirmation = true;
+                    self.status =
+                        "Plan ready · confirm or reject before write-capable tools are exposed"
+                            .into();
+                    cx.emit(AgentStatus::Attention);
+                } else {
+                    self.status = "Agent finished · verified".into();
+                    cx.emit(AgentStatus::Finished);
+                }
+                self.active_task = None;
+            }
+            TaskState::CompletedUnverified => {
+                if self.active_plan_request {
+                    self.awaiting_plan_confirmation = true;
+                    self.status =
+                        "Plan ready · confirm or reject before write-capable tools are exposed"
+                            .into();
+                    cx.emit(AgentStatus::Attention);
+                } else {
+                    self.status = "Agent finished · unverified (no acceptance command)".into();
+                    cx.emit(AgentStatus::Finished);
+                }
+                self.active_task = None;
+            }
+            TaskState::Cancelled => {
+                self.status = "Agent task cancelled".into();
+                self.active_task = None;
+                cx.emit(AgentStatus::Finished);
+            }
+            TaskState::Unknown => {
+                self.status = "Agent stopped with an unknown side-effect result".into();
+                self.active_task = None;
+                cx.emit(AgentStatus::Attention);
+            }
+            TaskState::Failed => {
+                self.status = "Agent task failed; inspect the last tool result".into();
+                self.active_task = None;
+                cx.emit(AgentStatus::Error);
+            }
+            state => {
+                self.status = format!("Agent task state: {state:?}");
+                self.active_task = Some(result.task);
+                cx.emit(AgentStatus::Attention);
+            }
+        }
+        if !self.active_plan_request && self.active_task.is_none() {
+            self.plan_confirmed = false;
+            self.awaiting_plan_confirmation = false;
+        }
+    }
+
+    fn persist_task_summary(&self, runtime: &TaskRuntime) {
+        let Some(dir) = self.data_dir.as_deref() else {
+            return;
+        };
+        let mut store = TaskSummaryStore::load(dir).unwrap_or_default();
+        let sequence = runtime.events().last().map(|event| event.sequence);
+        store.upsert(TaskSummary::from_task(runtime.task(), sequence));
+        let _ = store.persist(dir);
     }
 
     fn approve_tool(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
+        if self.external_pending_approval.take().is_some() {
+            self.dispatch_external_command(
+                ExternalCommand::Respond { approved: true },
+                "Returning approval to Codex…",
+                cx,
+            );
+            return;
+        }
         let Some(pending) = self.pending_approval.take() else {
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
-            return;
-        };
-        self.busy = true;
-        self.status = format!("Running approved tool: {}", pending.request.tool_name);
-        cx.emit(AgentStatus::Working);
-        cx.spawn(async move |view, cx| {
-            // 增量事件 channel：resume_agent 在后台线程逐条推 ChatEvent。
-            let (event_tx, mut event_rx) =
-                futures::channel::mpsc::unbounded::<termior_ai::ChatEvent>();
-            let task = cx
-                .background_executor()
-                .spawn(async move { resume_agent(runtime, pending, event_tx).await });
-            while let Some(event) = event_rx.next().await {
-                if let termior_ai::ChatEvent::TextDelta(delta) = event {
-                    let _ = view.update(cx, |view, cx| {
-                        view.append_text_delta(delta);
-                        cx.notify();
-                    });
-                }
-            }
-            let result = task.await;
-            let _ = view.update(cx, |view, cx| {
-                view.busy = false;
-                match result {
-                    Ok((outcome, edit)) => {
-                        view.apply_agent_result(Ok(outcome), cx);
-                        if let Some(summary) = edit {
-                            let review_request = EditReviewRequested(summary.clone());
-                            view.pending_edit = Some(PendingEdit {
-                                summary,
-                                decisions: HashMap::new(),
-                            });
-                            view.status = "Review every proposed hunk before writing".into();
-                            cx.emit(AgentStatus::Attention);
-                            cx.emit(review_request);
-                        }
-                    }
-                    Err(error) => {
-                        view.status = format!("Tool failed: {error}");
-                        cx.emit(AgentStatus::Error);
-                    }
-                }
-                view.persist_session();
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
+        let label = format!("Running approved tool: {}", pending.request.tool_name);
+        self.dispatch_task_command(
+            TaskCommand::ResolveApproval {
+                call_id: pending.request.call_id,
+                approved: true,
+            },
+            &label,
+            cx,
+        );
     }
 
     fn reject_tool(&mut self, cx: &mut Context<Self>) {
+        if self.external_pending_approval.take().is_some() {
+            self.dispatch_external_command(
+                ExternalCommand::Respond { approved: false },
+                "Returning rejection to Codex…",
+                cx,
+            );
+            return;
+        }
         if let Some(pending) = self.pending_approval.take() {
-            self.history = pending.history;
-            self.history.push(Message::assistant(format!(
-                "The user rejected the {} tool call.",
-                pending.request.tool_name
-            )));
-            self.status = "Tool call rejected".into();
-            cx.emit(AgentStatus::Finished);
-            self.persist_session();
-            cx.notify();
+            self.dispatch_task_command(
+                TaskCommand::ResolveApproval {
+                    call_id: pending.request.call_id,
+                    approved: false,
+                },
+                "Returning the rejection to the Agent…",
+                cx,
+            );
         }
     }
 
@@ -821,7 +1583,18 @@ impl ComposerView {
     /// 切换提交模式。Plan/挂起审批期间不允许切换，避免计划流状态错乱。
     /// 首次切到 Yolo 弹一次确认（本次应用运行内不再重复）。
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
-        if self.busy || self.pending_approval.is_some() || self.pending_edit.is_some() {
+        if self.backend_choice == AgentBackendChoice::CodexAppServer {
+            self.status =
+                "Codex app-server decides per-request approvals through its capability contract"
+                    .into();
+            cx.notify();
+            return;
+        }
+        if self.busy
+            || self.pending_approval.is_some()
+            || self.external_pending_approval.is_some()
+            || self.pending_edit.is_some()
+        {
             return;
         }
         if mode == Mode::Yolo && !self.yolo_confirmed {
@@ -888,7 +1661,44 @@ impl ComposerView {
     }
 
     fn send(&mut self, _event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        self.submit(cx);
+        if self.busy {
+            self.stop_active_task(cx);
+        } else {
+            self.submit(cx);
+        }
+    }
+
+    fn stop_active_task(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancellation) = &self.active_cancellation {
+            cancellation.cancel();
+            self.status = "Cancelling Agent task…".into();
+            cx.emit(AgentStatus::Attention);
+            cx.notify();
+            return;
+        }
+        if self.active_task.is_some() {
+            self.dispatch_task_command(TaskCommand::Cancel, "Cancelling Agent task…", cx);
+        }
+    }
+
+    fn continue_with_more_budget(&mut self, cx: &mut Context<Self>) {
+        let Some(runtime) = self.active_task.as_ref() else {
+            return;
+        };
+        if runtime.task().state != TaskState::WaitingUser {
+            return;
+        }
+        let mut budgets = runtime.task().budgets.clone();
+        budgets.max_model_steps = budgets.max_model_steps.saturating_add(25);
+        budgets.max_wall_clock_ms = budgets.max_wall_clock_ms.saturating_add(15 * 60 * 1_000);
+        budgets.max_tool_output_bytes = budgets
+            .max_tool_output_bytes
+            .saturating_add(4 * 1024 * 1024);
+        self.dispatch_task_command(
+            TaskCommand::IncreaseBudgets { budgets },
+            "Continuing Agent task with an increased budget…",
+            cx,
+        );
     }
 
     fn handle_key_down(
@@ -981,6 +1791,7 @@ impl ComposerView {
                 .iter()
                 .all(|message| !matches!(message.role, Role::User | Role::Assistant))
             && self.pending_approval.is_none()
+            && self.external_pending_approval.is_none()
             && self.pending_edit.is_none()
             && !self.awaiting_plan_confirmation
             && self.draft.attachments.is_empty()
@@ -998,6 +1809,9 @@ impl ComposerView {
     }
 
     fn model_setup_placeholder(&self) -> Option<&str> {
+        if self.backend_choice == AgentBackendChoice::CodexAppServer {
+            return None;
+        }
         if self.runtime.is_some() {
             return None;
         }
@@ -1015,85 +1829,163 @@ impl EventEmitter<EditReviewRequested> for ComposerView {}
 impl EventEmitter<ComposerDockToggle> for ComposerView {}
 impl EventEmitter<ComposerCollapse> for ComposerView {}
 
-async fn run_agent(
+async fn run_task_command(
     runtime: AgentRuntime,
-    history: Vec<Message>,
-    plan_only: bool,
+    mut task_runtime: TaskRuntime,
+    command: TaskCommand,
     event_tx: futures::channel::mpsc::UnboundedSender<termior_ai::ChatEvent>,
-) -> Result<AgentOutcome, String> {
-    let provider = HttpProvider::new(runtime.config).map_err(|error| error.to_string())?;
-    let mut prompt = runtime.system_prompt;
-    let tools = if plan_only {
-        prompt.push_str("\n\nPLAN MODE: First return an explicit numbered plan with file paths and approximate ranges. Do not invoke any approval-level tool until the user confirms the plan.");
-        runtime
-            .tools
-            .subset([
-                "read_file",
-                "list_directory",
-                "fs_search",
-                "fs_grep",
-                "get_terminal_context",
-            ])
-            .map_err(|error| error.to_string())?
-    } else {
-        runtime.tools
-    };
-    let agent = Agent::new(Box::new(provider), tools).with_system_prompt(prompt);
-    let mut on_event = move |ev: &termior_ai::ChatEvent| {
-        let _ = event_tx.unbounded_send(ev.clone());
-    };
-    agent
-        .run(
-            &history,
-            &|tool, arguments| {
-                runtime
-                    .executor
-                    .execute_auto(tool, arguments)
-                    .map_err(|error| error.to_string())
-            },
-            &mut on_event,
-        )
-        .await
-        .map_err(|error| error.to_string())
-}
-
-async fn resume_agent(
-    runtime: AgentRuntime,
-    pending: PendingApproval,
-    event_tx: futures::channel::mpsc::UnboundedSender<termior_ai::ChatEvent>,
-) -> Result<(AgentOutcome, Option<EditProposalSummary>), String> {
-    let provider = HttpProvider::new(runtime.config).map_err(|error| error.to_string())?;
-    let edit = Arc::new(Mutex::new(None));
-    let edit_capture = edit.clone();
-    let executor = runtime.executor.clone();
-    let callback = move |tool: &str, arguments: &str| {
-        let output = executor
-            .execute_approved(tool, arguments)
-            .map_err(|error| error.to_string())?;
-        if tool == "write_file" {
-            if let Ok(summary) = serde_json::from_str::<EditProposalSummary>(&output) {
-                *edit_capture.lock().unwrap() = Some(summary);
+) -> TaskRunResult {
+    let provider = match HttpProvider::new(runtime.config) {
+        Ok(provider) => provider,
+        Err(error) => {
+            return TaskRunResult {
+                task: task_runtime,
+                error: Some(error.to_string()),
             }
         }
-        Ok(output)
     };
-    let agent =
-        Agent::new(Box::new(provider), runtime.tools).with_system_prompt(runtime.system_prompt);
-    let mut on_event = move |ev: &termior_ai::ChatEvent| {
-        let _ = event_tx.unbounded_send(ev.clone());
+    let mut on_event = move |event: &termior_ai::ChatEvent| {
+        let _ = event_tx.unbounded_send(event.clone());
     };
-    let outcome = agent
-        .resume(
-            &pending.history,
-            &callback,
-            ApprovalDecision::Approve,
-            &pending.request,
-            &mut on_event,
-        )
+    let error = task_runtime
+        .handle(command, &provider, runtime.executor.as_ref(), &mut on_event)
         .await
-        .map_err(|error| error.to_string())?;
-    let edit = edit.lock().unwrap().clone();
-    Ok((outcome, edit))
+        .err()
+        .map(|error| error.to_string());
+    TaskRunResult {
+        task: task_runtime,
+        error,
+    }
+}
+
+fn run_external_command(
+    existing: Option<Arc<Mutex<ManagedAgentSession>>>,
+    command: ExternalCommand,
+    project_dir: PathBuf,
+    cancellation: CancellationToken,
+    event_tx: futures::channel::mpsc::UnboundedSender<BackendEvent>,
+) -> ExternalRunResult {
+    let session = match existing {
+        Some(session) => session,
+        None => {
+            let task_id = match &command {
+                ExternalCommand::Start { task_id, .. } => task_id.clone(),
+                ExternalCommand::Respond { .. } => {
+                    return ExternalRunResult {
+                        session: None,
+                        outcome: None,
+                        error: Some("Codex approval session is missing".into()),
+                    }
+                }
+            };
+            let created = ManagedAgentSession::connect(
+                Box::new(CodexBackend::new(
+                    std::env::var("TERMIOR_CODEX_PATH").unwrap_or_else(|_| "codex".into()),
+                )),
+                TaskLaunch {
+                    task_id,
+                    project_dir: project_dir.display().to_string(),
+                    environment_id: "codex-workspace-write".into(),
+                    model: None,
+                },
+            );
+            match created {
+                Ok(session) => Arc::new(Mutex::new(session)),
+                Err(error) => {
+                    return ExternalRunResult {
+                        session: None,
+                        outcome: None,
+                        error: Some(error.to_string()),
+                    }
+                }
+            }
+        }
+    };
+
+    let first = {
+        let mut guard = match session.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return ExternalRunResult {
+                    session: Some(session.clone()),
+                    outcome: None,
+                    error: Some("Codex session lock is poisoned".into()),
+                }
+            }
+        };
+        match command {
+            ExternalCommand::Start { text, .. } => {
+                guard.start_turn(text).map(|()| PumpOutcome::Pending)
+            }
+            ExternalCommand::Respond { approved } => guard.respond(
+                approved,
+                &mut |event| {
+                    let _ = event_tx.unbounded_send(event.clone());
+                },
+                std::time::Duration::from_millis(250),
+            ),
+        }
+    };
+    let mut outcome = match first {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return ExternalRunResult {
+                session: Some(session.clone()),
+                outcome: None,
+                error: Some(error.to_string()),
+            }
+        }
+    };
+
+    loop {
+        if !matches!(outcome, PumpOutcome::Pending) {
+            return ExternalRunResult {
+                session: Some(session.clone()),
+                outcome: Some(outcome),
+                error: None,
+            };
+        }
+        if cancellation.is_cancelled() {
+            let result = session
+                .lock()
+                .map_err(|_| "Codex session lock is poisoned".to_owned())
+                .and_then(|mut guard| guard.cancel().map_err(|error| error.to_string()));
+            return ExternalRunResult {
+                session: Some(session.clone()),
+                outcome: Some(match result {
+                    Ok(()) => PumpOutcome::Completed {
+                        success: false,
+                        status: "cancelled".into(),
+                    },
+                    Err(reason) => PumpOutcome::Unknown { reason },
+                }),
+                error: None,
+            };
+        }
+        outcome = match session.lock() {
+            Ok(mut guard) => {
+                match guard.pump_for(std::time::Duration::from_millis(250), &mut |event| {
+                    let _ = event_tx.unbounded_send(event.clone());
+                }) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return ExternalRunResult {
+                            session: Some(session.clone()),
+                            outcome: None,
+                            error: Some(error.to_string()),
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                return ExternalRunResult {
+                    session: Some(session.clone()),
+                    outcome: None,
+                    error: Some("Codex session lock is poisoned".into()),
+                }
+            }
+        };
+    }
 }
 
 impl Focusable for ComposerView {
@@ -1111,6 +2003,47 @@ impl gpui::Render for ComposerView {
             view: cx.entity().downgrade(),
         };
         let agent_name = self.active_agent_name().to_owned();
+        let agent_tooltip = self
+            .backend_capability_summary
+            .clone()
+            .unwrap_or_else(|| "Agent — click to switch".into());
+        let external_backend = self.backend_choice == AgentBackendChoice::CodexAppServer;
+        let mode_label = if external_backend {
+            "Backend approval"
+        } else {
+            self.mode.label()
+        };
+        let environment_id = self
+            .active_task
+            .as_ref()
+            .map(|runtime| runtime.task().environment_id.clone())
+            .unwrap_or_else(|| {
+                if external_backend {
+                    "codex-workspace-write".into()
+                } else {
+                    "direct-workspace".into()
+                }
+            });
+        let environment_tooltip = if external_backend {
+            format!(
+                "host={} · root={} · file=workspace-write · network=backend-declared · credentials=Codex-managed · process=backend-declared · trust=reported/unknown",
+                std::env::consts::OS,
+                self.workspace_root.display()
+            )
+        } else {
+            format!(
+                "host={} · root={} · file=workspace-confined · network=provider/tool policy · credentials=keyring references only · process=local session tree · trust=verified where probed",
+                std::env::consts::OS,
+                self.workspace_root.display()
+            )
+        };
+        let context_label = self.context_plan().map(|plan| {
+            format!(
+                "Context {}t · {} items",
+                plan.total_tokens,
+                plan.entries.len()
+            )
+        });
         let compact = self.is_compact();
         let placeholder = self.model_setup_placeholder();
         let show_status_row = placeholder.is_none() && !self.status.is_empty();
@@ -1252,7 +2185,32 @@ impl gpui::Render for ComposerView {
                         }),
                 )
         });
-        let approval = self.pending_approval.as_ref().map(|pending| {
+        let approval_display = self
+            .pending_approval
+            .as_ref()
+            .map(|pending| {
+                (
+                    format!(
+                        "Approval: {} · call={} · effect={:?}",
+                        pending.request.summary,
+                        pending.request.call_id,
+                        pending.contract.side_effect
+                    ),
+                    pending.request.arguments.clone(),
+                )
+            })
+            .or_else(|| {
+                self.external_pending_approval.as_ref().map(|pending| {
+                    (
+                        format!(
+                            "Codex approval: {} · request={} · call={}",
+                            pending.request_kind, pending.backend_request_id, pending.tool_call_id
+                        ),
+                        pending.arguments.clone(),
+                    )
+                })
+            });
+        let approval = approval_display.map(|(headline, arguments)| {
             div()
                 .flex()
                 .flex_col()
@@ -1263,15 +2221,8 @@ impl gpui::Render for ComposerView {
                 .border_1()
                 .border_color(crate::ui::color(p.status[2]))
                 .bg(crate::ui::alpha(p.status[2], 0.08))
-                .child(SharedString::from(format!(
-                    "Approval: {}",
-                    pending.request.summary
-                )))
-                .child(
-                    div()
-                        .text_xs()
-                        .child(SharedString::from(pending.request.arguments.clone())),
-                )
+                .child(SharedString::from(headline))
+                .child(div().text_xs().child(SharedString::from(arguments)))
                 .child(
                     div()
                         .flex()
@@ -1419,6 +2370,631 @@ impl gpui::Render for ComposerView {
                         ),
                 )
         });
+        let context_inspector = self
+            .context_inspector_open
+            .then_some(self.last_context_plan.as_ref())
+            .flatten()
+            .map(|plan| {
+                let rows = plan.entries.iter().enumerate().map(|(index, entry)| {
+                    div()
+                        .id(SharedString::from(format!("context-entry-{index}")))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .p_2()
+                        .rounded_md()
+                        .bg(crate::ui::alpha(p.foreground, 0.04))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .child(SharedString::from(entry.item_id.clone()))
+                                .child(SharedString::from(format!(
+                                    "{:?} · {}t",
+                                    entry.disposition, entry.tokens
+                                ))),
+                        )
+                        .child(div().text_xs().text_color(crate::ui::muted(&p)).child(
+                            SharedString::from(format!("{:?} · {}", entry.category, entry.reason)),
+                        ))
+                });
+                div()
+                    .id("context-inspector-panel")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(crate::ui::border(&p))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Context Inspector")
+                            .child(SharedString::from(format!(
+                                "{} / {} tokens",
+                                plan.total_tokens, plan.hard_limit
+                            ))),
+                    )
+                    .children(rows)
+            });
+        let recovery_center = self.recovery_center_open.then(|| {
+            let rows = self.recovery_tasks.iter().enumerate().map(|(index, task)| {
+                let retry_task_id = task.task_id.clone();
+                let abandon_task_id = task.task_id.clone();
+                let can_retry = task
+                    .available_actions
+                    .iter()
+                    .any(|action| action == "retry");
+                let can_abandon = task
+                    .available_actions
+                    .iter()
+                    .any(|action| action == "abandon");
+                div()
+                    .id(SharedString::from(format!("recovery-task-{index}")))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .p_2()
+                    .rounded_md()
+                    .bg(crate::ui::alpha(p.foreground, 0.04))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .child(SharedString::from(format!(
+                                "{} · {}",
+                                task.task_id, task.attempt_id
+                            )))
+                            .child(SharedString::from(format!(
+                                "{:?} · event {}",
+                                task.recovered_state, task.last_trusted_event
+                            ))),
+                    )
+                    .child(div().text_xs().text_color(crate::ui::muted(&p)).child(
+                        SharedString::from(format!(
+                            "persisted={} · backend={} · actions: {}",
+                            task.persisted_state,
+                            task.backend_id.as_deref().unwrap_or("unknown"),
+                            task.available_actions.join(", ")
+                        )),
+                    ))
+                    .when_some(task.diagnostic.clone(), |row, diagnostic| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(crate::ui::color(p.status[3]))
+                                .child(SharedString::from(diagnostic)),
+                        )
+                    })
+                    .when(can_retry || can_abandon, |row| {
+                        row.child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .when(can_retry, |actions| {
+                                    actions.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "recovery-retry-{index}"
+                                            )))
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(crate::ui::border(&p))
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .child("Prepare retry")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.apply_recovery_command(
+                                                        &retry_task_id,
+                                                        RecoveryCommand::Retry,
+                                                        cx,
+                                                    );
+                                                }),
+                                            ),
+                                    )
+                                })
+                                .when(can_abandon, |actions| {
+                                    actions.child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "recovery-abandon-{index}"
+                                            )))
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(crate::ui::color(p.status[3]))
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .child("Abandon")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.apply_recovery_command(
+                                                        &abandon_task_id,
+                                                        RecoveryCommand::Abandon,
+                                                        cx,
+                                                    );
+                                                }),
+                                            ),
+                                    )
+                                }),
+                        )
+                    })
+            });
+            div()
+                .id("recovery-center-panel")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&p))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Recovery Center"),
+                )
+                .when(self.recovery_tasks.is_empty(), |panel| {
+                    panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(crate::ui::muted(&p))
+                            .child("No unfinished tasks were found."),
+                    )
+                })
+                .children(rows)
+        });
+        let automation_center = self.automation_center_open.then(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let rows =
+                self.automations
+                    .automations
+                    .iter()
+                    .enumerate()
+                    .map(|(index, automation)| {
+                        let automation_id = automation.id.clone();
+                        let next = next_run_after(automation, now)
+                            .map(|timestamp| timestamp.to_string())
+                            .unwrap_or_else(|| "event/manual".into());
+                        let last = self
+                            .automations
+                            .recent_runs
+                            .iter()
+                            .rev()
+                            .find(|run| run.automation_id == automation.id)
+                            .map(|run| format!("{:?} ({})", run.status, run.run_id))
+                            .unwrap_or_else(|| "never".into());
+                        div()
+                            .id(SharedString::from(format!("automation-entry-{index}")))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .p_2()
+                            .rounded_md()
+                            .bg(crate::ui::alpha(p.foreground, 0.04))
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .child(SharedString::from(automation.name.clone()))
+                                    .child(if automation.enabled {
+                                        "enabled"
+                                    } else {
+                                        "disabled"
+                                    }),
+                            )
+                            .child(div().text_xs().text_color(crate::ui::muted(&p)).child(
+                                SharedString::from(format!(
+                                    "template v{} · next={} · last={} · {:?}",
+                                    automation.template.version, next, last, automation.trigger
+                                )),
+                            ))
+                            .when(automation.enabled, |row| {
+                                row.child(
+                                    div()
+                                        .id(SharedString::from(format!("run-automation-{index}")))
+                                        .px_2()
+                                        .py(px(2.0))
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(crate::ui::border(&p))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .child("Queue manual run")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.trigger_automation(&automation_id, cx);
+                                            }),
+                                        ),
+                                )
+                            })
+                    });
+            div()
+                .id("automation-center-panel")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&p))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Automations"))
+                .when(self.automations.automations.is_empty(), |panel| {
+                    panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(crate::ui::muted(&p))
+                            .child("No local automation templates are configured."),
+                    )
+                })
+                .children(rows)
+        });
+        let checkpoint_center =
+            self.checkpoint_center_open.then(|| {
+                let rows = self
+                    .checkpoints
+                    .iter()
+                    .enumerate()
+                    .map(|(index, checkpoint)| {
+                        let checkpoint_id = checkpoint.id.clone();
+                        let files = checkpoint
+                            .files
+                            .iter()
+                            .map(|file| file.relative_path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        div()
+                            .id(SharedString::from(format!("checkpoint-entry-{index}")))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .p_2()
+                            .rounded_md()
+                            .bg(crate::ui::alpha(p.foreground, 0.04))
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .child(SharedString::from(checkpoint.id.clone()))
+                                    .child(SharedString::from(format!(
+                                        "task {} · event {}",
+                                        checkpoint.task_id, checkpoint.sequence
+                                    ))),
+                            )
+                            .child(
+                                div().text_xs().text_color(crate::ui::muted(&p)).child(
+                                    SharedString::from(format!("recoverable files: {files}")),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("restore-checkpoint-{index}")))
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(crate::ui::border(&p))
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .child("Restore unchanged outputs")
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.restore_checkpoint(&checkpoint_id, cx);
+                                        }),
+                                    ),
+                            )
+                    });
+                div()
+                    .id("checkpoint-center-panel")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(crate::ui::border(&p))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("File Checkpoints"),
+                    )
+                    .child(div().text_xs().text_color(crate::ui::muted(&p)).child(
+                        "Process, network, and external-service effects are not reversible.",
+                    ))
+                    .children(rows)
+            });
+        let skill_center = self.skill_center_open.then(|| {
+            let rows = self.skills.iter().enumerate().map(|(index, skill)| {
+                let active = self.active_skills.iter().any(|name| name == &skill.name);
+                div()
+                    .id(SharedString::from(format!("skill-entry-{index}")))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .p_2()
+                    .rounded_md()
+                    .bg(crate::ui::alpha(p.foreground, 0.04))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .child(SharedString::from(format!("${}", skill.name)))
+                            .child(if active {
+                                "active this turn"
+                            } else {
+                                "available"
+                            }),
+                    )
+                    .child(div().text_xs().text_color(crate::ui::muted(&p)).child(
+                        SharedString::from(format!(
+                            "{} · source={} · allowed tools: {}",
+                            skill.description,
+                            skill.path.display(),
+                            if skill.allowed_tools.is_empty() {
+                                "task tool set".into()
+                            } else {
+                                skill
+                                    .allowed_tools
+                                    .iter()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            }
+                        )),
+                    ))
+            });
+            div()
+                .id("skill-center-panel")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&p))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Agent Skills"),
+                )
+                .when_some(self.skill_scan_error.clone(), |panel, error| {
+                    panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(crate::ui::color(p.status[3]))
+                            .child(SharedString::from(error)),
+                    )
+                })
+                .children(rows)
+        });
+        let memory_center = self.memory_center_open.then(|| {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let candidates =
+                self.memory
+                    .candidates
+                    .values()
+                    .enumerate()
+                    .map(|(index, candidate)| {
+                        let accept_id = candidate.id.clone();
+                        let reject_id = candidate.id.clone();
+                        div()
+                            .id(SharedString::from(format!("memory-candidate-{index}")))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .p_2()
+                            .rounded_md()
+                            .bg(crate::ui::alpha(p.status[2], 0.08))
+                            .child(SharedString::from(format!(
+                                "Candidate {} · confidence {}",
+                                candidate.id, candidate.confidence
+                            )))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .child(SharedString::from(candidate.content.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "accept-memory-{index}"
+                                            )))
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(crate::ui::border(&p))
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .child("Accept")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.apply_memory_action(
+                                                        &accept_id,
+                                                        MemoryAction::Accept,
+                                                        cx,
+                                                    );
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "reject-memory-{index}"
+                                            )))
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(crate::ui::color(p.status[3]))
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .child("Reject")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.apply_memory_action(
+                                                        &reject_id,
+                                                        MemoryAction::Reject,
+                                                        cx,
+                                                    );
+                                                }),
+                                            ),
+                                    ),
+                            )
+                    });
+            let entries = self
+                .memory
+                .entries
+                .values()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let toggle_id = entry.id.clone();
+                    let delete_id = entry.id.clone();
+                    let status = self
+                        .memory
+                        .status(&entry.id, now_ms)
+                        .unwrap_or(MemoryStatus::Paused);
+                    div()
+                        .id(SharedString::from(format!("memory-entry-{index}")))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .p_2()
+                        .rounded_md()
+                        .bg(crate::ui::alpha(p.foreground, 0.04))
+                        .child(SharedString::from(format!("{} · {:?}", entry.id, status)))
+                        .child(
+                            div()
+                                .text_xs()
+                                .child(SharedString::from(entry.content.clone())),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("toggle-memory-{index}")))
+                                        .px_2()
+                                        .py(px(2.0))
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(crate::ui::border(&p))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .child(if entry.enabled { "Pause" } else { "Resume" })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.apply_memory_action(
+                                                    &toggle_id,
+                                                    MemoryAction::TogglePause,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("delete-memory-{index}")))
+                                        .px_2()
+                                        .py(px(2.0))
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(crate::ui::color(p.status[3]))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .child("Delete")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.apply_memory_action(
+                                                    &delete_id,
+                                                    MemoryAction::Delete,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                ),
+                        )
+                });
+            div()
+                .id("memory-center-panel")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&p))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Agent Memory"),
+                )
+                .children(candidates)
+                .children(entries)
+        });
+        let budget_resume = self
+            .active_task
+            .as_ref()
+            .is_some_and(|runtime| runtime.task().state == TaskState::WaitingUser)
+            .then(|| {
+                div()
+                    .mx_3()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(crate::ui::color(p.status[2]))
+                    .child("The Agent reached its task budget.")
+                    .child(
+                        div()
+                            .id("continue-agent-budget")
+                            .mt_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(crate::ui::color(p.accent))
+                            .text_color(crate::ui::on_color(p.accent))
+                            .cursor_pointer()
+                            .child("Continue (+25 steps / +15 min)")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.continue_with_more_budget(cx)),
+                            ),
+                    )
+            });
         let plan_review = self.awaiting_plan_confirmation.then(|| {
             div()
                 .flex()
@@ -1551,10 +3127,163 @@ impl gpui::Render for ComposerView {
                     .border_color(crate::ui::border(&p))
                     .child(
                         div()
-                            .px_1()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Agent"),
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .px_1()
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Agent"),
+                            )
+                            .when(!self.recovery_tasks.is_empty(), |header| {
+                                header.child(
+                                    div()
+                                        .id("composer-recovery-center")
+                                        .px_2()
+                                        .py(px(2.0))
+                                        .rounded_md()
+                                        .bg(crate::ui::alpha(p.status[2], 0.14))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .child(SharedString::from(format!(
+                                            "Recovery {}",
+                                            self.recovery_tasks.len()
+                                        )))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.recovery_center_open =
+                                                    !this.recovery_center_open;
+                                                cx.notify();
+                                            }),
+                                    ),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("composer-automation-center")
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .rounded_md()
+                                    .bg(crate::ui::alpha(p.accent, 0.10))
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .child(SharedString::from(format!(
+                                        "Automations {}",
+                                        self.automations.automations.len()
+                                    )))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.automation_center_open =
+                                                !this.automation_center_open;
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
+                            .when(!self.checkpoints.is_empty(), |header| {
+                                header.child(
+                                    div()
+                                        .id("composer-checkpoint-center")
+                                        .px_2()
+                                        .py(px(2.0))
+                                        .rounded_md()
+                                        .bg(crate::ui::alpha(p.status[1], 0.12))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .child(SharedString::from(format!(
+                                            "Checkpoints {}",
+                                            self.checkpoints.len()
+                                        )))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.checkpoint_center_open =
+                                                    !this.checkpoint_center_open;
+                                                cx.notify();
+                                            }),
+                                    ),
+                                )
+                            })
+                            .when(!self.skills.is_empty() || self.skill_scan_error.is_some(), |header| {
+                                header.child(
+                                    div()
+                                        .id("composer-skill-center")
+                                        .px_2()
+                                        .py(px(2.0))
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(crate::ui::border(&p))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .child(SharedString::from(format!(
+                                            "Skills {}",
+                                            self.skills.len()
+                                        )))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.skill_center_open = !this.skill_center_open;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                )
+                            })
+                            .when(
+                                !self.memory.candidates.is_empty() || !self.memory.entries.is_empty(),
+                                |header| {
+                                    header.child(
+                                        div()
+                                            .id("composer-memory-center")
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(crate::ui::border(&p))
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .child(SharedString::from(format!(
+                                                "Memory {}",
+                                                self.memory.candidates.len()
+                                                    + self.memory.entries.len()
+                                            )))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.memory_center_open =
+                                                        !this.memory_center_open;
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
+                                },
+                            )
+                            .child({
+                                let environment_palette = p.clone();
+                                div()
+                                    .id("composer-environment")
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(crate::ui::border(&p))
+                                    .text_xs()
+                                    .child(SharedString::from(environment_id))
+                                    .tooltip(move |_window, cx| {
+                                        Tooltip::view(
+                                            environment_tooltip.clone(),
+                                            &environment_palette,
+                                            cx,
+                                        )
+                                    })
+                            }),
                     )
                     .child(
                         div()
@@ -1619,8 +3348,15 @@ impl gpui::Render for ComposerView {
                         .pb_1()
                         .gap_2()
                         .children(messages)
+                        .children(memory_center)
+                        .children(skill_center)
+                        .children(checkpoint_center)
+                        .children(automation_center)
+                        .children(recovery_center)
+                        .children(context_inspector)
                         .children(approval)
                         .children(edit_review)
+                        .children(budget_resume)
                         .children(plan_review),
                 )
             })
@@ -1698,28 +3434,39 @@ impl gpui::Render for ComposerView {
                             .text_xs()
                             .tooltip(move |_window, cx| {
                                 Tooltip::view(
-                                    "Approval mode: Auto / Plan / Yolo",
+                                    if external_backend {
+                                        "Approvals are requested by the external backend"
+                                    } else {
+                                        "Approval mode: Auto / Plan / Yolo"
+                                    },
                                     &mode_palette,
                                     cx,
                                 )
                             })
-                            .child(self.mode.label())
-                            .child(crate::ui::icon(
-                                Icon::ChevronDown,
-                                icon_size::XS,
-                                crate::ui::muted(&p),
-                            ))
+                            .child(mode_label)
+                            .when(!external_backend, |chip| {
+                                chip.child(crate::ui::icon(
+                                    Icon::ChevronDown,
+                                    icon_size::XS,
+                                    crate::ui::muted(&p),
+                                ))
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
+                                cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.mode_menu_open = !this.mode_menu_open;
+                                    if external_backend {
+                                        this.status = "Codex app-server owns approval policy; Termior still renders and records each request".into();
+                                    } else {
+                                        this.mode_menu_open = !this.mode_menu_open;
+                                    }
                                     cx.notify();
                                 }),
                             )
                     })
                     .child({
                         let agent_palette = p.clone();
+                        let agent_tooltip = agent_tooltip.clone();
                         div()
                             .id("composer-agent")
                             .px_2()
@@ -1734,7 +3481,7 @@ impl gpui::Render for ComposerView {
                             .overflow_hidden()
                             .text_xs()
                             .tooltip(move |_window, cx| {
-                                Tooltip::view("Agent — click to switch", &agent_palette, cx)
+                                Tooltip::view(agent_tooltip.clone(), &agent_palette, cx)
                             })
                             .child(SharedString::from(agent_name))
                             .on_mouse_down(
@@ -1742,13 +3489,45 @@ impl gpui::Render for ComposerView {
                                 cx.listener(|this, _, _, cx| this.cycle_custom_agent(cx)),
                             )
                     })
+                    .when_some(context_label, |toolbar, label| {
+                        let inspector_palette = p.clone();
+                        toolbar.child(
+                            div()
+                                .id("composer-context-inspector")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(crate::ui::border(&p))
+                                .text_xs()
+                                .text_color(crate::ui::muted(&p))
+                                .cursor_pointer()
+                                .tooltip(move |_window, cx| {
+                                    Tooltip::view(
+                                        "Context Inspector — sent, summarized, truncated, and excluded items",
+                                        &inspector_palette,
+                                        cx,
+                                    )
+                                })
+                                .child(SharedString::from(label))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.context_inspector_open =
+                                            !this.context_inspector_open;
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                    })
                     .child(div().flex_1().min_w(px(0.0)))
                     .child(
                         crate::ui::icon_button(
                             "composer-send",
-                            if self.busy { Icon::Loader } else { Icon::Send },
+                            if self.busy { Icon::Close } else { Icon::Send },
                             if self.busy {
-                                "Agent is working…"
+                                "Stop Agent task"
                             } else {
                                 "Send (Enter)"
                             },
@@ -1768,7 +3547,9 @@ impl gpui::Render for ComposerView {
                 )
             })
             // 模式下拉最后挂载：绘制顺序在输入区之后，能盖住下层内容。
-            .when(self.mode_menu_open, |root| root.child(mode_menu))
+            .when(self.mode_menu_open && !external_backend, |root| {
+                root.child(mode_menu)
+            })
     }
 }
 
@@ -1907,6 +3688,27 @@ fn image_mime(path: &Path) -> Option<&'static str> {
     })
 }
 
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+fn requested_skill_names(input: &str, skills: &[SkillMetadata]) -> Vec<String> {
+    skills
+        .iter()
+        .filter(|skill| {
+            input.split_whitespace().any(|word| {
+                word.starts_with('$')
+                    && word.trim_matches(|ch: char| {
+                        !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_'
+                    }) == skill.name
+            })
+        })
+        .map(|skill| skill.name.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod layout_tests {
     use super::*;
@@ -1937,6 +3739,23 @@ mod layout_tests {
         assert!(
             text.size.width > px(150.0),
             "composer input collapsed: {text:?}"
+        );
+    }
+
+    #[test]
+    fn skills_activate_only_through_an_explicit_dollar_mention() {
+        let skills = vec![SkillMetadata {
+            name: "review-code".into(),
+            description: "Review code".into(),
+            path: PathBuf::from(".agents/skills/review-code/SKILL.md"),
+            allowed_tools: Default::default(),
+            body_loaded: false,
+        }];
+
+        assert!(requested_skill_names("please review-code", &skills).is_empty());
+        assert_eq!(
+            requested_skill_names("please use $review-code, now", &skills),
+            vec!["review-code"]
         );
     }
 }

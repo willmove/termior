@@ -16,6 +16,9 @@ pub struct TerminalContext {
     pub recent_output: String,
     /// 是否为快照时刻（非缓存）。
     pub captured_at_unix_ms: u64,
+    /// Most recent OSC 133 command record. Missing shell integration remains `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_reference: Option<termior_terminal::TerminalCommandRecord>,
 }
 
 /// 上下文提供者：执行时抓取活动终端状态。
@@ -82,6 +85,7 @@ mod tests {
                 cwd: "/proj".into(),
                 recent_output: "$ ".into(),
                 captured_at_unix_ms: 123,
+                command_reference: None,
             },
         };
         let s = p.snapshot();

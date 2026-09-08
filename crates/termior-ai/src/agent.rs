@@ -216,7 +216,8 @@ impl Agent {
     }
 
     fn provider_messages(&self, messages: &[Message]) -> Vec<Message> {
-        let mut request = Vec::with_capacity(messages.len() + usize::from(self.system_prompt.is_some()));
+        let mut request =
+            Vec::with_capacity(messages.len() + usize::from(self.system_prompt.is_some()));
         if let Some(prompt) = &self.system_prompt {
             request.push(Message::system(prompt));
         }
@@ -252,7 +253,10 @@ impl Agent {
             if completed.contains(&call.id) {
                 continue;
             }
-            let arguments = match self.tools.validate_and_normalize(&call.name, &call.arguments) {
+            let arguments = match self
+                .tools
+                .validate_and_normalize(&call.name, &call.arguments)
+            {
                 Ok(arguments) => arguments,
                 Err(error) => {
                     messages.push(tool_result_message(crate::message::ToolResult::failure(

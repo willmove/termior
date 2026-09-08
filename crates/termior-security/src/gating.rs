@@ -21,6 +21,12 @@ pub enum ToolId {
     RunCommand,
     ShellSessionRun,
     ShellBgSpawn,
+    CommandStatus,
+    CommandReadOutput,
+    CommandWait,
+    CommandKill,
+    CommandClaim,
+    CommandWriteInput,
     /// Delegate a bounded task to a child agent; spawn remains approval-gated (FR-PLAN-02/04).
     RunSubagent,
     /// 实时上下文桥（FR-AGENT-07）——只读快照，自动执行。
@@ -41,6 +47,12 @@ impl ToolId {
             ToolId::RunCommand => "run_command",
             ToolId::ShellSessionRun => "shell_session_run",
             ToolId::ShellBgSpawn => "shell_bg_spawn",
+            ToolId::CommandStatus => "command_status",
+            ToolId::CommandReadOutput => "command_read_output",
+            ToolId::CommandWait => "command_wait",
+            ToolId::CommandKill => "command_kill",
+            ToolId::CommandClaim => "command_claim",
+            ToolId::CommandWriteInput => "command_write_input",
             ToolId::RunSubagent => "run_subagent",
             ToolId::GetTerminalContext => "get_terminal_context",
         }
@@ -53,6 +65,9 @@ impl ToolId {
             | ToolId::ListDirectory
             | ToolId::FsSearch
             | ToolId::FsGrep
+            | ToolId::CommandStatus
+            | ToolId::CommandReadOutput
+            | ToolId::CommandWait
             | ToolId::GetTerminalContext => ToolLevel::Auto,
             ToolId::WriteFile
             | ToolId::CreateDirectory
@@ -61,6 +76,9 @@ impl ToolId {
             | ToolId::RunCommand
             | ToolId::ShellSessionRun
             | ToolId::ShellBgSpawn
+            | ToolId::CommandKill
+            | ToolId::CommandClaim
+            | ToolId::CommandWriteInput
             | ToolId::RunSubagent => ToolLevel::Approval,
         }
     }
@@ -92,6 +110,12 @@ pub const ALL_TOOLS: &[ToolId] = &[
     ToolId::RunCommand,
     ToolId::ShellSessionRun,
     ToolId::ShellBgSpawn,
+    ToolId::CommandStatus,
+    ToolId::CommandReadOutput,
+    ToolId::CommandWait,
+    ToolId::CommandKill,
+    ToolId::CommandClaim,
+    ToolId::CommandWriteInput,
     ToolId::RunSubagent,
     ToolId::GetTerminalContext,
 ];
@@ -107,6 +131,9 @@ mod tests {
             ToolId::ListDirectory,
             ToolId::FsSearch,
             ToolId::FsGrep,
+            ToolId::CommandStatus,
+            ToolId::CommandReadOutput,
+            ToolId::CommandWait,
             ToolId::GetTerminalContext,
         ] {
             assert_eq!(t.level(), ToolLevel::Auto, "{} should be Auto", t.name());
@@ -123,6 +150,9 @@ mod tests {
             ToolId::RunCommand,
             ToolId::ShellSessionRun,
             ToolId::ShellBgSpawn,
+            ToolId::CommandKill,
+            ToolId::CommandClaim,
+            ToolId::CommandWriteInput,
             ToolId::RunSubagent,
         ] {
             assert_eq!(

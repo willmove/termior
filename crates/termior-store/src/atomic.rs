@@ -18,12 +18,17 @@ pub enum AtomicWriteError {
 /// 流程：在 `path` 同目录创建临时文件 → 写入 → flush+sync → rename 覆盖。
 /// 同目录保证 rename 是原子操作（同文件系统）。
 pub fn atomic_write(path: &Path, contents: &str) -> Result<(), AtomicWriteError> {
+    atomic_write_bytes(path, contents.as_bytes())
+}
+
+/// Atomically write arbitrary bytes to `path` using a same-directory temporary file.
+pub fn atomic_write_bytes(path: &Path, contents: &[u8]) -> Result<(), AtomicWriteError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
 
     // 用 tempfile 在同目录建临时文件，确保同文件系统 rename。
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(contents.as_bytes())?;
+    tmp.write_all(contents)?;
     tmp.as_file().sync_all()?; // 真实运行时保证数据落盘
     tmp.flush()?;
 

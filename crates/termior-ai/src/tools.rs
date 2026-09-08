@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use termior_security::deny_list::{canonicalize_logical, check_path, DenyReason, Direction};
 use termior_security::workspace::WorkspaceAuthRegistry;
 
@@ -94,6 +94,7 @@ pub enum ToolLevelSerde {
 pub struct ToolRegistry {
     pub workspace_auth: WorkspaceAuthRegistry,
     allowed_tools: Option<HashSet<String>>,
+    external_contracts: HashMap<String, ToolContract>,
 }
 
 impl Default for ToolRegistry {
@@ -101,6 +102,7 @@ impl Default for ToolRegistry {
         Self {
             workspace_auth: WorkspaceAuthRegistry::new(),
             allowed_tools: None,
+            external_contracts: HashMap::new(),
         }
     }
 }
@@ -110,7 +112,30 @@ impl ToolRegistry {
         Self {
             workspace_auth,
             allowed_tools: None,
+            external_contracts: HashMap::new(),
         }
+    }
+
+    /// Register a policy-normalized external tool such as an MCP server-qualified tool.
+    pub fn register_external(&mut self, contract: ToolContract) -> Result<(), ToolError> {
+        if contract.name.trim().is_empty() || self.external_contracts.contains_key(&contract.name) {
+            return Err(ToolError::InvalidArguments(
+                "external tool name is empty or already registered".into(),
+            ));
+        }
+        let schema = contract.parameters.as_object().ok_or_else(|| {
+            ToolError::InvalidArguments("external tool schema must be an object".into())
+        })?;
+        if schema.get("type").and_then(Value::as_str) != Some("object")
+            || schema.get("additionalProperties") != Some(&Value::Bool(false))
+        {
+            return Err(ToolError::InvalidArguments(
+                "external tool schema must be a closed object schema".into(),
+            ));
+        }
+        self.external_contracts
+            .insert(contract.name.clone(), contract);
+        Ok(())
     }
 
     /// Restrict a custom/sub-agent to an explicit tool subset (FR-PLAN-02/03).
@@ -122,8 +147,11 @@ impl ToolRegistry {
         let mut allowed = HashSet::new();
         for name in tools {
             let name = name.into();
-            termior_security::gating::ToolId::from_name(&name)
-                .ok_or_else(|| ToolError::Unknown(name.clone()))?;
+            if termior_security::gating::ToolId::from_name(&name).is_none()
+                && !self.external_contracts.contains_key(&name)
+            {
+                return Err(ToolError::Unknown(name));
+            }
             allowed.insert(name);
         }
         self.allowed_tools = Some(allowed);
@@ -147,7 +175,7 @@ impl ToolRegistry {
     /// Return enabled contracts. Every built-in contract has a closed object schema.
     pub fn contracts(&self) -> Vec<ToolContract> {
         use termior_security::gating::{ToolLevel, ALL_TOOLS};
-        ALL_TOOLS
+        let mut contracts = ALL_TOOLS
             .iter()
             .filter(|tool| self.allows(tool.name()))
             .map(|tool| {
@@ -171,7 +199,15 @@ impl ToolRegistry {
                     parallel_safe: false,
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        contracts.extend(
+            self.external_contracts
+                .values()
+                .filter(|tool| self.allows(&tool.name))
+                .cloned(),
+        );
+        contracts.sort_by(|left, right| left.name.cmp(&right.name));
+        contracts
     }
 
     /// Backwards-compatible name used by Provider adapters.
@@ -181,6 +217,9 @@ impl ToolRegistry {
 
     pub fn contract(&self, tool_name: &str) -> Result<ToolContract, ToolError> {
         self.ensure_allowed(tool_name)?;
+        if let Some(contract) = self.external_contracts.get(tool_name) {
+            return Ok(contract.clone());
+        }
         let tool = termior_security::gating::ToolId::from_name(tool_name)
             .ok_or_else(|| ToolError::Unknown(tool_name.to_owned()))?;
         self.contracts()
@@ -205,9 +244,20 @@ impl ToolRegistry {
         })
     }
 
+    pub fn redact_arguments_for_display(&self, arguments: &str) -> String {
+        let Ok(mut value) = serde_json::from_str::<Value>(arguments) else {
+            return "<invalid arguments>".into();
+        };
+        redact_json_value(None, &mut value);
+        serde_json::to_string(&value).unwrap_or_else(|_| "<redacted>".into())
+    }
+
     /// 判定工具是否需要审批（FR-SEC-01）。
     pub fn requires_approval(&self, tool_name: &str) -> Result<bool, ToolError> {
         self.ensure_allowed(tool_name)?;
+        if let Some(contract) = self.external_contracts.get(tool_name) {
+            return Ok(contract.approval == ApprovalClass::User);
+        }
         let id = termior_security::gating::ToolId::from_name(tool_name)
             .ok_or_else(|| ToolError::Unknown(tool_name.to_string()))?;
         Ok(matches!(
@@ -269,6 +319,16 @@ fn description_for(t: termior_security::gating::ToolId) -> &'static str {
         ToolId::RunCommand => "Run a one-shot subshell command (approval-gated).",
         ToolId::ShellSessionRun => "Run a command in the persistent agent shell (approval-gated).",
         ToolId::ShellBgSpawn => "Spawn a long-running background process (approval-gated).",
+        ToolId::CommandStatus => "Read structured state and exit evidence for a command session.",
+        ToolId::CommandReadOutput => "Read retained command output after an incremental cursor.",
+        ToolId::CommandWait => "Wait for a command session without terminating it on timeout.",
+        ToolId::CommandKill => "Terminate a command session and its process tree (approval-gated).",
+        ToolId::CommandClaim => {
+            "Request control of an existing terminal pane or command session (approval-gated)."
+        }
+        ToolId::CommandWriteInput => {
+            "Write input to a command session currently controlled by this task (approval-gated)."
+        }
         ToolId::RunSubagent => {
             "Delegate a bounded task to a restricted child agent (approval-gated)."
         }
@@ -332,6 +392,37 @@ fn parameters_for(tool: termior_security::gating::ToolId) -> Value {
         ToolId::ShellSessionRun => {
             object_schema(&["command"], [("command", string_schema(262_144))])
         }
+        ToolId::CommandStatus | ToolId::CommandKill | ToolId::CommandClaim => {
+            object_schema(&["session_id"], [("session_id", string_schema(256))])
+        }
+        ToolId::CommandWriteInput => object_schema(
+            &["session_id", "data"],
+            [
+                ("session_id", string_schema(256)),
+                ("data", string_schema(262_144)),
+            ],
+        ),
+        ToolId::CommandReadOutput => object_schema(
+            &["session_id"],
+            [
+                ("session_id", string_schema(256)),
+                ("after", json!({"type": "integer", "minimum": 0})),
+                (
+                    "max_bytes",
+                    json!({"type": "integer", "minimum": 1, "maximum": 1_048_576}),
+                ),
+            ],
+        ),
+        ToolId::CommandWait => object_schema(
+            &["session_id"],
+            [
+                ("session_id", string_schema(256)),
+                (
+                    "timeout_ms",
+                    json!({"type": "integer", "minimum": 1, "maximum": 30_000}),
+                ),
+            ],
+        ),
         ToolId::RunSubagent => object_schema(
             &["agent_id", "task"],
             [
@@ -353,6 +444,9 @@ fn side_effect_for(tool: termior_security::gating::ToolId) -> SideEffectClass {
         | ToolId::ListDirectory
         | ToolId::FsSearch
         | ToolId::FsGrep
+        | ToolId::CommandStatus
+        | ToolId::CommandReadOutput
+        | ToolId::CommandWait
         | ToolId::GetTerminalContext => SideEffectClass::Read,
         ToolId::WriteFile | ToolId::CreateDirectory | ToolId::Rename | ToolId::Delete => {
             SideEffectClass::LocalWrite
@@ -360,6 +454,9 @@ fn side_effect_for(tool: termior_security::gating::ToolId) -> SideEffectClass {
         ToolId::RunCommand
         | ToolId::ShellSessionRun
         | ToolId::ShellBgSpawn
+        | ToolId::CommandKill
+        | ToolId::CommandClaim
+        | ToolId::CommandWriteInput
         | ToolId::RunSubagent => SideEffectClass::Process,
     }
 }
@@ -368,6 +465,7 @@ fn timeout_for(tool: termior_security::gating::ToolId) -> u64 {
     use termior_security::gating::ToolId;
     match tool {
         ToolId::RunCommand | ToolId::ShellSessionRun => 30_000,
+        ToolId::CommandWait => 31_000,
         ToolId::ShellBgSpawn | ToolId::RunSubagent => 60_000,
         _ => 10_000,
     }
@@ -377,7 +475,10 @@ fn output_limit_for(tool: termior_security::gating::ToolId) -> u64 {
     use termior_security::gating::ToolId;
     match tool {
         ToolId::ReadFile => 2 * 1024 * 1024,
-        ToolId::RunCommand | ToolId::ShellSessionRun => 1024 * 1024,
+        ToolId::RunCommand
+        | ToolId::ShellSessionRun
+        | ToolId::CommandReadOutput
+        | ToolId::CommandWait => 1024 * 1024,
         _ => 512 * 1024,
     }
 }
@@ -389,6 +490,9 @@ fn idempotency_for(tool: termior_security::gating::ToolId) -> Idempotency {
         | ToolId::ListDirectory
         | ToolId::FsSearch
         | ToolId::FsGrep
+        | ToolId::CommandStatus
+        | ToolId::CommandReadOutput
+        | ToolId::CommandWait
         | ToolId::GetTerminalContext
         | ToolId::WriteFile
         | ToolId::CreateDirectory => Idempotency::Idempotent,
@@ -397,6 +501,9 @@ fn idempotency_for(tool: termior_security::gating::ToolId) -> Idempotency {
         | ToolId::RunCommand
         | ToolId::ShellSessionRun
         | ToolId::ShellBgSpawn
+        | ToolId::CommandKill
+        | ToolId::CommandClaim
+        | ToolId::CommandWriteInput
         | ToolId::RunSubagent => Idempotency::NonIdempotent,
     }
 }
@@ -406,7 +513,10 @@ fn invalid_arguments(tool: &str, path: &str, message: &str) -> ToolError {
 }
 
 fn validate_value(tool: &str, path: &str, value: &Value, schema: &Value) -> Result<(), ToolError> {
-    let expected = schema.get("type").and_then(Value::as_str).unwrap_or("object");
+    let expected = schema
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("object");
     let type_matches = match expected {
         "object" => value.is_object(),
         "string" => value.is_string(),
@@ -491,6 +601,35 @@ fn validate_value(tool: &str, path: &str, value: &Value, schema: &Value) -> Resu
         }
     }
     Ok(())
+}
+
+fn redact_json_value(field: Option<&str>, value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (name, child) in object {
+                redact_json_value(Some(name), child);
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                redact_json_value(field, child);
+            }
+        }
+        Value::String(text) => {
+            let sensitive_name = field.is_some_and(|name| {
+                let normalized = name.to_ascii_lowercase();
+                normalized.contains("secret")
+                    || normalized.contains("token")
+                    || normalized.contains("api_key")
+                    || normalized.contains("apikey")
+                    || normalized == "authorization"
+            });
+            if sensitive_name || termior_security::assert_no_secret_fields(text).is_err() {
+                *text = "<redacted>".into();
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

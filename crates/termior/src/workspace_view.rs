@@ -4345,6 +4345,9 @@ impl WorkspaceView {
             .as_ref()
             .map(|terminal| terminal.read(cx).recent_text())
             .unwrap_or_default();
+        let command_reference = terminal
+            .as_ref()
+            .and_then(|terminal| terminal.read(cx).recent_commands().last().cloned());
         if let Some(cwd) = &cwd {
             // 只同步 shell 当前目录；Explorer/Git 跟随的是 project_dir，
             // shell 的 cd 漂移不得拖动项目锚点。
@@ -4357,7 +4360,7 @@ impl WorkspaceView {
                 .into_owned()
         });
         self.composer.update(cx, |composer, _| {
-            composer.update_terminal_context(resolved_cwd.clone(), recent_output)
+            composer.update_terminal_context(resolved_cwd.clone(), recent_output, command_reference)
         });
         (resolved_cwd, preview)
     }

@@ -1,0 +1,22 @@
+[package]
+name = "termior-agent-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+termior-ai = { workspace = true }
+termior-vcs = { workspace = true }
+termior-security = { workspace = true }
+termior-terminal = { workspace = true }
+termior-store = { workspace = true }
+wait-timeout = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

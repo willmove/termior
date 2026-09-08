@@ -193,3 +193,55 @@ fn yolo_auto_approval_keeps_guards() {
         .execute_approved("write_file", r#"{"path":"../outside.txt","content":"x"}"#)
         .is_err());
 }
+
+#[test]
+fn reliable_runtime_yolo_cannot_bypass_secret_write_guard() {
+    use termior_ai::{
+        ApprovalPolicy, ChatEvent, Message, MockProvider, RuntimeBudgets, TaskCommand, TaskConfig,
+        TaskRuntime, ToolCall, ToolExecutor, ToolState,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let registry = ToolRegistry::new(WorkspaceAuthRegistry::with_roots([dir
+        .path()
+        .display()
+        .to_string()]));
+    let executor = ToolExecutor::new(dir.path(), registry.clone()).unwrap();
+    let provider = MockProvider::new(vec![
+        vec![ChatEvent::Done(Message {
+            role: termior_ai::Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "secret-write".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":".env","content":"TOKEN=leak"}"#.into(),
+            }],
+            tool_result: None,
+        })],
+        vec![ChatEvent::Done(Message::assistant("blocked"))],
+    ]);
+    let mut runtime = TaskRuntime::new(
+        TaskConfig::new("attack", dir.path(), "native", "direct"),
+        RuntimeBudgets::default(),
+        ApprovalPolicy::Yolo,
+    )
+    .with_tools(registry);
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::Start {
+            user_input: "write secret".into(),
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+
+    assert_eq!(runtime.invocations()[0].state, ToolState::Failed);
+    assert!(!dir.path().join(".env").exists());
+    assert!(runtime.invocations()[0]
+        .result
+        .as_ref()
+        .unwrap()
+        .output
+        .contains("deny-list"));
+}

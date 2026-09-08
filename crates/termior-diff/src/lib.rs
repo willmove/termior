@@ -8,8 +8,8 @@
 
 #![forbid(unsafe_code)]
 
-use similar::{ChangeTag, TextDiff};
 use serde::{Deserialize, Serialize};
+use similar::{ChangeTag, TextDiff};
 
 /// 单个 hunk。`id` 用于在 UI 中逐 hunk 接受/拒绝时稳定引用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,9 +211,7 @@ pub struct FileApplyResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FileChangeError {
-    #[error(
-        "baseline conflict for {path}: expected {expected_digest}, found {actual_digest}"
-    )]
+    #[error("baseline conflict for {path}: expected {expected_digest}, found {actual_digest}")]
     BaselineConflict {
         path: String,
         expected_digest: String,
@@ -235,8 +233,7 @@ pub fn apply_file_change(
             actual_digest,
         });
     }
-    let accepted: std::collections::HashSet<usize> =
-        accepted_hunks.iter().copied().collect();
+    let accepted: std::collections::HashSet<usize> = accepted_hunks.iter().copied().collect();
     let applied_hunks = change
         .hunks
         .iter()

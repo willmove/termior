@@ -17,6 +17,7 @@ members = [
     "crates/termior-ui-kit",
     "crates/termior-ui",
     "crates/termior-ai",
+    "crates/termior-agent-host",
     "crates/termior-hooks",
     "crates/termior-terminal",
     "crates/termior-editor",
@@ -77,6 +78,9 @@ pulldown-cmark = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 base64 = "0.22"
 wait-timeout = "0.2"
+sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
 criterion = { version = "0.5", default-features = false }
 # NFR 基准 harness 用：进程级 RSS / 冷启动测量（spec §8 NFR-01/04）。
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
@@ -94,6 +98,7 @@ termior-platform = { path = "crates/termior-platform" }
 termior-ui-kit = { path = "crates/termior-ui-kit" }
 termior-ui = { path = "crates/termior-ui" }
 termior-ai = { path = "crates/termior-ai" }
+termior-agent-host = { path = "crates/termior-agent-host" }
 termior-hooks = { path = "crates/termior-hooks" }
 termior-terminal = { path = "crates/termior-terminal" }
 termior-editor = { path = "crates/termior-editor" }

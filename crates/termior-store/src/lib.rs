@@ -12,13 +12,21 @@
 #![forbid(unsafe_code)]
 
 pub mod atomic;
+pub mod checkpoint;
 pub mod collections;
 pub mod keymap;
 pub mod migrate;
 pub mod paths;
+pub mod recovery;
+pub mod redaction;
+pub mod retention;
 pub mod settings;
+pub mod task_journal;
 
-pub use atomic::{atomic_write, AtomicWriteError};
+pub use atomic::{atomic_write, atomic_write_bytes, AtomicWriteError};
+pub use checkpoint::{
+    CheckpointError, CheckpointManifest, CheckpointStore, RestoreAction, RestorePlan,
+};
 pub use collections::{DataFiles, JsonStore, JsonStoreError};
 pub use keymap::{
     default_keymap, KeyAction, KeyBinding, KeymapConflict, KeymapEntry, Platform, UserKeyBinding,
@@ -26,10 +34,17 @@ pub use keymap::{
 };
 pub use migrate::{migrate, MigrationError, SCHEMA_VERSION};
 pub use paths::{app_data_dir, AppDataError};
+pub use recovery::{
+    RecoveredOperation, RecoveredOperationState, RecoveryCenter, RecoveryCommand,
+    RecoveryTaskSummary,
+};
+pub use redaction::{RedactionReport, StreamingRedactor};
+pub use retention::{CleanupCandidate, CleanupReport, RetentionManager, RetentionPolicy};
 pub use settings::{
     default_settings, BackgroundSettings, ModelProviderSettings, ModelSettings, Settings,
     ShellDetection, TerminalSettings,
 };
+pub use task_journal::{JournalError, JournalEvent, JournalRecovery, TaskJournal, TaskSnapshot};
 
 /// FR-SEC-06 / INV-5：扫描待落盘文本是否含形似密钥的明文。命中返回错误。
 ///

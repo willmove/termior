@@ -23,13 +23,18 @@ use gpui::{
     ScrollWheelEvent, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled,
     Subscription, Task, TextAlign, TextRun, UTF16Selection, UnderlineStyle, WeakEntity, Window,
 };
+use std::{path::PathBuf, sync::Arc};
 use termior_store::{TerminalSettings, UserKeymap};
-use termior_terminal::{PtySessionConfig, TerminalBridge, TerminalEventProxy};
+use termior_terminal::{
+    shared_terminal_service, CommandCreate, CommandOwner, CommandSessionId, Controller,
+    LocalTerminalService, PtySessionConfig, TerminalBridge, TerminalEventProxy, TerminalService,
+    TerminalServiceError,
+};
 use termior_terminal_core::{
     find_hyperlinks,
     osc::{AgentState, OscEvent},
     shell_integration::{cd_command, ShellKind},
-    TerminalSearch,
+    OscCommandTracker, OutputCursor, TerminalCommandRecord, TerminalSearch,
 };
 use termior_theme::{Color as ThemeColor, ResolvedPalette, TerminalPalette};
 use termior_ui_kit::{tokens, SearchOverlay};
@@ -37,6 +42,7 @@ use termior_ui_kit::{tokens, SearchOverlay};
 use crate::keystroke::{encode_paste, keystroke_to_pty_bytes};
 
 const MAX_PTY_BATCH_BYTES: usize = 256 * 1024;
+static NEXT_TERMINAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// 终端网格四周与窗格边缘之间保留的间隙（像素）。避免文字紧贴窗格边框。
 /// 取 `space::MD`——终端字号由用户设置驱动，但内边距仍落在 4px 栅格上。
@@ -80,6 +86,8 @@ pub struct TerminalView {
     emitted_title: Option<String>,
     localhost_urls: Vec<String>,
     agent_state: Option<AgentState>,
+    command_tracker: OscCommandTracker,
+    output_sequence: u64,
     marked_text: String,
     search_overlay: SearchOverlay,
     search: TerminalSearch,
@@ -101,6 +109,8 @@ pub struct TerminalView {
     scroll_px: f32,
     last_mouse_cell: Option<(i32, usize, Option<MouseButton>)>,
     keymap: UserKeymap,
+    command_service: Arc<LocalTerminalService>,
+    command_session_id: Option<CommandSessionId>,
 }
 
 impl TerminalView {
@@ -131,6 +141,36 @@ impl TerminalView {
         let rows = PtySessionConfig::default().rows as usize;
         let output_rx = bridge.take_output().expect("output channel");
         let (event_proxy, mut event_rx) = TerminalEventProxy::new(bridge.writer());
+        let command_service = shared_terminal_service();
+        let pane_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let command_session_id = command_service
+            .register_pane(
+                CommandCreate {
+                    owner: CommandOwner::User,
+                    project_dir: pane_root.display().to_string(),
+                    environment_id: "direct-pane".into(),
+                    cwd: pane_root.display().to_string(),
+                    shell: format!("{:?}", bridge.shell_kind()),
+                    command: String::new(),
+                    interactive: true,
+                    rows: PtySessionConfig::default().rows,
+                    cols: PtySessionConfig::default().cols,
+                },
+                bridge.writer(),
+            )
+            .map_err(|error| log::warn!("terminal pane registration failed: {error}"))
+            .ok();
+        let terminal_id = command_session_id.as_ref().map_or_else(
+            || {
+                format!(
+                    "terminal-{}",
+                    NEXT_TERMINAL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
+            },
+            |id| id.0.clone(),
+        );
+        let observed_service = command_service.clone();
+        let observed_session = command_session_id.clone();
         log::info!("PTY attached: cols={cols} rows={rows}");
 
         let term_config = TermConfig {
@@ -167,6 +207,9 @@ impl TerminalView {
                 let bytes = data.bytes;
                 let events = data.events;
                 let localhost_urls = data.localhost_urls;
+                if let Some(id) = observed_session.as_ref() {
+                    let _ = observed_service.observe_pane_output(id, bytes.clone());
+                }
                 let _ = this.update(cx, |view, cx| {
                     if !first_byte_seen {
                         first_byte_seen = true;
@@ -176,11 +219,16 @@ impl TerminalView {
                         );
                     }
                     view.vte_processor.advance(&mut view.term, &bytes);
+                    view.output_sequence = view.output_sequence.saturating_add(1);
+                    let output_cursor = OutputCursor {
+                        sequence: view.output_sequence,
+                    };
                     while let Ok(event) = event_rx.try_recv() {
                         view.handle_terminal_event(event, cx);
                     }
                     for ev in events {
                         log::info!("OSC event: {ev:?}");
+                        view.command_tracker.observe(&ev, output_cursor);
                         match ev {
                             OscEvent::Cwd { path, .. } => {
                                 view.latest_cwd = Some(path);
@@ -210,6 +258,9 @@ impl TerminalView {
                 }
             }
             log::info!("PTY output stream ended");
+            if let Some(id) = observed_session.as_ref() {
+                let _ = observed_service.observe_pane_exit(id, None);
+            }
             let _ = this.update(cx, |_view, cx| {
                 cx.emit(TerminalViewEvent::Exited(None));
                 cx.notify();
@@ -238,6 +289,8 @@ impl TerminalView {
             emitted_title: None,
             localhost_urls: Vec::new(),
             agent_state: None,
+            command_tracker: OscCommandTracker::new(terminal_id, ""),
+            output_sequence: 0,
             marked_text: String::new(),
             search_overlay: SearchOverlay::default(),
             search: TerminalSearch::default(),
@@ -254,6 +307,8 @@ impl TerminalView {
             last_mouse_cell: None,
             text_style,
             keymap,
+            command_service,
+            command_session_id,
         }
     }
 
@@ -287,8 +342,37 @@ impl TerminalView {
         termior_ai::context::tail_lines(&self.buffer_text, 300)
     }
 
+    pub fn recent_commands(&self) -> &[TerminalCommandRecord] {
+        self.command_tracker.records()
+    }
+
     pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
-        self.bridge.writer().write_all(bytes)
+        match self.command_session_id.as_ref() {
+            Some(id) => match self
+                .command_service
+                .write_stdin(id, &Controller::User, bytes)
+            {
+                Ok(()) => Ok(()),
+                Err(TerminalServiceError::ControllerMismatch { .. }) => {
+                    self.take_over_user().map_err(std::io::Error::other)?;
+                    self.command_service
+                        .write_stdin(id, &Controller::User, bytes)
+                        .map_err(std::io::Error::other)
+                }
+                Err(error) => Err(std::io::Error::other(error)),
+            },
+            None => self.bridge.writer().write_all(bytes),
+        }
+    }
+
+    fn take_over_user(&self) -> Result<OutputCursor, String> {
+        let id = self
+            .command_session_id
+            .as_ref()
+            .ok_or_else(|| "terminal pane is not registered".to_owned())?;
+        self.command_service
+            .take_over(id)
+            .map_err(|error| error.to_string())
     }
 
     /// 生成把本会话 shell 切到 `dir` 的注入命令（含回车），按 spawn 时解析的
@@ -346,7 +430,7 @@ impl TerminalView {
                 let color = self.term.colors()[index]
                     .unwrap_or_else(|| terminal_rgb_for_index(index, &self.palette));
                 let reply = formatter(color);
-                if let Err(error) = self.write_input(reply.as_bytes()) {
+                if let Err(error) = self.bridge.writer().write_all(reply.as_bytes()) {
                     log::warn!("terminal color reply failed: {error}");
                 }
             }
@@ -358,7 +442,7 @@ impl TerminalView {
                     cell_height: self.line_height_px.round().clamp(1.0, u16::MAX as f32) as u16,
                 };
                 let reply = formatter(size);
-                if let Err(error) = self.write_input(reply.as_bytes()) {
+                if let Err(error) = self.bridge.writer().write_all(reply.as_bytes()) {
                     log::warn!("terminal size reply failed: {error}");
                 }
             }
@@ -367,18 +451,24 @@ impl TerminalView {
                 cx.notify();
             }
             AlacrittyEvent::Exit => {
+                if let Some(id) = self.command_session_id.as_ref() {
+                    let _ = self.command_service.observe_pane_exit(id, None);
+                }
                 cx.emit(TerminalViewEvent::Exited(None));
                 cx.notify();
             }
             AlacrittyEvent::ChildExit(status) => {
                 log::info!("terminal child exited: {status:?}");
+                if let Some(id) = self.command_session_id.as_ref() {
+                    let _ = self.command_service.observe_pane_exit(id, status.code());
+                }
                 cx.emit(TerminalViewEvent::Exited(status.code()));
                 cx.notify();
             }
             AlacrittyEvent::PtyWrite(text) => {
                 // `TerminalEventProxy` handles this synchronously; keep this branch defensive in
                 // case an alternate proxy forwards it in the future.
-                if let Err(error) = self.write_input(text.as_bytes()) {
+                if let Err(error) = self.bridge.writer().write_all(text.as_bytes()) {
                     log::warn!("terminal protocol reply failed: {error}");
                 }
             }
@@ -503,11 +593,18 @@ impl TerminalView {
         if is_paste_shortcut(&ev.keystroke) {
             let mode = *self.term.mode();
             let writer = self.bridge.writer();
+            let command_service = self.command_service.clone();
+            let command_session_id = self.command_session_id.clone();
             // Same deferral as the copy path above.
             cx.defer(move |cx| {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                     let bytes = encode_paste(&text, mode);
-                    if let Err(error) = writer.write_all(&bytes) {
+                    if let Err(error) = write_user_input(
+                        &command_service,
+                        command_session_id.as_ref(),
+                        &writer,
+                        &bytes,
+                    ) {
                         log::warn!("PTY paste error: {error}");
                     }
                 }
@@ -524,7 +621,7 @@ impl TerminalView {
             return;
         }
         if !bytes.is_empty() {
-            if let Err(e) = self.bridge.writer().write_all(&bytes) {
+            if let Err(e) = self.write_input(&bytes) {
                 log::warn!("PTY write error: {e}");
             }
         }
@@ -1033,7 +1130,7 @@ impl InputHandler for TerminalInputHandler {
                     return;
                 }
                 view.marked_text.clear();
-                if let Err(error) = view.bridge.writer().write_all(text.as_bytes()) {
+                if let Err(error) = view.write_input(text.as_bytes()) {
                     log::warn!("PTY IME write error: {error}");
                 }
                 cx.notify();
@@ -1082,6 +1179,27 @@ impl InputHandler for TerminalInputHandler {
         _cx: &mut App,
     ) -> Option<usize> {
         None
+    }
+}
+
+fn write_user_input(
+    service: &LocalTerminalService,
+    session_id: Option<&CommandSessionId>,
+    fallback: &termior_terminal::WriterHandle,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    match session_id {
+        Some(id) => match service.write_stdin(id, &Controller::User, bytes) {
+            Ok(()) => Ok(()),
+            Err(TerminalServiceError::ControllerMismatch { .. }) => {
+                service.take_over(id).map_err(std::io::Error::other)?;
+                service
+                    .write_stdin(id, &Controller::User, bytes)
+                    .map_err(std::io::Error::other)
+            }
+            Err(error) => Err(std::io::Error::other(error)),
+        },
+        None => fallback.write_all(bytes),
     }
 }
 
