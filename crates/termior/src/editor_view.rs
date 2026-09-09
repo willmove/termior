@@ -45,6 +45,8 @@ pub struct EditorView {
     syntax: SyntaxDocument,
     focus_handle: FocusHandle,
     marked_text: String,
+    /// IME 候选窗锚点（光标行文本区的探针每帧刷新）。
+    ime_anchor: crate::ime_anchor::ImeAnchor,
     title: String,
     theme: EditorTheme,
     search: SearchOverlay,
@@ -70,6 +72,7 @@ impl EditorView {
             syntax: SyntaxDocument::new(SyntaxLanguage::Rust, text),
             focus_handle: cx.focus_handle(),
             marked_text: String::new(),
+            ime_anchor: crate::ime_anchor::ImeAnchor::new(),
             title: "Untitled".into(),
             theme: default_editor_theme(),
             search: SearchOverlay::default(),
@@ -100,6 +103,7 @@ impl EditorView {
             syntax,
             focus_handle: cx.focus_handle(),
             marked_text: String::new(),
+            ime_anchor: crate::ime_anchor::ImeAnchor::new(),
             title: path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -483,7 +487,11 @@ impl EditorView {
         }
     }
 
-    fn render_visible_lines(&mut self, range: Range<usize>) -> Vec<AnyElement> {
+    fn render_visible_lines(
+        &mut self,
+        range: Range<usize>,
+        ime_anchor: &crate::ime_anchor::ImeAnchor,
+    ) -> Vec<AnyElement> {
         let requested_lines = range.len();
         let viewport = self.buffer.text_for_lines(range.clone());
         let global_end = viewport.start_byte + viewport.text.len();
@@ -579,7 +587,18 @@ impl EditorView {
                             .text_color(parse_hex_alpha(&theme.foreground, 0x66))
                             .child(SharedString::from(format!("{}", line_index + 1))),
                     )
-                    .child(div().flex().flex_1().children(segments))
+                    // IME 候选窗锚点探针只挂在光标行的文本区；虚拟化时光标行
+                    // 不在视口则保留上一帧锚点（输入法很少在光标离屏时使用）。
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .relative()
+                            .children(segments)
+                            .when(cursor_line == Some(line_index), |text| {
+                                text.child(crate::ime_anchor::anchor_probe(ime_anchor))
+                            }),
+                    )
                     .into_any_element()
             })
             .collect()
@@ -764,11 +783,12 @@ impl Render for EditorView {
             view: cx.entity().downgrade(),
         };
         let line_count = self.buffer.len_lines();
+        let ime_anchor = self.ime_anchor.clone();
         let lines = uniform_list(
             "editor-lines",
             line_count,
-            cx.processor(|this, range: Range<usize>, _window, _cx| {
-                this.render_visible_lines(range)
+            cx.processor(move |this, range: Range<usize>, _window, _cx| {
+                this.render_visible_lines(range, &ime_anchor)
             }),
         )
         .track_scroll(&self.scroll_handle)
@@ -1035,7 +1055,7 @@ impl InputHandler for EditorInputHandler {
         _replacement_range: Option<Range<usize>>,
         new_text: &str,
         _new_marked_range: Option<Range<usize>>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) {
         if let Some(view) = self.view.upgrade() {
@@ -1045,6 +1065,8 @@ impl InputHandler for EditorInputHandler {
                 view.marked_text = new_text.to_owned();
                 cx.notify();
             });
+            // 预编辑串变化时重新上报锚点，候选窗贴住编辑器光标。
+            window.invalidate_character_coordinates();
         }
     }
 
@@ -1060,10 +1082,20 @@ impl InputHandler for EditorInputHandler {
     fn bounds_for_range(
         &mut self,
         _range: Range<usize>,
-        _window: &mut Window,
-        _cx: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
-        None
+        // IME 候选窗锚点：光标行文本区 bounds + 光标列前的前缀宽度（探针每帧刷新）。
+        let view = self.view.upgrade()?;
+        let view = view.read(cx);
+        let (line, col) = view
+            .buffer
+            .line_col_for_char(view.buffer.cursor().char_index)
+            .ok()?;
+        let line_text = view.buffer.text_for_lines(line..line + 1).text;
+        let line_text = line_text.trim_end_matches('\n');
+        let byte: usize = line_text.chars().take(col).map(char::len_utf8).sum();
+        view.ime_anchor.caret_bounds(line_text, byte, window)
     }
 
     fn character_index_for_point(
@@ -1219,4 +1251,56 @@ fn parse_hex_alpha(value: &str, alpha: u32) -> gpui::Rgba {
         .ok()
         .map(|rgb| gpui::rgba((rgb << 8) | (alpha & 0xff)))
         .unwrap_or_else(|| gpui::rgba(0xffffff88))
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// IME 候选窗锚点必须落在光标行的文本区：光标下移一行，锚点 y 跟着下移。
+    #[test]
+    fn ime_anchor_tracks_editor_cursor_line() {
+        let mut cx = TestAppContext::single();
+        let (editor, vcx) = cx.add_window_view(|_, cx| EditorView::untitled(cx));
+
+        let anchor_y = |vcx: &mut gpui::VisualTestContext| {
+            vcx.update(|window, cx| {
+                let mut handler = EditorInputHandler {
+                    view: editor.downgrade(),
+                };
+                handler
+                    .bounds_for_range(0..0, window, cx)
+                    .expect("bounds_for_range must report caret bounds after paint")
+                    .origin
+                    .y
+            })
+        };
+
+        // 光标在第 1 行：先绘制拿到基线锚点。
+        editor.update(vcx, |view, _| {
+            let _ = view.buffer.set_cursor(0);
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let top = anchor_y(vcx);
+
+        // 光标移到第 2 行（可见范围内），锚点 y 必须下移。
+        editor.update(vcx, |view, _| {
+            let start = view.buffer.text_for_lines(1..2).start_char;
+            let _ = view.buffer.set_cursor(start + 2);
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let below = anchor_y(vcx);
+
+        assert!(
+            below > top,
+            "IME anchor must move down with the cursor: top={top:?} below={below:?}"
+        );
+    }
 }

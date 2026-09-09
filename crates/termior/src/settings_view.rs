@@ -76,6 +76,8 @@ pub struct SettingsView {
     /// 保证与输入框实际渲染继承的字体一致。
     edit_font: Font,
     marked_text: String,
+    /// IME 候选窗锚点（编辑中文本字段的探针每帧刷新）。
+    ime_anchor: crate::ime_anchor::ImeAnchor,
     credential_present: bool,
     /// 已输入但尚未写入钥匙串的 API key（需显式 Save API key）。
     pending_api_key: Option<String>,
@@ -132,6 +134,8 @@ impl SettingsView {
             edit_bounds: None,
             edit_font: Font::default(),
             marked_text: String::new(),
+            // IME 候选窗锚点（编辑中文本字段的探针每帧刷新）。
+            ime_anchor: crate::ime_anchor::ImeAnchor::new(),
             credential_present: false,
             pending_api_key: None,
             capture_shortcut: None,
@@ -1210,7 +1214,10 @@ impl SettingsView {
                     let _ = view.update(cx, |view, _| view.edit_bounds = Some(bounds));
                 },
             )
+            // 显式钉在定位祖先原点：无 inset 的 absolute 会排在静态位置（文本之后）。
             .absolute()
+            .top_0()
+            .left_0()
             .size_full()
         };
         let chars: Vec<char> = if field == EditField::ApiKey {
@@ -1240,17 +1247,21 @@ impl SettingsView {
                 .flex()
                 .flex_row()
                 .items_baseline()
+                .relative()
                 .children(run(prefix, false))
                 .children(run(selected, true))
                 .children(run(suffix, false))
                 .child(bounds_probe)
+                .child(crate::ime_anchor::anchor_probe(&self.ime_anchor))
                 .into_any_element()
         } else {
             // 无选区：单一文本子节点（含 `|` 光标字符）。不做 flex 拆段加
             // 独立光标元素——拆段曾在真实字体下被压成逐字换行的竖排。
             div()
+                .relative()
                 .child(SharedString::from(self.display_edit(field)))
                 .child(bounds_probe)
+                .child(crate::ime_anchor::anchor_probe(&self.ime_anchor))
                 .into_any_element()
         }
     }
@@ -2593,7 +2604,7 @@ impl InputHandler for SettingsInputHandler {
         _: Option<Range<usize>>,
         text: &str,
         _: Option<Range<usize>>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) {
         if let Some(view) = self.view.upgrade() {
@@ -2601,6 +2612,8 @@ impl InputHandler for SettingsInputHandler {
                 view.marked_text = text.into();
                 cx.notify();
             });
+            // 预编辑串变化时重新上报锚点，候选窗贴住编辑字段光标。
+            window.invalidate_character_coordinates();
         }
     }
     fn unmark_text(&mut self, _: &mut Window, cx: &mut App) {
@@ -2614,10 +2627,20 @@ impl InputHandler for SettingsInputHandler {
     fn bounds_for_range(
         &mut self,
         _: Range<usize>,
-        _: &mut Window,
-        _: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
-        None
+        // IME 候选窗锚点：编辑字段文本 bounds + 光标前缀宽度（探针每帧刷新）。
+        // API key 按掩码测量，与渲染一致。
+        let view = self.view.upgrade()?;
+        let view = view.read(cx);
+        let text = if view.edit_field == Some(EditField::ApiKey) {
+            "•".repeat(view.draft.chars().count())
+        } else {
+            view.draft.clone()
+        };
+        let byte = char_to_byte(&text, view.cursor);
+        view.ime_anchor.caret_bounds(&text, byte, window)
     }
     fn character_index_for_point(
         &mut self,
@@ -2776,6 +2799,43 @@ mod edit_tests {
             assert_eq!(view.select_menu, None);
             view.select_profile(usize::MAX, cx); // 越界时保持原索引
             assert_eq!(view.profile().map(|p| p.id.as_str()), Some("deepseek"));
+        });
+    }
+
+    /// IME 候选窗锚点必须落在编辑字段文本上，且随光标前缀（如 CJK）右移。
+    /// 探针只在编辑中的字段渲染，所以切到 Models 页并把 Model 字段置为编辑态。
+    #[test]
+    fn ime_anchor_tracks_edit_field_prefix() {
+        let mut cx = TestAppContext::single();
+        let (view, vcx) = cx.add_window_view(|_, cx| {
+            let mut view = SettingsView::new(Settings::default(), None, None, None, None, cx);
+            view.page = SettingsPage::Models;
+            view.edit_field = Some(EditField::Model);
+            view.draft = "你好model".into();
+            view.cursor = "你好".chars().count();
+            view
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        vcx.update(|window, cx| {
+            let mut handler = SettingsInputHandler {
+                view: view.downgrade(),
+            };
+            let bounds = handler
+                .bounds_for_range(0..0, window, cx)
+                .expect("bounds_for_range must report caret bounds while editing");
+            let edit = view
+                .read(cx)
+                .edit_bounds
+                .expect("edit bounds recorded by probe");
+            assert_eq!(bounds.origin.y, edit.origin.y);
+            assert!(
+                bounds.origin.x > edit.origin.x,
+                "CJK prefix must shift anchor right: {bounds:?} vs {edit:?}"
+            );
+            assert!(bounds.size.height > px(0.0));
         });
     }
 }

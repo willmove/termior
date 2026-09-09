@@ -259,6 +259,8 @@ pub struct GitHistoryView {
     files: Vec<String>,
     query: String,
     marked_text: String,
+    /// IME 候选窗锚点（过滤器输入行的探针每帧刷新）。
+    ime_anchor: crate::ime_anchor::ImeAnchor,
     focus_handle: FocusHandle,
 }
 
@@ -270,6 +272,7 @@ impl GitHistoryView {
             files,
             query: String::new(),
             marked_text: String::new(),
+            ime_anchor: crate::ime_anchor::ImeAnchor::new(),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -334,6 +337,7 @@ impl gpui::Render for GitHistoryView {
         let handler = GitHistoryInputHandler {
             view: cx.entity().downgrade(),
         };
+        let ime_anchor = self.ime_anchor.clone();
         let query = self.query.to_ascii_lowercase();
         let commits = self
             .commits
@@ -433,10 +437,16 @@ impl gpui::Render for GitHistoryView {
                     .border_1()
                     .border_color(ui::color(p.accent))
                     .bg(ui::color(p.elevated))
-                    .child(SharedString::from(format!(
-                        "Search history: {}|",
-                        self.query
-                    ))),
+                    .child(
+                        div()
+                            .relative()
+                            .child(SharedString::from(format!(
+                                "Search history: {}|",
+                                self.query
+                            )))
+                            // IME 候选窗锚点探针：记录输入行文本 bounds 与样式。
+                            .child(crate::ime_anchor::anchor_probe(&ime_anchor)),
+                    ),
             )
             .child(
                 div()
@@ -552,7 +562,7 @@ impl InputHandler for GitHistoryInputHandler {
         _: Option<Range<usize>>,
         text: &str,
         _: Option<Range<usize>>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) {
         if let Some(view) = self.view.upgrade() {
@@ -560,6 +570,8 @@ impl InputHandler for GitHistoryInputHandler {
                 view.marked_text = text.into();
                 cx.notify();
             });
+            // 预编辑串变化时重新上报锚点，候选窗贴住过滤器输入行。
+            window.invalidate_character_coordinates();
         }
     }
 
@@ -575,10 +587,14 @@ impl InputHandler for GitHistoryInputHandler {
     fn bounds_for_range(
         &mut self,
         _: Range<usize>,
-        _: &mut Window,
-        _: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
-        None
+        // 过滤器光标恒在 query 末尾：锚点 = "Search history: {query}" 的终点。
+        let view = self.view.upgrade()?;
+        let view = view.read(cx);
+        let text = format!("Search history: {}", view.query);
+        view.ime_anchor.caret_bounds(&text, text.len(), window)
     }
 
     fn character_index_for_point(
@@ -588,5 +604,37 @@ impl InputHandler for GitHistoryInputHandler {
         _: &mut App,
     ) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// IME 候选窗锚点必须落在过滤器输入行文本的末尾（光标恒在 query 结尾）。
+    #[test]
+    fn ime_anchor_tracks_history_filter_text_end() {
+        let mut cx = TestAppContext::single();
+        let (view, vcx) =
+            cx.add_window_view(|_, cx| GitHistoryView::new(Vec::new(), Vec::new(), cx));
+        view.update(vcx, |view, _| {
+            view.query = "fix".into();
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        vcx.update(|window, cx| {
+            let mut handler = GitHistoryInputHandler {
+                view: view.downgrade(),
+            };
+            let bounds = handler
+                .bounds_for_range(0..0, window, cx)
+                .expect("bounds_for_range must report caret bounds after paint");
+            assert!(bounds.origin.x > px(0.0), "anchor {bounds:?}");
+            assert!(bounds.origin.y > px(0.0), "anchor {bounds:?}");
+            assert!(bounds.size.height > px(0.0), "anchor {bounds:?}");
+        });
     }
 }

@@ -117,6 +117,8 @@ pub struct ComposerView {
     draft: ComposerDraft,
     cursor: usize,
     marked_text: String,
+    /// IME 候选窗锚点（输入行文本的探针每帧刷新）。
+    ime_anchor: crate::ime_anchor::ImeAnchor,
     focus_handle: FocusHandle,
     history: Vec<Message>,
     /// 提交模式（Auto/Plan/Yolo）；随会话持久化，见 FR-AGENT-11。
@@ -191,6 +193,7 @@ impl ComposerView {
             draft: ComposerDraft::default(),
             cursor: 0,
             marked_text: String::new(),
+            ime_anchor: crate::ime_anchor::ImeAnchor::new(),
             focus_handle: cx.focus_handle(),
             history: Vec::new(),
             mode: Mode::Auto,
@@ -2002,6 +2005,7 @@ impl gpui::Render for ComposerView {
         let handler = ComposerInputHandler {
             view: cx.entity().downgrade(),
         };
+        let ime_anchor = self.ime_anchor.clone();
         let agent_name = self.active_agent_name().to_owned();
         let agent_tooltip = self
             .backend_capability_summary
@@ -3381,7 +3385,10 @@ impl gpui::Render for ComposerView {
                                 text.text_color(crate::ui::muted(&p))
                             })
                             .debug_selector(|| "composer-input-text".into())
-                            .child(SharedString::from(input_display)),
+                            .relative()
+                            .child(SharedString::from(input_display))
+                            // IME 候选窗锚点探针：记录输入行文本 bounds 与样式。
+                            .child(crate::ime_anchor::anchor_probe(&ime_anchor)),
                     ),
             )
             .child(
@@ -3617,7 +3624,7 @@ impl InputHandler for ComposerInputHandler {
         _: Option<Range<usize>>,
         text: &str,
         _: Option<Range<usize>>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) {
         if let Some(view) = self.view.upgrade() {
@@ -3625,6 +3632,8 @@ impl InputHandler for ComposerInputHandler {
                 view.marked_text = text.into();
                 cx.notify();
             });
+            // 预编辑串变化时重新上报锚点，候选窗贴住输入行光标。
+            window.invalidate_character_coordinates();
         }
     }
     fn unmark_text(&mut self, _: &mut Window, cx: &mut App) {
@@ -3638,10 +3647,15 @@ impl InputHandler for ComposerInputHandler {
     fn bounds_for_range(
         &mut self,
         _: Range<usize>,
-        _: &mut Window,
-        _: &mut App,
+        window: &mut Window,
+        cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
-        None
+        // IME 候选窗锚点：输入行文本 bounds + 光标前缀宽度（探针每帧刷新）。
+        let view = self.view.upgrade()?;
+        let view = view.read(cx);
+        let byte = char_to_byte(&view.draft.input, view.cursor);
+        view.ime_anchor
+            .caret_bounds(&view.draft.input, byte, window)
     }
     fn character_index_for_point(
         &mut self,
@@ -3740,6 +3754,38 @@ mod layout_tests {
             text.size.width > px(150.0),
             "composer input collapsed: {text:?}"
         );
+    }
+
+    /// IME 候选窗锚点必须落在输入行文本上，且随光标前缀（如 CJK）右移。
+    #[test]
+    fn ime_anchor_tracks_composer_input_cursor() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        composer.update(vcx, |view, _| {
+            view.draft.input = "你好 world".into();
+            view.cursor = "你好".chars().count();
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let text = vcx
+            .debug_bounds("composer-input-text")
+            .expect("input text rendered");
+        vcx.update(|window, cx| {
+            let mut handler = ComposerInputHandler {
+                view: composer.downgrade(),
+            };
+            let bounds = handler
+                .bounds_for_range(0..0, window, cx)
+                .expect("bounds_for_range must report caret bounds after paint");
+            assert_eq!(bounds.origin.y, text.origin.y);
+            assert!(
+                bounds.origin.x > text.origin.x,
+                "CJK prefix must shift anchor right: {bounds:?} vs {text:?}"
+            );
+            assert!(bounds.size.height > px(0.0));
+        });
     }
 
     #[test]

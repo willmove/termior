@@ -10,6 +10,7 @@ mod background_image;
 mod composer_view;
 mod editor_view;
 mod git_views;
+mod ime_anchor;
 mod keystroke;
 mod markdown_preview_view;
 mod markdown_render;
