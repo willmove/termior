@@ -16,11 +16,11 @@ use futures::{
 };
 use gpui::{
     actions, anchored, canvas, div, ease_in_out, prelude::*, px, relative, size, Animation,
-    AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, Context, CursorStyle,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, PromptButton,
-    PromptLevel, Role, SharedString, Task, UTF16Selection, Window, WindowAppearance, WindowBounds,
-    WindowControlArea,
+    AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, Context, CursorStyle, Decorations,
+    Div, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, HitboxBehavior,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    PromptButton, PromptLevel, ResizeEdge, Role, SharedString, Size, Stateful, Task, Tiling,
+    UTF16Selection, Window, WindowAppearance, WindowBounds, WindowControlArea,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -59,7 +59,7 @@ use termior_ui::{
 };
 use termior_ui_kit::{
     empty_hint, empty_state_message, icon, menu_panel, menu_separator, text as ui_text,
-    titlebar::{draws_own_window_controls, window_controls},
+    titlebar::{draws_own_window_controls, handles_own_window_control_clicks, window_controls},
     tokens::{self, icon_size},
     Icon, LayoutNode, PaneId, SplitDirection, Tooltip,
 };
@@ -90,6 +90,11 @@ const WORKSPACE_HEADER_HEIGHT: f32 = tokens::height::TITLE_BAR;
 /// 标题栏拖拽区的最小宽度。标签页再多也要留下能抓住窗口的地方。
 const TITLE_BAR_DRAG_MIN_WIDTH: f32 = 48.0;
 const STATUS_BAR_HEIGHT: f32 = 24.0;
+/// CSD 窗口四周的环带宽度：既是不可见缩放手柄的命中带，也是阴影/圆角的留白
+/// （对齐 Zed 的 `CLIENT_SIDE_DECORATION_SHADOW`）。见 `render_window_frame`。
+const WINDOW_RESIZE_BAND: Pixels = px(10.0);
+/// CSD 窗口圆角半径（对齐 Zed 的 `CLIENT_SIDE_DECORATION_ROUNDING`）。
+const WINDOW_ROUNDING: Pixels = px(10.0);
 /// Composer 拖拽手柄厚度，与 pane 分隔条一致。
 const COMPOSER_RESIZE_HANDLE_SIZE: f32 = 5.0;
 /// 多 pane 时非活动 pane 的不透明度——压暗可辨，终端文本仍可读。
@@ -299,6 +304,12 @@ pub struct WorkspaceView {
     sidebar_resizing: bool,
     /// Composer 面板拖拽调整尺寸进行中（方向取决于当前停靠位置）。
     composer_resizing: bool,
+    /// 标题栏拖拽已按下、等待首个移动事件（Linux/BSD 自管窗口移动，见
+    /// [`Self::start_titlebar_move`]）。Windows 走 HTCAPTION 命中测试，不用它。
+    titlebar_move_armed: bool,
+    /// 鼠标当前悬停的 CSD 缩放边，用于光标提示的增量重绘（见
+    /// [`Self::render_window_frame`]）。
+    resize_edge_hint: Option<ResizeEdge>,
     pane_resizing: Option<PaneResizeState>,
     content_matches: Vec<ContentMatch>,
     content_search_generation: u64,
@@ -571,6 +582,8 @@ impl WorkspaceView {
             pane_context_menu: None,
             sidebar_resizing: false,
             composer_resizing: false,
+            titlebar_move_armed: false,
+            resize_edge_hint: None,
             pane_resizing: None,
             content_matches: Vec::new(),
             content_search_generation: 0,
@@ -2954,6 +2967,48 @@ impl WorkspaceView {
             self.persist_workspace();
             cx.notify();
         }
+    }
+
+    /// Linux/BSD 标题栏拖拽的第一步：按下时 armed，真正的窗口移动在
+    /// [`Self::move_titlebar`] 的首个移动事件里交给合成器
+    /// （`start_window_move`），避免单纯点击也触发移动；双击按桌面约定
+    /// 最大化/还原（Windows 上由 HTCAPTION 原生处理，不进这里）。
+    fn start_titlebar_move(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if event.click_count >= 2 {
+            self.titlebar_move_armed = false;
+            window.zoom_window();
+        } else {
+            self.titlebar_move_armed = true;
+        }
+    }
+
+    /// [`Self::start_titlebar_move`] 的 armed 状态只在左键确实按住时生效：
+    /// 若按下后指针移出窗口再松开，armed 会残留到指针回来，`pressed_button`
+    /// 校验能拦住这种无按键的假拖拽。
+    fn move_titlebar(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if self.titlebar_move_armed && event.pressed_button == Some(MouseButton::Left) {
+            self.titlebar_move_armed = false;
+            window.start_window_move();
+        }
+    }
+
+    fn stop_titlebar_move(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.titlebar_move_armed = false;
     }
 
     fn persist_workspace(&self) {
@@ -5470,7 +5525,7 @@ impl gpui::Render for WorkspaceView {
                     )
                     .child(self.composer.clone())
             });
-        div()
+        let root = div()
             .id("workspace-root")
             .relative()
             .track_focus(&self.focus_handle)
@@ -5479,7 +5534,9 @@ impl gpui::Render for WorkspaceView {
             }))
             .on_key_down(cx.listener(Self::global_key))
             .on_mouse_move(cx.listener(Self::resize_panels))
+            .on_mouse_move(cx.listener(Self::move_titlebar))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::stop_panel_resizes))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::stop_titlebar_move))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event, _window, cx| {
@@ -5548,7 +5605,17 @@ impl gpui::Render for WorkspaceView {
                             .flex_1()
                             .min_w(px(TITLE_BAR_DRAG_MIN_WIDTH))
                             .h_full()
-                            .window_control_area(WindowControlArea::Drag),
+                            .window_control_area(WindowControlArea::Drag)
+                            // Windows：HTCAPTION 命中测试原生处理拖拽与双击。
+                            // Linux/BSD：gpui 后端不做窗口控制命中测试，拖拽
+                            // 与双击最大化由应用自己处理（对齐 Zed
+                            // platform_title_bar 的 Linux 路径）。
+                            .when(handles_own_window_control_clicks(), |gap| {
+                                gap.on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(Self::start_titlebar_move),
+                                )
+                            }),
                     )
                     .child(
                         // 标题栏操作区：打开工作区 + 通知 + 设置。
@@ -5796,7 +5863,139 @@ impl gpui::Render for WorkspaceView {
             )
             .children(explorer_context_menu)
             .children(new_tab_menu)
-            .children(pane_context_menu)
+            .children(pane_context_menu);
+        self.render_window_frame(root, &p, window, cx)
+    }
+}
+
+impl WorkspaceView {
+    /// CSD 窗口框（对齐 Zed `workspace::client_side_decorations`，仅 Linux/BSD
+    /// 且平台报告 [`Decorations::Client`] 时启用）：合成器下窗口管理器不画任何
+    /// 边框，缩放手柄（环带命中 + `start_window_resize`）、resize 光标、阴影、
+    /// 圆角全部由应用自绘。环带是布局内边距而非覆盖层，不会抢内容的点击——
+    /// 这也是必须用环带而不是贴边覆盖层的原因：覆盖层无法在内容处理器之前
+    /// 拦截按下事件。tiled/maximized 的边不留环带也不可缩放。
+    ///
+    /// Windows（WS_THICKFRAME/命中测试）与 macOS（系统边框）原样返回；X11 无
+    /// 合成器时 gpui 自动回退 [`Decorations::Server`]，同样原样返回。
+    fn render_window_frame(
+        &mut self,
+        content: impl IntoElement,
+        p: &ResolvedPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        const BORDER: Pixels = px(1.0);
+        if !handles_own_window_control_clicks() {
+            return div().id("window-frame").size_full().child(content);
+        }
+        let Decorations::Client { tiling } = window.window_decorations() else {
+            window.set_client_inset(px(0.0));
+            return div().id("window-frame").size_full().child(content);
+        };
+        // 告诉 WM 真实内容内缩（X11 写 _GTK_FRAME_EXTENTS）：最大化时窗口可以
+        // 铺到显示器边缘，内容仍落在工作区内。
+        window.set_client_inset(WINDOW_RESIZE_BAND);
+
+        div()
+            .id("window-frame")
+            .map(|frame| rounded_client_corners(frame, &tiling))
+            .when(!tiling.top, |frame| frame.pt(WINDOW_RESIZE_BAND))
+            .when(!tiling.bottom, |frame| frame.pb(WINDOW_RESIZE_BAND))
+            .when(!tiling.left, |frame| frame.pl(WINDOW_RESIZE_BAND))
+            .when(!tiling.right, |frame| frame.pr(WINDOW_RESIZE_BAND))
+            // resize 光标登记在渲染帧上，鼠标位置变化不会自动重算样式；进入/
+            // 离开/切换缩放边时刷一帧，下方 canvas 才会为新位置登记光标。
+            .on_mouse_move(
+                cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                    let edge = resize_edge(
+                        event.position,
+                        WINDOW_RESIZE_BAND,
+                        window.window_bounds().get_bounds().size,
+                        tiling,
+                    );
+                    if edge != this.resize_edge_hint {
+                        this.resize_edge_hint = edge;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_down(MouseButton::Left, move |event, window, _| {
+                if let Some(edge) = resize_edge(
+                    event.position,
+                    WINDOW_RESIZE_BAND,
+                    window.window_bounds().get_bounds().size,
+                    tiling,
+                ) {
+                    window.start_window_resize(edge);
+                }
+            })
+            .size_full()
+            .child(
+                div()
+                    .cursor(CursorStyle::Arrow)
+                    .map(|inner| rounded_client_corners(inner, &tiling))
+                    .border_color(ui::border(p))
+                    .when(!tiling.top, |inner| inner.border_t(BORDER))
+                    .when(!tiling.bottom, |inner| inner.border_b(BORDER))
+                    .when(!tiling.left, |inner| inner.border_l(BORDER))
+                    .when(!tiling.right, |inner| inner.border_r(BORDER))
+                    .when(!tiling.is_tiled(), |inner| {
+                        inner.shadow(vec![gpui::BoxShadow::new(
+                            px(0.0),
+                            px(0.0),
+                            gpui::Hsla {
+                                h: 0.0,
+                                s: 0.0,
+                                l: 0.0,
+                                a: 0.4,
+                            },
+                        )
+                        .blur_radius(WINDOW_RESIZE_BAND / 2.0)])
+                    })
+                    .size_full()
+                    .child(content),
+            )
+            .child(
+                // 全窗口命中盒：按当前鼠标位置把 resize 光标登记到渲染帧上。
+                // 只有光标登记，没有鼠标监听，不会影响内容的命中测试。
+                canvas(
+                    |_bounds, window, _| {
+                        window.insert_hitbox(
+                            Bounds::new(
+                                Point::new(px(0.0), px(0.0)),
+                                window.window_bounds().get_bounds().size,
+                            ),
+                            HitboxBehavior::Normal,
+                        )
+                    },
+                    move |_bounds, hitbox, window, _cx| {
+                        let mouse = window.mouse_position();
+                        let size = window.window_bounds().get_bounds().size;
+                        let Some(edge) = resize_edge(mouse, WINDOW_RESIZE_BAND, size, tiling)
+                        else {
+                            return;
+                        };
+                        window.set_cursor_style(
+                            match edge {
+                                ResizeEdge::Top | ResizeEdge::Bottom => CursorStyle::ResizeUpDown,
+                                ResizeEdge::Left | ResizeEdge::Right => {
+                                    CursorStyle::ResizeLeftRight
+                                }
+                                ResizeEdge::TopLeft | ResizeEdge::BottomRight => {
+                                    CursorStyle::ResizeUpLeftDownRight
+                                }
+                                ResizeEdge::TopRight | ResizeEdge::BottomLeft => {
+                                    CursorStyle::ResizeUpRightDownLeft
+                                }
+                            },
+                            &hitbox,
+                        );
+                    },
+                )
+                .size_full()
+                .absolute(),
+            )
     }
 }
 
@@ -5815,6 +6014,81 @@ impl Drop for WorkspaceView {
 
 fn single_pane(content: PaneContent) -> HashMap<PaneId, PaneContent> {
     HashMap::from([(PaneId(1), content)])
+}
+
+/// 判断窗口坐标 `pos` 是否落在 CSD 缩放环带上（边或 1.5 倍环带宽的角），
+/// 在则返回应缩放的边（对齐 Zed `workspace::resize_edge`）。tiled 的边不缩放。
+fn resize_edge(
+    pos: Point<Pixels>,
+    band: Pixels,
+    window_size: Size<Pixels>,
+    tiling: Tiling,
+) -> Option<ResizeEdge> {
+    let inner = Bounds::new(Point::default(), window_size).inset(band * 1.5);
+    if inner.contains(&pos) {
+        return None;
+    }
+
+    let corner = size(band * 1.5, band * 1.5);
+    let top_left = Bounds::new(Point::new(px(0.0), px(0.0)), corner);
+    if !tiling.top && top_left.contains(&pos) {
+        return Some(ResizeEdge::TopLeft);
+    }
+    let top_right = Bounds::new(
+        Point::new(window_size.width - corner.width, px(0.0)),
+        corner,
+    );
+    if !tiling.top && top_right.contains(&pos) {
+        return Some(ResizeEdge::TopRight);
+    }
+    let bottom_left = Bounds::new(
+        Point::new(px(0.0), window_size.height - corner.height),
+        corner,
+    );
+    if !tiling.bottom && bottom_left.contains(&pos) {
+        return Some(ResizeEdge::BottomLeft);
+    }
+    let bottom_right = Bounds::new(
+        Point::new(
+            window_size.width - corner.width,
+            window_size.height - corner.height,
+        ),
+        corner,
+    );
+    if !tiling.bottom && bottom_right.contains(&pos) {
+        return Some(ResizeEdge::BottomRight);
+    }
+
+    if !tiling.top && pos.y < band {
+        Some(ResizeEdge::Top)
+    } else if !tiling.bottom && pos.y > window_size.height - band {
+        Some(ResizeEdge::Bottom)
+    } else if !tiling.left && pos.x < band {
+        Some(ResizeEdge::Left)
+    } else if !tiling.right && pos.x > window_size.width - band {
+        Some(ResizeEdge::Right)
+    } else {
+        None
+    }
+}
+
+/// 给 CSD 窗口/内容元素加圆角：只圆「两条邻边都未 tiled」的角
+/// （对齐 Zed `theme::ClientDecorationsExt::rounded_client_corners`）。
+fn rounded_client_corners<S: Styled>(element: S, tiling: &Tiling) -> S {
+    let mut element = element;
+    if !tiling.top && !tiling.left {
+        element = element.rounded_tl(WINDOW_ROUNDING);
+    }
+    if !tiling.top && !tiling.right {
+        element = element.rounded_tr(WINDOW_ROUNDING);
+    }
+    if !tiling.bottom && !tiling.left {
+        element = element.rounded_bl(WINDOW_ROUNDING);
+    }
+    if !tiling.bottom && !tiling.right {
+        element = element.rounded_br(WINDOW_ROUNDING);
+    }
+    element
 }
 
 fn new_preview_view(url: String, cx: &mut Context<WorkspaceView>) -> Entity<PreviewView> {
