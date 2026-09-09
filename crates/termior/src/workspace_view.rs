@@ -2036,7 +2036,7 @@ impl WorkspaceView {
     }
 
     /// 关闭指定标签页(标签栏 ✕ 按钮/中键点击),不要求它是活动标签。
-    fn close_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
+    fn close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.model.tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
@@ -2059,6 +2059,9 @@ impl WorkspaceView {
             };
             if let Some(active) = self.model.active {
                 self.activate_runtime(active, cx);
+                // 关闭的是活动 tab：被关 pane 可能正持有键盘焦点（句柄随实体消亡），
+                // 显式把焦点交给幸存的活动 pane，否则输入会落到 workspace root 上。
+                self.focus_active_pane(window, cx);
             } else {
                 self.follow_active_tab_project(cx);
             }
@@ -2066,7 +2069,7 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn close_active(&mut self, cx: &mut Context<Self>) {
+    fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.model.active else { return };
         let pane_ids = self
             .tabs
@@ -2088,6 +2091,8 @@ impl WorkspaceView {
             }
             if let Some(active) = self.model.active {
                 self.activate_runtime(active, cx);
+                // 整个 tab 被关掉时，焦点随被关 pane 消亡；交给幸存的活动 pane。
+                self.focus_active_pane(window, cx);
             } else {
                 self.follow_active_tab_project(cx);
             }
@@ -3679,7 +3684,7 @@ impl WorkspaceView {
             KeyAction::NewPrivateTerminal => self.create_terminal(true, window, cx),
             KeyAction::NewEditorTab => self.create_editor(cx),
             KeyAction::NewPreviewTab => self.request_preview(window, cx),
-            KeyAction::ClosePaneOrTab => self.close_active(cx),
+            KeyAction::ClosePaneOrTab => self.close_active(window, cx),
             KeyAction::GotoTab1 => {
                 let _ = self.model.switch_index(1);
                 if let Some(active) = self.model.active {
@@ -4735,6 +4740,8 @@ impl gpui::Render for WorkspaceView {
                 let close_hover = ui::hover_wash(&p);
                 div()
                     .id(SharedString::from(format!("tab-{}", id.0)))
+                    // 测试里用 debug_bounds 定位 tab 头（release 构建下为 no-op）。
+                    .debug_selector(move || format!("tab-header-{}", id.0))
                     .relative()
                     .h_full()
                     .pl_3()
@@ -4817,9 +4824,9 @@ impl gpui::Render for WorkspaceView {
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _event, _window, cx| {
+                                cx.listener(move |this, _event, window, cx| {
                                     cx.stop_propagation();
-                                    this.close_tab(id, cx);
+                                    this.close_tab(id, window, cx);
                                 }),
                             )
                     })
@@ -4828,15 +4835,19 @@ impl gpui::Render for WorkspaceView {
                         cx.listener(move |this, _event, window, cx| {
                             this.activate_runtime(id, cx);
                             this.focus_active_pane(window, cx);
+                            // 抑制 GPUI 对可聚焦祖先（workspace-root 的 track_focus）
+                            // 的鼠标按下自动聚焦：否则它会在冒泡后期把刚交给新
+                            // tab pane 的焦点抢回去，用户切完 tab 还得再点一下终端。
+                            window.prevent_default();
                             cx.notify();
                         }),
                     )
                     // 中键关闭：桌面端标签页的通用约定。
                     .on_mouse_down(
                         MouseButton::Middle,
-                        cx.listener(move |this, _event, _window, cx| {
+                        cx.listener(move |this, _event, window, cx| {
                             cx.stop_propagation();
-                            this.close_tab(id, cx);
+                            this.close_tab(id, window, cx);
                         }),
                     )
             })
@@ -6590,5 +6601,152 @@ mod explorer_ui_tests {
         assert!(snapshot.history.is_empty());
         assert!(snapshot.branch.is_none());
         assert_eq!(snapshot.root, root);
+    }
+}
+
+/// 焦点回归：点击 tab 头切换 tab 后，键盘焦点必须落进新 tab 的活动 pane，
+/// 与 Windows Terminal 等主流终端一致（否则每次切完 tab 都得再点一下终端）。
+#[cfg(test)]
+mod tab_focus_tests {
+    use super::*;
+    use gpui::{Modifiers, MouseButton, TestAppContext};
+
+    fn editor_focus_handle(ws: &WorkspaceView, tab_id: TabId, cx: &App) -> FocusHandle {
+        let tab = ws.tabs.iter().find(|tab| tab.id == tab_id).unwrap();
+        let focused = ws.model.tab(tab_id).unwrap().layout.focused;
+        match tab.panes.get(&focused).unwrap() {
+            PaneContent::Editor(editor) => editor.read(cx).focus_handle(cx),
+            _ => panic!("expected editor pane"),
+        }
+    }
+
+    fn tab_header_bounds(
+        tab_id: TabId,
+        cx: &mut gpui::VisualTestContext,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        let selector: &'static str = Box::leak(format!("tab-header-{}", tab_id.0).into_boxed_str());
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("tab header {selector} not rendered"))
+    }
+
+    #[gpui::test]
+    fn clicking_tab_header_moves_focus_into_its_pane(cx: &mut TestAppContext) {
+        let (workspace, cx) =
+            cx.add_window_view(|_window, cx| WorkspaceView::new(std::env::temp_dir(), false, cx));
+
+        let (tab_a, tab_b) = cx.update(|_window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.create_editor(cx);
+                let tab_a = ws.model.active.unwrap();
+                ws.create_editor(cx);
+                let tab_b = ws.model.active.unwrap();
+                (tab_a, tab_b)
+            })
+        });
+        cx.run_until_parked();
+        // 首帧：让 tab 头进入 hit-test 树。
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        // 焦点先落在 tab A 的编辑器里，模拟「正在 A 里打字，然后点 B 的 tab 头」。
+        let handle_a = cx.update(|_window, cx| editor_focus_handle(workspace.read(cx), tab_a, cx));
+        cx.update(|window, cx| {
+            window.focus(&handle_a, cx);
+        });
+        let handle_b = cx.update(|_window, cx| editor_focus_handle(workspace.read(cx), tab_b, cx));
+        let root_focus = cx.update(|_window, cx| workspace.read(cx).focus_handle.clone());
+
+        let bounds = tab_header_bounds(tab_b, cx);
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Left, Modifiers::default());
+
+        let focused = cx.update(|window, cx| window.focused(cx));
+        assert_eq!(
+            focused,
+            Some(handle_b),
+            "clicking a tab header must hand keyboard focus to that tab's pane"
+        );
+        assert_ne!(
+            focused,
+            Some(root_focus),
+            "workspace root must not steal focus back from the activated pane"
+        );
+    }
+
+    #[gpui::test]
+    fn switching_tabs_by_keyboard_keeps_focus_in_pane(cx: &mut TestAppContext) {
+        let (workspace, cx) =
+            cx.add_window_view(|_window, cx| WorkspaceView::new(std::env::temp_dir(), false, cx));
+
+        let (tab_a, tab_b) = cx.update(|_window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.create_editor(cx);
+                let tab_a = ws.model.active.unwrap();
+                ws.create_editor(cx);
+                let tab_b = ws.model.active.unwrap();
+                (tab_a, tab_b)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        let handle_a = cx.update(|_window, cx| editor_focus_handle(workspace.read(cx), tab_a, cx));
+        cx.update(|window, cx| {
+            window.focus(&handle_a, cx);
+        });
+
+        // 与 global_key 的 GotoTab1 分支同一调用序列。
+        cx.update(|window, cx| {
+            workspace.update(cx, |ws, cx| {
+                let _ = ws.model.switch_to(tab_a);
+                ws.activate_runtime(tab_a, cx);
+                ws.focus_active_pane(window, cx);
+            })
+        });
+
+        let handle_a_again =
+            cx.update(|_window, cx| editor_focus_handle(workspace.read(cx), tab_a, cx));
+        let focused = cx.update(|window, cx| window.focused(cx));
+        assert_eq!(focused, Some(handle_a_again));
+        let _ = (tab_b, handle_a);
+    }
+
+    #[gpui::test]
+    fn closing_active_tab_hands_focus_to_surviving_pane(cx: &mut TestAppContext) {
+        let (workspace, cx) =
+            cx.add_window_view(|_window, cx| WorkspaceView::new(std::env::temp_dir(), false, cx));
+
+        let (tab_a, tab_b) = cx.update(|_window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.create_editor(cx);
+                let tab_a = ws.model.active.unwrap();
+                ws.create_editor(cx);
+                let tab_b = ws.model.active.unwrap();
+                (tab_a, tab_b)
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        let handle_a = cx.update(|_window, cx| editor_focus_handle(workspace.read(cx), tab_a, cx));
+        let handle_b = cx.update(|_window, cx| editor_focus_handle(workspace.read(cx), tab_b, cx));
+        cx.update(|window, cx| {
+            window.focus(&handle_b, cx);
+        });
+
+        // 中键关闭活动 tab B：焦点应回到幸存 tab A 的编辑器。
+        let bounds = tab_header_bounds(tab_b, cx);
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Middle, Modifiers::default());
+
+        let focused = cx.update(|window, cx| window.focused(cx));
+        assert_eq!(
+            focused,
+            Some(handle_a),
+            "closing the focused tab must hand focus to the surviving tab's pane"
+        );
     }
 }
