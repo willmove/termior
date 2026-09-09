@@ -23,7 +23,7 @@ use gpui::{
     ScrollWheelEvent, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled,
     Subscription, Task, TextAlign, TextRun, UTF16Selection, UnderlineStyle, WeakEntity, Window,
 };
-use std::{path::PathBuf, sync::Arc};
+use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
 use termior_store::{TerminalSettings, UserKeymap};
 use termior_terminal::{
     shared_terminal_service, CommandCreate, CommandOwner, CommandSessionId, Controller,
@@ -106,6 +106,8 @@ pub struct TerminalView {
     cell_width: f32,
     line_height_px: f32,
     viewport_origin: Point<Pixels>,
+    /// 最近一帧光标单元格的窗口坐标（paint 闭包每帧刷新），IME 候选窗锚点。
+    ime_cursor_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     scroll_px: f32,
     last_mouse_cell: Option<(i32, usize, Option<MouseButton>)>,
     keymap: UserKeymap,
@@ -303,6 +305,7 @@ impl TerminalView {
             cell_width: text_style.font_size * 0.6 + text_style.letter_spacing,
             line_height_px,
             viewport_origin: Point::default(),
+            ime_cursor_bounds: Rc::new(Cell::new(None)),
             scroll_px: 0.0,
             last_mouse_cell: None,
             text_style,
@@ -899,6 +902,7 @@ impl Render for TerminalView {
         let current_cell_width = self.cell_width;
         let current_line_height = self.line_height_px;
         let current_origin = self.viewport_origin;
+        let ime_cursor_bounds = self.ime_cursor_bounds.clone();
 
         div()
             .id("terminal-view")
@@ -981,6 +985,13 @@ impl Render for TerminalView {
                     if input_focus.is_focused(window) {
                         window.handle_input(&input_focus, input_handler, cx);
                     }
+                    // IME 候选窗锚点：每帧按当前布局刷新，供 bounds_for_range 读取。
+                    ime_cursor_bounds.set(Some(cursor_cell_bounds(
+                        layout.origin,
+                        layout.line_height,
+                        layout.cell_width,
+                        &snapshot.cursor,
+                    )));
                     paint_terminal(
                         &layout,
                         &snapshot,
@@ -1143,7 +1154,7 @@ impl InputHandler for TerminalInputHandler {
         _replacement_range: Option<std::ops::Range<usize>>,
         new_text: &str,
         _new_marked_range: Option<std::ops::Range<usize>>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) {
         if let Some(view) = self.view.upgrade() {
@@ -1151,6 +1162,8 @@ impl InputHandler for TerminalInputHandler {
                 view.marked_text = new_text.to_owned();
                 cx.notify();
             });
+            // 预编辑串变化时重新上报锚点，窗口移动/缩放后候选窗仍贴住光标。
+            window.invalidate_character_coordinates();
         }
     }
 
@@ -1165,11 +1178,19 @@ impl InputHandler for TerminalInputHandler {
 
     fn bounds_for_range(
         &mut self,
-        _range: std::ops::Range<usize>,
+        range: std::ops::Range<usize>,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
-        None
+        // IME 候选窗定位（Windows 在 WM_IME_STARTCOMPOSITION 时经 GPUI 读取）：
+        // 返回最近一帧光标单元格的窗口坐标，并按预编辑串 UTF-16 起点右移，
+        // 与 Zed 终端行为一致。返回 None 会让各 IME 退回默认位置（小狼毫在
+        // 窗口左上角、微软拼音在右下角）。
+        let view = self.view.upgrade()?;
+        let view = view.read(cx);
+        let mut bounds = view.ime_cursor_bounds.get()?;
+        bounds.origin.x += px(view.cell_width * range.start as f32);
+        Some(bounds)
     }
 
     fn character_index_for_point(
@@ -1689,6 +1710,25 @@ fn flush_run(
     );
 }
 
+/// 光标单元格矩形。paint_cursor 的绘制与 IME 候选窗锚点共用此几何，
+/// 保证候选窗贴着用户看到的光标，而不是 IME 的默认回退位置。
+fn cursor_cell_bounds(
+    origin: Point<Pixels>,
+    line_height: Pixels,
+    cell_width: f32,
+    cursor: &CursorSnapshot,
+) -> Bounds<Pixels> {
+    let col = cursor.col as f32;
+    let row = cursor.row as f32;
+    Bounds {
+        origin: point(
+            origin.x + px(col * cell_width),
+            origin.y + line_height * row,
+        ),
+        size: gpui::size(px(cell_width), line_height),
+    }
+}
+
 /// 绘制光标。
 fn paint_cursor(
     cursor: &CursorSnapshot,
@@ -1698,13 +1738,8 @@ fn paint_cursor(
     cw: f32,
     window: &mut Window,
 ) {
-    let col = cursor.col as f32;
-    let row = cursor.row as f32;
-    let cell_origin = point(origin.x + px(col * cw), origin.y + lh * row);
-    let cell_bounds = Bounds {
-        origin: cell_origin,
-        size: gpui::size(px(cw), lh),
-    };
+    let cell_bounds = cursor_cell_bounds(origin, lh, cw, cursor);
+    let cell_origin = cell_bounds.origin;
     let color = theme_color_to_hsla(palette.foreground);
     match cursor.shape {
         CursorShape::Block => {
@@ -2111,6 +2146,61 @@ mod protocol_tests {
         cx.read_window(&window, |terminal, cx| {
             let terminal = terminal.read(cx);
             assert_eq!(terminal.term.columns(), wide_cols);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn ime_input_handler_anchors_candidates_at_cursor_cell() {
+        let mut cx = TestAppContext::single();
+        let bridge = TerminalBridge::spawn(&PtySessionConfig::default()).expect("PTY spawn");
+        let window = cx.open_window(size(px(640.0), px(480.0)), move |_, cx| {
+            TerminalView::from_bridge(
+                bridge,
+                default_theme().palette().clone(),
+                TerminalSettings::default(),
+                UserKeymap::default(),
+                cx,
+            )
+        });
+
+        // 绘制两帧让 resize(on_next_frame) 与 paint 都收敛，再校验锚点几何。
+        cx.update_window(window.into(), |terminal, window, cx| {
+            window.draw(cx).clear();
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear();
+            window.simulate_next_frame(cx);
+            let terminal = terminal.downcast::<TerminalView>().expect("terminal root");
+
+            // 与 GPUI Windows 平台 WM_IME_STARTCOMPOSITION 相同的调用路径。
+            let mut handler = TerminalInputHandler {
+                view: terminal.downgrade(),
+            };
+            let anchor = handler
+                .bounds_for_range(0..0, window, cx)
+                .expect("bounds_for_range must report caret bounds after paint");
+
+            let (origin, cell_width, line_height) = {
+                let view = terminal.read(cx);
+                (view.viewport_origin, view.cell_width, view.line_height_px)
+            };
+            let cursor = collect_snapshot(terminal.read(cx).term.renderable_content()).cursor;
+            assert_eq!(
+                anchor.origin,
+                point(
+                    origin.x + px(cursor.col as f32 * cell_width),
+                    origin.y + px(line_height * cursor.row as f32),
+                ),
+                "IME anchor must sit on the painted cursor cell"
+            );
+            assert_eq!(anchor.size, gpui::size(px(cell_width), px(line_height)));
+
+            // 预编辑串内的偏移按 UTF-16 起点右移（Zed 终端同款行为）。
+            let shifted = handler
+                .bounds_for_range(2..2, window, cx)
+                .expect("shifted bounds");
+            assert_eq!(shifted.origin.x, anchor.origin.x + px(cell_width * 2.0));
+            assert_eq!(shifted.origin.y, anchor.origin.y);
         })
         .unwrap();
     }
