@@ -27,6 +27,11 @@ pub(crate) fn main_window_options(bounds: WindowBounds) -> WindowOptions {
             traffic_light_position: Some(point(px(12.0), px((height::TITLE_BAR - 16.0) / 2.0))),
         }),
         window_decorations: Some(WindowDecorations::Client),
+        // Linux CSD：窗口四周的 resize 环带/阴影是透明像素，透出合成器桌面
+        // （见 workspace_view::render_window_frame）。无合成器时 gpui 回退
+        // Server 装饰，内容满幅绘制，透明背景无副作用。其他平台保持不透明。
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        window_background: gpui::WindowBackgroundAppearance::Transparent,
         ..window_options(bounds)
     }
 }
