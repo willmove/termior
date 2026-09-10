@@ -6504,7 +6504,7 @@ dependencies = [
 
 [[package]]
 name = "termior"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "alacritty_terminal",
  "env_logger",
@@ -6536,7 +6536,7 @@ dependencies = [
 
 [[package]]
 name = "termior-agent-host"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "futures",
  "reqwest",
@@ -6554,7 +6554,7 @@ dependencies = [
 
 [[package]]
 name = "termior-ai"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64",
  "chrono",
@@ -6580,7 +6580,7 @@ dependencies = [
 
 [[package]]
 name = "termior-bench"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "alacritty_terminal",
  "criterion",
@@ -6591,7 +6591,7 @@ dependencies = [
 
 [[package]]
 name = "termior-diff"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "similar",
@@ -6600,7 +6600,7 @@ dependencies = [
 
 [[package]]
 name = "termior-editor"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "criterion",
  "ropey",
@@ -6624,7 +6624,7 @@ dependencies = [
 
 [[package]]
 name = "termior-explorer"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "grep-matcher",
  "grep-regex",
@@ -6638,7 +6638,7 @@ dependencies = [
 
 [[package]]
 name = "termior-explorer-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "globset",
  "nucleo-matcher",
@@ -6648,7 +6648,7 @@ dependencies = [
 
 [[package]]
 name = "termior-hooks"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dirs 5.0.1",
  "serde",
@@ -6660,7 +6660,7 @@ dependencies = [
 
 [[package]]
 name = "termior-platform"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -6669,7 +6669,7 @@ dependencies = [
 
 [[package]]
 name = "termior-preview"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "pulldown-cmark",
  "regex",
@@ -6680,7 +6680,7 @@ dependencies = [
 
 [[package]]
 name = "termior-security"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -6688,7 +6688,7 @@ dependencies = [
 
 [[package]]
 name = "termior-store"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "dirs 5.0.1",
  "serde",
@@ -6700,7 +6700,7 @@ dependencies = [
 
 [[package]]
 name = "termior-terminal"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "alacritty_terminal",
  "futures",
@@ -6717,7 +6717,7 @@ dependencies = [
 
 [[package]]
 name = "termior-terminal-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "regex",
  "serde",
@@ -6727,7 +6727,7 @@ dependencies = [
 
 [[package]]
 name = "termior-theme"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -6736,7 +6736,7 @@ dependencies = [
 
 [[package]]
 name = "termior-ui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -6746,7 +6746,7 @@ dependencies = [
 
 [[package]]
 name = "termior-ui-kit"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "gpui",
  "serde",
@@ -6757,7 +6757,7 @@ dependencies = [
 
 [[package]]
 name = "termior-vcs"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "git2",
  "serde",
