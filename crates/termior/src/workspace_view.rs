@@ -6875,8 +6875,10 @@ mod tab_focus_tests {
 
     #[gpui::test]
     fn clicking_tab_header_moves_focus_into_its_pane(cx: &mut TestAppContext) {
-        let (workspace, cx) =
-            cx.add_window_view(|_window, cx| WorkspaceView::new(std::env::temp_dir(), false, cx));
+        let (workspace, cx) = cx.add_window_view(|_window, cx| {
+            crate::updater::init(cx);
+            WorkspaceView::new(std::env::temp_dir(), false, cx)
+        });
 
         let (tab_a, tab_b) = cx.update(|_window, cx| {
             workspace.update(cx, |ws, cx| {
@@ -6919,8 +6921,10 @@ mod tab_focus_tests {
 
     #[gpui::test]
     fn switching_tabs_by_keyboard_keeps_focus_in_pane(cx: &mut TestAppContext) {
-        let (workspace, cx) =
-            cx.add_window_view(|_window, cx| WorkspaceView::new(std::env::temp_dir(), false, cx));
+        let (workspace, cx) = cx.add_window_view(|_window, cx| {
+            crate::updater::init(cx);
+            WorkspaceView::new(std::env::temp_dir(), false, cx)
+        });
 
         let (tab_a, tab_b) = cx.update(|_window, cx| {
             workspace.update(cx, |ws, cx| {
@@ -6959,8 +6963,10 @@ mod tab_focus_tests {
 
     #[gpui::test]
     fn closing_active_tab_hands_focus_to_surviving_pane(cx: &mut TestAppContext) {
-        let (workspace, cx) =
-            cx.add_window_view(|_window, cx| WorkspaceView::new(std::env::temp_dir(), false, cx));
+        let (workspace, cx) = cx.add_window_view(|_window, cx| {
+            crate::updater::init(cx);
+            WorkspaceView::new(std::env::temp_dir(), false, cx)
+        });
 
         let (tab_a, tab_b) = cx.update(|_window, cx| {
             workspace.update(cx, |ws, cx| {

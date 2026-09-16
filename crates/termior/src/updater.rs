@@ -22,6 +22,9 @@ pub fn entity(cx: &App) -> Entity<Updater> {
 }
 
 pub fn init(cx: &mut App) {
+    if cx.has_global::<GlobalUpdater>() {
+        return;
+    }
     let updater = cx.new(|_| Updater {
         status: "Updates have not been checked".into(),
         busy: false,
