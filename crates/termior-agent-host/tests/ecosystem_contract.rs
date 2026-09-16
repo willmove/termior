@@ -100,6 +100,8 @@ fn fake_acp_server_passes_initialize_session_and_prompt_contract() {
             "powershell".to_string(),
             vec![
                 "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
                 "-File".into(),
                 script.display().to_string(),
             ],
@@ -185,6 +187,8 @@ if ($callback.result.content -ne 'from-host') { exit 9 }
             "powershell".to_string(),
             vec![
                 "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
                 "-File".into(),
                 script.display().to_string(),
             ],
@@ -318,6 +322,8 @@ $null = [Console]::In.ReadLine()
             "powershell".to_string(),
             vec![
                 "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
                 "-File".into(),
                 script.display().to_string(),
             ],
