@@ -6662,7 +6662,12 @@ dependencies = [
 name = "termior-platform"
 version = "0.1.6"
 dependencies = [
+ "reqwest",
+ "semver",
  "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "thiserror 1.0.69",
  "url",
 ]

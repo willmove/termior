@@ -39,6 +39,8 @@ pub struct Settings {
     pub show_dotfiles: bool,
     /// 代理通知开关（FR-NOTIF-05 P1）。
     pub agent_notifications: bool,
+    /// Check stable releases and download verified installers in the background.
+    pub automatic_updates: bool,
     /// WebGL→GPU 渲染等价开关占位（FR-SET-01）。
     pub prefer_software_rendering: bool,
     /// Vim compatibility layer (FR-EDIT-06).
@@ -310,6 +312,7 @@ pub fn default_settings() -> Settings {
         custom_instructions: String::new(),
         show_dotfiles: true,
         agent_notifications: true,
+        automatic_updates: true,
         prefer_software_rendering: false,
         vim_mode: false,
         wsl_distribution: None,
@@ -378,10 +381,23 @@ mod tests {
         assert_eq!(s.version, SETTINGS_VERSION);
         assert!(s.show_dotfiles);
         assert!(s.agent_notifications);
+        assert!(s.automatic_updates);
         assert_eq!(s.theme_id, "default");
         assert_eq!(s.light_theme_id, "default-light");
         assert_eq!(s.dark_theme_id, "default");
         s.validate().unwrap();
+    }
+
+    #[test]
+    fn automatic_updates_default_for_old_settings_and_preserve_opt_out() {
+        let mut old = serde_json::to_value(default_settings()).unwrap();
+        old.as_object_mut().unwrap().remove("automatic_updates");
+        let mut settings: Settings = serde_json::from_value(old).unwrap();
+        assert!(settings.automatic_updates);
+        settings.automatic_updates = false;
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(!restored.automatic_updates);
     }
 
     #[test]

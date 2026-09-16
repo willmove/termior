@@ -1,4 +1,4 @@
-# cargo-deny 配置 — 对齐 spec NFR-09（Apache-2.0 项目，第三方 crate 需核验许可）
+# cargo-deny 配置 — 对齐 spec NFR-09（MIT 项目，第三方 crate 需核验许可）
 # 与 spec §3.1「版本与依赖纪律」、风险 R6（依赖纪律与体积）。
 #
 # 用法：cargo deny check
@@ -16,7 +16,7 @@ ignore = []
 
 # ─────────────────────────────  licenses  ─────────────────────────────
 [licenses]
-# 允许的许可：宽松型 + Apache，覆盖本项目纯逻辑依赖（serde/similar/nucleo/ignore/
+# 允许的第三方许可：宽松型 + Apache，覆盖本项目纯逻辑依赖（serde/similar/nucleo/ignore/
 # globset/dirs/tempfile/thiserror 及其 transitive）的实际许可。
 allow = [
     "MIT",

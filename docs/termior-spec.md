@@ -177,6 +177,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | FR-WS-03 | 任意 tab 可分栏：`Cmd+D` 右分、`Cmd+Shift+D` 下分、`Cmd+[` / `Cmd+]` 切换焦点、`Cmd+W` 关闭焦点 pane（最后一个 pane 时关闭 tab）；pane 可拖拽调整尺寸、独立关闭 | P0 |
 | FR-WS-04 | sidebar 活动栏含三个面板：文件浏览器、源码管理、Git 历史；`Cmd+B` 折叠/展开，`Cmd+Shift+E` 聚焦浏览器 | P0 |
 | FR-WS-05 | 状态栏为上下文条：终端显示 cwd 面包屑（OSC 7），编辑器显示文件路径与行列；右侧含工作区名（活动 tab 的项目文件夹名）、git 分支、AI 状态（工具计数仅在 >0 时显示）、localhost 预览 pill | P0 |
+| FR-WS-09 | 状态栏以单一 Composer 菜单按钮提供显示/隐藏、底部停靠、右侧停靠；终端 tab 另有显示/隐藏终端区域按钮，作用于当前 tab 的全部分栏，隐藏只跳过渲染、不销毁 PTY。隐藏状态按 tab 持久化，Composer 可占满腾出的内容区，恢复终端后沿用原有停靠尺寸；状态栏按钮始终可用于恢复显示 | P0 |
 | FR-WS-06 | 自绘标题栏：标签栏与窗口控制合并为一行；操作区仅通知铃铛与设置；分栏入口在 pane 上下文菜单；主题选择在设置窗；工作区切换（本地 + Windows WSL）在状态栏 | P0（WSL 为 P1） |
 | FR-WS-08 | 每个 tab 持有独立的项目文件夹（`project_dir`）：打开文件夹（标题栏/状态栏按钮、`Cmd/Ctrl+O`）只重定向**活动 tab**，其他 tab 不受影响；运行中的终端注入 `cd` 同步（会话不中断）；文件浏览器、Git 面板与状态栏工作区名跟随活动 tab 的 `project_dir`；`project_dir` 不随 shell `cd`（OSC 7）漂移；全局 `root` 降为兑底（新建 tab 无继承来源、private terminal 使用） | P0 |
 | FR-WS-07 | 设置为独立 GPUI 窗口（`Cmd+,`），左侧竖向导航六页：General / Models / Themes / Shortcuts / Agents / About；自动保存（敏感凭据仍显式确认） | P0 |
@@ -296,6 +297,8 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | FR-PROV-04 | 密钥入 OS 钥匙串（keyring crate，service `Termior-ai`：macOS Keychain / Windows Credential Manager / Linux Secret Service，headless 文件回退）；settings 文件、日志、环境变量永不出现明文 key；切换活动 key 时清空内存会话映射，盘上会话保留并重绑定 | P0 |
 | FR-PROV-05 | 统一出网层：所有 Provider HTTP 流量经 `Termior-security` 的 SSRF guard（拦截 loopback/link-local/私网段，显式配置的本地 Provider base URL 白名单放行） | P0 |
 
+**设置交互**：Models 按「选择服务商 → 配置模型 → 保存密钥并测试连接 → 设置聊天/补全用途」组织。明确区分普通配置自动保存与 API Key 显式保存，本地 Provider 标注密钥可选。未保存密钥按 Provider 隔离在内存中，切换配置不得串用；连接检查进行中防止重复请求，结果只反馈到对应 Provider。
+
 **技术要点**：Provider 抽象为 `trait Provider { fn stream_chat(...) -> impl Stream<Item = ChatEvent>; }`，统一消息/工具调用/流式增量事件模型，各家做请求/响应适配器；SSE 解析用 `eventsource-stream` 或手写行协议解析；网络全部在 tokio 线程池，事件经 channel 进 GPUI。
 
 ### 6.10 Composer 与 Agent 运行时（FR-AGENT）
@@ -324,6 +327,8 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | FR-PLAN-02 | 子代理：主代理可调 `run_subagent` 把窄任务委托给「窄提示词 + 工具子集」的子代理，完成后结果回报父代理 | P1 |
 | FR-PLAN-03 | 自定义代理（设置 → Agents）：独立系统提示词 + 任意工具子集 + 图标颜色；持久化于 `Termior-ai-agents.json`；Composer 代理选择器切换；每个会话记住创建时的活动代理 | P1 |
 | FR-PLAN-04 | Plan mode 与子代理可组合：计划中列出子代理调用步骤，可在 spawn 前拒绝 | P1 |
+
+**设置交互**：Agents 优先展示自定义代理，通过名称直接选择；工具以可读名称分组勾选，提供只读预设与清空操作，明确空工具集仅支持对话。图标和颜色折叠为外观选项，删除需在界面内确认。Claude Code 终端 hooks 独立于内置代理配置。Models / Agents 输入字段支持 Tab / Shift+Tab 顺序切换。
 
 ### 6.12 会话与记忆（FR-SESS）
 
@@ -366,6 +371,9 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | FR-SET-01 | 六页签设置窗口：General（shell、字体、autocomplete、自定义指令、dotfiles、WebGL→GPU 渲染等价开关）、Models、Themes、Shortcuts、Agents、About（版本、数据迁移错误展示） | P0 |
 | FR-SET-02 | 所有快捷键可重绑定；GPUI keymap + context 系统实现，冲突检测 | P1（P0 固定默认键位） |
 | FR-SET-03 | 默认键位采用跨平台桌面应用的通用习惯（见附录 A），macOS 使用 Cmd，Win/Linux 映射为 Ctrl | P0 |
+| FR-SET-04 | 自动更新默认开启：启动后延迟 15 秒及每 6 小时从 `willmove/termior` GitHub Releases 检查稳定版，按 SemVer 仅接受更高版本；自动下载当前 OS/CPU 的安装包，校验 SHA-256；About 提供开关、手动检查、状态/错误、安装与发行说明入口，主窗口提示已下载更新。用户点击后交给系统安装器，绝不自动关闭终端或重启应用 | P1 |
+
+**更新边界**：Windows 使用 Inno Setup，macOS 使用 DMG，Linux 使用 DEB。安装器的权限确认及最终安装步骤由用户完成；便携版、不支持 DEB 的 Linux 或缺失对应 CPU 产物时可转到发行下载页手动更新。更新只访问固定 GitHub 仓库与其 HTTPS 资产 CDN，不携带 Provider 凭据或遥测。此为应用维护通道，不向 Agent 工具暴露安装能力。校验和防止损坏，不等同于代码签名；现有发行物仍未签名。关闭自动更新后不再开始后台检查/下载，已在途请求可能完成但其结果作废。测试/基准启动不执行自动更新。
 
 ### 6.16 可靠任务运行时（FR-ARUN）
 
@@ -499,7 +507,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | NFR-06 | 稳定性 | PTY reader panic 不拖垮进程（会话标记为死亡可重开）；会话/设置数据在崩溃后完好（原子写保证） |
 | NFR-07 | 输入法 | 终端/编辑器/Composer 全面支持 IME 预编辑（中文输入一等公民） |
 | NFR-08 | 隐私 | 无遥测、无账号、离线可用（本地 Provider 路径全功能） |
-| NFR-09 | 许可 | 项目以 Apache-2.0 发布；所有第三方 crate、图标、字体与其他打包资产均需核验许可并保留必要声明 |
+| NFR-09 | 许可 | 项目以 MIT 发布；所有第三方 crate、图标、字体与其他打包资产均需核验许可并保留必要声明 |
 | NFR-10 | 可测性 | 网格解析、diff/hunk、graph lane、deny-list、SSRF 判定、hooks 安装器均为纯函数/独立模块，单测覆盖率 ≥ 80% |
 | NFR-11 | UI 依赖预算 | 不引入 gpui-component（ADR 0003）；新增 UI 依赖须说明 Release 体积、冷启动与空闲 RSS 影响，并由 NFR-01/04/05 门禁把关；空闲零重绘见 NFR-03 |
 | NFR-12 | Agent 可靠性 | 固定评测任务集的工具调用不丢失、不重复；所有完成状态均能追溯至验证证据或 unverified 原因 |

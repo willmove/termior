@@ -69,7 +69,7 @@ spec §3.1 已把"token → 控件样式映射"的职责写给 `termior-ui-kit`�
 
 ### D5 — 图标走内嵌 SVG + GPUI `svg()`
 
-GPUI 的 `svg()` 元素把 SVG 作为单色遮罩渲染，颜色跟随 `text_color`，能直接消费现有 palette。Zed 本身即此路径，踩坑成本低。选用 Lucide 子集（ISC 许可，与 Apache-2.0 兼容），约 30–40 个图标、20–40KB，对 60MB 二进制预算无影响。
+GPUI 的 `svg()` 元素把 SVG 作为单色遮罩渲染，颜色跟随 `text_color`，能直接消费现有 palette。Zed 本身即此路径，踩坑成本低。选用 Lucide 子集（ISC 许可，与 MIT 兼容），约 30–40 个图标、20–40KB，对 60MB 二进制预算无影响。
 
 需要新增 `AssetSource` 实现（`Application::new().with_assets(...)`）——当前 `assets/` 下只有应用图标（`.ico` / `.icns` / `.png`），代码里没有任何资源加载设施。
 

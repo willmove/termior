@@ -37,7 +37,6 @@ enum EditField {
     BackgroundBlur,
     AgentName,
     AgentPrompt,
-    AgentTools,
     AgentIcon,
     AgentColor,
 }
@@ -53,6 +52,7 @@ enum SelectMenu {
     EditorTheme,
     Appearance,
     ProviderProfile,
+    AgentProfile,
 }
 
 pub struct SettingsView {
@@ -81,6 +81,10 @@ pub struct SettingsView {
     credential_present: bool,
     /// 已输入但尚未写入钥匙串的 API key（需显式 Save API key）。
     pending_api_key: Option<String>,
+    credential_drafts: std::collections::HashMap<String, String>,
+    agent_appearance_open: bool,
+    confirm_agent_removal: bool,
+    connection_check: Option<String>,
     capture_shortcut: Option<KeyAction>,
     themes: ThemeLibrary,
     agents: AgentDefinitionStore,
@@ -100,6 +104,7 @@ pub struct SettingsView {
     save_generation: u64,
     /// `commit_edit` 改了 settings 后置位，由调用方 `schedule_save`。
     settings_dirty: bool,
+    _updater_subscription: gpui::Subscription,
 }
 
 impl SettingsView {
@@ -120,6 +125,7 @@ impl SettingsView {
             .and_then(|dir| DataFiles::new(dir).agents().load().ok())
             .unwrap_or_default();
         let mut view = Self {
+            _updater_subscription: cx.observe(&crate::updater::entity(cx), |_, _, cx| cx.notify()),
             page: SettingsPage::General,
             settings,
             migration_error,
@@ -138,6 +144,10 @@ impl SettingsView {
             ime_anchor: crate::ime_anchor::ImeAnchor::new(),
             credential_present: false,
             pending_api_key: None,
+            credential_drafts: Default::default(),
+            agent_appearance_open: false,
+            confirm_agent_removal: false,
+            connection_check: None,
             capture_shortcut: None,
             themes,
             agents,
@@ -159,7 +169,13 @@ impl SettingsView {
         self.commit_edit();
         self.schedule_save_if_dirty(cx);
         self.page = page;
+        self.select_menu = None;
+        self.confirm_agent_removal = false;
         cx.notify();
+    }
+
+    pub(crate) fn show_about(&mut self, cx: &mut Context<Self>) {
+        self.set_page(SettingsPage::About, cx);
     }
 
     fn page_label(page: SettingsPage) -> &'static str {
@@ -421,7 +437,6 @@ impl SettingsView {
                 .agent()
                 .map(|a| a.system_prompt.clone())
                 .unwrap_or_default(),
-            EditField::AgentTools => self.agent().map(|a| a.tools.join(", ")).unwrap_or_default(),
             EditField::AgentIcon => self.agent().map(|a| a.icon.clone()).unwrap_or_default(),
             EditField::AgentColor => self.agent().map(|a| a.color.clone()).unwrap_or_default(),
         }
@@ -499,17 +514,6 @@ impl SettingsView {
             EditField::AgentPrompt => {
                 if let Some(agent) = self.agent_mut() {
                     agent.system_prompt = value;
-                }
-                Ok(())
-            }
-            EditField::AgentTools => {
-                if let Some(agent) = self.agent_mut() {
-                    agent.tools = value
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|tool| !tool.is_empty())
-                        .map(str::to_owned)
-                        .collect();
                 }
                 Ok(())
             }
@@ -681,9 +685,16 @@ impl SettingsView {
     fn select_profile(&mut self, index: usize, cx: &mut Context<Self>) {
         self.commit_edit();
         self.schedule_save_if_dirty(cx);
-        if index < self.settings.models.profiles.len() {
-            self.profile_index = index;
+        if index >= self.settings.models.profiles.len() {
+            return;
         }
+        if let (Some(key), Some(draft)) = (self.profile_key(), self.pending_api_key.take()) {
+            self.credential_drafts.insert(key, draft);
+        }
+        self.profile_index = index;
+        self.pending_api_key = self
+            .profile_key()
+            .and_then(|key| self.credential_drafts.remove(&key));
         self.select_menu = None;
         self.refresh_credential_state();
         self.status.clear();
@@ -727,12 +738,23 @@ impl SettingsView {
 
     fn ping_provider(&mut self, cx: &mut Context<Self>) {
         self.commit_edit();
+        self.schedule_save_if_dirty(cx);
+        if self.pending_api_key.is_some() {
+            self.status = "Save API key before testing this connection.".into();
+            cx.notify();
+            return;
+        }
+        if self.connection_check.is_some() {
+            return;
+        }
         let Some(profile) = self.profile().cloned() else {
             return;
         };
         let api_key = self
             .profile_key()
             .and_then(|key| KeyringSecretStore::new().get(&key).ok().flatten());
+        let profile_id = profile.id.clone();
+        self.connection_check = Some(profile_id.clone());
         self.status = "Checking provider…".into();
         let task = cx.spawn(async move |view, cx| {
             let result = cx
@@ -744,6 +766,11 @@ impl SettingsView {
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
+                view.connection_check = None;
+                if view.profile().map(|p| &p.id) != Some(&profile_id) {
+                    cx.notify();
+                    return;
+                }
                 view.status = match result {
                     Ok(duration) => format!("Reachable in {} ms", duration.as_millis()),
                     Err(error) => format!("Provider check failed: {error}"),
@@ -931,6 +958,9 @@ impl SettingsView {
     }
 
     fn new_agent(&mut self, cx: &mut Context<Self>) {
+        self.commit_edit();
+        self.confirm_agent_removal = false;
+        self.select_menu = None;
         let next = (1..)
             .find(|index| {
                 !self
@@ -953,19 +983,48 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn cycle_agent(&mut self, delta: isize, cx: &mut Context<Self>) {
+    fn select_agent(&mut self, index: usize, cx: &mut Context<Self>) {
         self.commit_edit();
         self.schedule_save_if_dirty(cx);
-        let len = self.agents.agents.len();
-        if len > 0 {
-            self.agent_index =
-                (self.agent_index as isize + delta).rem_euclid(len as isize) as usize;
+        if index < self.agents.agents.len() {
+            self.agent_index = index;
         }
+        self.confirm_agent_removal = false;
+        self.select_menu = None;
+        cx.notify();
+    }
+
+    fn toggle_agent_tool(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.commit_edit();
+        if let Some(agent) = self.agent_mut() {
+            if agent.tools.iter().any(|tool| tool == name) {
+                agent.tools.retain(|tool| tool != name);
+            } else {
+                agent.tools.push(name.to_owned());
+            }
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn set_agent_tools(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        self.commit_edit();
+        if let Some(agent) = self.agent_mut() {
+            agent.tools = termior_security::gating::ALL_TOOLS
+                .iter()
+                .filter(|tool| {
+                    read_only && tool.level() == termior_security::gating::ToolLevel::Auto
+                })
+                .map(|tool| tool.name().to_owned())
+                .collect();
+        }
+        self.schedule_save(cx);
         cx.notify();
     }
 
     fn remove_agent(&mut self, cx: &mut Context<Self>) {
         self.commit_edit();
+        self.confirm_agent_removal = false;
         if self.agent_index < self.agents.agents.len() {
             self.agents.agents.remove(self.agent_index);
             self.agent_index = self
@@ -1020,7 +1079,7 @@ impl SettingsView {
     fn handle_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(action) = self.capture_shortcut {
@@ -1104,6 +1163,32 @@ impl SettingsView {
             return;
         }
         let shift = modifiers.shift;
+        if event.keystroke.key == "tab" {
+            let fields: &[EditField] = match self.page {
+                SettingsPage::Models => &[EditField::Model, EditField::BaseUrl, EditField::ApiKey],
+                SettingsPage::Agents if self.agent_appearance_open => &[
+                    EditField::AgentName,
+                    EditField::AgentPrompt,
+                    EditField::AgentIcon,
+                    EditField::AgentColor,
+                ],
+                SettingsPage::Agents => &[EditField::AgentName, EditField::AgentPrompt],
+                _ => &[],
+            };
+            if let Some(index) = fields
+                .iter()
+                .position(|field| Some(*field) == self.edit_field)
+            {
+                let next = if shift {
+                    (index + fields.len() - 1) % fields.len()
+                } else {
+                    (index + 1) % fields.len()
+                };
+                self.begin_edit(fields[next], window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
         let extend = |this: &mut Self, target: usize| {
             this.anchor.get_or_insert(this.cursor);
             this.cursor = target;
@@ -1645,7 +1730,7 @@ impl SettingsView {
                     if p.enabled { "" } else { " (disabled)" }
                 )
             })
-            .unwrap_or_else(|| "Not set — the Agent panel cannot run".into());
+            .unwrap_or_else(|| "Not set — choose a provider".into());
         let completion_profile_label = self
             .settings
             .models
@@ -1660,8 +1745,8 @@ impl SettingsView {
             .gap_6()
             .child(
                 self.section(
-                    "Provider",
-                    "Pick a profile to edit below. Credentials stay in the OS keychain and are never written to settings JSON.",
+                    "1. Choose a provider",
+                    "Connect a model service for the built-in Agent. Changes save automatically; API keys require Save API key.",
                     [div()
                         .flex()
                         .flex_col()
@@ -1691,10 +1776,61 @@ impl SettingsView {
                         .into_any_element()],
                 ),
             )
+            .child(self.section(
+                "2. Configure the model",
+                "Use the model ID from your provider or local model server.",
+                [
+                    self.edit_row(
+                        "Model",
+                        "Provider model identifier used for requests.",
+                        EditField::Model,
+                        cx,
+                    ),
+                    self.edit_row(
+                        "Base URL",
+                        "Keep the preset URL unless using a proxy or your own server. Local servers may use HTTP.",
+                        EditField::BaseUrl,
+                        cx,
+                    ),
+                ],
+            ))
             .child(
                 self.section(
-                    "Default models",
-                    "Which profile the Agent panel (chat) and inline completion use. Setting a default also enables the profile.",
+                    "3. Connect and test",
+                    if profile.local { "API key is optional for this local provider. Start your model server, then test the connection." } else { "Add your provider API key, save it securely, then test the connection." },
+                    [
+                        self.edit_row(
+                            "API key",
+                            "Never written to settings files — stored only in the OS keychain.",
+                            EditField::ApiKey,
+                            cx,
+                        ),
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                Self::button("Save API key", "save-api-key", &self.palette)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.save_api_key(cx)),
+                                    ),
+                            )
+                            .child(
+                                Self::button(if self.connection_check.is_some() { "Testing…" } else { "Test connection" }, "ping-provider", &self.palette)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| this.ping_provider(cx)),
+                                    ),
+                            )
+                            .into_any_element(),
+                    ],
+                ),
+            )
+            .child(
+                self.section(
+                    "4. Choose where to use this model",
+                    "Chat powers the Composer. Completion is configured separately. Choosing a default enables this provider.",
                     [
                         div()
                             .flex()
@@ -1702,7 +1838,7 @@ impl SettingsView {
                             .gap_1()
                             .child(
                                 div().text_sm().child(SharedString::from(format!(
-                                    "Chat (Agent panel): {chat_profile_label}"
+                                    "Chat (Composer): {chat_profile_label}"
                                 ))),
                             )
                             .child(
@@ -1757,57 +1893,6 @@ impl SettingsView {
                                         this.make_active_completion(cx)
                                     }),
                                 ),
-                            )
-                            .into_any_element(),
-                    ],
-                ),
-            )
-            .child(self.section(
-                "Endpoint",
-                "Model id and base URL for the selected provider profile.",
-                [
-                    self.edit_row(
-                        "Model",
-                        "Provider model identifier used for requests.",
-                        EditField::Model,
-                        cx,
-                    ),
-                    self.edit_row(
-                        "Base URL",
-                        "HTTPS endpoint for the provider API.",
-                        EditField::BaseUrl,
-                        cx,
-                    ),
-                ],
-            ))
-            .child(
-                self.section(
-                    "Credentials",
-                    "Saving an API key and testing connectivity require explicit actions.",
-                    [
-                        self.edit_row(
-                            "API key",
-                            "Never written to settings files — stored only in the OS keychain.",
-                            EditField::ApiKey,
-                            cx,
-                        ),
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .child(
-                                Self::button("Save API key", "save-api-key", &self.palette)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.save_api_key(cx)),
-                                    ),
-                            )
-                            .child(
-                                Self::button("Test connection", "ping-provider", &self.palette)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.ping_provider(cx)),
-                                    ),
                             )
                             .into_any_element(),
                     ],
@@ -2198,6 +2283,32 @@ impl SettingsView {
         )
     }
 
+    fn agent_tools(&self, cx: &mut Context<Self>) -> AnyElement {
+        use termior_security::gating::{ToolLevel, ALL_TOOLS};
+        let Some(agent) = self.agent() else {
+            return div().into_any_element();
+        };
+        div().flex().flex_col().gap_2()
+            .child(format!("Tools · {} selected", agent.tools.len()))
+            .child(div().text_xs().text_color(crate::ui::muted(&self.palette))
+                .child("No tools selected means conversation only. Write and command tools follow the approval mode chosen in the Composer."))
+            .child(div().flex().gap_2()
+                .child(Self::button("Read-only preset", "agent-read-only", &self.palette)
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.set_agent_tools(true, cx))))
+                .child(Self::button("Clear all", "agent-no-tools", &self.palette)
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.set_agent_tools(false, cx)))))
+            .child(div().id("agent-tools-list").max_h(px(280.0)).overflow_y_scroll().children([ToolLevel::Auto, ToolLevel::Approval].into_iter().map(|level| {
+                div().flex().flex_col().gap_1()
+                    .child(div().text_sm().child(if level == ToolLevel::Auto { "Read and inspect" } else { "Make changes and run commands" }))
+                    .children(ALL_TOOLS.iter().filter(move |tool| tool.level() == level).map(|tool| {
+                        let name = tool.name();
+                        Self::select_option(tool_label(*tool), SharedString::from(format!("agent-tool-{name}")), agent.tools.iter().any(|t| t == name), &self.palette)
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.toggle_agent_tool(name, cx)))
+                    }))
+            })))
+            .into_any_element()
+    }
+
     fn agents_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let hook_status = termior_hooks::status()
             .map(|status| {
@@ -2208,77 +2319,145 @@ impl SettingsView {
                 }
             })
             .unwrap_or("unavailable");
-        let agent_controls = if self.agents.agents.is_empty() {
-            div().child("No custom agents yet").into_any_element()
-        } else {
+        let agent_controls = if let Some(agent) = self.agent() {
+            let menu_open = self.select_menu == Some(SelectMenu::AgentProfile);
             div()
                 .flex()
                 .flex_col()
-                .gap_2()
-                .child(SharedString::from(format!(
-                    "Custom agent {}/{} · {}",
-                    self.agent_index + 1,
-                    self.agents.agents.len(),
-                    self.agent()
-                        .map(|agent| agent.id.as_str())
-                        .unwrap_or_default()
-                )))
+                .gap_4()
                 .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(
-                            Self::button("‹", "previous-agent", &self.palette).on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.cycle_agent(-1, cx)),
-                            ),
-                        )
-                        .child(
-                            Self::button("›", "next-agent", &self.palette).on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.cycle_agent(1, cx)),
-                            ),
-                        )
-                        .child(
-                            Self::button("Remove", "remove-agent", &self.palette).on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.remove_agent(cx)),
-                            ),
-                        ),
+                    Self::select_button(
+                        "Agent",
+                        agent.name.clone(),
+                        "agent-select",
+                        menu_open,
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_select_menu(SelectMenu::AgentProfile, cx);
+                        }),
+                    ),
                 )
-                .children([
-                    self.edit_row(
-                        "Name",
-                        "Display name in the Composer agent switcher.",
-                        EditField::AgentName,
-                        cx,
+                .when(menu_open, |container| {
+                    container.child(div().flex().flex_col().children(
+                        self.agents.agents.iter().enumerate().map(|(index, agent)| {
+                            Self::select_option(
+                                agent.name.clone(),
+                                SharedString::from(format!("agent-option-{}", agent.id)),
+                                index == self.agent_index,
+                                &self.palette,
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| this.select_agent(index, cx)),
+                            )
+                        }),
+                    ))
+                })
+                .child(self.edit_row(
+                    "Name",
+                    "Shown in the Composer agent selector.",
+                    EditField::AgentName,
+                    cx,
+                ))
+                .child(self.edit_row(
+                    "Instructions",
+                    "Describe the agent's role, workflow and preferred response style.",
+                    EditField::AgentPrompt,
+                    cx,
+                ))
+                .child(self.agent_tools(cx))
+                .child(
+                    Self::button(
+                        if self.agent_appearance_open {
+                            "▾ Appearance"
+                        } else {
+                            "▸ Appearance"
+                        },
+                        "agent-appearance",
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.agent_appearance_open = !this.agent_appearance_open;
+                            cx.notify();
+                        }),
                     ),
-                    self.edit_row(
-                        "System prompt",
-                        "Instructions prepended to every chat with this agent.",
-                        EditField::AgentPrompt,
-                        cx,
+                )
+                .when(self.agent_appearance_open, |container| {
+                    container.children([
+                        self.edit_row(
+                            "Icon",
+                            "Icon key shown next to the agent name.",
+                            EditField::AgentIcon,
+                            cx,
+                        ),
+                        self.edit_row(
+                            "Color",
+                            "Accent color in #RRGGBB format.",
+                            EditField::AgentColor,
+                            cx,
+                        ),
+                    ])
+                })
+                .child(
+                    Self::button("Delete agent…", "remove-agent", &self.palette).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.confirm_agent_removal = true;
+                            cx.notify();
+                        }),
                     ),
-                    self.edit_row(
-                        "Tools",
-                        "Comma-separated tool ids this agent may call.",
-                        EditField::AgentTools,
-                        cx,
-                    ),
-                    self.edit_row(
-                        "Icon",
-                        "Icon key shown next to the agent name.",
-                        EditField::AgentIcon,
-                        cx,
-                    ),
-                    self.edit_row(
-                        "Color",
-                        "Accent color hex for the agent chip.",
-                        EditField::AgentColor,
-                        cx,
-                    ),
-                ])
+                )
+                .when(self.confirm_agent_removal, |container| {
+                    container.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(format!(
+                                "Delete {}? This removes the saved agent profile.",
+                                agent.name
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        Self::button(
+                                            "Delete agent",
+                                            "confirm-remove-agent",
+                                            &self.palette,
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| this.remove_agent(cx)),
+                                        ),
+                                    )
+                                    .child(
+                                        Self::button(
+                                            "Cancel",
+                                            "cancel-remove-agent",
+                                            &self.palette,
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.confirm_agent_removal = false;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    ),
+                            ),
+                    )
+                })
                 .into_any_element()
+        } else {
+            div().text_sm().child("Create your first agent to save a role, instructions and tool permissions. You can then choose it in the Composer.").into_any_element()
         };
         div()
             .flex()
@@ -2286,8 +2465,23 @@ impl SettingsView {
             .gap_6()
             .child(
                 self.section(
-                    "Claude Code hooks",
-                    "Install or remove Claude Code hooks that notify Termior about agent activity.",
+                    "Custom agents",
+                    "Customize the built-in Agent. Models configures its connection; this page defines its role and tools. Changes save automatically.",
+                    [
+                        Self::button("New custom agent", "new-agent", &self.palette)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.new_agent(cx)),
+                            )
+                            .into_any_element(),
+                        agent_controls,
+                    ],
+                ),
+            )
+            .child(
+                self.section(
+                    "Terminal integration · Claude Code",
+                    "Optional: report activity from Claude Code running in a terminal. Independent of custom agents above.",
                     [
                         div()
                             .text_sm()
@@ -2337,21 +2531,47 @@ impl SettingsView {
                     .into_any_element()],
                 ),
             )
-            .child(
-                self.section(
-                    "Custom agents",
-                    "Local agent profiles available in the Composer switcher.",
-                    [
-                        Self::button("New custom agent", "new-agent", &self.palette)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.new_agent(cx)),
-                            )
-                            .into_any_element(),
-                        agent_controls,
-                    ],
-                ),
-            )
+            .into_any_element()
+    }
+
+    fn update_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let updater = crate::updater::entity(cx);
+        let state = updater.read(cx);
+        let ready = state.ready.is_some();
+        let busy = state.busy;
+        let opened = state.installer_opened;
+        div().flex().flex_col().gap_3()
+            .child(Self::button(
+                format!("Automatic updates: {}", on_off(self.settings.automatic_updates)),
+                "automatic-updates", &self.palette,
+            ).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.settings.automatic_updates = !this.settings.automatic_updates;
+                crate::updater::set_enabled(this.settings.automatic_updates, cx);
+                this.schedule_save(cx);
+                cx.notify();
+            })))
+            .child(div().text_sm().child(state.status.clone()))
+            .child(div().text_xs().text_color(crate::ui::muted(&self.palette))
+                .child("Checks stable GitHub releases at startup and every 6 hours, then downloads a verified installer. Installation starts only when you choose it. Portable installs may need the release downloads; Linux requires a DEB installer."))
+            .when(!busy && !opened, |view| view.child(
+                Self::button(if ready { "Install update…" } else { "Check for updates" }, "check-update", &self.palette)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |_, _, _, cx| {
+                        crate::updater::entity(cx).update(cx, |updater, cx| {
+                            if ready { updater.install(cx); } else { updater.check(cx); }
+                        });
+                    }))
+            ))
+            .child(Self::button("Release notes and downloads", "release-downloads", &self.palette)
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.pending_tasks.push(cx.spawn(async move |this, cx| {
+                        let result = cx.background_executor().spawn(async {
+                            termior_platform::open_external(termior_platform::update::RELEASES_URL)
+                        }).await;
+                        if let Err(error) = result {
+                            let _ = this.update(cx, |this, cx| { this.status = error.to_string(); cx.notify(); });
+                        }
+                    }));
+                })))
             .into_any_element()
     }
 
@@ -2370,12 +2590,11 @@ impl SettingsView {
                         .text_sm()
                         .child(format!("Termior {}", env!("CARGO_PKG_VERSION")))
                         .into_any_element(),
+                    self.update_controls(cx),
                     div()
                         .text_sm()
                         .text_color(crate::ui::muted(&self.palette))
-                        .child(
-                            "Apache-2.0 · No account · No telemetry · Offline with local providers",
-                        )
+                        .child("MIT · No account · No telemetry · Offline with local providers")
                         .into_any_element(),
                     div()
                         .text_xs()
@@ -2652,6 +2871,31 @@ impl InputHandler for SettingsInputHandler {
     }
 }
 
+fn tool_label(tool: termior_security::gating::ToolId) -> &'static str {
+    use termior_security::gating::ToolId::*;
+    match tool {
+        ReadFile => "Read files",
+        ListDirectory => "List folders",
+        FsSearch => "Find files",
+        FsGrep => "Search file contents",
+        GetTerminalContext => "Read terminal context",
+        WriteFile => "Write files",
+        CreateDirectory => "Create folders",
+        Rename => "Rename files and folders",
+        Delete => "Delete files and folders",
+        RunCommand => "Run a command",
+        ShellSessionRun => "Run in a persistent shell",
+        ShellBgSpawn => "Start background commands",
+        CommandStatus => "Check command status",
+        CommandReadOutput => "Read command output",
+        CommandWait => "Wait for commands",
+        CommandKill => "Stop commands",
+        CommandClaim => "Take control of commands",
+        CommandWriteInput => "Send input to commands",
+        RunSubagent => "Delegate to subagents",
+    }
+}
+
 fn on_off(value: bool) -> &'static str {
     if value {
         "On"
@@ -2685,6 +2929,7 @@ mod edit_tests {
     #[test]
     fn paste_replaces_selection() {
         let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
         let view = view_with_draft(&mut cx, "abcdef");
         view.update(&mut cx, |view, cx| {
             view.cursor = 2;
@@ -2699,6 +2944,7 @@ mod edit_tests {
     #[test]
     fn paste_inserts_at_cursor_without_selection() {
         let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
         let view = view_with_draft(&mut cx, "abc");
         view.update(&mut cx, |view, cx| {
             view.cursor = 1;
@@ -2712,6 +2958,7 @@ mod edit_tests {
     #[test]
     fn paste_strips_line_breaks_for_single_line_fields() {
         let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
         let view = view_with_draft(&mut cx, "");
         view.update(&mut cx, |view, cx| {
             view.insert_text("sk-\r\n123\n", cx);
@@ -2722,6 +2969,7 @@ mod edit_tests {
     #[test]
     fn collapsed_anchor_does_not_resurrect_selection_after_paste() {
         let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
         let view = view_with_draft(&mut cx, "ab");
         view.update(&mut cx, |view, cx| {
             // Shift+Left 再 Shift+Right 会留下 anchor == cursor 的折叠态。
@@ -2736,6 +2984,7 @@ mod edit_tests {
     #[test]
     fn delete_selection_collapses_cursor_to_start() {
         let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
         let view = view_with_draft(&mut cx, "abcdef");
         view.update(&mut cx, |view, _cx| {
             view.cursor = 2;
@@ -2751,6 +3000,7 @@ mod edit_tests {
     #[test]
     fn select_all_spans_whole_draft() {
         let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
         let view = view_with_draft(&mut cx, "gpt-4o");
         view.update(&mut cx, |view, _cx| {
             view.anchor = Some(0);
@@ -2761,6 +3011,7 @@ mod edit_tests {
     #[test]
     fn double_click_word_range_covers_urls_and_symbols() {
         let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
         let view = view_with_draft(&mut cx, "https://example.com/a b");
         view.update(&mut cx, |view, _cx| {
             // 点击 URL 内部：整段 URL 算一个词。
@@ -2777,6 +3028,7 @@ mod edit_tests {
     #[test]
     fn make_active_chat_enables_profile() {
         let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
         let view = cx.new(|cx| SettingsView::new(Settings::default(), None, None, None, None, cx));
         view.update(&mut cx, |view, cx| {
             assert!(!view.settings.models.profiles[0].enabled);
@@ -2792,6 +3044,7 @@ mod edit_tests {
     #[test]
     fn select_profile_switches_index_and_clamps() {
         let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
         let view = cx.new(|cx| SettingsView::new(Settings::default(), None, None, None, None, cx));
         view.update(&mut cx, |view, cx| {
             view.select_profile(7, cx); // DeepSeek
@@ -2803,10 +3056,90 @@ mod edit_tests {
     }
 
     /// IME 候选窗锚点必须落在编辑字段文本上，且随光标前缀（如 CJK）右移。
+    #[test]
+    fn credential_drafts_stay_with_their_provider() {
+        let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
+        let view = cx.new(|cx| SettingsView::new(Settings::default(), None, None, None, None, cx));
+        view.update(&mut cx, |view, cx| {
+            view.edit_field = Some(EditField::ApiKey);
+            view.draft = "test-only-provider-a".into();
+            view.select_profile(1, cx);
+            assert!(view.pending_api_key.is_none());
+            view.pending_api_key = Some("test-only-provider-b".into());
+            view.select_profile(0, cx);
+            assert_eq!(
+                view.pending_api_key.as_deref(),
+                Some("test-only-provider-a")
+            );
+            view.select_profile(1, cx);
+            assert_eq!(
+                view.pending_api_key.as_deref(),
+                Some("test-only-provider-b")
+            );
+            assert!(!serde_json::to_string(&view.settings)
+                .unwrap()
+                .contains("test-only"));
+        });
+    }
+
+    #[test]
+    fn creating_and_selecting_agents_commits_to_the_original_agent() {
+        let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
+        let view = cx.new(|cx| SettingsView::new(Settings::default(), None, None, None, None, cx));
+        view.update(&mut cx, |view, cx| {
+            view.new_agent(cx);
+            view.edit_field = Some(EditField::AgentName);
+            view.draft = "Reviewer".into();
+            view.new_agent(cx);
+            assert_eq!(view.agents.agents[0].name, "Reviewer");
+            view.edit_field = Some(EditField::AgentName);
+            view.draft = "Writer".into();
+            view.select_agent(0, cx);
+            assert_eq!(view.agents.agents[1].name, "Writer");
+            assert_eq!(view.agent().unwrap().name, "Reviewer");
+        });
+    }
+
+    #[test]
+    fn tool_presets_and_toggles_preserve_permission_boundaries() {
+        use termior_security::gating::{ToolId, ToolLevel};
+        let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
+        let view = cx.new(|cx| SettingsView::new(Settings::default(), None, None, None, None, cx));
+        view.update(&mut cx, |view, cx| {
+            view.new_agent(cx);
+            view.set_agent_tools(true, cx);
+            let tools = &view.agent().unwrap().tools;
+            assert!(!tools.is_empty());
+            assert!(tools
+                .iter()
+                .all(|name| ToolId::from_name(name).unwrap().level() == ToolLevel::Auto));
+            view.toggle_agent_tool("write_file", cx);
+            assert!(view
+                .agent()
+                .unwrap()
+                .tools
+                .iter()
+                .any(|t| t == "write_file"));
+            view.toggle_agent_tool("write_file", cx);
+            assert!(!view
+                .agent()
+                .unwrap()
+                .tools
+                .iter()
+                .any(|t| t == "write_file"));
+            view.set_agent_tools(false, cx);
+            assert!(view.agent().unwrap().tools.is_empty());
+        });
+    }
+
     /// 探针只在编辑中的字段渲染，所以切到 Models 页并把 Model 字段置为编辑态。
     #[test]
     fn ime_anchor_tracks_edit_field_prefix() {
         let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
         let (view, vcx) = cx.add_window_view(|_, cx| {
             let mut view = SettingsView::new(Settings::default(), None, None, None, None, cx);
             view.page = SettingsPage::Models;

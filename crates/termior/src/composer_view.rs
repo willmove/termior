@@ -152,6 +152,7 @@ pub struct ComposerView {
     selected_path_suggestion: usize,
     /// 停靠位置与底部停靠高度，由 WorkspaceView 在恢复/拖拽/切换后同步。
     dock: ComposerDock,
+    fill_workspace: bool,
     panel_height: f32,
     /// 会话消息区的滚动容器；贴底时跟随新输出自动下滚。
     scroll_handle: ScrollHandle,
@@ -230,6 +231,7 @@ impl ComposerView {
             path_suggestions: Vec::new(),
             selected_path_suggestion: 0,
             dock: ComposerDock::Bottom,
+            fill_workspace: false,
             panel_height: termior_ui::DEFAULT_COMPOSER_HEIGHT,
             scroll_handle: ScrollHandle::new(),
             last_context_plan: None,
@@ -1788,7 +1790,8 @@ impl ComposerView {
 
     /// 底部停靠且空对话、无审批/附件时收缩到输入行高度；右侧停靠恒为整栏高度。
     pub fn is_compact(&self) -> bool {
-        self.dock == ComposerDock::Bottom
+        !self.fill_workspace
+            && self.dock == ComposerDock::Bottom
             && self
                 .history
                 .iter()
@@ -1807,6 +1810,13 @@ impl ComposerView {
         if self.dock != dock || self.panel_height != panel_height {
             self.dock = dock;
             self.panel_height = panel_height;
+            cx.notify();
+        }
+    }
+
+    pub fn set_fill_workspace(&mut self, fill: bool, cx: &mut Context<Self>) {
+        if self.fill_workspace != fill {
+            self.fill_workspace = fill;
             cx.notify();
         }
     }
@@ -3094,10 +3104,10 @@ impl gpui::Render for ComposerView {
             .flex_col()
             .relative()
             .overflow_hidden()
-            .when(self.dock == ComposerDock::Right, |root| {
+            .when(self.fill_workspace || self.dock == ComposerDock::Right, |root| {
                 root.w_full().h_full()
             })
-            .when(self.dock == ComposerDock::Bottom, |root| {
+            .when(!self.fill_workspace && self.dock == ComposerDock::Bottom, |root| {
                 root.w_full()
                     .when(compact, |root| root.min_h(px(COMPOSER_COMPACT_HEIGHT)))
                     .when(!compact, |root| root.h(px(self.panel_height)))

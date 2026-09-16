@@ -11,7 +11,16 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $distRoot = Join-Path $repoRoot "dist"
-$artifactName = "termior-$Version-$Platform-x86_64"
+# Build runs natively in release.yml; name artifacts after the actual Rust host.
+$rustHost = (& rustc -vV | Select-String '^host: (.+)$').Matches.Groups[1].Value
+if ($LASTEXITCODE -ne 0 -or $rustHost -notmatch '^(x86_64|aarch64)-') {
+    throw "Unsupported Rust release host: $rustHost"
+}
+$architecture = $Matches[1]
+if ($Platform -eq "windows" -and $architecture -ne "x86_64") {
+    throw "The Windows installer currently supports x86_64 only"
+}
+$artifactName = "termior-$Version-$Platform-$architecture"
 $stage = Join-Path $distRoot $artifactName
 $binaryName = if ($Platform -eq "windows") { "termior.exe" } else { "termior" }
 $binary = Join-Path $repoRoot "target/release/$binaryName"
@@ -139,4 +148,3 @@ switch ($Platform) {
         Assert-SizeAndChecksum -Path $archive -MaxMiB $MaxArchiveMiB
     }
 }
-

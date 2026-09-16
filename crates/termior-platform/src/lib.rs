@@ -4,6 +4,7 @@
 
 mod notification;
 mod open;
+pub mod update;
 
 pub use notification::{
     AgentIndicator, AgentStatus, NativeNotifier, Notification, NotificationContext,

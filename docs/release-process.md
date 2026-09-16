@@ -247,6 +247,14 @@ Confirm that:
 - The curated bilingual notes and the full comparison link are present.
 - The assets include all 12 files: per platform (windows zip + setup.exe, macos tar.gz + dmg,
   linux tar.gz + deb), each with its `.sha256` sidecar.
+- Installer names must match the updater contract: `termior-X.Y.Z-<platform>-<arch>` plus
+  `-setup.exe` (windows), `.dmg` (macos), or `.deb` (linux). `arch` is the actual Rust build
+  architecture (`x86_64` or `aarch64`), not an assumed runner architecture. macOS native
+  ARM runners therefore produce `macos-aarch64` assets. Do not rename them to x86_64.
+- Every installer needs its exact-name `.sha256` sidecar (`<hex SHA-256>  <asset filename>`).
+  The in-app updater refuses missing, malformed, mismatched, or oversized assets, and only
+  consumes stable releases newer than the running application. Test an update from the
+  preceding version on each supported platform before declaring in-app updates verified.
 - The tag workflow succeeded on all three platforms and in the publish job.
 - Local `main`, `origin/main`, the version-bump commit, and the annotated tag resolve to the
   intended release state, and the local worktree is clean.

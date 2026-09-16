@@ -302,6 +302,7 @@ pub struct WorkspaceView {
     /// 标签栏新建下拉的锚点；`None` 表示关闭。
     new_tab_menu: Option<Point<Pixels>>,
     pane_context_menu: Option<PaneContextMenu>,
+    composer_menu_open: bool,
     sidebar_resizing: bool,
     /// Composer 面板拖拽调整尺寸进行中（方向取决于当前停靠位置）。
     composer_resizing: bool,
@@ -581,6 +582,7 @@ impl WorkspaceView {
             explorer_context_menu: None,
             new_tab_menu: None,
             pane_context_menu: None,
+            composer_menu_open: false,
             sidebar_resizing: false,
             composer_resizing: false,
             titlebar_move_armed: false,
@@ -675,6 +677,9 @@ impl WorkspaceView {
             // can abort a GUI-subsystem process if a worker panics.
             return;
         }
+        crate::updater::start(self.settings.automatic_updates, cx);
+        let updater = crate::updater::entity(cx);
+        cx.observe(&updater, |_, _, cx| cx.notify()).detach();
         self.schedule_explorer_scan(self.explorer_requested_root.clone(), cx);
         self.refresh_vcs_data(cx);
         self._background_task = Some(cx.spawn(async move |workspace, cx| loop {
@@ -723,6 +728,8 @@ impl WorkspaceView {
     /// Used by `scripts/settings-close-smoke.ps1`; normal launches never call this method.
     pub(crate) fn start_settings_close_smoke(&self, cx: &mut Context<Self>) {
         let handle = self.open_settings_window(cx);
+        // Exercise the shared updater subscription and About controls before closing.
+        let _ = handle.update(cx, |settings, _, cx| settings.show_about(cx));
         cx.spawn(async move |_, cx| {
             // Let the settings window paint at least once (matches real title-bar close timing).
             cx.background_executor()
@@ -1907,6 +1914,7 @@ impl WorkspaceView {
     }
 
     fn close_chrome_menus(&mut self) {
+        self.composer_menu_open = false;
         self.new_tab_menu = None;
         self.pane_context_menu = None;
         self.explorer_context_menu = None;
@@ -2195,6 +2203,10 @@ impl WorkspaceView {
     }
 
     fn focus_active_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_area_hidden() {
+            window.focus(&self.focus_handle, cx);
+            return;
+        }
         if let Some(focus) = self.active_pane_focus_handle(cx) {
             window.focus(&focus, cx);
         }
@@ -2820,19 +2832,36 @@ impl WorkspaceView {
     /// 快捷键共用；收起时把焦点交还工作区，避免把键盘焦点留在已隐藏的输入框里。
     fn set_composer_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.model.composer_visible = visible;
+        self.persist_workspace();
         if !visible {
             window.focus(&self.focus_handle, cx);
         }
         cx.notify();
     }
 
-    fn toggle_composer(
-        &mut self,
-        _event: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.set_composer_visible(!self.model.composer_visible, window, cx);
+    fn terminal_area_hidden(&self) -> bool {
+        self.model
+            .active_tab()
+            .is_some_and(|tab| tab.kind == TabKind::Terminal && tab.terminal_hidden)
+    }
+
+    fn toggle_terminal_area(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.model.active_tab_mut() else {
+            return;
+        };
+        if tab.kind != TabKind::Terminal {
+            return;
+        }
+        tab.terminal_hidden = !tab.terminal_hidden;
+        self.pane_context_menu = None;
+        self.pane_resizing = None;
+        if self.terminal_area_hidden() {
+            window.focus(&self.focus_handle, cx);
+        } else {
+            self.focus_active_pane(window, cx);
+        }
+        self.persist_workspace();
+        cx.notify();
     }
 
     /// 底部/右侧停靠切换（Composer 面板内按钮触发）。切换后同步面板渲染并立即持久化。
@@ -3206,6 +3235,7 @@ impl WorkspaceView {
     }
 
     fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
+        crate::updater::set_enabled(settings.automatic_updates, cx);
         self.settings = settings;
         if let Some(library) = self.data_dir.as_ref().and_then(|dir| {
             termior_store::DataFiles::new(dir)
@@ -3669,6 +3699,12 @@ impl WorkspaceView {
     }
 
     fn global_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && self.composer_menu_open {
+            self.composer_menu_open = false;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.handle_command_key(event, window, cx) {
             cx.stop_propagation();
             return;
@@ -5543,7 +5579,66 @@ impl gpui::Render for WorkspaceView {
         let input_entity = cx.entity();
         // Composer 停靠区：右侧停靠挂在内容行末尾，底部停靠排在内容行之下；
         // 分隔线由拖拽手柄承担，手柄双击恢复默认尺寸。
-        let composer_section_right = (self.model.composer_visible
+        let terminal_hidden = self.terminal_area_hidden();
+        self.composer.update(cx, |composer, cx| {
+            composer.set_fill_workspace(terminal_hidden, cx)
+        });
+        let composer_menu = self.composer_menu_open.then(|| {
+            menu_panel(&p)
+                .id("composer-layout-menu")
+                .absolute()
+                .right(px(12.0))
+                .bottom(px(STATUS_BAR_HEIGHT + 4.0))
+                .w(px(220.0))
+                .children(
+                    [
+                        (
+                            if self.model.composer_visible {
+                                "Hide Agent (Ctrl+I)"
+                            } else {
+                                "Show Agent (Ctrl+I)"
+                            },
+                            None,
+                        ),
+                        ("Dock Agent to bottom", Some(ComposerDock::Bottom)),
+                        ("Dock Agent to right", Some(ComposerDock::Right)),
+                    ]
+                    .into_iter()
+                    .map(|(label, dock)| {
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .cursor_pointer()
+                            .hover({
+                                let wash = ui::hover_wash(&p);
+                                move |style| style.bg(wash)
+                            })
+                            .child(label)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.composer_menu_open = false;
+                                    if let Some(dock) = dock {
+                                        this.model.composer_dock = dock;
+                                        this.sync_composer_layout(cx);
+                                        this.set_composer_visible(true, window, cx);
+                                    } else {
+                                        this.set_composer_visible(
+                                            !this.model.composer_visible,
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }),
+                            )
+                    }),
+                )
+        });
+        let composer_section_right = (!terminal_hidden
+            && self.model.composer_visible
             && self.model.composer_dock == ComposerDock::Right)
             .then(|| {
                 let wash = ui::hover_wash(&p);
@@ -5575,7 +5670,8 @@ impl gpui::Render for WorkspaceView {
                             .child(self.composer.clone()),
                     )
             });
-        let composer_section_bottom = (self.model.composer_visible
+        let composer_section_bottom = (!terminal_hidden
+            && self.model.composer_visible
             && self.model.composer_dock == ComposerDock::Bottom)
             .then(|| {
                 let wash = ui::hover_wash(&p);
@@ -5618,7 +5714,8 @@ impl gpui::Render for WorkspaceView {
                     let closed_explorer = this.explorer_context_menu.take().is_some();
                     let closed_new_tab = this.new_tab_menu.take().is_some();
                     let closed_pane = this.pane_context_menu.take().is_some();
-                    if closed_explorer || closed_new_tab || closed_pane {
+                    let closed_composer = std::mem::replace(&mut this.composer_menu_open, false);
+                    if closed_explorer || closed_new_tab || closed_pane || closed_composer {
                         cx.notify();
                     }
                 }),
@@ -5760,7 +5857,26 @@ impl gpui::Render for WorkspaceView {
                                         MouseButton::Left,
                                         cx.listener(Self::open_settings),
                                     ),
-                            ),
+                            )
+                            .when(crate::updater::entity(cx).read(cx).ready.is_some(), |bar| {
+                                bar.child(
+                                    ui::button(
+                                        "update-ready",
+                                        "Update available",
+                                        ui::ButtonKind::Subtle,
+                                        &p,
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            let handle = this.open_settings_window(cx);
+                                            let _ = handle.update(cx, |settings, _, cx| {
+                                                settings.show_about(cx)
+                                            });
+                                        }),
+                                    ),
+                                )
+                            }),
                     )
                     .when(draws_own_window_controls(), |bar| {
                         bar.child(window_controls(&p, window.is_maximized()))
@@ -5781,7 +5897,10 @@ impl gpui::Render for WorkspaceView {
                             .flex_1()
                             .min_w(px(0.0))
                             .size_full()
-                            .child(active_content),
+                            .when(!terminal_hidden, |area| area.child(active_content))
+                            .when(terminal_hidden && self.model.composer_visible, |area| {
+                                area.child(self.composer.clone())
+                            }),
                     )
                     .children(composer_section_right),
             )
@@ -5884,61 +6003,59 @@ impl gpui::Render for WorkspaceView {
                                     ),
                                 )
                             })
-                            .child({
-                                // 停靠位置切换的第二入口（主入口在 Agent 面板头），图标指向将要停靠的一侧。
-                                let dock = self.model.composer_dock;
+                            .when(
+                                self.model
+                                    .active_tab()
+                                    .is_some_and(|tab| tab.kind == TabKind::Terminal),
+                                |row| {
+                                    row.child(
+                                        ui::icon_button(
+                                            "terminal-toggle",
+                                            Icon::Terminal,
+                                            if terminal_hidden {
+                                                "Show terminal panes"
+                                            } else {
+                                                "Hide terminal panes"
+                                            },
+                                            &p,
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, window, cx| {
+                                                this.toggle_terminal_area(window, cx);
+                                            }),
+                                        ),
+                                    )
+                                },
+                            )
+                            .child(
                                 ui::icon_button(
-                                    "composer-dock-status",
-                                    dock.toggle_icon(),
-                                    dock.toggle_label(),
+                                    "composer-menu-toggle",
+                                    match self.model.composer_dock {
+                                        ComposerDock::Bottom => Icon::PanelBottom,
+                                        ComposerDock::Right => Icon::PanelRight,
+                                    },
+                                    "Agent panel: visibility and docking",
                                     &p,
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|workspace, _event, _window, cx| {
-                                        workspace.toggle_composer_dock(cx);
+                                    cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        window.focus(&this.focus_handle, cx);
+                                        let open = !this.composer_menu_open;
+                                        this.close_chrome_menus();
+                                        this.composer_menu_open = open;
+                                        cx.notify();
                                     }),
-                                )
-                            })
-                            .child({
-                                // 收起/展开底部 Agent 栏。图标随状态切换，且常驻在状态栏，
-                                // 因此无论 Agent 栏收起还是展开都能再次点到。
-                                let wash = ui::hover_wash(&p);
-                                let tint = gpui_color_alpha(p.foreground, 0.72);
-                                let (composer_glyph, composer_label) =
-                                    if self.model.composer_visible {
-                                        (Icon::ChevronDown, "Collapse Agent Bar  (Ctrl+I)")
-                                    } else {
-                                        (Icon::ChevronUp, "Expand Agent Bar  (Ctrl+I)")
-                                    };
-                                div()
-                                    .id("composer-toggle")
-                                    .aria_label(composer_label)
-                                    .tooltip({
-                                        let palette = p.clone();
-                                        move |_window, cx| {
-                                            Tooltip::view(composer_label, &palette, cx)
-                                        }
-                                    })
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(tokens::space::XS))
-                                    .h(px(tokens::height::REGULAR))
-                                    .px(px(tokens::space::SM))
-                                    .rounded(px(tokens::radius::MD))
-                                    .cursor_pointer()
-                                    .hover(move |style| style.bg(wash))
-                                    .child(ui::icon(composer_glyph, icon_size::SM, tint))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(Self::toggle_composer),
-                                    )
-                            }),
+                                ),
+                            ),
                     ),
             )
             .children(explorer_context_menu)
             .children(new_tab_menu)
-            .children(pane_context_menu);
+            .children(pane_context_menu)
+            .children(composer_menu);
         self.render_window_frame(root, &p, window, cx)
     }
 }

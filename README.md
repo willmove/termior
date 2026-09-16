@@ -6,14 +6,14 @@
 
 > 开源、跨平台、终端优先的 AI 原生开发工作台（ADE）。BYOK、本地优先、无账号、无遥测。
 
-Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、文件浏览器、Git、Web 预览，以及具有工具调用、审批和 AI diff 审阅能力的 Agent。产品与工程规格见 [docs/termior-spec.md](docs/termior-spec.md)。
+Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、文件浏览器、Git、Web 预览，以及具有工具调用、审批、变更审阅与恢复能力的内置/外部 Agent。产品与工程规格见 [docs/termior-spec.md](docs/termior-spec.md)。
 
 ## 核心价值
 
 1. **原生低延迟**：核心 UI 无 JS 运行时与 IPC 序列化边界，终端和编辑器直接使用原生 GPU 渲染，常态目标 60 fps，高刷屏目标 120 fps。
 2. **终端与 AI 深度协同**：真 PTY、实时 cwd/缓冲上下文、工具调用、审批与 hunk 级 diff 审阅集中在同一工作区。
 3. **本地优先与用户掌控**：BYOK、密钥只进系统钥匙串、无遥测、无账号，并支持 LM Studio、MLX、Ollama 等本地推理服务。
-4. **明确的安全边界**：所有触盘、触 shell、触密钥和触网操作统一经过 workspace 授权、审批、deny-list 与 SSRF 策略门控。
+4. **明确的安全边界**：内置 Agent 的触盘、触 shell、触密钥和触网操作统一经过 workspace 授权、审批、deny-list 与 SSRF 策略门控；外部 Agent 则明确显示其后端、执行环境、实际隔离能力与未知项，不把后端自有操作伪装成已受内置门控。
 
 ## 当前桌面里程碑
 
@@ -27,12 +27,15 @@ Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、�
 - Web 预览：localhost URL 检测 + URL 校验 + 系统浏览器打开（不内嵌 WebView，见 [ADR 0002](docs/adr/0002-remove-embedded-webview.md)）；
 - 10 套应用主题、自定义主题模型和全窗背景配置；
 - OpenAI、Anthropic、Gemini、Groq、xAI、Cerebras、OpenRouter、DeepSeek、Mistral、OpenAI-compatible、LM Studio、MLX、Ollama 的真实 HTTP/SSE 适配；
-- OS 钥匙串、会话/项目记忆、文件/图片/剪贴板/`@path` 附件、snippets/TODO、Plan mode、子代理、自定义代理；
-- 真实 Agent 工具执行、审批卡片、命令超时、持久 shell、后台进程，以及 `write_file → AI diff → 逐 hunk 决策 → 原子写` 安全闭环；
+- OS 钥匙串、会话/项目记忆、文件/图片/剪贴板/`@path` 附件、snippets/TODO，以及 Auto/Plan/Yolo 三档提交模式；
+- 可序列化 Task/Turn、预算与取消、真实工具执行、审批卡片、命令超时、持久 shell、后台进程，以及 `write_file → AI diff → 逐 hunk 决策 → 原子写` 安全闭环；
+- 内置 Agent 与 Codex app-server 可在 Composer 中切换；独立 `termior-agent-host` 提供结构化后端契约、Codex/ACP 适配、能力协商和执行环境描述；
+- `AGENTS.md` 分层规则、Context Inspector、Agent Skills、MCP stdio/Streamable HTTP、受限 Hooks、可审阅 Memory、自定义 Agent 与子任务编排；
+- journal/snapshot 恢复、Recovery Center、内容寻址 checkpoint、direct/worktree/sandboxed 执行环境，以及任务树与自动化排队入口；
 - 内置/终端 Agent 统一通知路由：可见时抑制、隐藏时主题 toast、窗口失焦时系统通知，并在 header 铃铛列出当前状态；
 - Claude Code OSC hooks 的安全、幂等安装与卸载。
 
-这仍是阶段性里程碑，不等于整份 spec 已最终验收。尚待继续完善的交互和非功能项记录在 [docs/desktop-milestone.md](docs/desktop-milestone.md)。
+这仍是阶段性里程碑，不等于整份 spec 已最终验收。基础桌面范围见 [docs/desktop-milestone.md](docs/desktop-milestone.md)；Agent A–E 的实现证据与平台 sandbox、远端 MCP OAuth、真实 ACP 客户端和自动化后台执行等边界见 [docs/ai-agent-implementation-status.md](docs/ai-agent-implementation-status.md)。
 
 ## Workspace
 
@@ -40,7 +43,7 @@ Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、�
 crates/
   termior                  GPUI 桌面应用与视图接线
   termior-ui               tab/sidebar/workspace 持久状态
-  termior-ui-kit           pane 布局与共享搜索模型
+  termior-ui-kit           通用控件、pane 布局与共享搜索模型
   termior-terminal         PTY 会话、进程生命周期和字节桥
   termior-terminal-core    OSC、shell integration、搜索
   termior-editor           Rope、tree-sitter、Vim、补全状态
@@ -48,13 +51,15 @@ crates/
   termior-explorer-core    模糊匹配与 glob 纯逻辑
   termior-vcs              Git 状态、diff、历史和远端操作
   termior-preview          localhost 检测与预览状态
-  termior-ai               Provider、Agent、工具、会话和 Composer
+  termior-ai               Provider、任务运行时、工具、上下文与编排
+  termior-agent-host        内置/外部 Agent 后端契约、Codex、ACP 与 MCP
   termior-diff             hunk diff 与接受集应用
   termior-security         授权、deny-list、SSRF、工具门控
-  termior-store            原子 JSON、迁移、设置、键位
+  termior-store            原子 JSON、迁移、设置、任务 journal 与 checkpoint
   termior-theme            中央语义色板与主题库
   termior-hooks            Claude Code hooks
-  termior-platform         系统通知与外部 URL 边界
+  termior-platform         系统通知、外部 URL 与自动更新平台边界
+  termior-bench            冷启动、内存、帧率与 PTY 吞吐门禁
 ```
 
 ## 构建与验证
@@ -63,14 +68,20 @@ crates/
 
 ### 验证
 
+以下主要命令与 CI 的 core/desktop 分工保持一致：
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-cargo build --workspace --release
+cargo clippy --workspace --all-targets --exclude termior -- -D warnings
+cargo test --workspace --exclude termior --all-targets
+cargo test -p termior-ui-kit --no-default-features
+cargo check -p termior
+cargo clippy -p termior --all-targets -- -D warnings
+cargo test -p termior --all-targets
+cargo build -p termior --release
 cargo llvm-cov --workspace --exclude termior --tests --fail-under-lines 80
 cargo bench -p termior-editor --bench large_file -- --quick
+cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
 应用图标以 `assets/termior-logo.svg` 为唯一源文件。修改 SVG 后，使用 Node.js 22+
@@ -94,6 +105,19 @@ Release 体积主要来自 GPUI 原生渲染栈、终端/VTE、按语言引入�
 
 Provider 的 endpoint、模型和启用状态保存在 `Termior-settings.json`；API key 只通过设置窗口写入 OS 钥匙串，绝不会序列化进设置或会话文件。
 
+### 自动更新
+
+设置 → **About** 提供自动更新开关（默认开启）、手动检查和发行说明入口。应用在启动
+15 秒后、此后每 6 小时检查 GitHub 稳定版；发现新版本时按系统和 CPU 架构下载安装包，
+并核验 SHA-256。下载完成后标题栏显示 **Update available**，点击进入 About，选择
+**Install update…** 打开系统安装程序。请先结束终端任务，再关闭应用完成安装；更新器
+不会自动关闭应用或终端。关闭自动更新后仍可手动检查。
+
+Windows 使用 Inno Setup，macOS 打开 DMG 后拖拽替换应用，Linux 使用 DEB 安装器。
+便携版、不支持 DEB 的发行版、缺少对应架构安装包时，请使用发行下载页手动更新。
+网络或校验失败会显示错误并保留当前版本；交给系统安装器的文件保留在系统临时目录，
+安装完成后可删除。校验和只用于检查文件完整性；当前 Windows 与 macOS 安装包尚未签名。
+
 ## 隐私与安全
 
 - 无遥测、无账号、无自动上传；
@@ -104,5 +128,6 @@ Provider 的 endpoint、模型和启用状态保存在 `Termior-settings.json`�
 
 ## 许可
 
-Apache License 2.0。第三方依赖许可由 `cargo deny --exclude termior check` 审计；
-GPUI 上游依赖树另行核验。
+项目本身采用 [MIT License](LICENSE)。第三方依赖许可由
+`cargo deny --exclude termior check` 审计；[LICENSE-APACHE](LICENSE-APACHE) 仅为 vendored
+`gpui_windows` 保留其上游 Apache-2.0 条款，GPUI 上游依赖树另行核验。

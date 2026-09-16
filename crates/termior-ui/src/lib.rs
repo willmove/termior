@@ -38,6 +38,9 @@ pub struct TabState {
     /// Private terminal tabs do not inherit the active tab's cwd or application environment.
     #[serde(default)]
     pub private_terminal: bool,
+    /// Hide this terminal tab's pane area without stopping its sessions.
+    #[serde(default)]
+    pub terminal_hidden: bool,
     pub layout: PaneLayout,
     /// View owners increment this for meaningful state changes; tab switching never does.
     pub state_generation: u64,
@@ -204,6 +207,7 @@ impl WorkspaceState {
             project_dir,
             resource: None,
             private_terminal: kind == TabKind::Terminal && private,
+            terminal_hidden: false,
             layout: PaneLayout::new(),
             state_generation: 0,
         });
@@ -500,6 +504,28 @@ mod tests {
 
         assert_eq!(removed.len(), 2);
         assert_eq!(ws.active_tab().unwrap().layout.panes(), vec![second]);
+    }
+
+    #[test]
+    fn terminal_visibility_roundtrips_per_tab_and_preserves_layout() {
+        let mut ws = WorkspaceState::new("/workspace");
+        let first = ws.new_tab(TabKind::Terminal, "one", false);
+        ws.split_active(SplitDirection::Right).unwrap();
+        let layout = ws.active_tab().unwrap().layout.clone();
+        ws.active_tab_mut().unwrap().terminal_hidden = true;
+        ws.new_tab(TabKind::Terminal, "two", false);
+        assert!(!ws.active_tab().unwrap().terminal_hidden);
+        let mut restored: WorkspaceState =
+            serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        restored.switch_to(first).unwrap();
+        assert!(restored.active_tab().unwrap().terminal_hidden);
+        assert_eq!(restored.active_tab().unwrap().layout, layout);
+        let mut legacy = serde_json::to_value(&restored).unwrap();
+        for tab in legacy["tabs"].as_array_mut().unwrap() {
+            tab.as_object_mut().unwrap().remove("terminal_hidden");
+        }
+        let legacy: WorkspaceState = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.tabs.iter().all(|tab| !tab.terminal_hidden));
     }
 
     #[test]
