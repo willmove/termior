@@ -5858,7 +5858,7 @@ impl gpui::Render for WorkspaceView {
                                         cx.listener(Self::open_settings),
                                     ),
                             )
-                            .when(crate::updater::entity(cx).read(cx).ready.is_some(), |bar| {
+                            .when(crate::updater::ready(cx), |bar| {
                                 bar.child(
                                     ui::button(
                                         "update-ready",

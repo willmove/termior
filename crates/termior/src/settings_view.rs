@@ -116,6 +116,7 @@ impl SettingsView {
         on_theme_preview: Option<ThemePreviewCallback>,
         cx: &mut Context<Self>,
     ) -> Self {
+        crate::updater::init(cx);
         let themes = data_dir
             .as_ref()
             .and_then(|dir| DataFiles::new(dir).themes().load().ok())

@@ -21,6 +21,11 @@ pub fn entity(cx: &App) -> Entity<Updater> {
     cx.global::<GlobalUpdater>().0.clone()
 }
 
+pub fn ready(cx: &App) -> bool {
+    cx.try_global::<GlobalUpdater>()
+        .is_some_and(|updater| updater.0.read(cx).ready.is_some())
+}
+
 pub fn init(cx: &mut App) {
     if cx.has_global::<GlobalUpdater>() {
         return;
@@ -39,6 +44,7 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn start(enabled: bool, cx: &mut App) {
+    init(cx);
     entity(cx).update(cx, |this, cx| {
         this.enabled = enabled;
         if this.timer.is_some() {
@@ -68,6 +74,7 @@ pub fn start(enabled: bool, cx: &mut App) {
 }
 
 pub fn set_enabled(enabled: bool, cx: &mut App) {
+    init(cx);
     entity(cx).update(cx, |this, cx| {
         if this.enabled == enabled {
             return;

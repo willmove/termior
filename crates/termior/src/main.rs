@@ -52,7 +52,6 @@ fn main() {
     application()
         .with_assets(termior_ui_kit::IconAssets)
         .run(move |cx: &mut App| {
-            updater::init(cx);
             // 必须在建窗前解析：GPUI 找不到 family 时会静默回退到比例字体，
             // 终端网格宽和字形 advance 就会对不上（见 monospace_font 模块注释）。
             let text_system = cx.text_system().clone();
