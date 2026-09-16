@@ -536,6 +536,57 @@ impl TerminalView {
         cx.notify();
     }
 
+    pub fn has_selection(&self) -> bool {
+        self.term
+            .selection
+            .as_ref()
+            .is_some_and(|selection| !selection.is_empty())
+    }
+
+    pub fn copy_selection(&self, cx: &mut Context<Self>) {
+        if let Some(text) = self.term.selection_to_string() {
+            // Key listeners run inside this entity's update; defer the clipboard
+            // access so Windows clipboard message pumping cannot re-enter while
+            // the RefCell is borrowed (same hazard as in handle_terminal_event).
+            cx.defer(move |cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
+        }
+    }
+
+    pub fn paste_clipboard(&self, cx: &mut Context<Self>) {
+        let mode = *self.term.mode();
+        let writer = self.bridge.writer();
+        let command_service = self.command_service.clone();
+        let command_session_id = self.command_session_id.clone();
+        // Same deferral as the copy path above.
+        cx.defer(move |cx| {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let bytes = encode_paste(&text, mode);
+                if let Err(error) = write_user_input(
+                    &command_service,
+                    command_session_id.as_ref(),
+                    &writer,
+                    &bytes,
+                ) {
+                    log::warn!("PTY paste error: {error}");
+                }
+            }
+        });
+    }
+
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        let mut selection = Selection::new(
+            SelectionType::Simple,
+            TerminalPoint::new(self.term.topmost_line(), Column(0)),
+            Side::Left,
+        );
+        selection.update(
+            TerminalPoint::new(self.term.bottommost_line(), self.term.last_column()),
+            Side::Right,
+        );
+        self.term.selection = Some(selection);
+        cx.notify();
+    }
+
     pub fn open_search(&mut self, cx: &mut Context<Self>) {
         self.search_overlay.open();
         self.update_search();
@@ -585,33 +636,11 @@ impl TerminalView {
             return;
         }
         if is_copy_shortcut(&ev.keystroke) {
-            if let Some(text) = self.term.selection_to_string() {
-                // Key listeners run inside this entity's update; defer the clipboard
-                // access so Windows clipboard message pumping cannot re-enter while
-                // the RefCell is borrowed (same hazard as in handle_terminal_event).
-                cx.defer(move |cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
-            }
+            self.copy_selection(cx);
             return;
         }
         if is_paste_shortcut(&ev.keystroke) {
-            let mode = *self.term.mode();
-            let writer = self.bridge.writer();
-            let command_service = self.command_service.clone();
-            let command_session_id = self.command_session_id.clone();
-            // Same deferral as the copy path above.
-            cx.defer(move |cx| {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    let bytes = encode_paste(&text, mode);
-                    if let Err(error) = write_user_input(
-                        &command_service,
-                        command_session_id.as_ref(),
-                        &writer,
-                        &bytes,
-                    ) {
-                        log::warn!("PTY paste error: {error}");
-                    }
-                }
-            });
+            self.paste_clipboard(cx);
             return;
         }
         let bytes = keystroke_to_pty_bytes(&ev.keystroke, *self.term.mode());
@@ -707,6 +736,10 @@ impl TerminalView {
                 if let Some(report) = mouse_report(point, button, true, event.modifiers, mode) {
                     let _ = self.write_input(&report);
                 }
+            }
+            // Mouse-aware terminal programs own right-click unless Shift is held.
+            if event.button == MouseButton::Right {
+                cx.stop_propagation();
             }
         } else if event.button == MouseButton::Left {
             let selection_type = match event.click_count {

@@ -193,6 +193,7 @@ struct ExplorerContextMenu {
 
 #[derive(Debug, Clone)]
 struct PaneContextMenu {
+    terminal: Option<Entity<TerminalView>>,
     position: Point<Pixels>,
 }
 
@@ -3846,7 +3847,17 @@ impl WorkspaceView {
                             workspace.focus_active_pane(window, cx);
                             workspace.explorer_context_menu = None;
                             workspace.new_tab_menu = None;
+                            let terminal = workspace
+                                .tabs
+                                .iter()
+                                .find(|tab| Some(tab.id) == workspace.model.active)
+                                .and_then(|tab| tab.panes.get(&pane_id))
+                                .and_then(|pane| match pane {
+                                    PaneContent::Terminal(terminal) => Some(terminal.clone()),
+                                    _ => None,
+                                });
                             workspace.pane_context_menu = Some(PaneContextMenu {
+                                terminal,
                                 position: event.position,
                             });
                             cx.notify();
@@ -5435,6 +5446,47 @@ impl gpui::Render for WorkspaceView {
                 menu_panel(&p)
                     .id("pane-context-menu")
                     .w(px(240.0))
+                    .when_some(menu.terminal, |panel, terminal| {
+                        let can_copy = terminal.read(cx).has_selection();
+                        panel
+                            .child(terminal_menu_item(
+                                "复制",
+                                "terminal-copy",
+                                can_copy,
+                                TerminalMenuAction::Copy,
+                                terminal.clone(),
+                                &p,
+                                cx,
+                            ))
+                            .child(terminal_menu_item(
+                                "粘贴",
+                                "terminal-paste",
+                                true,
+                                TerminalMenuAction::Paste,
+                                terminal.clone(),
+                                &p,
+                                cx,
+                            ))
+                            .child(terminal_menu_item(
+                                "全选",
+                                "terminal-select-all",
+                                true,
+                                TerminalMenuAction::SelectAll,
+                                terminal.clone(),
+                                &p,
+                                cx,
+                            ))
+                            .child(terminal_menu_item(
+                                "查找…",
+                                "terminal-find",
+                                true,
+                                TerminalMenuAction::Find,
+                                terminal,
+                                &p,
+                                cx,
+                            ))
+                            .child(menu_separator(&p))
+                    })
                     .child(split_menu_item(
                         "Split right",
                         "pane-menu-split-right",
@@ -6337,6 +6389,69 @@ fn new_tab_menu_item(
                         this.handle_new_tab_action(action, window, cx);
                     }),
                 )
+        })
+}
+
+#[derive(Clone, Copy)]
+enum TerminalMenuAction {
+    Copy,
+    Paste,
+    SelectAll,
+    Find,
+}
+
+fn terminal_menu_item(
+    label: &'static str,
+    id: &'static str,
+    enabled: bool,
+    action: TerminalMenuAction,
+    terminal: Entity<TerminalView>,
+    p: &ResolvedPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> impl IntoElement {
+    let hover_bg = ui::hover_wash(p);
+    let focus_ring = ui::focus_ring(p);
+    let activate =
+        move |this: &mut WorkspaceView, window: &mut Window, cx: &mut Context<WorkspaceView>| {
+            cx.stop_propagation();
+            this.pane_context_menu = None;
+            terminal.update(cx, |view, cx| {
+                window.focus(&view.focus_handle(cx), cx);
+                match action {
+                    TerminalMenuAction::Copy => view.copy_selection(cx),
+                    TerminalMenuAction::Paste => view.paste_clipboard(cx),
+                    TerminalMenuAction::SelectAll => view.select_all(cx),
+                    TerminalMenuAction::Find => view.open_search(cx),
+                }
+            });
+            cx.notify();
+        };
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .text_xs()
+        .opacity(if enabled { 1.0 } else { 0.45 })
+        .focusable()
+        .tab_stop(enabled)
+        .role(Role::Button)
+        .aria_label(label)
+        .focus_visible(move |style| style.border_1().border_color(focus_ring))
+        .child(label)
+        .when(enabled, |item| {
+            let click = activate.clone();
+            item.cursor_pointer()
+                .hover(move |style| style.bg(hover_bg))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| click(this, window, cx)),
+                )
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "return" | "space") {
+                        activate(this, window, cx);
+                    }
+                }))
         })
 }
 
