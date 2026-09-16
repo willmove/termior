@@ -4745,9 +4745,15 @@ impl gpui::Render for WorkspaceView {
             .model
             .tabs
             .iter()
-            .map(|tab| {
+            .enumerate()
+            .map(|(index, tab)| {
                 let id = tab.id;
                 let selected = active == Some(id);
+                let next_selected = self
+                    .model
+                    .tabs
+                    .get(index + 1)
+                    .is_some_and(|next| active == Some(next.id));
                 let close_hover = ui::hover_wash(&p);
                 div()
                     .id(SharedString::from(format!("tab-{}", id.0)))
@@ -4763,6 +4769,8 @@ impl gpui::Render for WorkspaceView {
                     .items_center()
                     .gap_1()
                     .cursor_pointer()
+                    .rounded_tl(px(tokens::radius::MD))
+                    .rounded_tr(px(tokens::radius::MD))
                     // 激活 tab 与下方内容区同色（连成一体），非激活 tab 沉入标题栏底色。
                     .bg(if selected {
                         gpui_color(p.background)
@@ -4777,27 +4785,31 @@ impl gpui::Render for WorkspaceView {
                     .when(!selected, |d| {
                         d.hover(move |style| style.bg(gpui_color(p.elevated)))
                     })
-                    // 激活 tab 顶部 accent 条 + tab 间细分隔线，划清每个 tab 的边界。
+                    // 高亮线避开顶部圆角，底部保持直角以衔接内容区。
                     .when(selected, |d| {
                         d.child(
                             div()
                                 .absolute()
                                 .top_0()
-                                .left_0()
-                                .right_0()
+                                .left(px(tokens::radius::MD))
+                                .right(px(tokens::radius::MD))
                                 .h(px(2.0))
+                                .rounded(px(1.0))
                                 .bg(gpui_color(p.accent)),
                         )
                     })
-                    .child(
-                        div()
-                            .absolute()
-                            .right_0()
-                            .top(px(10.0))
-                            .bottom(px(10.0))
-                            .w(px(1.0))
-                            .bg(gpui_color_alpha(p.foreground, 0.12)),
-                    )
+                    // 激活 tab 两侧不画分隔线，避免边缘出现一像素的凹口。
+                    .when(!selected && !next_selected, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .right_0()
+                                .top(px(10.0))
+                                .bottom(px(10.0))
+                                .w(px(1.0))
+                                .bg(gpui_color_alpha(p.foreground, 0.12)),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
