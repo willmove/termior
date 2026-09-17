@@ -115,6 +115,13 @@ class Sftp(paramiko.SFTPServerInterface):
         except OSError as e:
             return paramiko.SFTPServer.convert_errno(e.errno)
 
+    def rmdir(self, name):
+        try:
+            self.path(name).rmdir()
+            return paramiko.SFTP_OK
+        except OSError as e:
+            return paramiko.SFTPServer.convert_errno(e.errno)
+
     def rename(self, old, new):
         try:
             self.path(old).rename(self.path(new))

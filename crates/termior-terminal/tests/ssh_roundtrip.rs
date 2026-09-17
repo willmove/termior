@@ -114,6 +114,44 @@ fn ssh_and_sftp_real_roundtrip() {
         known_hosts_file: dir.path().join("known_hosts").display().to_string(),
         ..Profile::default()
     };
+    // The same production OpenSSH batch service powers the active-tab Remote
+    // Explorer. Exercise its structured list/mutate path against the fixture,
+    // including names that must never be routed through a remote shell.
+    std::fs::write(dir.path().join("remote/existing file.txt"), b"existing").unwrap();
+    let listing = termior_ssh::sftp::list(&profile, "/").unwrap();
+    assert_eq!(listing.cwd, "/");
+    assert!(listing
+        .entries
+        .iter()
+        .any(|entry| entry.name == "existing file.txt" && !entry.is_dir));
+    for operation in [
+        termior_ssh::sftp::Operation::CreateDirectory {
+            path: "/远程 folder".into(),
+        },
+        termior_ssh::sftp::Operation::CreateFile {
+            path: "/远程 folder/[draft] file.txt".into(),
+        },
+        termior_ssh::sftp::Operation::Rename {
+            from: "/远程 folder/[draft] file.txt".into(),
+            to: "/远程 folder/final file.txt".into(),
+        },
+    ] {
+        termior_ssh::sftp::execute(&profile, &operation).unwrap();
+    }
+    let listing = termior_ssh::sftp::list(&profile, "/远程 folder").unwrap();
+    assert!(listing
+        .entries
+        .iter()
+        .any(|entry| entry.name == "final file.txt"));
+    termior_ssh::sftp::execute(
+        &profile,
+        &termior_ssh::sftp::Operation::RemoveDirectory {
+            path: "/远程 folder".into(),
+            recursive: true,
+        },
+    )
+    .unwrap();
+    assert!(!dir.path().join("remote/远程 folder").exists());
     let (code, output) = run(
         Connection {
             profile: profile.clone(),

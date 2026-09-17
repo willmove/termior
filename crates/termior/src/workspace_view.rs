@@ -23,7 +23,7 @@ use gpui::{
     UTF16Selection, Window, WindowAppearance, WindowBounds, WindowControlArea,
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
     process::Command,
@@ -317,6 +317,8 @@ pub struct WorkspaceView {
     remote_explorer_selected: Option<String>,
     remote_explorer_loading: bool,
     remote_explorer_generation: u64,
+    remote_operation_generation: u64,
+    remote_explorer_dirty: HashSet<TabId>,
     remote_explorer_error: Option<String>,
     remote_pending_name_parent: Option<String>,
     remote_pending_rename_target: Option<String>,
@@ -621,6 +623,8 @@ impl WorkspaceView {
             remote_explorer_selected: None,
             remote_explorer_loading: false,
             remote_explorer_generation: 0,
+            remote_operation_generation: 0,
+            remote_explorer_dirty: HashSet::new(),
             remote_explorer_error: None,
             remote_pending_name_parent: None,
             remote_pending_rename_target: None,
@@ -1038,6 +1042,8 @@ impl WorkspaceView {
         path: String,
         cx: &mut Context<Self>,
     ) {
+        self.remote_explorer_generation = self.remote_explorer_generation.saturating_add(1);
+        let generation = self.remote_explorer_generation;
         if !self.remote_runtime_connected(tab_id) {
             self.remote_explorer_loading = false;
             self.remote_explorer_error =
@@ -1051,8 +1057,6 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
-        self.remote_explorer_generation = self.remote_explorer_generation.saturating_add(1);
-        let generation = self.remote_explorer_generation;
         self.remote_explorer_loading = true;
         self.remote_explorer_error = None;
         self.remote_explorer_selected = None;
@@ -1063,12 +1067,13 @@ impl WorkspaceView {
         cx.spawn(async move |workspace, cx| {
             let result = task.await;
             let _ = workspace.update(cx, |workspace, cx| {
-                if generation != workspace.remote_explorer_generation
-                    || workspace.model.active != Some(tab_id)
-                {
+                if generation != workspace.remote_explorer_generation {
                     return;
                 }
                 workspace.remote_explorer_loading = false;
+                if workspace.model.active != Some(tab_id) {
+                    return;
+                }
                 match result {
                     Ok(listing) => {
                         workspace
@@ -1125,6 +1130,7 @@ impl WorkspaceView {
             return false;
         };
         if !self.remote_runtime_connected(tab_id) {
+            self.remote_explorer_generation = self.remote_explorer_generation.saturating_add(1);
             self.remote_explorer = None;
             self.remote_explorer_error =
                 Some("Reconnect the SSH/SFTP tab to browse remote files.".into());
@@ -1145,6 +1151,13 @@ impl WorkspaceView {
         let Some((tab_id, _, refresh_path)) = self.active_remote_explorer_context() else {
             return;
         };
+        if !self.remote_runtime_connected(tab_id) {
+            self.command_message = Some("Reconnect the SSH/SFTP tab first.".into());
+            cx.notify();
+            return;
+        }
+        self.remote_operation_generation = self.remote_operation_generation.saturating_add(1);
+        let generation = self.remote_operation_generation;
         self.remote_explorer_loading = true;
         self.command_message = Some("Running remote SFTP operation…".into());
         let task_profile = profile.clone();
@@ -1154,16 +1167,23 @@ impl WorkspaceView {
         cx.spawn(async move |workspace, cx| {
             let result = task.await;
             let _ = workspace.update(cx, |workspace, cx| {
-                if workspace.model.active != Some(tab_id) {
+                if generation != workspace.remote_operation_generation {
                     return;
                 }
+                if workspace.model.active != Some(tab_id) {
+                    workspace.remote_explorer_dirty.insert(tab_id);
+                    if let Err(error) = result {
+                        log::warn!("background remote Explorer operation failed: {error}");
+                    }
+                    return;
+                }
+                workspace.remote_explorer_loading = false;
                 match result {
                     Ok(()) => {
                         workspace.command_message = Some(success);
                         workspace.schedule_remote_explorer_scan(tab_id, profile, refresh_path, cx);
                     }
                     Err(error) => {
-                        workspace.remote_explorer_loading = false;
                         workspace.command_message =
                             Some(format!("Remote operation failed: {error}"));
                     }
@@ -2502,6 +2522,7 @@ impl WorkspaceView {
     fn follow_active_tab_project(&mut self, cx: &mut Context<Self>) {
         if let Some((tab_id, profile, path)) = self.active_remote_explorer_context() {
             if !self.remote_runtime_connected(tab_id) {
+                self.remote_explorer_generation = self.remote_explorer_generation.saturating_add(1);
                 self.remote_explorer = None;
                 self.remote_explorer_loading = false;
                 self.remote_explorer_error =
@@ -2513,7 +2534,8 @@ impl WorkspaceView {
                 state.tab_id == tab_id
                     && (state.listing.cwd == path || (path == "." && !state.listing.cwd.is_empty()))
             });
-            if !already_showing {
+            let dirty = self.remote_explorer_dirty.remove(&tab_id);
+            if dirty || !already_showing {
                 self.schedule_remote_explorer_scan(tab_id, profile, path, cx);
             }
             return;
@@ -3068,9 +3090,14 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((_, profile, root)) = self.active_remote_explorer_context() else {
+        let Some((tab_id, profile, root)) = self.active_remote_explorer_context() else {
             return;
         };
+        if !self.remote_runtime_connected(tab_id) {
+            self.command_message = Some("Reconnect the SSH/SFTP tab first.".into());
+            cx.notify();
+            return;
+        }
         let path = target.remote_path().unwrap_or(&root).to_owned();
         match action {
             ExplorerContextAction::CreateFile | ExplorerContextAction::CreateDirectory => {

@@ -241,7 +241,8 @@ pub fn validate_remote_name(name: &str) -> Result<(), crate::Error> {
     if name.is_empty()
         || name != name.trim()
         || matches!(name, "." | "..")
-        || name.contains(['/', '\\'])
+        || name.contains('/')
+        || (cfg!(windows) && name.contains('\\'))
         || name.chars().any(char::is_control)
     {
         return Err(crate::Error::Invalid(
@@ -257,8 +258,8 @@ fn parse_listing(output: &str) -> Result<RemoteListing, Error> {
         .find_map(|line| line.trim().strip_prefix("Remote working directory:"))
         .map(str::trim)
         .filter(|path| !path.is_empty())
-        .ok_or_else(|| Error::InvalidOutput("missing remote working directory".into()))?
-        .to_owned();
+        .ok_or_else(|| Error::InvalidOutput("missing remote working directory".into()))?;
+    let cwd = normalize_remote_display_path(cwd);
     let mut entries = Vec::new();
     for line in output.lines().map(str::trim_end) {
         let line = line.trim_start();
@@ -293,6 +294,30 @@ fn parse_listing(output: &str) -> Result<RemoteListing, Error> {
         _ => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
     });
     Ok(RemoteListing { cwd, entries })
+}
+
+fn normalize_remote_display_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." if !components.is_empty() => {
+                components.pop();
+            }
+            ".." if !absolute => components.push(component),
+            ".." => {}
+            component => components.push(component),
+        }
+    }
+    let joined = components.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else if joined.is_empty() {
+        ".".into()
+    } else {
+        joined
+    }
 }
 
 fn parse_long_listing_line(line: &str) -> Option<(&str, Option<u64>, &str)> {
@@ -360,6 +385,12 @@ lrwxrwxrwx    1 me users           3 Sep 17 10:03 link -> src
     fn long_listing_parser_ignores_diagnostics() {
         assert!(parse_long_listing_line("Connected to example.").is_none());
         assert!(parse_long_listing_line("Couldn't stat remote file").is_none());
+    }
+
+    #[test]
+    fn normalizes_repeated_remote_root_separators() {
+        let listing = parse_listing("Remote working directory: //\n").unwrap();
+        assert_eq!(listing.cwd, "/");
     }
 
     #[test]
