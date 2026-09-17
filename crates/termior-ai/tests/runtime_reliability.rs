@@ -468,7 +468,7 @@ fn pre_tool_hook_replacement_is_revalidated_and_shown_in_the_new_approval() {
         )
         .unwrap();
         (
-            "powershell".to_owned(),
+            "pwsh.exe".to_owned(),
             vec![
                 "-NoProfile".into(),
                 "-File".into(),
