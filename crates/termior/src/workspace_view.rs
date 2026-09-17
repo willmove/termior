@@ -162,6 +162,7 @@ enum CommandMode {
     CreateFile,
     CreateDirectory,
     Rename,
+    Move,
     GitCommit,
     GitCreateBranch,
     GitSwitchBranch,
@@ -177,6 +178,7 @@ impl CommandMode {
             Self::CreateFile => "Create file",
             Self::CreateDirectory => "Create directory",
             Self::Rename => "Rename",
+            Self::Move => "Move remote item",
             Self::GitCommit => "Git commit",
             Self::GitCreateBranch => "Create branch",
             Self::GitSwitchBranch => "Switch branch",
@@ -189,6 +191,12 @@ impl CommandMode {
 struct ExplorerContextMenu {
     target: ExplorerContextTarget,
     position: Point<Pixels>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteExplorerState {
+    tab_id: TabId,
+    listing: termior_ssh::sftp::RemoteListing,
 }
 
 #[derive(Debug, Clone)]
@@ -218,21 +226,38 @@ enum ExplorerContextTarget {
     Workspace,
     Directory(PathBuf),
     File(PathBuf),
+    RemoteWorkspace(String),
+    RemoteDirectory(String),
+    RemoteFile(String),
 }
 
 impl ExplorerContextTarget {
-    fn path(&self, root: &Path) -> PathBuf {
+    fn local_path(&self, root: &Path) -> Option<PathBuf> {
         match self {
-            Self::Workspace => root.to_path_buf(),
-            Self::Directory(path) | Self::File(path) => path.clone(),
+            Self::Workspace => Some(root.to_path_buf()),
+            Self::Directory(path) | Self::File(path) => Some(path.clone()),
+            Self::RemoteWorkspace(_) | Self::RemoteDirectory(_) | Self::RemoteFile(_) => None,
         }
+    }
+
+    fn remote_path(&self) -> Option<&str> {
+        match self {
+            Self::RemoteWorkspace(path) | Self::RemoteDirectory(path) | Self::RemoteFile(path) => {
+                Some(path)
+            }
+            _ => None,
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        self.remote_path().is_some()
     }
 
     fn kind(&self) -> ExplorerContextTargetKind {
         match self {
-            Self::Workspace => ExplorerContextTargetKind::Workspace,
-            Self::Directory(_) => ExplorerContextTargetKind::Directory,
-            Self::File(_) => ExplorerContextTargetKind::File,
+            Self::Workspace | Self::RemoteWorkspace(_) => ExplorerContextTargetKind::Workspace,
+            Self::Directory(_) | Self::RemoteDirectory(_) => ExplorerContextTargetKind::Directory,
+            Self::File(_) | Self::RemoteFile(_) => ExplorerContextTargetKind::File,
         }
     }
 }
@@ -250,11 +275,15 @@ enum ExplorerContextAction {
     CreateFile,
     CreateDirectory,
     Rename,
+    Move,
     Delete,
     Reveal,
     AttachToAi,
     FindFile,
     SearchContent,
+    UploadFile,
+    UploadDirectory,
+    Download,
     Refresh,
 }
 
@@ -282,6 +311,15 @@ pub struct WorkspaceView {
     explorer: Option<FileIndex>,
     explorer_tree: TreeState,
     explorer_watcher: Option<WorkspaceWatcher>,
+    remote_explorer: Option<RemoteExplorerState>,
+    remote_explorer_paths: HashMap<TabId, String>,
+    remote_terminal_cwds: HashMap<TabId, String>,
+    remote_explorer_selected: Option<String>,
+    remote_explorer_loading: bool,
+    remote_explorer_generation: u64,
+    remote_explorer_error: Option<String>,
+    remote_pending_name_parent: Option<String>,
+    remote_pending_rename_target: Option<String>,
     explorer_requested_root: PathBuf,
     /// True while a deep index for the current generation is still outstanding.
     explorer_deep_indexing: bool,
@@ -577,6 +615,15 @@ impl WorkspaceView {
             explorer: None,
             explorer_tree,
             explorer_watcher: None,
+            remote_explorer: None,
+            remote_explorer_paths: HashMap::new(),
+            remote_terminal_cwds: HashMap::new(),
+            remote_explorer_selected: None,
+            remote_explorer_loading: false,
+            remote_explorer_generation: 0,
+            remote_explorer_error: None,
+            remote_pending_name_parent: None,
+            remote_pending_rename_target: None,
             explorer_requested_root: initial_project_root,
             explorer_deep_indexing: true,
             explorer_scan_generation: 0,
@@ -984,6 +1031,149 @@ impl WorkspaceView {
         .detach();
     }
 
+    fn schedule_remote_explorer_scan(
+        &mut self,
+        tab_id: TabId,
+        profile: termior_ssh::Profile,
+        path: String,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.remote_runtime_connected(tab_id) {
+            self.remote_explorer_loading = false;
+            self.remote_explorer_error =
+                Some("Reconnect the SSH/SFTP tab to browse remote files.".into());
+            cx.notify();
+            return;
+        }
+        if termior_ssh::quote_sftp_path(&path).is_err() {
+            self.remote_explorer_loading = false;
+            self.remote_explorer_error = Some("Invalid remote path".into());
+            cx.notify();
+            return;
+        }
+        self.remote_explorer_generation = self.remote_explorer_generation.saturating_add(1);
+        let generation = self.remote_explorer_generation;
+        self.remote_explorer_loading = true;
+        self.remote_explorer_error = None;
+        self.remote_explorer_selected = None;
+        let task_profile = profile.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { termior_ssh::sftp::list(&task_profile, &path) });
+        cx.spawn(async move |workspace, cx| {
+            let result = task.await;
+            let _ = workspace.update(cx, |workspace, cx| {
+                if generation != workspace.remote_explorer_generation
+                    || workspace.model.active != Some(tab_id)
+                {
+                    return;
+                }
+                workspace.remote_explorer_loading = false;
+                match result {
+                    Ok(listing) => {
+                        workspace
+                            .remote_explorer_paths
+                            .insert(tab_id, listing.cwd.clone());
+                        workspace.remote_explorer = Some(RemoteExplorerState {
+                            tab_id,
+                            listing,
+                        });
+                        workspace.remote_explorer_error = None;
+                    }
+                    Err(error) => {
+                        workspace.remote_explorer = None;
+                        workspace.remote_explorer_error = Some(format!(
+                            "Remote Explorer: {error}. Check the SSH/SFTP authentication prompt and connection settings."
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn active_remote_explorer_context(&self) -> Option<(TabId, termior_ssh::Profile, String)> {
+        let tab = self.model.active_tab()?;
+        let remote = tab.remote.as_ref()?;
+        if remote.transfer.is_some() {
+            return None;
+        }
+        let path = self
+            .remote_explorer_paths
+            .get(&tab.id)
+            .or_else(|| self.remote_terminal_cwds.get(&tab.id))
+            .cloned()
+            .unwrap_or_else(|| ".".into());
+        Some((tab.id, remote.profile.clone(), path))
+    }
+
+    fn remote_runtime_connected(&self, tab_id: TabId) -> bool {
+        self.tabs
+            .iter()
+            .find(|runtime| runtime.id == tab_id)
+            .is_some_and(|runtime| {
+                runtime
+                    .panes
+                    .values()
+                    .any(|pane| matches!(pane, PaneContent::Terminal(_)))
+            })
+    }
+
+    fn refresh_remote_explorer(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((tab_id, profile, path)) = self.active_remote_explorer_context() else {
+            return false;
+        };
+        if !self.remote_runtime_connected(tab_id) {
+            self.remote_explorer = None;
+            self.remote_explorer_error =
+                Some("Reconnect the SSH/SFTP tab to browse remote files.".into());
+            cx.notify();
+            return true;
+        }
+        self.schedule_remote_explorer_scan(tab_id, profile, path, cx);
+        true
+    }
+
+    fn run_remote_explorer_operation(
+        &mut self,
+        profile: termior_ssh::Profile,
+        operation: termior_ssh::sftp::Operation,
+        success: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((tab_id, _, refresh_path)) = self.active_remote_explorer_context() else {
+            return;
+        };
+        self.remote_explorer_loading = true;
+        self.command_message = Some("Running remote SFTP operation…".into());
+        let task_profile = profile.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { termior_ssh::sftp::execute(&task_profile, &operation) });
+        cx.spawn(async move |workspace, cx| {
+            let result = task.await;
+            let _ = workspace.update(cx, |workspace, cx| {
+                if workspace.model.active != Some(tab_id) {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        workspace.command_message = Some(success);
+                        workspace.schedule_remote_explorer_scan(tab_id, profile, refresh_path, cx);
+                    }
+                    Err(error) => {
+                        workspace.remote_explorer_loading = false;
+                        workspace.command_message =
+                            Some(format!("Remote operation failed: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn apply_explorer_index(&mut self, index: FileIndex, cx: &mut Context<Self>) {
         let root_changed = self
             .explorer
@@ -1018,6 +1208,9 @@ impl WorkspaceView {
     }
 
     fn refresh_workspace_data(&mut self, cx: &mut Context<Self>) {
+        if self.refresh_remote_explorer(cx) {
+            return;
+        }
         self.schedule_explorer_scan(self.explorer_requested_root.clone(), cx);
         self.refresh_vcs_data(cx);
     }
@@ -1350,6 +1543,9 @@ impl WorkspaceView {
                     if let Some(pane) = tab.panes.get_mut(&pane_id) {
                         *pane = PaneContent::Terminal(entity);
                     }
+                }
+                if workspace.model.active == Some(tab_id) {
+                    workspace.follow_active_tab_project(cx);
                 }
                 let should_focus = workspace.model.active == Some(tab_id)
                     && workspace
@@ -2304,6 +2500,24 @@ impl WorkspaceView {
     /// 切 Tab 重扫复用可取消/世代作废扫描，过期结果不会覆盖新根。
     /// 无活动 Tab 时 `active_project_dir()` 回落兑底根，与状态栏 pill 保持一致。
     fn follow_active_tab_project(&mut self, cx: &mut Context<Self>) {
+        if let Some((tab_id, profile, path)) = self.active_remote_explorer_context() {
+            if !self.remote_runtime_connected(tab_id) {
+                self.remote_explorer = None;
+                self.remote_explorer_loading = false;
+                self.remote_explorer_error =
+                    Some("Reconnect the SSH/SFTP tab to browse remote files.".into());
+                cx.notify();
+                return;
+            }
+            let already_showing = self.remote_explorer.as_ref().is_some_and(|state| {
+                state.tab_id == tab_id
+                    && (state.listing.cwd == path || (path == "." && !state.listing.cwd.is_empty()))
+            });
+            if !already_showing {
+                self.schedule_remote_explorer_scan(tab_id, profile, path, cx);
+            }
+            return;
+        }
         let project_dir = self.model.active_project_dir().to_path_buf();
         if project_dir.is_dir() && self.explorer_requested_root != project_dir {
             self.schedule_explorer_scan(project_dir, cx);
@@ -2718,9 +2932,13 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         match &target {
-            ExplorerContextTarget::Workspace => {}
+            ExplorerContextTarget::Workspace | ExplorerContextTarget::RemoteWorkspace(_) => {}
             ExplorerContextTarget::Directory(path) | ExplorerContextTarget::File(path) => {
                 self.explorer_tree.select(path.clone());
+            }
+            ExplorerContextTarget::RemoteDirectory(path)
+            | ExplorerContextTarget::RemoteFile(path) => {
+                self.remote_explorer_selected = Some(path.clone());
             }
         }
         self.command_mode = CommandMode::Browse;
@@ -2739,6 +2957,10 @@ impl WorkspaceView {
         let Some(target) = self.explorer_context_menu.take().map(|menu| menu.target) else {
             return;
         };
+        if target.is_remote() {
+            self.handle_remote_explorer_context_action(target, action, window, cx);
+            return;
+        }
         let root = self.explorer_requested_root.clone();
         match action {
             ExplorerContextAction::Open => {
@@ -2753,6 +2975,9 @@ impl WorkspaceView {
                         path.parent().map(Path::to_path_buf).unwrap_or(root)
                     }
                     ExplorerContextTarget::Workspace => root,
+                    ExplorerContextTarget::RemoteWorkspace(_)
+                    | ExplorerContextTarget::RemoteDirectory(_)
+                    | ExplorerContextTarget::RemoteFile(_) => return,
                 };
                 if action == ExplorerContextAction::CreateFile {
                     self.begin_name_command(
@@ -2780,6 +3005,9 @@ impl WorkspaceView {
                         path
                     }
                     ExplorerContextTarget::Workspace => return,
+                    ExplorerContextTarget::RemoteWorkspace(_)
+                    | ExplorerContextTarget::RemoteDirectory(_)
+                    | ExplorerContextTarget::RemoteFile(_) => return,
                 };
                 let parent = path
                     .parent()
@@ -2799,9 +3027,12 @@ impl WorkspaceView {
                     cx,
                 );
             }
+            ExplorerContextAction::Move => return,
             ExplorerContextAction::Delete => self.delete_selected_with_prompt(window, cx),
             ExplorerContextAction::Reveal => {
-                let path = target.path(&root);
+                let Some(path) = target.local_path(&root) else {
+                    return;
+                };
                 self.command_message = reveal_in_system_file_manager(
                     &path,
                     target.kind() == ExplorerContextTargetKind::File,
@@ -2819,12 +3050,249 @@ impl WorkspaceView {
             ExplorerContextAction::SearchContent => {
                 self.begin_command(CommandMode::SearchContent, cx)
             }
+            ExplorerContextAction::UploadFile
+            | ExplorerContextAction::UploadDirectory
+            | ExplorerContextAction::Download => return,
             ExplorerContextAction::Refresh => {
                 self.refresh_workspace_data(cx);
                 self.command_message = Some("Explorer refresh scheduled".into());
             }
         }
         cx.notify();
+    }
+
+    fn handle_remote_explorer_context_action(
+        &mut self,
+        target: ExplorerContextTarget,
+        action: ExplorerContextAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, profile, root)) = self.active_remote_explorer_context() else {
+            return;
+        };
+        let path = target.remote_path().unwrap_or(&root).to_owned();
+        match action {
+            ExplorerContextAction::CreateFile | ExplorerContextAction::CreateDirectory => {
+                let parent = match &target {
+                    ExplorerContextTarget::RemoteDirectory(path)
+                    | ExplorerContextTarget::RemoteWorkspace(path) => path.clone(),
+                    ExplorerContextTarget::RemoteFile(path) => {
+                        termior_ssh::sftp::parent(path).unwrap_or(root)
+                    }
+                    _ => return,
+                };
+                self.remote_pending_name_parent = Some(parent);
+                self.remote_pending_rename_target = None;
+                self.begin_name_command(
+                    if action == ExplorerContextAction::CreateFile {
+                        CommandMode::CreateFile
+                    } else {
+                        CommandMode::CreateDirectory
+                    },
+                    PathBuf::new(),
+                    None,
+                    if action == ExplorerContextAction::CreateFile {
+                        "untitled"
+                    } else {
+                        "New Folder"
+                    },
+                    window,
+                    cx,
+                );
+            }
+            ExplorerContextAction::Rename => {
+                if matches!(target, ExplorerContextTarget::RemoteWorkspace(_)) {
+                    return;
+                }
+                let parent = termior_ssh::sftp::parent(&path).unwrap_or_else(|| root.clone());
+                let prefill = termior_ssh::sftp::file_name(&path).to_owned();
+                self.remote_pending_name_parent = Some(parent);
+                self.remote_pending_rename_target = Some(path);
+                self.begin_name_command(
+                    CommandMode::Rename,
+                    PathBuf::new(),
+                    None,
+                    &prefill,
+                    window,
+                    cx,
+                );
+            }
+            ExplorerContextAction::Move => {
+                if matches!(target, ExplorerContextTarget::RemoteWorkspace(_)) {
+                    return;
+                }
+                self.remote_pending_name_parent = termior_ssh::sftp::parent(&path);
+                self.remote_pending_rename_target = Some(path.clone());
+                self.begin_name_command(CommandMode::Move, PathBuf::new(), None, &path, window, cx);
+            }
+            ExplorerContextAction::Delete => {
+                let is_dir = matches!(target, ExplorerContextTarget::RemoteDirectory(_));
+                self.delete_remote_with_prompt(profile, path, is_dir, window, cx);
+            }
+            ExplorerContextAction::UploadFile => {
+                self.choose_remote_upload(profile, path, false, window, cx)
+            }
+            ExplorerContextAction::UploadDirectory => {
+                self.choose_remote_upload(profile, path, true, window, cx)
+            }
+            ExplorerContextAction::Download => {
+                let recursive = matches!(target, ExplorerContextTarget::RemoteDirectory(_));
+                self.choose_remote_download(profile, path, recursive, window, cx);
+            }
+            ExplorerContextAction::Refresh => {
+                self.refresh_remote_explorer(cx);
+                self.command_message = Some("Remote Explorer refresh scheduled".into());
+            }
+            ExplorerContextAction::Open
+            | ExplorerContextAction::Reveal
+            | ExplorerContextAction::AttachToAi
+            | ExplorerContextAction::FindFile
+            | ExplorerContextAction::SearchContent => {}
+        }
+        cx.notify();
+    }
+
+    fn delete_remote_with_prompt(
+        &mut self,
+        profile: termior_ssh::Profile,
+        path: String,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "Delete remote item",
+            Some(&format!(
+                "Permanently delete {path}{}?",
+                if is_dir {
+                    " and all of its contents"
+                } else {
+                    ""
+                }
+            )),
+            &[PromptButton::ok("Delete"), PromptButton::cancel("Cancel")],
+            cx,
+        );
+        cx.spawn(async move |workspace, cx| {
+            if !matches!(answer.await, Ok(0)) {
+                return;
+            }
+            let _ = workspace.update(cx, |workspace, cx| {
+                let operation = if is_dir {
+                    termior_ssh::sftp::Operation::RemoveDirectory {
+                        path: path.clone(),
+                        recursive: true,
+                    }
+                } else {
+                    termior_ssh::sftp::Operation::RemoveFile { path: path.clone() }
+                };
+                workspace.run_remote_explorer_operation(
+                    profile,
+                    operation,
+                    format!("Deleted remote {path}"),
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    fn choose_remote_upload(
+        &mut self,
+        profile: termior_ssh::Profile,
+        remote_directory: String,
+        directory: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |workspace, cx| {
+            let dialog = rfd::AsyncFileDialog::new().set_title(if directory {
+                "Choose a folder to upload"
+            } else {
+                "Choose a file to upload"
+            });
+            let selected = if directory {
+                dialog.pick_folder().await
+            } else {
+                dialog.pick_file().await
+            };
+            let Some(selected) = selected else {
+                return;
+            };
+            let local_path = selected.path().to_string_lossy().into_owned();
+            let confirmed = rfd::AsyncMessageDialog::new()
+                .set_title("Upload to remote host")
+                .set_description("Existing remote files with the same name may be overwritten.")
+                .set_level(rfd::MessageLevel::Warning)
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show()
+                .await;
+            if confirmed != rfd::MessageDialogResult::Ok {
+                return;
+            }
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                let connection = termior_ssh::Connection {
+                    profile,
+                    kind: termior_ssh::SessionKind::Sftp,
+                    transfer: Some(termior_ssh::Transfer {
+                        upload: true,
+                        local_path,
+                        remote_path: remote_directory,
+                        recursive: directory,
+                        resume: false,
+                    }),
+                };
+                workspace.connect_remote(connection, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn choose_remote_download(
+        &mut self,
+        profile: termior_ssh::Profile,
+        remote_path: String,
+        recursive: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn_in(window, async move |workspace, cx| {
+            let Some(selected) = rfd::AsyncFileDialog::new()
+                .set_title("Choose a download folder")
+                .pick_folder()
+                .await
+            else {
+                return;
+            };
+            let local_path = selected.path().to_string_lossy().into_owned();
+            let confirmed = rfd::AsyncMessageDialog::new()
+                .set_title("Download from remote host")
+                .set_description("Existing local files with the same name may be overwritten.")
+                .set_level(rfd::MessageLevel::Warning)
+                .set_buttons(rfd::MessageButtons::OkCancel)
+                .show()
+                .await;
+            if confirmed != rfd::MessageDialogResult::Ok {
+                return;
+            }
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                let connection = termior_ssh::Connection {
+                    profile,
+                    kind: termior_ssh::SessionKind::Sftp,
+                    transfer: Some(termior_ssh::Transfer {
+                        upload: false,
+                        local_path,
+                        remote_path,
+                        recursive,
+                        resume: false,
+                    }),
+                };
+                workspace.connect_remote(connection, window, cx);
+            });
+        })
+        .detach();
     }
 
     fn has_dirty_editor_under(&self, target: &Path, cx: &App) -> bool {
@@ -3502,6 +3970,8 @@ impl WorkspaceView {
         }
         self.pending_name_parent = None;
         self.pending_rename_target = None;
+        self.remote_pending_name_parent = None;
+        self.remote_pending_rename_target = None;
         self.explorer_context_menu = None;
         cx.notify();
     }
@@ -3522,6 +3992,7 @@ impl WorkspaceView {
             CommandMode::CreateFile => "Type a file name, then press Enter".into(),
             CommandMode::CreateDirectory => "Type a directory name, then press Enter".into(),
             CommandMode::Rename => "Edit the name, then press Enter".into(),
+            CommandMode::Move => "Enter the destination remote path, then press Enter".into(),
             _ => String::new(),
         });
         self.pending_name_parent = Some(parent);
@@ -3574,6 +4045,70 @@ impl WorkspaceView {
         if self.command_mode == CommandMode::SearchContent {
             self.start_content_search(input, cx);
             return;
+        }
+        if matches!(
+            self.command_mode,
+            CommandMode::CreateFile
+                | CommandMode::CreateDirectory
+                | CommandMode::Rename
+                | CommandMode::Move
+        ) {
+            if let Some((_, profile, root)) = self.active_remote_explorer_context() {
+                let parent = self.remote_pending_name_parent.clone().unwrap_or(root);
+                let operation = match self.command_mode {
+                    CommandMode::CreateFile => termior_ssh::sftp::join(&parent, &input)
+                        .map(|path| termior_ssh::sftp::Operation::CreateFile { path }),
+                    CommandMode::CreateDirectory => termior_ssh::sftp::join(&parent, &input)
+                        .map(|path| termior_ssh::sftp::Operation::CreateDirectory { path }),
+                    CommandMode::Rename => self
+                        .remote_pending_rename_target
+                        .clone()
+                        .ok_or_else(|| {
+                            termior_ssh::Error::Invalid(
+                                "Select a remote file or directory first".into(),
+                            )
+                        })
+                        .and_then(|from| {
+                            termior_ssh::sftp::join(&parent, &input)
+                                .map(|to| termior_ssh::sftp::Operation::Rename { from, to })
+                        }),
+                    CommandMode::Move => self
+                        .remote_pending_rename_target
+                        .clone()
+                        .ok_or_else(|| {
+                            termior_ssh::Error::Invalid(
+                                "Select a remote file or directory first".into(),
+                            )
+                        })
+                        .and_then(|from| {
+                            let to = if input.starts_with('/') {
+                                input.clone()
+                            } else {
+                                format!("{}/{}", parent.trim_end_matches('/'), input)
+                            };
+                            termior_ssh::quote_sftp_path(&to)
+                                .map(|_| termior_ssh::sftp::Operation::Rename { from, to })
+                        }),
+                    _ => unreachable!(),
+                };
+                match operation {
+                    Ok(operation) => {
+                        self.run_remote_explorer_operation(
+                            profile,
+                            operation,
+                            "Remote operation completed".into(),
+                            cx,
+                        );
+                        self.command_mode = CommandMode::Browse;
+                        self.command_input.clear();
+                        self.command_marked_text.clear();
+                        self.remote_pending_name_parent = None;
+                        self.remote_pending_rename_target = None;
+                    }
+                    Err(error) => self.command_message = Some(error.to_string()),
+                }
+                return;
+            }
         }
         let completed_mode = self.command_mode;
         let result = match self.command_mode {
@@ -3658,6 +4193,7 @@ impl WorkspaceView {
                     None => Err("Select a file or directory first".to_owned()),
                 }
             }
+            CommandMode::Move => Err("Move is only available in a remote Explorer".to_owned()),
             CommandMode::GitCommit => self.git_repository().and_then(|repo| {
                 repo.commit(&input)
                     .map(|_| ())
@@ -3698,6 +4234,7 @@ impl WorkspaceView {
                     CommandMode::CreateFile
                         | CommandMode::CreateDirectory
                         | CommandMode::Rename
+                        | CommandMode::Move
                         | CommandMode::GitCommit
                         | CommandMode::GitCreateBranch
                         | CommandMode::GitSwitchBranch
@@ -4192,6 +4729,204 @@ impl WorkspaceView {
         }
     }
 
+    fn remote_explorer_content(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (tab_id, profile, requested_path) = self.active_remote_explorer_context()?;
+        let listing = self
+            .remote_explorer
+            .as_ref()
+            .filter(|state| state.tab_id == tab_id)
+            .map(|state| &state.listing);
+        let root = listing
+            .map(|listing| listing.cwd.as_str())
+            .unwrap_or(requested_path.as_str());
+        let root_for_up = root.to_owned();
+        let up_profile = profile.clone();
+        let toolbar = div()
+            .flex()
+            .flex_row()
+            .gap_1()
+            .mb_1()
+            .child(explorer_tool_button(
+                "remote-explorer-up",
+                Icon::ChevronUp,
+                "Parent directory",
+                &self.palette,
+                cx,
+                move |this, cx| {
+                    if let Some(parent) = termior_ssh::sftp::parent(&root_for_up) {
+                        this.remote_explorer_paths.insert(tab_id, parent.clone());
+                        this.schedule_remote_explorer_scan(tab_id, up_profile.clone(), parent, cx);
+                    }
+                },
+            ))
+            .child(explorer_tool_button(
+                "remote-explorer-new-file",
+                Icon::File,
+                ui_text::explorer::NEW_FILE,
+                &self.palette,
+                cx,
+                |this, cx| this.begin_command(CommandMode::CreateFile, cx),
+            ))
+            .child(explorer_tool_button(
+                "remote-explorer-new-dir",
+                Icon::Folder,
+                ui_text::explorer::NEW_DIRECTORY,
+                &self.palette,
+                cx,
+                |this, cx| this.begin_command(CommandMode::CreateDirectory, cx),
+            ))
+            .child(explorer_tool_button(
+                "remote-explorer-refresh",
+                Icon::Refresh,
+                ui_text::explorer::REFRESH,
+                &self.palette,
+                cx,
+                |this, cx| {
+                    this.refresh_remote_explorer(cx);
+                },
+            ));
+
+        let rows = listing
+            .map(|listing| {
+                listing
+                    .entries
+                    .iter()
+                    .cloned()
+                    .map(|entry| {
+                        let path = entry.path.clone();
+                        let right_path = path.clone();
+                        let is_dir = entry.is_dir;
+                        let selected = self.remote_explorer_selected.as_deref() == Some(&path);
+                        let profile = profile.clone();
+                        div()
+                            .id(SharedString::from(format!("remote-file-{path}")))
+                            .w_full()
+                            .px_1()
+                            .py(px(2.0))
+                            .rounded_sm()
+                            .text_xs()
+                            .cursor_pointer()
+                            .when(selected, |row| row.bg(ui::selected_wash(&self.palette)))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .whitespace_nowrap()
+                                    .child(explorer_icon(
+                                        remote_icon_kind(&entry.name, entry.is_dir),
+                                        false,
+                                        &self.palette,
+                                    ))
+                                    .child(SharedString::from(entry.name)),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.explorer_context_menu = None;
+                                    if is_dir {
+                                        this.remote_explorer_paths.insert(tab_id, path.clone());
+                                        this.schedule_remote_explorer_scan(
+                                            tab_id,
+                                            profile.clone(),
+                                            path.clone(),
+                                            cx,
+                                        );
+                                    } else {
+                                        this.remote_explorer_selected = Some(path.clone());
+                                        window.focus(&this.focus_handle, cx);
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    this.remote_explorer_selected = Some(right_path.clone());
+                                    this.show_explorer_context_menu(
+                                        if is_dir {
+                                            ExplorerContextTarget::RemoteDirectory(
+                                                right_path.clone(),
+                                            )
+                                        } else {
+                                            ExplorerContextTarget::RemoteFile(right_path.clone())
+                                        },
+                                        event.position,
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let target = ExplorerContextTarget::RemoteWorkspace(root.to_owned());
+        let host_label = if profile.user.is_empty() {
+            profile.host.clone()
+        } else {
+            format!("{}@{}", profile.user, profile.host)
+        };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(toolbar)
+                .child(
+                    div()
+                        .px_1()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(ui::muted(&self.palette))
+                        .child(SharedString::from(format!(
+                            "{host_label}:{root}{}",
+                            if self.remote_explorer_loading {
+                                "  · loading…"
+                            } else {
+                                "  · remote"
+                            }
+                        ))),
+                )
+                .children(self.remote_explorer_error.clone().map(|error| {
+                    div()
+                        .px_1()
+                        .py_1()
+                        .text_xs()
+                        .text_color(gpui_color(self.palette.status[3]))
+                        .child(SharedString::from(error))
+                }))
+                .child(
+                    div()
+                        .id("remote-explorer-scroll")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_x_scroll()
+                        .overflow_y_scroll()
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                this.show_explorer_context_menu(
+                                    target.clone(),
+                                    event.position,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                        .children(rows)
+                        .children(
+                            (listing.is_some_and(|listing| listing.entries.is_empty())
+                                && !self.remote_explorer_loading)
+                                .then(|| empty_hint("Remote directory is empty", &self.palette)),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn sidebar_content(&self, cx: &mut Context<Self>) -> AnyElement {
         let command_bar = (self.command_mode != CommandMode::Browse).then(|| {
             div()
@@ -4338,288 +5073,304 @@ impl WorkspaceView {
             }
 
             SidebarPanel::Explorer => {
-                let toolbar = div()
-                    .flex()
-                    .flex_row()
-                    .gap_1()
-                    .mb_1()
-                    .child(explorer_tool_button(
-                        "explorer-find",
-                        Icon::Search,
-                        ui_text::explorer::FIND,
-                        &self.palette,
-                        cx,
-                        |this, cx| this.begin_command(CommandMode::FindFile, cx),
-                    ))
-                    .child(explorer_tool_button(
-                        "explorer-search",
-                        Icon::FileText,
-                        ui_text::explorer::SEARCH,
-                        &self.palette,
-                        cx,
-                        |this, cx| this.begin_command(CommandMode::SearchContent, cx),
-                    ))
-                    .child(explorer_tool_button(
-                        "explorer-new-file",
-                        Icon::File,
-                        ui_text::explorer::NEW_FILE,
-                        &self.palette,
-                        cx,
-                        |this, cx| this.begin_command(CommandMode::CreateFile, cx),
-                    ))
-                    .child(explorer_tool_button(
-                        "explorer-new-dir",
-                        Icon::Folder,
-                        ui_text::explorer::NEW_DIRECTORY,
-                        &self.palette,
-                        cx,
-                        |this, cx| this.begin_command(CommandMode::CreateDirectory, cx),
-                    ))
-                    .child(explorer_tool_button(
-                        "explorer-refresh",
-                        Icon::Refresh,
-                        ui_text::explorer::REFRESH,
-                        &self.palette,
-                        cx,
-                        |this, cx| this.refresh_workspace_data(cx),
-                    ));
+                if let Some(remote) = self.remote_explorer_content(cx) {
+                    remote
+                } else {
+                    let toolbar = div()
+                        .flex()
+                        .flex_row()
+                        .gap_1()
+                        .mb_1()
+                        .child(explorer_tool_button(
+                            "explorer-find",
+                            Icon::Search,
+                            ui_text::explorer::FIND,
+                            &self.palette,
+                            cx,
+                            |this, cx| this.begin_command(CommandMode::FindFile, cx),
+                        ))
+                        .child(explorer_tool_button(
+                            "explorer-search",
+                            Icon::FileText,
+                            ui_text::explorer::SEARCH,
+                            &self.palette,
+                            cx,
+                            |this, cx| this.begin_command(CommandMode::SearchContent, cx),
+                        ))
+                        .child(explorer_tool_button(
+                            "explorer-new-file",
+                            Icon::File,
+                            ui_text::explorer::NEW_FILE,
+                            &self.palette,
+                            cx,
+                            |this, cx| this.begin_command(CommandMode::CreateFile, cx),
+                        ))
+                        .child(explorer_tool_button(
+                            "explorer-new-dir",
+                            Icon::Folder,
+                            ui_text::explorer::NEW_DIRECTORY,
+                            &self.palette,
+                            cx,
+                            |this, cx| this.begin_command(CommandMode::CreateDirectory, cx),
+                        ))
+                        .child(explorer_tool_button(
+                            "explorer-refresh",
+                            Icon::Refresh,
+                            ui_text::explorer::REFRESH,
+                            &self.palette,
+                            cx,
+                            |this, cx| this.refresh_workspace_data(cx),
+                        ));
 
-                let root_label = self
-                    .explorer_requested_root
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| self.explorer_requested_root.display().to_string());
-                let active_path = self
-                    .model
-                    .active_tab()
-                    .and_then(|tab| tab.resource.as_deref())
-                    .map(PathBuf::from);
-                let (visible_entries, visible_entry_count) = self
-                    .explorer
-                    .as_ref()
-                    .map(|index| {
-                        let mut entries = index
-                            .entries()
-                            .iter()
-                            .filter(|entry| explorer_entry_visible(entry, &self.explorer_tree))
-                            .collect::<Vec<_>>();
-                        entries.sort_by(|a, b| a.relative.cmp(&b.relative));
-                        let count = entries.len();
-                        let visible = entries.into_iter().take(500).cloned().collect::<Vec<_>>();
-                        (visible, count)
-                    })
-                    .unwrap_or_else(|| (Vec::new(), 0));
-                let tree_content_width = explorer_content_width(&visible_entries);
-
-                let rows = if self.command_mode == CommandMode::FindFile {
-                    self.explorer
+                    let root_label = self
+                        .explorer_requested_root
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| self.explorer_requested_root.display().to_string());
+                    let active_path = self
+                        .model
+                        .active_tab()
+                        .and_then(|tab| tab.resource.as_deref())
+                        .map(PathBuf::from);
+                    let (visible_entries, visible_entry_count) = self
+                        .explorer
                         .as_ref()
                         .map(|index| {
-                            index
-                                .fuzzy(&self.command_input, 80)
-                                .into_iter()
-                                .map(|hit| {
-                                    let path = index.root().join(&hit.path);
-                                    div()
-                                        .id(SharedString::from(format!("find-{}", hit.path)))
-                                        .px_2()
-                                        .py_1()
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .child(SharedString::from(hit.path))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.open_editor(path.clone(), cx)
-                                            }),
-                                        )
-                                })
-                                .collect::<Vec<_>>()
+                            let mut entries = index
+                                .entries()
+                                .iter()
+                                .filter(|entry| explorer_entry_visible(entry, &self.explorer_tree))
+                                .collect::<Vec<_>>();
+                            entries.sort_by(|a, b| a.relative.cmp(&b.relative));
+                            let count = entries.len();
+                            let visible =
+                                entries.into_iter().take(500).cloned().collect::<Vec<_>>();
+                            (visible, count)
                         })
-                        .unwrap_or_default()
-                } else if self.command_mode == CommandMode::SearchContent {
-                    self.content_matches
-                        .iter()
-                        .map(|hit| {
-                            let path = hit.path.clone();
+                        .unwrap_or_else(|| (Vec::new(), 0));
+                    let tree_content_width = explorer_content_width(&visible_entries);
+
+                    let rows = if self.command_mode == CommandMode::FindFile {
+                        self.explorer
+                            .as_ref()
+                            .map(|index| {
+                                index
+                                    .fuzzy(&self.command_input, 80)
+                                    .into_iter()
+                                    .map(|hit| {
+                                        let path = index.root().join(&hit.path);
+                                        div()
+                                            .id(SharedString::from(format!("find-{}", hit.path)))
+                                            .px_2()
+                                            .py_1()
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .child(SharedString::from(hit.path))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.open_editor(path.clone(), cx)
+                                                }),
+                                            )
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    } else if self.command_mode == CommandMode::SearchContent {
+                        self.content_matches
+                            .iter()
+                            .map(|hit| {
+                                let path = hit.path.clone();
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "search-{}-{}",
+                                        path.display(),
+                                        hit.line_number
+                                    )))
+                                    .px_2()
+                                    .py_1()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .child(SharedString::from(format!(
+                                        "{}:{}  {}",
+                                        path.strip_prefix(&self.explorer_requested_root)
+                                            .unwrap_or(&path)
+                                            .display(),
+                                        hit.line_number,
+                                        hit.line
+                                    )))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.open_editor(path.clone(), cx)
+                                        }),
+                                    )
+                            })
+                            .collect()
+                    } else {
+                        visible_entries
+                            .into_iter()
+                            .map(|entry| {
+                                let path = entry.path.clone();
+                                let right_path = path.clone();
+                                let selected =
+                                    self.explorer_tree.selected() == Some(path.as_path());
+                                let active = active_path.as_ref() == Some(&path);
+                                let expanded = self.explorer_tree.is_expanded(&path);
+                                let is_dir = entry.is_dir;
+                                let icon = entry.icon;
+                                let label = entry
+                                    .path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or(&entry.relative)
+                                    .to_owned();
+                                div()
+                                    .id(SharedString::from(format!("file-{}", entry.relative)))
+                                    .ml(px(entry.depth as f32 * 12.0))
+                                    .w_full()
+                                    .min_w(px(tree_content_width))
+                                    .px_1()
+                                    .py(px(2.0))
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .when(selected, |row| row.bg(ui::selected_wash(&self.palette)))
+                                    .when(active, |row| {
+                                        row.bg(ui::alpha(self.palette.accent, 0.35))
+                                    })
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_1()
+                                            .whitespace_nowrap()
+                                            .child(explorer_icon(icon, expanded, &self.palette))
+                                            .child(SharedString::from(label)),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _event, window, cx| {
+                                            this.explorer_context_menu = None;
+                                            this.explorer_tree.select(path.clone());
+                                            if is_dir {
+                                                this.explorer_tree.toggle_expanded(path.clone());
+                                                window.focus(&this.focus_handle, cx);
+                                            } else {
+                                                this.open_editor(path.clone(), cx);
+                                            }
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(
+                                            move |this, event: &MouseDownEvent, window, cx| {
+                                                cx.stop_propagation();
+                                                this.show_explorer_context_menu(
+                                                    if is_dir {
+                                                        ExplorerContextTarget::Directory(
+                                                            right_path.clone(),
+                                                        )
+                                                    } else {
+                                                        ExplorerContextTarget::File(
+                                                            right_path.clone(),
+                                                        )
+                                                    },
+                                                    event.position,
+                                                    window,
+                                                    cx,
+                                                );
+                                            },
+                                        ),
+                                    )
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let background_target = ExplorerContextTarget::Workspace;
+                    div()
+                        .flex()
+                        .flex_col()
+                        .size_full()
+                        .child(toolbar)
+                        .child(
                             div()
-                                .id(SharedString::from(format!(
-                                    "search-{}-{}",
-                                    path.display(),
-                                    hit.line_number
-                                )))
-                                .px_2()
+                                .px_1()
+                                .pb_1()
+                                .text_xs()
+                                .text_color(ui::muted(&self.palette))
+                                .child(SharedString::from(format!(
+                                    "{}{}",
+                                    root_label,
+                                    if self.explorer_deep_indexing {
+                                        "  · indexing…"
+                                    } else if self.explorer_index_incomplete {
+                                        "  · index incomplete"
+                                    } else if visible_entry_count > 500 {
+                                        "  · showing first 500"
+                                    } else {
+                                        ""
+                                    }
+                                ))),
+                        )
+                        .children(self.explorer_error.clone().map(|error| {
+                            div()
+                                .px_1()
                                 .py_1()
                                 .text_xs()
-                                .cursor_pointer()
-                                .child(SharedString::from(format!(
-                                    "{}:{}  {}",
-                                    path.strip_prefix(&self.explorer_requested_root)
-                                        .unwrap_or(&path)
-                                        .display(),
-                                    hit.line_number,
-                                    hit.line
-                                )))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.open_editor(path.clone(), cx)
-                                    }),
-                                )
-                        })
-                        .collect()
-                } else {
-                    visible_entries
-                        .into_iter()
-                        .map(|entry| {
-                            let path = entry.path.clone();
-                            let right_path = path.clone();
-                            let selected = self.explorer_tree.selected() == Some(path.as_path());
-                            let active = active_path.as_ref() == Some(&path);
-                            let expanded = self.explorer_tree.is_expanded(&path);
-                            let is_dir = entry.is_dir;
-                            let icon = entry.icon;
-                            let label = entry
-                                .path
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or(&entry.relative)
-                                .to_owned();
-                            div()
-                                .id(SharedString::from(format!("file-{}", entry.relative)))
-                                .ml(px(entry.depth as f32 * 12.0))
-                                .w_full()
-                                .min_w(px(tree_content_width))
-                                .px_1()
-                                .py(px(2.0))
-                                .rounded_sm()
-                                .text_xs()
-                                .cursor_pointer()
-                                .when(selected, |row| row.bg(ui::selected_wash(&self.palette)))
-                                .when(active, |row| row.bg(ui::alpha(self.palette.accent, 0.35)))
-                                .child(
+                                .text_color(gpui_color(self.palette.status[3]))
+                                .child(SharedString::from(error))
+                        }))
+                        .children(
+                            (self.explorer_index_incomplete && self.explorer_error.is_none()).then(
+                                || {
                                     div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap_1()
-                                        .whitespace_nowrap()
-                                        .child(explorer_icon(icon, expanded, &self.palette))
-                                        .child(SharedString::from(label)),
-                                )
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _event, window, cx| {
-                                        this.explorer_context_menu = None;
-                                        this.explorer_tree.select(path.clone());
-                                        if is_dir {
-                                            this.explorer_tree.toggle_expanded(path.clone());
-                                            window.focus(&this.focus_handle, cx);
-                                        } else {
-                                            this.open_editor(path.clone(), cx);
-                                        }
-                                        cx.notify();
-                                    }),
-                                )
+                                        .px_1()
+                                        .py_1()
+                                        .text_xs()
+                                        .text_color(ui::muted(&self.palette))
+                                        .child(SharedString::from(
+                                            ui_text::explorer::INDEX_INCOMPLETE,
+                                        ))
+                                },
+                            ),
+                        )
+                        .child(
+                            div()
+                                .id("explorer-scroll")
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .overflow_x_scroll()
+                                .overflow_y_scroll()
                                 .on_mouse_down(
                                     MouseButton::Right,
                                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
                                         this.show_explorer_context_menu(
-                                            if is_dir {
-                                                ExplorerContextTarget::Directory(right_path.clone())
-                                            } else {
-                                                ExplorerContextTarget::File(right_path.clone())
-                                            },
+                                            background_target.clone(),
                                             event.position,
                                             window,
                                             cx,
                                         );
                                     }),
                                 )
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let background_target = ExplorerContextTarget::Workspace;
-                div()
-                    .flex()
-                    .flex_col()
-                    .size_full()
-                    .child(toolbar)
-                    .child(
-                        div()
-                            .px_1()
-                            .pb_1()
-                            .text_xs()
-                            .text_color(ui::muted(&self.palette))
-                            .child(SharedString::from(format!(
-                                "{}{}",
-                                root_label,
-                                if self.explorer_deep_indexing {
-                                    "  · indexing…"
-                                } else if self.explorer_index_incomplete {
-                                    "  · index incomplete"
-                                } else if visible_entry_count > 500 {
-                                    "  · showing first 500"
-                                } else {
-                                    ""
-                                }
-                            ))),
-                    )
-                    .children(self.explorer_error.clone().map(|error| {
-                        div()
-                            .px_1()
-                            .py_1()
-                            .text_xs()
-                            .text_color(gpui_color(self.palette.status[3]))
-                            .child(SharedString::from(error))
-                    }))
-                    .children(
-                        (self.explorer_index_incomplete && self.explorer_error.is_none()).then(
-                            || {
-                                div()
-                                    .px_1()
-                                    .py_1()
-                                    .text_xs()
-                                    .text_color(ui::muted(&self.palette))
-                                    .child(SharedString::from(ui_text::explorer::INDEX_INCOMPLETE))
-                            },
-                        ),
-                    )
-                    .child(
-                        div()
-                            .id("explorer-scroll")
-                            .flex_1()
-                            .min_h(px(0.0))
-                            .overflow_x_scroll()
-                            .overflow_y_scroll()
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                    this.show_explorer_context_menu(
-                                        background_target.clone(),
-                                        event.position,
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                            )
-                            .children(rows)
-                            .children(
-                                (self.explorer.is_some()
-                                    && !self.explorer_deep_indexing
-                                    && self
-                                        .explorer
-                                        .as_ref()
-                                        .is_some_and(|index| index.entries().is_empty()))
-                                .then(|| {
-                                    empty_hint(ui_text::empty::NO_VISIBLE_FILES, &self.palette)
-                                }),
-                            ),
-                    )
-                    .children(self.explorer_skipped_footer(cx))
-                    .into_any_element()
+                                .children(rows)
+                                .children(
+                                    (self.explorer.is_some()
+                                        && !self.explorer_deep_indexing
+                                        && self
+                                            .explorer
+                                            .as_ref()
+                                            .is_some_and(|index| index.entries().is_empty()))
+                                    .then(|| {
+                                        empty_hint(ui_text::empty::NO_VISIBLE_FILES, &self.palette)
+                                    }),
+                                ),
+                        )
+                        .children(self.explorer_skipped_footer(cx))
+                        .into_any_element()
+                }
             }
             SidebarPanel::SourceControl => {
                 let branch = self
@@ -4760,9 +5511,26 @@ impl WorkspaceView {
     }
 
     fn sync_terminal_context(&mut self, cx: &mut Context<Self>) -> (String, Option<String>) {
-        if let Some(remote) = self.model.active_tab().and_then(|tab| tab.remote.as_ref()) {
+        if let Some((tab_id, remote)) = self
+            .model
+            .active_tab()
+            .and_then(|tab| tab.remote.as_ref().map(|remote| (tab.id, remote.clone())))
+        {
+            // A remote OSC 7 is session-scoped metadata only: it follows this
+            // tab's SFTP Explorer and never mutates local cwd/project_dir.
+            let reported_cwd = self
+                .active_terminal()
+                .and_then(|terminal| terminal.read(cx).latest_cwd().map(str::to_owned));
+            if let Some(path) = reported_cwd.filter(|path| path.starts_with('/')) {
+                let changed = self.remote_terminal_cwds.get(&tab_id) != Some(&path);
+                if changed && termior_ssh::quote_sftp_path(&path).is_ok() {
+                    self.remote_terminal_cwds.insert(tab_id, path.clone());
+                    self.remote_explorer_paths.insert(tab_id, path.clone());
+                    self.schedule_remote_explorer_scan(tab_id, remote.profile.clone(), path, cx);
+                }
+            }
             let label = format!(
-                "{:?} · {}@{} · 本地 Agent 未连接此主机",
+                "{:?} · {}@{} · Remote Explorer via SFTP · 本地 Agent 未连接此主机",
                 remote.kind, remote.profile.user, remote.profile.host
             );
             self.composer.update(cx, |composer, _| {
@@ -5752,42 +6520,40 @@ impl gpui::Render for WorkspaceView {
                     )
             })
             .collect::<Vec<_>>();
-        let explorer_context_menu =
-            self.explorer_context_menu.clone().map(|menu| {
-                let target_kind = menu.target.kind();
-                anchored().position(menu.position).child(
-                    menu_panel(&p)
-                        .id("explorer-context-menu")
-                        .w(px(220.0))
-                        .children(explorer_context_actions(target_kind).iter().copied().map(
-                            |action| {
-                                div()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .hover({
-                                        let wash = ui::hover_wash(&p);
-                                        move |style| style.bg(wash)
-                                    })
-                                    .child(explorer_context_action_label(action))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _event, window, cx| {
-                                            cx.stop_propagation();
-                                            this.handle_explorer_context_action(action, window, cx);
-                                        }),
-                                    )
-                            },
-                        ))
-                        .with_animation(
-                            "explorer-menu-fade-in",
-                            Animation::new(UI_FADE_IN).with_easing(ease_in_out),
-                            |style, delta| style.opacity(delta),
-                        ),
-                )
-            });
+        let explorer_context_menu = self.explorer_context_menu.clone().map(|menu| {
+            anchored().position(menu.position).child(
+                menu_panel(&p)
+                    .id("explorer-context-menu")
+                    .w(px(220.0))
+                    .children(explorer_context_actions(&menu.target).iter().copied().map(
+                        |action| {
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .cursor_pointer()
+                                .hover({
+                                    let wash = ui::hover_wash(&p);
+                                    move |style| style.bg(wash)
+                                })
+                                .child(explorer_context_action_label(action))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _event, window, cx| {
+                                        cx.stop_propagation();
+                                        this.handle_explorer_context_action(action, window, cx);
+                                    }),
+                                )
+                        },
+                    ))
+                    .with_animation(
+                        "explorer-menu-fade-in",
+                        Animation::new(UI_FADE_IN).with_easing(ease_in_out),
+                        |style, delta| style.opacity(delta),
+                    ),
+            )
+        });
         let can_split_right = self.can_split_active(SplitDirection::Right, window);
         let can_split_down = self.can_split_active(SplitDirection::Down, window);
         let has_multiple_panes = self.active_pane_count() > 1;
@@ -6715,6 +7481,29 @@ fn explorer_icon(kind: IconKind, expanded: bool, p: &ResolvedPalette) -> gpui::S
     icon(glyph, icon_size::SM, tint)
 }
 
+fn remote_icon_kind(name: &str, is_dir: bool) -> IconKind {
+    if is_dir {
+        return IconKind::Folder;
+    }
+    let lower = name.to_ascii_lowercase();
+    let extension = lower.rsplit_once('.').map(|(_, extension)| extension);
+    match extension {
+        Some("rs") => IconKind::Rust,
+        Some("js" | "jsx" | "mjs" | "cjs") => IconKind::JavaScript,
+        Some("ts" | "tsx" | "mts" | "cts") => IconKind::TypeScript,
+        Some("py" | "pyi") => IconKind::Python,
+        Some("go") => IconKind::Go,
+        Some("java") => IconKind::Java,
+        Some("html" | "htm") => IconKind::Html,
+        Some("css" | "scss" | "sass" | "less") => IconKind::Css,
+        Some("json" | "jsonc") => IconKind::Json,
+        Some("md" | "markdown") => IconKind::Markdown,
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg") => IconKind::Image,
+        Some("toml" | "yaml" | "yml" | "ini") => IconKind::Config,
+        _ => IconKind::File,
+    }
+}
+
 fn explorer_tool_button(
     id: &'static str,
     glyph: Icon,
@@ -6732,8 +7521,37 @@ fn explorer_tool_button(
     )
 }
 
-fn explorer_context_actions(kind: ExplorerContextTargetKind) -> &'static [ExplorerContextAction] {
-    match kind {
+fn explorer_context_actions(target: &ExplorerContextTarget) -> &'static [ExplorerContextAction] {
+    if target.is_remote() {
+        return match target.kind() {
+            ExplorerContextTargetKind::File => &[
+                ExplorerContextAction::Download,
+                ExplorerContextAction::Rename,
+                ExplorerContextAction::Move,
+                ExplorerContextAction::Delete,
+                ExplorerContextAction::Refresh,
+            ],
+            ExplorerContextTargetKind::Directory => &[
+                ExplorerContextAction::CreateFile,
+                ExplorerContextAction::CreateDirectory,
+                ExplorerContextAction::UploadFile,
+                ExplorerContextAction::UploadDirectory,
+                ExplorerContextAction::Download,
+                ExplorerContextAction::Rename,
+                ExplorerContextAction::Move,
+                ExplorerContextAction::Delete,
+                ExplorerContextAction::Refresh,
+            ],
+            ExplorerContextTargetKind::Workspace => &[
+                ExplorerContextAction::CreateFile,
+                ExplorerContextAction::CreateDirectory,
+                ExplorerContextAction::UploadFile,
+                ExplorerContextAction::UploadDirectory,
+                ExplorerContextAction::Refresh,
+            ],
+        };
+    }
+    match target.kind() {
         ExplorerContextTargetKind::File => &[
             ExplorerContextAction::Open,
             ExplorerContextAction::Rename,
@@ -6767,11 +7585,15 @@ fn explorer_context_action_label(action: ExplorerContextAction) -> &'static str 
         ExplorerContextAction::CreateFile => "New File…",
         ExplorerContextAction::CreateDirectory => "New Folder…",
         ExplorerContextAction::Rename => "Rename…",
+        ExplorerContextAction::Move => "Move…",
         ExplorerContextAction::Delete => "Delete…",
         ExplorerContextAction::Reveal => "Show in File Manager",
         ExplorerContextAction::AttachToAi => "Attach to AI",
         ExplorerContextAction::FindFile => "Find File…",
         ExplorerContextAction::SearchContent => "Search in Files…",
+        ExplorerContextAction::UploadFile => "Upload File…",
+        ExplorerContextAction::UploadDirectory => "Upload Folder…",
+        ExplorerContextAction::Download => "Download…",
         ExplorerContextAction::Refresh => "Refresh",
     }
 }
@@ -7186,15 +8008,24 @@ mod explorer_ui_tests {
 
     #[test]
     fn explorer_context_actions_are_target_specific() {
-        let file = explorer_context_actions(ExplorerContextTargetKind::File);
+        let file = explorer_context_actions(&ExplorerContextTarget::File(PathBuf::from(
+            "/workspace/file.txt",
+        )));
         assert!(file.contains(&ExplorerContextAction::Open));
         assert!(file.contains(&ExplorerContextAction::AttachToAi));
         assert!(!file.contains(&ExplorerContextAction::CreateDirectory));
 
-        let workspace = explorer_context_actions(ExplorerContextTargetKind::Workspace);
+        let workspace = explorer_context_actions(&ExplorerContextTarget::Workspace);
         assert!(workspace.contains(&ExplorerContextAction::CreateFile));
         assert!(workspace.contains(&ExplorerContextAction::SearchContent));
         assert!(!workspace.contains(&ExplorerContextAction::Delete));
+
+        let remote = explorer_context_actions(&ExplorerContextTarget::RemoteDirectory(
+            "/home/me/src".into(),
+        ));
+        assert!(remote.contains(&ExplorerContextAction::UploadFile));
+        assert!(remote.contains(&ExplorerContextAction::Download));
+        assert!(!remote.contains(&ExplorerContextAction::Reveal));
     }
 
     #[test]

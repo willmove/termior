@@ -204,9 +204,22 @@ fn run_reader_filtered(reader: &mut Box<dyn Read + Send>, mut tx: Sender<PtyData
                         .collect()
                 };
                 // channel 关闭（消费方 drop）时退出循环。
+                // Remote OSC must never enter the local terminal/Agent context. The
+                // sole exception is OSC 7 cwd, retained as remote-session metadata so
+                // the File Explorer can follow that SSH tab without changing the local
+                // workspace root (FR-SSH-07).
+                let events = if remote {
+                    filtered
+                        .events
+                        .into_iter()
+                        .filter(|event| matches!(event, OscEvent::Cwd { .. }))
+                        .collect()
+                } else {
+                    filtered.events
+                };
                 if futures::executor::block_on(tx.send(PtyData {
                     bytes: filtered.visible,
-                    events: if remote { Vec::new() } else { filtered.events },
+                    events,
                     localhost_urls,
                 }))
                 .is_err()
@@ -252,7 +265,10 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         run_reader_filtered(&mut reader, tx, true);
         let data = rx.try_recv().unwrap();
-        assert!(data.events.is_empty());
+        assert!(matches!(
+            data.events.as_slice(),
+            [OscEvent::Cwd { host, path }] if host == "remote" && path == "/etc"
+        ));
         assert!(data.localhost_urls.is_empty());
         assert!(String::from_utf8_lossy(&data.bytes).contains("hello"));
         assert!(!data.bytes.windows(3).any(|bytes| bytes == b"]7;"));

@@ -67,6 +67,17 @@ keyboard-interactive（公钥仍优先）。代理/跳板连接因 OpenSSH 无�
 交互操作直接遵循 OpenSSH 行为；图形传输的覆盖确认不适用于手工输入的命令。
 参考：[OpenSSH SFTP 手册](https://man.openbsd.org/sftp.1)。
 
+当当前活动 Tab 是 SSH 或 SFTP 会话时，左侧 **File Explorer** 自动显示同一主机的
+远程目录，而不是本地 `project_dir`。远程 shell 提供 OSC 7 cwd 时跟随该目录；否则
+从 SFTP 登录目录开始。点击文件夹进入，顶部向上箭头返回父目录；右键可新建文件/文件夹、
+重命名、移动、递归删除、上传文件/文件夹或下载。上传和下载仍建立独立传输 Tab，并在
+可能覆盖现有目标前确认。切回本地 Tab 后，本地文件树立即恢复。
+
+Explorer 操作通过 OpenSSH SFTP 的结构化 batch stdin 执行，不拼接远端 shell 命令。
+它使用与连接相同的主机校验和认证助手；未保存的密码可能需要为新的 SFTP 连接再次输入，
+使用 SSH Agent 或明确启用系统凭据库可避免重复输入。递归删除先枚举远端树并设置深度与
+条目上限，超限即停止，不会退化为远端 shell `rm`。
+
 ## 平台和边界
 
 本机须安装 `ssh` 和 `sftp` 并可从 PATH 启动。Windows 可使用系统 OpenSSH Client，
@@ -79,9 +90,10 @@ SFTP 客户端；验证版本为 Windows OpenSSH 9.5p2。缺少程序或版本�
 默认 15）、`keepalive_secs`（1–3600，默认 30）和 `known_hosts_file`（默认空，
 沿用系统配置）。默认不转发 agent、X11 或端口；这不是端口转发管理器。
 
-SSH/SFTP 属于用户控制的远程会话；本地文件树、Git、Composer Agent 仍在本机。
-远端 OSC 和 localhost 输出不会重定向本地上下文。本轮没有远程 Agent、远程编辑器、
-双栏远程文件树或无人值守的后台传输服务。Windows OpenSSH 会改写
+SSH/SFTP 属于用户控制的远程会话；File Explorer 仅在活动远程 Tab 中切换为该主机的
+SFTP 视图，Git、Composer Agent 与 `project_dir` 仍在本机。远端 OSC 7 只更新该 Tab
+的远程 Explorer 路径；其他远端 OSC 和 localhost 输出不会重定向本地上下文。本轮没有
+远程 Agent、远程编辑器、双栏文件树或无人值守的后台传输服务。Windows OpenSSH 会改写
 字面反斜杠，因此这种罕见远端文件名被拒绝，避免传错文件。
 
 ## 验证

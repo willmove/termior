@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod credentials;
+pub mod sftp;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
