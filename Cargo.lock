@@ -6515,6 +6515,7 @@ dependencies = [
  "log",
  "rfd",
  "serde_json",
+ "tempfile",
  "termior-agent-host",
  "termior-ai",
  "termior-editor",
@@ -6524,6 +6525,7 @@ dependencies = [
  "termior-platform",
  "termior-preview",
  "termior-security",
+ "termior-ssh",
  "termior-store",
  "termior-terminal",
  "termior-terminal-core",
@@ -6532,6 +6534,7 @@ dependencies = [
  "termior-ui-kit",
  "termior-vcs",
  "winresource",
+ "zeroize",
 ]
 
 [[package]]
@@ -6692,6 +6695,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "termior-ssh"
+version = "0.1.6"
+dependencies = [
+ "keyring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "termior-store",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "termior-store"
 version = "0.1.7"
 dependencies = [
@@ -6711,9 +6728,11 @@ dependencies = [
  "futures",
  "log",
  "portable-pty",
+ "serde_json",
  "tempfile",
  "termior-preview",
  "termior-security",
+ "termior-ssh",
  "termior-terminal-core",
  "thiserror 1.0.69",
  "vte 0.13.1",
@@ -6745,6 +6764,7 @@ version = "0.1.7"
 dependencies = [
  "serde",
  "serde_json",
+ "termior-ssh",
  "termior-ui-kit",
  "thiserror 1.0.69",
 ]

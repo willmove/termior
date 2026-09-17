@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+termior-ssh.workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 termior-ui-kit = { workspace = true }

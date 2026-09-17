@@ -24,6 +24,9 @@ pub enum TabKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TabState {
+    /// Explicit SSH/SFTP target. Restored tabs stay disconnected until user reconnects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<termior_ssh::Connection>,
     pub id: TabId,
     pub kind: TabKind,
     pub title: String,
@@ -49,6 +52,7 @@ pub struct TabState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarPanel {
+    Ssh,
     Explorer,
     SourceControl,
     GitHistory,
@@ -206,6 +210,7 @@ impl WorkspaceState {
             cwd,
             project_dir,
             resource: None,
+            remote: None,
             private_terminal: kind == TabKind::Terminal && private,
             terminal_hidden: false,
             layout: PaneLayout::new(),

@@ -4,6 +4,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/termior-ssh",
     "crates/termior-theme",
     "crates/termior-store",
     "crates/termior-security",
@@ -34,6 +35,7 @@ repository = "https://github.com/termior/termior"
 
 # 统一版本管理（对齐 Spec §3.1「版本与依赖纪律」）
 [workspace.dependencies]
+termior-ssh = { path = "crates/termior-ssh" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
@@ -79,6 +81,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 base64 = "0.22"
 wait-timeout = "0.2"
 sha2 = "0.10"
+zeroize = "1"
 semver = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 chrono-tz = { version = "0.10", features = ["serde"] }

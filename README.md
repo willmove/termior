@@ -21,6 +21,7 @@ Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、�
 
 - 持久化工作区、8 类 tab、分栏、Explorer/Source Control/History 侧栏、状态栏、独立设置窗口；
 - portable-pty + alacritty_terminal 真终端，shell integration、OSC 7/133/777、IME、搜索、回滚滚动、URL/localhost 检测和 Windows Job Object；
+- [SSH 会话与 SFTP](docs/ssh.md)：连接配置与侧栏快捷连接、系统凭据库、密码/MFA/密钥/agent 认证、跳板机、主机指纹校验、文件/目录上传下载与续传；
 - Rope 编辑缓冲、虚拟可视区、tree-sitter 增量高亮、搜索、撤销重做、10 套独立编辑器主题和 Vim 交互层；
 - 文件索引、gitignore、模糊查找、后台流式 grep、文件监听、键盘树导航与完整上下文菜单；
 - Git 专用 diff/history/commit-file 页签、文件/hunk stage/unstage、确认 discard、commit、branch、fetch/pull/push 与 commit graph；
@@ -45,6 +46,7 @@ crates/
   termior-ui               tab/sidebar/workspace 持久状态
   termior-ui-kit           通用控件、pane 布局与共享搜索模型
   termior-terminal         PTY 会话、进程生命周期和字节桥
+  termior-ssh              OpenSSH 连接配置、认证选项与 SFTP 传输命令
   termior-terminal-core    OSC、shell integration、搜索
   termior-editor           Rope、tree-sitter、Vim、补全状态
   termior-explorer         文件索引、树、搜索、watcher

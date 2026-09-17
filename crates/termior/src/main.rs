@@ -17,6 +17,8 @@ mod markdown_render;
 mod monospace_font;
 mod preview_view;
 mod settings_view;
+mod ssh_askpass;
+mod ssh_view;
 mod terminal_view;
 mod ui;
 mod updater;
@@ -30,6 +32,9 @@ use std::{ffi::OsString, io::Write as _, path::PathBuf};
 use workspace_view::{OpenWorkspace, WorkspaceView};
 
 fn main() {
+    if std::env::var_os("TERMIOR_SSH_ASKPASS").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        ssh_askpass::run();
+    }
     install_panic_log();
     let _ = env_logger::try_init();
     let smoke_test = std::env::var_os("TERMIOR_SMOKE_TEST").is_some();
@@ -91,6 +96,13 @@ fn main() {
                     if let Some(secs) = idle_redraw_probe_secs {
                         workspace.update(cx, |workspace, cx| {
                             workspace.start_idle_redraw_probe(secs, cx);
+                        });
+                    }
+                    if std::env::var_os("TERMIOR_OPEN_SSH_MANAGER").is_some() {
+                        let workspace = workspace.clone();
+                        window.on_next_frame(move |window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| workspace.open_ssh_manager(window, cx));
                         });
                     }
                     if nfr_measure {

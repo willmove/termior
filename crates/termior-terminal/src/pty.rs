@@ -29,6 +29,8 @@ pub enum SpawnError {
 /// PTY 会话配置：选择 shell、初始尺寸、工作目录。
 #[derive(Debug, Clone)]
 pub struct PtySessionConfig {
+    /// Explicit user-owned remote session; never passed through a local shell.
+    pub remote: Option<termior_ssh::Connection>,
     /// None 时按平台探测默认 shell。
     pub shell: Option<ShellKind>,
     /// Optional executable path/name. Manual shell settings use this field.
@@ -55,6 +57,7 @@ pub struct PtySessionConfig {
 impl Default for PtySessionConfig {
     fn default() -> Self {
         Self {
+            remote: None,
             shell: None,
             shell_program: None,
             shell_integration: false,
@@ -75,6 +78,7 @@ impl Default for PtySessionConfig {
 /// child 句柄可由 [`PtySession::take_child`] 取走交给退出监听线程（阻塞 `wait`），
 /// 会话侧保留 `clone_killer` 得到的 killer，kill 能力不受影响。
 pub struct PtySession {
+    remote: bool,
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
@@ -187,6 +191,7 @@ impl PtySession {
         let killer = child.clone_killer();
 
         Ok(Self {
+            remote: config.remote.is_some(),
             master: pair.master,
             writer: Arc::new(Mutex::new(writer)),
             killer,
@@ -207,6 +212,10 @@ impl PtySession {
     /// 是否为 WSL 会话。
     pub fn is_wsl(&self) -> bool {
         self.is_wsl
+    }
+
+    pub fn is_remote(&self) -> bool {
+        self.remote
     }
 
     /// 克隆 reader（在调用方线程里 read PTY 输出）。可多次克隆。
@@ -352,6 +361,63 @@ fn build_command(
     integration_enabled: bool,
     config: &PtySessionConfig,
 ) -> Result<(CommandBuilder, Option<tempfile::TempDir>), SpawnError> {
+    if let Some(remote) = &config.remote {
+        let invocation = remote
+            .profile
+            .invocation(remote.kind)
+            .map_err(|error| SpawnError::Spawn(error.to_string()))?;
+        let mut cmd = CommandBuilder::new(invocation.program);
+        let mut batch_dir = None;
+        if let Some(transfer) = &remote.transfer {
+            if remote.kind != termior_ssh::SessionKind::Sftp {
+                return Err(SpawnError::Spawn(
+                    "Transfers require an SFTP session".into(),
+                ));
+            }
+            let batch = transfer
+                .batch()
+                .map_err(|error| SpawnError::Spawn(error.to_string()))?;
+            let dir = tempfile::tempdir()?;
+            let file = dir.path().join("transfer.sftp");
+            std::fs::write(&file, batch)?;
+            // Explicitly retain PTY authentication despite sftp's batch default.
+            // First SSH option wins, so this precedes -b's implicit BatchMode=yes.
+            cmd.args(["-o", "BatchMode=no", "-N", "-b"]);
+            cmd.arg(file);
+            batch_dir = Some(dir);
+        }
+        cmd.args(&invocation.args);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("TERM_PROGRAM", "Termior");
+        if remote.profile.use_saved_credentials {
+            // Only non-secret metadata crosses the environment boundary. The helper
+            // reads the OS vault and replies over OpenSSH's private stdout pipe.
+            if batch_dir.is_none() {
+                batch_dir = Some(tempfile::tempdir()?);
+            }
+            let helper = std::env::var_os("TERMIOR_SSH_ASKPASS_EXE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or(std::env::current_exe()?);
+            cmd.env("SSH_ASKPASS", helper);
+            cmd.env("SSH_ASKPASS_REQUIRE", "force");
+            cmd.env("TERMIOR_SSH_ASKPASS", "1");
+            cmd.env(
+                "TERMIOR_SSH_ASKPASS_PROFILE",
+                serde_json::to_string(&remote.profile)
+                    .map_err(|e| SpawnError::Spawn(e.to_string()))?,
+            );
+            cmd.env(
+                "TERMIOR_SSH_ASKPASS_STATE",
+                batch_dir.as_ref().unwrap().path(),
+            );
+        } else {
+            cmd.env("SSH_ASKPASS_REQUIRE", "never");
+        }
+        if let Some(cwd) = resolve_cwd(config) {
+            cmd.cwd(cwd);
+        }
+        return Ok((cmd, batch_dir));
+    }
     if config.wsl_distribution.is_some() {
         return build_wsl_command(kind, integration_enabled, config);
     }

@@ -201,6 +201,7 @@ struct PaneContextMenu {
 enum NewTabAction {
     Terminal,
     Editor,
+    Ssh,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +267,11 @@ enum SplitMenuAction {
 }
 
 pub struct WorkspaceView {
+    pending_terminals: std::collections::HashSet<(TabId, PaneId)>,
+    main_window: Option<gpui::AnyWindowHandle>,
+    ssh_profiles: termior_ssh::Profiles,
+    ssh_profiles_error: Option<String>,
+    ssh_manager_window: Option<gpui::WindowHandle<crate::ssh_view::SshView>>,
     model: WorkspaceState,
     tabs: Vec<AppTab>,
     themes: Vec<Theme>,
@@ -302,7 +308,6 @@ pub struct WorkspaceView {
     /// 标签栏新建下拉的锚点；`None` 表示关闭。
     new_tab_menu: Option<Point<Pixels>>,
     pane_context_menu: Option<PaneContextMenu>,
-    composer_menu_open: bool,
     sidebar_resizing: bool,
     /// Composer 面板拖拽调整尺寸进行中（方向取决于当前停靠位置）。
     composer_resizing: bool,
@@ -456,7 +461,11 @@ impl WorkspaceView {
                                         )
                                     }),
                                 TabKind::Terminal | TabKind::Preview => {
-                                    PaneContent::Placeholder(format!("Restoring {}…", tab.title))
+                                    PaneContent::Placeholder(if tab.remote.is_some() {
+                                        "远程会话未连接。使用上方「重新连接」恢复。".into()
+                                    } else {
+                                        format!("Restoring {}…", tab.title)
+                                    })
                                 }
                                 TabKind::AiDiff | TabKind::GitDiff | TabKind::GitCommitFile => {
                                     PaneContent::Placeholder(format!(
@@ -554,6 +563,11 @@ impl WorkspaceView {
         let explorer_tree = TreeState::new(initial_project_root.clone());
         Self {
             model,
+            pending_terminals: Default::default(),
+            main_window: None,
+            ssh_profiles: termior_ssh::Profiles::default(),
+            ssh_profiles_error: None,
+            ssh_manager_window: None,
             tabs,
             themes,
             theme_index,
@@ -582,7 +596,6 @@ impl WorkspaceView {
             explorer_context_menu: None,
             new_tab_menu: None,
             pane_context_menu: None,
-            composer_menu_open: false,
             sidebar_resizing: false,
             composer_resizing: false,
             titlebar_move_armed: false,
@@ -610,11 +623,13 @@ impl WorkspaceView {
     }
 
     pub fn restore_or_create_runtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.main_window = Some(window.window_handle());
+        self.reload_ssh_profiles();
         let terminal_panes: Vec<(TabId, PaneId, Option<PathBuf>, bool)> = self
             .model
             .tabs
             .iter()
-            .filter(|tab| tab.kind == TabKind::Terminal)
+            .filter(|tab| tab.kind == TabKind::Terminal && tab.remote.is_none())
             .flat_map(|tab| {
                 tab.layout
                     .panes()
@@ -1201,6 +1216,9 @@ impl WorkspaceView {
         window_handle: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) {
+        if !self.pending_terminals.insert((tab_id, pane_id)) {
+            return;
+        }
         let palette = self.palette.clone();
         let terminal_settings = self.settings.terminal.clone();
         let keymap = self.settings.keymap.clone();
@@ -1211,6 +1229,12 @@ impl WorkspaceView {
             ShellDetection::Manual { .. } => None,
         };
         let config = termior_terminal::PtySessionConfig {
+            remote: self
+                .model
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .and_then(|tab| tab.remote.clone()),
             shell_program,
             shell_integration: true,
             inherit_environment: !private,
@@ -1227,6 +1251,7 @@ impl WorkspaceView {
                 Ok(bridge) => bridge,
                 Err(error) => {
                     let _ = workspace.update(cx, |workspace, cx| {
+                        workspace.pending_terminals.remove(&(tab_id, pane_id));
                         if let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                             if let Some(pane) = tab.panes.get_mut(&pane_id) {
                                 *pane = PaneContent::Placeholder(format!(
@@ -1241,6 +1266,14 @@ impl WorkspaceView {
                 }
             };
             let _ = workspace.update(cx, |workspace, cx| {
+                workspace.pending_terminals.remove(&(tab_id, pane_id));
+                if !workspace
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.id == tab_id && tab.panes.contains_key(&pane_id))
+                {
+                    return;
+                }
                 let entity = cx.new(|cx| {
                     TerminalView::from_bridge(bridge, palette, terminal_settings, keymap, cx)
                 });
@@ -1296,8 +1329,11 @@ impl WorkspaceView {
                             {
                                 match event {
                                     TerminalViewEvent::TitleChanged(title) => {
-                                        tab.title =
-                                            title.clone().unwrap_or_else(|| "Terminal".to_owned());
+                                        if tab.remote.is_none() {
+                                            tab.title = title
+                                                .clone()
+                                                .unwrap_or_else(|| "Terminal".to_owned());
+                                        }
                                     }
                                     TerminalViewEvent::Bell => {
                                         log::debug!("terminal bell in tab {}", tab_id.0);
@@ -1331,6 +1367,140 @@ impl WorkspaceView {
             });
         })
         .detach();
+    }
+
+    fn reconnect_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.model.active_tab().filter(|tab| tab.remote.is_some()) else {
+            return;
+        };
+        if tab
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.transfer.is_some())
+        {
+            self.open_ssh_manager(window, cx);
+            return;
+        }
+        let (id, pane, cwd) = (tab.id, tab.layout.focused, tab.project_dir.clone());
+        if self.pending_terminals.contains(&(id, pane)) {
+            return;
+        }
+        if let Some(terminal) = self.active_terminal() {
+            if !terminal.read(cx).has_exited() {
+                return;
+            }
+        }
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.panes
+                .insert(pane, PaneContent::Placeholder("正在连接…".into()));
+        }
+        self.spawn_terminal_into(id, pane, Some(cwd), false, Some(window.window_handle()), cx);
+    }
+
+    fn reload_ssh_profiles(&mut self) {
+        match self
+            .data_dir
+            .as_ref()
+            .map(|dir| termior_ssh::Profiles::load(dir))
+            .transpose()
+        {
+            Ok(profiles) => {
+                self.ssh_profiles = profiles.unwrap_or_default();
+                self.ssh_profiles_error = None;
+            }
+            Err(error) => {
+                self.ssh_profiles_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn connect_remote(
+        &mut self,
+        connection: termior_ssh::Connection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = format!(
+            "{} · {}",
+            if connection.transfer.is_some() {
+                "SFTP 传输"
+            } else if connection.kind == termior_ssh::SessionKind::Shell {
+                "SSH"
+            } else {
+                "SFTP"
+            },
+            connection.profile.name
+        );
+        let id = self.model.new_tab(TabKind::Terminal, &title, false);
+        if let Some(tab) = self.model.active_tab_mut() {
+            tab.remote = Some(connection);
+        }
+        self.tabs.push(AppTab {
+            id,
+            panes: single_pane(PaneContent::Placeholder("正在连接…".into())),
+        });
+        self.activate_runtime(id, cx);
+        self.spawn_terminal_into(
+            id,
+            PaneId(1),
+            Some(self.model.active_project_dir().to_path_buf()),
+            false,
+            Some(window.window_handle()),
+            cx,
+        );
+        self.persist_workspace();
+        window.activate_window();
+        cx.notify();
+    }
+
+    pub(crate) fn open_ssh_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(handle) = self.ssh_manager_window {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+        }
+        let workspace = cx.entity().downgrade();
+        let main_window = window.window_handle();
+        let dir = self.data_dir.clone();
+        let connect = Box::new(move |connection: termior_ssh::Connection, app: &mut App| {
+            let _ = main_window.update(app, |_, window, cx| {
+                let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.connect_remote(connection, window, cx);
+                });
+            });
+        });
+        let bounds = Bounds::centered(None, size(px(860.), px(700.)), cx);
+        match cx.open_window(
+            app_identity::window_options(WindowBounds::Windowed(bounds)),
+            |window, cx| {
+                let view = cx.new(|cx| crate::ssh_view::SshView::new(dir, connect, cx));
+                window.set_window_title("SSH / SFTP · Termior");
+                window.on_window_should_close(cx, |window, _| {
+                    window.remove_window();
+                    false
+                });
+                window.focus(&view.read(cx).focus_handle(cx), cx);
+                view
+            },
+        ) {
+            Ok(handle) => {
+                if let Ok(view) = handle.entity(cx) {
+                    cx.subscribe(
+                        &view,
+                        |this, _, _: &crate::ssh_view::ProfilesChanged, cx| {
+                            this.reload_ssh_profiles();
+                            cx.notify();
+                        },
+                    )
+                    .detach();
+                }
+                self.ssh_manager_window = Some(handle);
+            }
+            Err(error) => self.command_message = Some(format!("SSH manager: {error}")),
+        }
     }
 
     fn create_editor(&mut self, cx: &mut Context<Self>) {
@@ -1864,6 +2034,13 @@ impl WorkspaceView {
         let Some(tab) = self.model.active_tab() else {
             return false;
         };
+        if tab
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.transfer.is_some())
+        {
+            return false;
+        }
         let (width, height) = self.pane_area_size(window);
         tab.layout.can_split_focused(
             direction,
@@ -1877,6 +2054,14 @@ impl WorkspaceView {
     }
 
     fn split_unavailable_message(&self, direction: Option<SplitDirection>) -> String {
+        if self
+            .model
+            .active_tab()
+            .and_then(|tab| tab.remote.as_ref())
+            .is_some_and(|remote| remote.transfer.is_some())
+        {
+            return "文件传输不能通过分栏重复执行。请在连接管理中创建并确认新的传输。".into();
+        }
         if self.model.active_tab().is_none() {
             return "Open a tab before splitting a pane.".into();
         }
@@ -1914,7 +2099,6 @@ impl WorkspaceView {
     }
 
     fn close_chrome_menus(&mut self) {
-        self.composer_menu_open = false;
         self.new_tab_menu = None;
         self.pane_context_menu = None;
         self.explorer_context_menu = None;
@@ -2138,6 +2322,16 @@ impl WorkspaceView {
         window_handle: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .model
+            .tabs
+            .iter()
+            .any(|tab| tab.id == tab_id && tab.remote.is_some())
+        {
+            // Preserve output and authentication errors. Reconnection is always explicit.
+            cx.notify();
+            return;
+        }
         if let Some(code) = exit_code {
             log::info!(
                 "terminal pane {} in tab {} exited with code {code}",
@@ -2287,6 +2481,7 @@ impl WorkspaceView {
         match action {
             NewTabAction::Terminal => self.create_terminal(false, window, cx),
             NewTabAction::Editor => self.create_editor(cx),
+            NewTabAction::Ssh => self.open_ssh_manager(window, cx),
         }
     }
 
@@ -3172,6 +3367,8 @@ impl WorkspaceView {
         let migration_error = self.migration_error.clone();
         let data_dir = self.data_dir.clone();
         let workspace = cx.entity().downgrade();
+        let ssh_workspace = workspace.clone();
+        let main_window = self.main_window;
         let preview_workspace = workspace.clone();
         let on_save = Box::new(move |settings: &Settings, app: &mut gpui::App| {
             if let Some(workspace) = workspace.upgrade() {
@@ -3220,6 +3417,19 @@ impl WorkspaceView {
                         cx,
                     )
                 });
+                cx.subscribe(
+                    &view,
+                    move |_, _: &crate::settings_view::OpenSshManager, app| {
+                        if let Some(main_window) = main_window {
+                            let _ = main_window.update(app, |_, window, cx| {
+                                let _ = ssh_workspace.update(cx, |workspace, cx| {
+                                    workspace.open_ssh_manager(window, cx)
+                                });
+                            });
+                        }
+                    },
+                )
+                .detach();
                 let flush_view = view.downgrade();
                 window.on_window_should_close(cx, move |window, cx| {
                     if let Some(view) = flush_view.upgrade() {
@@ -3699,12 +3909,6 @@ impl WorkspaceView {
     }
 
     fn global_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.key == "escape" && self.composer_menu_open {
-            self.composer_menu_open = false;
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
         if self.handle_command_key(event, window, cx) {
             cx.stop_propagation();
             return;
@@ -4018,6 +4222,121 @@ impl WorkspaceView {
                 .child(SharedString::from(message))
         });
         let content = match self.model.sidebar_panel {
+            SidebarPanel::Ssh => {
+                let mut panel = div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_2()
+                    .child(div().text_sm().child("SSH / SFTP 会话"))
+                    .child(
+                        ui::button("ssh-manage", "管理连接…", ButtonKind::Subtle, &self.palette)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.open_ssh_manager(window, cx)
+                                }),
+                            ),
+                    );
+                if let Some(error) = &self.ssh_profiles_error {
+                    panel = panel.child(
+                        div()
+                            .text_xs()
+                            .child(SharedString::from(format!("配置读取失败：{error}"))),
+                    );
+                } else if self.ssh_profiles.connections.is_empty() {
+                    panel = panel.child(div().text_xs().child("暂无连接，点击管理连接添加。"));
+                }
+                for (i, profile) in self.ssh_profiles.connections.iter().enumerate() {
+                    let ssh = profile.clone();
+                    let sftp = profile.clone();
+                    panel = panel.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                ui::button(
+                                    ("ssh-saved", i),
+                                    SharedString::from(profile.name.clone()),
+                                    ButtonKind::Ghost,
+                                    &self.palette,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.connect_remote(
+                                            termior_ssh::Connection {
+                                                profile: ssh.clone(),
+                                                kind: termior_ssh::SessionKind::Shell,
+                                                transfer: None,
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                )),
+                            )
+                            .child(div().text_xs().child(SharedString::from(format!(
+                                "{}@{}",
+                                profile.user, profile.host
+                            ))))
+                            .child(
+                                ui::button(
+                                    ("sftp-saved", i),
+                                    "打开 SFTP",
+                                    ButtonKind::Subtle,
+                                    &self.palette,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.connect_remote(
+                                            termior_ssh::Connection {
+                                                profile: sftp.clone(),
+                                                kind: termior_ssh::SessionKind::Sftp,
+                                                transfer: None,
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                    },
+                                )),
+                            ),
+                    );
+                }
+                let sessions: Vec<_> = self
+                    .model
+                    .tabs
+                    .iter()
+                    .filter(|tab| tab.remote.is_some())
+                    .collect();
+                if !sessions.is_empty() {
+                    panel = panel.child(div().mt_3().text_xs().child("已打开会话"));
+                    for (i, tab) in sessions.into_iter().enumerate() {
+                        let id = tab.id;
+                        panel = panel.child(
+                            ui::button(
+                                ("ssh-open", i),
+                                SharedString::from(tab.title.clone()),
+                                if self.model.active == Some(id) {
+                                    ButtonKind::Primary
+                                } else {
+                                    ButtonKind::Ghost
+                                },
+                                &self.palette,
+                            )
+                            .overflow_hidden()
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.activate_runtime(id, cx);
+                                    this.focus_active_pane(window, cx);
+                                    cx.notify();
+                                },
+                            )),
+                        );
+                    }
+                }
+                panel.into_any_element()
+            }
+
             SidebarPanel::Explorer => {
                 let toolbar = div()
                     .flex()
@@ -4441,6 +4760,16 @@ impl WorkspaceView {
     }
 
     fn sync_terminal_context(&mut self, cx: &mut Context<Self>) -> (String, Option<String>) {
+        if let Some(remote) = self.model.active_tab().and_then(|tab| tab.remote.as_ref()) {
+            let label = format!(
+                "{:?} · {}@{} · 本地 Agent 未连接此主机",
+                remote.kind, remote.profile.user, remote.profile.host
+            );
+            self.composer.update(cx, |composer, _| {
+                composer.update_terminal_context(String::new(), String::new(), None)
+            });
+            return (label, None);
+        }
         let terminal = self.active_terminal().cloned();
         let cwd = terminal
             .as_ref()
@@ -5182,6 +5511,7 @@ impl gpui::Render for WorkspaceView {
                         .border_color(ui::border(&p))
                         .children(
                             [
+                                (Icon::Terminal, SidebarPanel::Ssh, "SSH / SFTP"),
                                 (
                                     Icon::Files,
                                     SidebarPanel::Explorer,
@@ -5482,6 +5812,14 @@ impl gpui::Render for WorkspaceView {
                         &p,
                         cx,
                     ))
+                    .child(new_tab_menu_item(
+                        "SSH / SFTP 连接…",
+                        "new-tab-ssh",
+                        true,
+                        NewTabAction::Ssh,
+                        &p,
+                        cx,
+                    ))
                     .with_animation(
                         "new-tab-menu-fade-in",
                         Animation::new(UI_FADE_IN).with_easing(ease_in_out),
@@ -5583,60 +5921,6 @@ impl gpui::Render for WorkspaceView {
         self.composer.update(cx, |composer, cx| {
             composer.set_fill_workspace(terminal_hidden, cx)
         });
-        let composer_menu = self.composer_menu_open.then(|| {
-            menu_panel(&p)
-                .id("composer-layout-menu")
-                .absolute()
-                .right(px(12.0))
-                .bottom(px(STATUS_BAR_HEIGHT + 4.0))
-                .w(px(220.0))
-                .children(
-                    [
-                        (
-                            if self.model.composer_visible {
-                                "Hide Agent (Ctrl+I)"
-                            } else {
-                                "Show Agent (Ctrl+I)"
-                            },
-                            None,
-                        ),
-                        ("Dock Agent to bottom", Some(ComposerDock::Bottom)),
-                        ("Dock Agent to right", Some(ComposerDock::Right)),
-                    ]
-                    .into_iter()
-                    .map(|(label, dock)| {
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .text_xs()
-                            .cursor_pointer()
-                            .hover({
-                                let wash = ui::hover_wash(&p);
-                                move |style| style.bg(wash)
-                            })
-                            .child(label)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.composer_menu_open = false;
-                                    if let Some(dock) = dock {
-                                        this.model.composer_dock = dock;
-                                        this.sync_composer_layout(cx);
-                                        this.set_composer_visible(true, window, cx);
-                                    } else {
-                                        this.set_composer_visible(
-                                            !this.model.composer_visible,
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                }),
-                            )
-                    }),
-                )
-        });
         let composer_section_right = (!terminal_hidden
             && self.model.composer_visible
             && self.model.composer_dock == ComposerDock::Right)
@@ -5714,8 +5998,7 @@ impl gpui::Render for WorkspaceView {
                     let closed_explorer = this.explorer_context_menu.take().is_some();
                     let closed_new_tab = this.new_tab_menu.take().is_some();
                     let closed_pane = this.pane_context_menu.take().is_some();
-                    let closed_composer = std::mem::replace(&mut this.composer_menu_open, false);
-                    if closed_explorer || closed_new_tab || closed_pane || closed_composer {
+                    if closed_explorer || closed_new_tab || closed_pane {
                         cx.notify();
                     }
                 }),
@@ -5897,7 +6180,92 @@ impl gpui::Render for WorkspaceView {
                             .flex_1()
                             .min_w(px(0.0))
                             .size_full()
-                            .when(!terminal_hidden, |area| area.child(active_content))
+                            .flex()
+                            .flex_col()
+                            .when(
+                                self.model
+                                    .active_tab()
+                                    .is_some_and(|tab| tab.remote.is_some()),
+                                |area| {
+                                    let running = self
+                                        .active_terminal()
+                                        .is_some_and(|terminal| !terminal.read(cx).has_exited());
+                                    area.child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .px_2()
+                                            .py_1()
+                                            .child(if running {
+                                                "远程会话运行中 / 认证中"
+                                            } else {
+                                                match self.active_terminal().and_then(|terminal| {
+                                                    terminal.read(cx).exit_code()
+                                                }) {
+                                                    Some(0) => "已正常完成",
+                                                    Some(_) => {
+                                                        "连接 / 传输失败或已取消（详见输出）"
+                                                    }
+                                                    None => "远程会话未连接",
+                                                }
+                                            })
+                                            .child(
+                                                ui::button(
+                                                    "remote-reconnect",
+                                                    if self
+                                                        .model
+                                                        .active_tab()
+                                                        .and_then(|tab| tab.remote.as_ref())
+                                                        .is_some_and(|remote| {
+                                                            remote.transfer.is_some()
+                                                        })
+                                                    {
+                                                        "新建传输…"
+                                                    } else {
+                                                        "重新连接"
+                                                    },
+                                                    ButtonKind::Subtle,
+                                                    &p,
+                                                )
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.reconnect_remote(window, cx)
+                                                })),
+                                            )
+                                            .child(
+                                                ui::button(
+                                                    "remote-disconnect",
+                                                    "断开",
+                                                    ButtonKind::Ghost,
+                                                    &p,
+                                                )
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some(terminal) =
+                                                        this.active_terminal().cloned()
+                                                    {
+                                                        terminal.update(cx, |terminal, _| {
+                                                            terminal.disconnect()
+                                                        });
+                                                    }
+                                                })),
+                                            )
+                                            .child(
+                                                ui::button(
+                                                    "remote-manager",
+                                                    "连接管理",
+                                                    ButtonKind::Ghost,
+                                                    &p,
+                                                )
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.open_ssh_manager(window, cx)
+                                                })),
+                                            ),
+                                    )
+                                },
+                            )
+                            .when(!terminal_hidden, |area| {
+                                area.child(div().flex_1().min_h_0().child(active_content))
+                            })
                             .when(terminal_hidden && self.model.composer_visible, |area| {
                                 area.child(self.composer.clone())
                             }),
@@ -6030,23 +6398,29 @@ impl gpui::Render for WorkspaceView {
                             )
                             .child(
                                 ui::icon_button(
-                                    "composer-menu-toggle",
-                                    match self.model.composer_dock {
-                                        ComposerDock::Bottom => Icon::PanelBottom,
-                                        ComposerDock::Right => Icon::PanelRight,
+                                    "composer-toggle",
+                                    if self.model.composer_visible {
+                                        Icon::ChevronDown
+                                    } else {
+                                        Icon::ChevronUp
                                     },
-                                    "Agent panel: visibility and docking",
+                                    if self.model.composer_visible {
+                                        "Hide Agent panel (Ctrl+I)"
+                                    } else {
+                                        "Show Agent panel (Ctrl+I)"
+                                    },
                                     &p,
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, window, cx| {
                                         cx.stop_propagation();
-                                        window.focus(&this.focus_handle, cx);
-                                        let open = !this.composer_menu_open;
                                         this.close_chrome_menus();
-                                        this.composer_menu_open = open;
-                                        cx.notify();
+                                        this.set_composer_visible(
+                                            !this.model.composer_visible,
+                                            window,
+                                            cx,
+                                        );
                                     }),
                                 ),
                             ),
@@ -6054,8 +6428,7 @@ impl gpui::Render for WorkspaceView {
             )
             .children(explorer_context_menu)
             .children(new_tab_menu)
-            .children(pane_context_menu)
-            .children(composer_menu);
+            .children(pane_context_menu);
         self.render_window_frame(root, &p, window, cx)
     }
 }

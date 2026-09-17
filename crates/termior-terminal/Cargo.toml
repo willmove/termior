@@ -6,6 +6,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+serde_json.workspace = true
+termior-ssh.workspace = true
 portable-pty = { workspace = true }
 alacritty_terminal = { workspace = true }
 vte = { workspace = true }
@@ -26,4 +28,3 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-

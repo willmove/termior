@@ -64,6 +64,8 @@ pub enum TerminalViewEvent {
 
 /// GPUI 终端视图。
 pub struct TerminalView {
+    exited: bool,
+    exit_code: Option<i32>,
     bridge: TerminalBridge,
     /// spawn 时解析出的实际 shell 类型（cd 注入按此分派语法）。
     shell_kind: ShellKind,
@@ -142,26 +144,31 @@ impl TerminalView {
         let cols = PtySessionConfig::default().cols as usize;
         let rows = PtySessionConfig::default().rows as usize;
         let output_rx = bridge.take_output().expect("output channel");
+        let exit_rx = bridge.take_exit().expect("exit channel");
         let (event_proxy, mut event_rx) = TerminalEventProxy::new(bridge.writer());
         let command_service = shared_terminal_service();
         let pane_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let command_session_id = command_service
-            .register_pane(
-                CommandCreate {
-                    owner: CommandOwner::User,
-                    project_dir: pane_root.display().to_string(),
-                    environment_id: "direct-pane".into(),
-                    cwd: pane_root.display().to_string(),
-                    shell: format!("{:?}", bridge.shell_kind()),
-                    command: String::new(),
-                    interactive: true,
-                    rows: PtySessionConfig::default().rows,
-                    cols: PtySessionConfig::default().cols,
-                },
-                bridge.writer(),
-            )
-            .map_err(|error| log::warn!("terminal pane registration failed: {error}"))
-            .ok();
+        let command_session_id = if bridge.is_remote() {
+            None
+        } else {
+            command_service
+                .register_pane(
+                    CommandCreate {
+                        owner: CommandOwner::User,
+                        project_dir: pane_root.display().to_string(),
+                        environment_id: "direct-pane".into(),
+                        cwd: pane_root.display().to_string(),
+                        shell: format!("{:?}", bridge.shell_kind()),
+                        command: String::new(),
+                        interactive: true,
+                        rows: PtySessionConfig::default().rows,
+                        cols: PtySessionConfig::default().cols,
+                    },
+                    bridge.writer(),
+                )
+                .map_err(|error| log::warn!("terminal pane registration failed: {error}"))
+                .ok()
+        };
         let terminal_id = command_session_id.as_ref().map_or_else(
             || {
                 format!(
@@ -263,8 +270,11 @@ impl TerminalView {
             if let Some(id) = observed_session.as_ref() {
                 let _ = observed_service.observe_pane_exit(id, None);
             }
-            let _ = this.update(cx, |_view, cx| {
-                cx.emit(TerminalViewEvent::Exited(None));
+            let exit_code = exit_rx.await.ok().flatten();
+            let _ = this.update(cx, |view, cx| {
+                view.exited = true;
+                view.exit_code = exit_code;
+                cx.emit(TerminalViewEvent::Exited(exit_code));
                 cx.notify();
             });
         });
@@ -275,6 +285,8 @@ impl TerminalView {
         let is_wsl = bridge.is_wsl();
         Self {
             bridge,
+            exited: false,
+            exit_code: None,
             shell_kind,
             is_wsl,
             term,
@@ -381,7 +393,21 @@ impl TerminalView {
     /// 生成把本会话 shell 切到 `dir` 的注入命令（含回车），按 spawn 时解析的
     /// shell 类型与 WSL 状态选择语法（cmd 用 `cd /d`，WSL 转 `/mnt/<drive>` 路径）。
     pub fn cd_command_to(&self, dir: &std::path::Path) -> String {
+        if self.bridge.is_remote() {
+            return String::new();
+        }
         cd_command(self.shell_kind, self.is_wsl, dir)
+    }
+
+    pub fn disconnect(&mut self) {
+        let _ = self.bridge.kill();
+    }
+
+    pub fn has_exited(&self) -> bool {
+        self.exited
+    }
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
     }
 
     fn handle_terminal_event(&mut self, event: AlacrittyEvent, cx: &mut Context<Self>) {

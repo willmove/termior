@@ -8,6 +8,8 @@ authors.workspace = true
 # GPUI 入口 crate（FR-WS 骨架 / FR-THEME 渲染层接入 / FR-TERM 终端 tab）。
 # gpui / gpui_platform 锁定到与已验证编译通过的同一 zed rev。
 [dependencies]
+zeroize.workspace = true
+termior-ssh.workspace = true
 gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49" }
 # gpui_platform 的 default features 为空，且它以 default-features = false 依赖 gpui_linux；
 # 不显式打开 wayland / x11 时，Linux 下 current_platform() 会走到 unreachable!() 而 panic。
@@ -41,6 +43,7 @@ rfd = "0.17.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49", features = ["test-support"] }
 
 [build-dependencies]

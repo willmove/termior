@@ -57,7 +57,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 
 - NG1：不做 LSP 全功能 IDE（无补全引擎、无调试器）；编辑器定位是「终端旁的顺手编辑器 + AI diff 审阅面」。
 - NG2：不做可修改任意 UI 或绕过安全门的通用插件系统 / 扩展市场；允许支持受控的 Agent Skills、MCP 工具与 Agent 后端适配器。
-- NG3：M10 前不做远程开发（SSH 工作区）与云端托管 Agent；本地 Agent 子进程和本地 worktree 不属于远程开发。
+- NG3：不把本地 Agent、文件浏览器或 Git 隐式切换为远程执行。用户管理的 SSH 终端与 SFTP 传输按 §6.23 提供；远程 Agent/完整远程工作区与云端托管仍不在本轮范围。
 - NG4：不以极限压缩安装包体积为首要目标；优先保证原生渲染性能、功能完整性与跨平台稳定性。
 - NG5：不内置任何托管模型代理服务；永远 BYOK。
 
@@ -177,7 +177,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | FR-WS-03 | 任意 tab 可分栏：`Cmd+D` 右分、`Cmd+Shift+D` 下分、`Cmd+[` / `Cmd+]` 切换焦点、`Cmd+W` 关闭焦点 pane（最后一个 pane 时关闭 tab）；pane 可拖拽调整尺寸、独立关闭 | P0 |
 | FR-WS-04 | sidebar 活动栏含三个面板：文件浏览器、源码管理、Git 历史；`Cmd+B` 折叠/展开，`Cmd+Shift+E` 聚焦浏览器 | P0 |
 | FR-WS-05 | 状态栏为上下文条：终端显示 cwd 面包屑（OSC 7），编辑器显示文件路径与行列；右侧含工作区名（活动 tab 的项目文件夹名）、git 分支、AI 状态（工具计数仅在 >0 时显示）、localhost 预览 pill | P0 |
-| FR-WS-09 | 状态栏以单一 Composer 菜单按钮提供显示/隐藏、底部停靠、右侧停靠；终端 tab 另有显示/隐藏终端区域按钮，作用于当前 tab 的全部分栏，隐藏只跳过渲染、不销毁 PTY。隐藏状态按 tab 持久化，Composer 可占满腾出的内容区，恢复终端后沿用原有停靠尺寸；状态栏按钮始终可用于恢复显示 | P0 |
+| FR-WS-09 | 状态栏以单一上下箭头按钮一键显示/隐藏 Composer，无二级菜单；底部/右侧停靠切换保留在 Composer 面板头；终端 tab 另有显示/隐藏终端区域按钮，作用于当前 tab 的全部分栏，隐藏只跳过渲染、不销毁 PTY。隐藏状态按 tab 持久化，Composer 可占满腾出的内容区，恢复终端后沿用原有停靠尺寸；状态栏按钮始终可用于恢复显示 | P0 |
 | FR-WS-06 | 自绘标题栏：标签栏与窗口控制合并为一行；操作区仅通知铃铛与设置；分栏入口在 pane 上下文菜单；主题选择在设置窗；工作区切换（本地 + Windows WSL）在状态栏 | P0（WSL 为 P1） |
 | FR-WS-08 | 每个 tab 持有独立的项目文件夹（`project_dir`）：打开文件夹（标题栏/状态栏按钮、`Cmd/Ctrl+O`）只重定向**活动 tab**，其他 tab 不受影响；运行中的终端注入 `cd` 同步（会话不中断）；文件浏览器、Git 面板与状态栏工作区名跟随活动 tab 的 `project_dir`；`project_dir` 不随 shell `cd`（OSC 7）漂移；全局 `root` 降为兑底（新建 tab 无继承来源、private terminal 使用） | P0 |
 | FR-WS-07 | 设置为独立 GPUI 窗口（`Cmd+,`），左侧竖向导航六页：General / Models / Themes / Shortcuts / Agents / About；自动保存（敏感凭据仍显式确认） | P0 |
@@ -467,6 +467,21 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 
 ---
 
+### 6.23 SSH 会话与 SFTP 文件传输（FR-SSH）
+
+| ID | 需求 | 优先级 |
+|---|---|---|
+| FR-SSH-01 | 标签栏新建菜单、系统偏好设置和左侧 SSH/SFTP 面板提供连接管理入口；左侧保存连接可直接启动 SSH/SFTP；管理窗口支持小窗口滚动、可见滚动条和自然宽度光标；支持配置新建、选择、编辑、保存和确认删除；字段包含名称、主机/SSH config 别名、用户名、端口、私钥和多级跳板机 | P1 |
+| FR-SSH-02 | 使用系统 OpenSSH，通过独立 PTY 支持自动认证、密码/keyboard-interactive、加密私钥与 ssh-agent；密码及私钥口令可选保存到系统凭据库，通过独立 OpenSSH askpass 进程复用；无明文降级；OTP、任意 keyboard-interactive 与代理/跳板提示须交互确认；秘密不进入配置、环境变量、命令行参数或 Agent 会话日志 | P1 |
+| FR-SSH-03 | 首次主机密钥须由用户确认；变更密钥拒绝连接；沿用 OpenSSH known_hosts 与 config；默认禁止 agent/X11/端口转发及 LocalCommand；连接超时、保活有界 | P1 |
+| FR-SSH-04 | SSH/SFTP 保持后台标签会话、支持尺寸同步与显式断开；连接失败或退出保留输出；重启恢复为断开状态，显式重连，不自动重放传输 | P1 |
+| FR-SSH-05 | 提供交互 SFTP 的浏览、目录/文件管理，以及图形文件选择式上传/下载、目录递归、续传、覆盖前确认；传输在独立标签显示进度与错误，关闭/断开可取消，成功由进程退出码判定 | P1 |
+| FR-SSH-06 | SSH 目标和 SFTP 路径在服务层校验；不用 shell 拼接命令。远端 OSC 不得变更本地 cwd、Agent 状态或 localhost 预览；远程 PTY 不注册到本地 Agent TerminalService | P1 |
+
+用户在连接管理中选择主机、文件并确认执行构成对该次连接/传输的明确授权。文件选择授权仅限该次 SFTP 操作，不扩大本地 Agent workspace 注册表。本轮不向 AI 暴露 SSH/SFTP 执行 API。连接设置以原子 JSON 保存，主机信任由 OpenSSH 管理，用户选择保存的密码与私钥口令由系统凭据库管理。实现决策见 ADR 0006，支持边界与验证见 `docs/ssh.md`。
+
+**验收标准**：真实 OpenSSH 客户端通过应用 PTY 连接隔离测试服务；密钥与密码登录成功；主机密钥变化失败；文件上传下载字节一致；中文、空格、方括号文件名准确；部分文件续传及目录传输通过；远端 OSC 不影响本地上下文；失败保留退出码与输出。
+
 ## 7. 数据与持久化（FR-DATA）
 
 应用数据目录经 `dirs` crate 解析（bundle id 建议 `app.<org>.Termior`），绝不裸读 `$HOME`/`%APPDATA%`：
@@ -480,6 +495,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | 文件 | 内容 |
 |---|---|
 | `Termior-settings.json` | 应用偏好：主题、字体、快捷键、补全开关、代理开关、WSL 发行版等 |
+| `Termior-ssh.json` | SSH 连接配置 schema v1；不含密码、私钥内容、口令或 OTP |
 | `Termior-ai-sessions.json` | 会话列表、activeId、每会话消息历史 |
 | `Termior-ai-agents.json` | 自定义代理（系统提示词 + 工具子集） |
 | `Termior-ai-snippets.json` | Composer `#handle` 片段 |
@@ -559,7 +575,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 - Q3：会话消息历史膨胀策略（单文件 JSON 何时拆分为每会话一文件）。
 - Q4：Claude Code 之外第二个终端代理（Codex 等）的 hooks 适配排期。
 - Q5：各平台 sandboxed 执行的最低可发布能力矩阵；能力不足的平台必须拒绝相应配置，不以 direct 回退。
-- Q6：M10 之后是否引入远程主机或云端 Agent；M6–M10 仅定义本地执行。
+- Q6：SSH/SFTP 用户会话见 §6.23；远程 Agent/完整远程工作区与云端 Agent 的执行边界仍需单独设计。
 - Q7：长期任务数据的默认保留期和磁盘预算，需在 M9 实现前以真实任务数据确定。
 
 ---

@@ -1,3 +1,6 @@
+pub struct OpenSshManager;
+impl gpui::EventEmitter<OpenSshManager> for SettingsView {}
+
 use gpui::{
     canvas, div, prelude::*, px, AnyElement, App, Bounds, ClipboardItem, Context, FocusHandle,
     Focusable, Font, InputHandler, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
@@ -1554,6 +1557,17 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_6()
+            .child(
+                self.section(
+                    "SSH / SFTP",
+                    "管理远程连接、认证凭据与文件传输。",
+                    [
+                        Self::button("管理 SSH / SFTP 连接", "ssh-settings", &self.palette)
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(OpenSshManager)))
+                            .into_any_element(),
+                    ],
+                ),
+            )
             .child(self.section(
                 "Terminal",
                 "Defaults for new terminal panes. Changes apply after auto-save.",

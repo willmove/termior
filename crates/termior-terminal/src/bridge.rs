@@ -68,6 +68,7 @@ impl EventListener for TerminalEventProxy {
 /// // 主线程循环：while let Some(data) = rx.next().await { vte_parser.advance(&mut term, &data.bytes); }
 /// ```
 pub struct TerminalBridge {
+    exit_rx: Option<futures::channel::oneshot::Receiver<Option<i32>>>,
     session: PtySession,
     output_rx: Option<Receiver<PtyData>>,
     /// 持有 reader 线程句柄，drop 时自然分离（reader 线程在 PTY EOF 后退出）。
@@ -80,16 +81,18 @@ impl TerminalBridge {
     /// spawn PTY 会话并启动 reader 线程；返回的 bridge 持有输出 channel 接收端。
     pub fn spawn(config: &PtySessionConfig) -> Result<Self, SpawnError> {
         let mut session = PtySession::spawn(config)?;
+        let remote = session.is_remote();
         let mut reader = session.take_reader()?;
         // Bound queued output so a fast producer (for example `cat` on a large file) applies
         // backpressure instead of growing application memory without limit.
         let (output_tx, output_rx) = mpsc::channel::<PtyData>(64);
         let mut exit_signaler = output_tx.clone();
+        let (exit_tx, exit_rx) = futures::channel::oneshot::channel();
 
         let handle = thread::Builder::new()
             .name("termior-pty-reader".into())
             .spawn(move || {
-                run_reader(&mut reader, output_tx);
+                run_reader_filtered(&mut reader, output_tx, remote);
             })
             .map_err(|e| SpawnError::Open(format!("reader thread: {e}")))?;
 
@@ -103,15 +106,27 @@ impl TerminalBridge {
         let watcher = thread::Builder::new()
             .name("termior-pty-child-watcher".into())
             .spawn(move || {
-                match child.wait() {
-                    Ok(status) => log::info!("PTY child exited: {status:?}"),
-                    Err(error) => log::warn!("PTY child wait failed: {error}"),
-                }
+                let code = match child.wait() {
+                    Ok(status) => {
+                        log::info!("PTY child exited: {status:?}");
+                        Some(status.exit_code() as i32)
+                    }
+                    Err(error) => {
+                        log::warn!("PTY child wait failed: {error}");
+                        None
+                    }
+                };
+                let _ = exit_tx.send(code);
+                // ConPTY reports process termination before its final output is delivered.
+                // Leave a short drain window so connection and SFTP errors remain visible.
+                #[cfg(windows)]
+                std::thread::sleep(std::time::Duration::from_millis(150));
                 exit_signaler.close_channel();
             })
             .map_err(|e| SpawnError::Open(format!("child watcher thread: {e}")))?;
 
         Ok(Self {
+            exit_rx: Some(exit_rx),
             session,
             output_rx: Some(output_rx),
             _reader: handle,
@@ -123,6 +138,10 @@ impl TerminalBridge {
     /// 只能调用一次；重复调用返回 None。
     pub fn take_output(&mut self) -> Option<Receiver<PtyData>> {
         self.output_rx.take()
+    }
+
+    pub fn take_exit(&mut self) -> Option<futures::channel::oneshot::Receiver<Option<i32>>> {
+        self.exit_rx.take()
     }
 
     /// resize PTY + 网格（消费方同步 resize Term 后调用）。
@@ -151,6 +170,10 @@ impl TerminalBridge {
     pub fn is_wsl(&self) -> bool {
         self.session.is_wsl()
     }
+
+    pub fn is_remote(&self) -> bool {
+        self.session.is_remote()
+    }
 }
 
 impl Drop for TerminalBridge {
@@ -162,7 +185,7 @@ impl Drop for TerminalBridge {
 }
 
 /// reader 线程主循环：循环 read，每批投递到 channel；PTY EOF 或 channel 关闭时退出。
-fn run_reader(reader: &mut Box<dyn Read + Send>, mut tx: Sender<PtyData>) {
+fn run_reader_filtered(reader: &mut Box<dyn Read + Send>, mut tx: Sender<PtyData>, remote: bool) {
     let mut buf = [0u8; 8192];
     let mut osc_filter = OscStreamFilter::new();
     let mut url_detector = LocalhostDetector::default();
@@ -171,15 +194,19 @@ fn run_reader(reader: &mut Box<dyn Read + Send>, mut tx: Sender<PtyData>) {
             Ok(0) => break, // EOF：子进程关闭了输出
             Ok(n) => {
                 let filtered = osc_filter.feed(&buf[..n]);
-                let localhost_urls = url_detector
-                    .feed(&filtered.visible)
-                    .into_iter()
-                    .map(|url| url.to_string())
-                    .collect();
+                let localhost_urls = if remote {
+                    Vec::new()
+                } else {
+                    url_detector
+                        .feed(&filtered.visible)
+                        .into_iter()
+                        .map(|url| url.to_string())
+                        .collect()
+                };
                 // channel 关闭（消费方 drop）时退出循环。
                 if futures::executor::block_on(tx.send(PtyData {
                     bytes: filtered.visible,
-                    events: filtered.events,
+                    events: if remote { Vec::new() } else { filtered.events },
                     localhost_urls,
                 }))
                 .is_err()
@@ -216,6 +243,20 @@ impl WriterHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_output_cannot_mutate_local_context() {
+        let mut reader: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(
+            b"hello\x1b]7;file://remote/etc\x07\x1b]777;notify;Termior;working\x07 http://localhost:3000\r\n".to_vec()
+        ));
+        let (tx, mut rx) = mpsc::channel(64);
+        run_reader_filtered(&mut reader, tx, true);
+        let data = rx.try_recv().unwrap();
+        assert!(data.events.is_empty());
+        assert!(data.localhost_urls.is_empty());
+        assert!(String::from_utf8_lossy(&data.bytes).contains("hello"));
+        assert!(!data.bytes.windows(3).any(|bytes| bytes == b"]7;"));
+    }
 
     #[derive(Clone)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
