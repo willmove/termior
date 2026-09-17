@@ -78,6 +78,10 @@ class Sftp(paramiko.SFTPServerInterface):
     lstat = stat
 
     def list_folder(self, name):
+        with (root / "listings.log").open("a", encoding="utf-8") as log:
+            log.write(name + "\n")
+        if name == "/slow":
+            time.sleep(5)
         try:
             result = []
             for child in self.path(name).iterdir():
@@ -149,7 +153,11 @@ def serve(client):
         pass
     finally:
         transport.close()
+        with (root / "disconnected.log").open("a", encoding="utf-8") as log:
+            log.write("disconnected\n")
 
 while True:
     client, _ = listener.accept()
+    with (root / "connections.log").open("a", encoding="utf-8") as log:
+        log.write("connected\n")
     threading.Thread(target=serve, args=(client,), daemon=True).start()

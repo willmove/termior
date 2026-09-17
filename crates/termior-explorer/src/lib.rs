@@ -2,10 +2,13 @@
 
 #![forbid(unsafe_code)]
 
+mod directory;
 mod index;
 mod search;
 mod tree;
 mod watcher;
+
+pub use directory::{list_directory, DirectoryEntry};
 
 pub use index::{
     FileEntry, FileIndex, IconKind, IndexError, SkipReason, SkippedEntry, SHALLOW_MAX_DEPTH,

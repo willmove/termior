@@ -1,0 +1,1524 @@
+//! User-owned graphical SFTP sessions. Remote operations reuse the workspace's
+//! persistent SFTP client; transfers retain the existing cancellable PTY jobs.
+use super::*;
+use termior_ssh::{Connection, Profile, SessionKind, Transfer};
+
+pub(super) fn is_browser_connection(connection: &Connection) -> bool {
+    connection.kind == SessionKind::Sftp && connection.transfer.is_none()
+}
+
+#[derive(Clone)]
+pub(super) struct SessionMenu {
+    profile: Profile,
+    position: Point<Pixels>,
+}
+
+pub(super) struct LocalBrowserState {
+    pub connected: bool,
+    transfers: Vec<TabId>,
+    pub(super) local_focused: bool,
+    pub(super) path: PathBuf,
+    entries: Vec<termior_explorer::DirectoryEntry>,
+    selected: Option<PathBuf>,
+    scroll: ScrollHandle,
+    generation: u64,
+    loading: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+pub(super) struct LocalFileDrag {
+    pub path: PathBuf,
+}
+#[derive(Clone)]
+pub(super) struct RemoteFileDrag {
+    pub tab_id: TabId,
+    pub path: String,
+    pub is_dir: bool,
+    pub name: String,
+}
+pub(super) struct FileDragPreview(pub String);
+impl Render for FileDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(gpui::rgb(0x263445))
+            .text_color(gpui::rgb(0xffffff))
+            .text_sm()
+            .child(self.0.clone())
+    }
+}
+
+pub(super) fn display_size(size: Option<u64>, directory: bool) -> String {
+    if directory {
+        return "—".into();
+    }
+    match size {
+        Some(n) if n >= 1024 * 1024 * 1024 => {
+            format!("{:.1} GB", n as f64 / (1024. * 1024. * 1024.))
+        }
+        Some(n) if n >= 1024 * 1024 => format!("{:.1} MB", n as f64 / (1024. * 1024.)),
+        Some(n) if n >= 1024 => format!("{:.1} KB", n as f64 / 1024.),
+        Some(n) => format!("{n} B"),
+        None => "—".into(),
+    }
+}
+
+impl WorkspaceView {
+    pub(super) fn active_is_sftp_browser(&self) -> bool {
+        self.model
+            .active_tab()
+            .and_then(|tab| tab.remote.as_ref())
+            .is_some_and(is_browser_connection)
+    }
+
+    pub(super) fn ssh_session_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut panel =
+            div()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_2()
+                        .py_1()
+                        .child(div().text_sm().child("SSH 会话"))
+                        .child(
+                            ui::button("ssh-manage", "管理…", ButtonKind::Subtle, &self.palette)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_ssh_manager(window, cx)
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .px_2()
+                        .pb_2()
+                        .text_xs()
+                        .child("双击连接 · 右键打开 SFTP"),
+                );
+        if let Some(error) = &self.ssh_profiles_error {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .text_xs()
+                    .child(format!("配置读取失败：{error}")),
+            );
+        } else if self.ssh_profiles.connections.is_empty() {
+            panel = panel.child(div().px_2().text_xs().child("暂无连接，点击管理添加。"));
+        }
+        for (index, profile) in self.ssh_profiles.connections.iter().enumerate() {
+            let left = profile.clone();
+            let right = profile.clone();
+            let label = profile.name.clone();
+            let selected = self.ssh_selected.as_deref() == Some(&profile.name);
+            let tooltip = if profile.user.is_empty() {
+                profile.host.clone()
+            } else {
+                format!("{}@{}", profile.user, profile.host)
+            };
+            let wash = ui::hover_wash(&self.palette);
+            let tooltip_palette = self.palette.clone();
+            panel = panel.child(
+                div()
+                    .id(("ssh-saved", index))
+                    .debug_selector(move || format!("ssh-saved-{index}"))
+                    .h(px(28.))
+                    .flex_shrink_0()
+                    .w_full()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .cursor_pointer()
+                    .overflow_hidden()
+                    .hover(move |style| style.bg(wash))
+                    .when(selected, |row| row.bg(ui::selected_wash(&self.palette)))
+                    .child(ui::icon(
+                        Icon::Terminal,
+                        icon_size::SM,
+                        gpui_color(self.palette.accent),
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(label),
+                    )
+                    .tooltip(move |_, cx| Tooltip::view(tooltip.clone(), &tooltip_palette, cx))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.ssh_selected = Some(left.name.clone());
+                            this.ssh_context_menu = None;
+                            window.focus(&this.focus_handle, cx);
+                            if event.click_count == 2 {
+                                this.connect_remote(
+                                    Connection {
+                                        profile: left.clone(),
+                                        kind: SessionKind::Shell,
+                                        transfer: None,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.explorer_context_menu = None;
+                            this.pane_context_menu = None;
+                            this.ssh_selected = Some(right.name.clone());
+                            this.ssh_context_menu = Some(SessionMenu {
+                                profile: right.clone(),
+                                position: event.position,
+                            });
+                            window.focus(&this.focus_handle, cx);
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        let sessions: Vec<_> = self
+            .model
+            .tabs
+            .iter()
+            .filter(|tab| tab.remote.is_some())
+            .collect();
+        if !sessions.is_empty() {
+            panel = panel.child(div().mt_3().px_2().py_1().text_xs().child("已打开会话"));
+            for (index, tab) in sessions.into_iter().enumerate() {
+                let id = tab.id;
+                let wash = ui::hover_wash(&self.palette);
+                panel = panel.child(
+                    div()
+                        .id(("ssh-open", index))
+                        .h(px(28.))
+                        .flex_shrink_0()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .text_xs()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .cursor_pointer()
+                        .when(self.model.active == Some(id), |row| {
+                            row.bg(ui::selected_wash(&self.palette))
+                        })
+                        .hover(move |s| s.bg(wash))
+                        .child(tab.title.clone())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.activate_runtime(id, cx);
+                            this.focus_active_pane(window, cx);
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+        panel.into_any_element()
+    }
+
+    pub(super) fn ssh_session_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.ssh_context_menu.clone()?;
+        let mut panel = menu_panel(&self.palette).id("ssh-session-menu").w(px(200.));
+        for (index, label) in [
+            "连接 SSH",
+            "以 SFTP 连接",
+            "重命名…",
+            "编辑会话…",
+            "删除会话…",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let profile = menu.profile.clone();
+            let wash = ui::hover_wash(&self.palette);
+            panel = panel.child(
+                div()
+                    .id(("ssh-menu", index))
+                    .px_3()
+                    .py_1()
+                    .text_sm()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(wash))
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.ssh_context_menu = None;
+                            match index {
+                                0 | 1 => this.connect_remote(
+                                    Connection {
+                                        profile: profile.clone(),
+                                        kind: if index == 0 {
+                                            SessionKind::Shell
+                                        } else {
+                                            SessionKind::Sftp
+                                        },
+                                        transfer: None,
+                                    },
+                                    window,
+                                    cx,
+                                ),
+                                2 | 3 => {
+                                    this.open_ssh_manager(window, cx);
+                                    if let Some(handle) = this.ssh_manager_window {
+                                        let _ = handle.update(cx, |view, _, cx| {
+                                            view.edit_saved(&profile.name, index == 2, cx)
+                                        });
+                                    }
+                                }
+                                _ => this.delete_saved_session(profile.clone(), window, cx),
+                            }
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        Some(
+            anchored()
+                .position(menu.position)
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+
+    fn delete_saved_session(
+        &mut self,
+        profile: Profile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "删除会话配置",
+            Some(&format!("删除“{}”？已打开的连接会继续运行。", profile.name)),
+            &[PromptButton::ok("删除"), PromptButton::cancel("取消")],
+            cx,
+        );
+        let dir = self.data_dir.clone();
+        cx.spawn(async move |workspace, cx| {
+            if !matches!(answer.await, Ok(0)) {
+                return;
+            }
+            let result = (|| -> Result<(), String> {
+                let dir = dir.as_ref().ok_or("应用数据目录不可用")?;
+                let mut profiles = termior_ssh::Profiles::load(dir).map_err(|e| e.to_string())?;
+                let index = profiles
+                    .connections
+                    .iter()
+                    .position(|saved| saved == &profile)
+                    .ok_or("会话配置已变化，请重新选择后删除")?;
+                profiles.connections.remove(index);
+                profiles.save(dir).map_err(|e| e.to_string())?;
+                if profile.use_saved_credentials
+                    && !profiles.connections.iter().any(|p| {
+                        p.use_saved_credentials
+                            && termior_ssh::credentials::same_target(p, &profile)
+                    })
+                {
+                    termior_ssh::credentials::delete_all(&profile)
+                        .map_err(|e| format!("配置已删除，但系统凭据清理失败：{e}"))?;
+                }
+                Ok(())
+            })();
+            let _ = workspace.update(cx, |this, cx| {
+                this.reload_ssh_profiles();
+                if let Some(handle) = this.ssh_manager_window {
+                    let _ = handle.update(cx, |view, _, cx| view.refresh_saved_profiles(cx));
+                }
+                this.ssh_selected = None;
+                this.command_message = Some(
+                    result
+                        .map(|_| "会话配置已删除".into())
+                        .unwrap_or_else(|e| e),
+                );
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn handle_sftp_local_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.active_is_sftp_browser()
+            || self.command_mode != CommandMode::Browse
+            || !self.focus_handle.is_focused(window)
+        {
+            return false;
+        }
+        let Some(id) = self.model.active else {
+            return false;
+        };
+        let Some(state) = self
+            .sftp_browsers
+            .get_mut(&id)
+            .filter(|state| state.local_focused)
+        else {
+            return false;
+        };
+        let key = event.keystroke.key.as_str();
+        if matches!(key, "left" | "backspace") {
+            if let Some(parent) = state.path.parent().map(Path::to_path_buf) {
+                self.scan_sftp_local(id, parent, cx);
+            }
+            return true;
+        }
+        if state.entries.is_empty() {
+            return matches!(
+                key,
+                "up" | "down" | "home" | "end" | "enter" | "return" | "right"
+            );
+        }
+        let selected = state
+            .entries
+            .iter()
+            .position(|entry| Some(&entry.path) == state.selected.as_ref())
+            .unwrap_or(0);
+        let index = match key {
+            "up" => selected.saturating_sub(1),
+            "down" => (selected + 1).min(state.entries.len() - 1),
+            "home" => 0,
+            "end" => state.entries.len() - 1,
+            "enter" | "return" | "right" => {
+                let entry = &state.entries[selected];
+                if entry.is_dir {
+                    let path = entry.path.clone();
+                    self.scan_sftp_local(id, path, cx);
+                }
+                return true;
+            }
+            _ => return false,
+        };
+        state.selected = Some(state.entries[index].path.clone());
+        state.scroll.scroll_to_item(index);
+        cx.notify();
+        true
+    }
+
+    pub(super) fn start_sftp_browser(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        let Some(tab) = self.model.tabs.iter().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let Some(remote) = tab.remote.clone() else {
+            return;
+        };
+        let initial = tab.project_dir.clone();
+        let state = self
+            .sftp_browsers
+            .entry(tab_id)
+            .or_insert_with(|| LocalBrowserState {
+                connected: true,
+                transfers: Vec::new(),
+                local_focused: false,
+                path: initial,
+                entries: Vec::new(),
+                selected: None,
+                scroll: ScrollHandle::new(),
+                generation: 0,
+                loading: false,
+                error: None,
+            });
+        state.connected = true;
+        let local_path = state.path.clone();
+        self.scan_sftp_local(tab_id, local_path, cx);
+        self.scan_remote_directory(tab_id, remote.profile, ".".into(), false, cx);
+        cx.notify();
+    }
+
+    pub(super) fn scan_sftp_local(&mut self, tab_id: TabId, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(state) = self.sftp_browsers.get_mut(&tab_id) else {
+            return;
+        };
+        state.generation += 1;
+        let generation = state.generation;
+        state.loading = true;
+        state.error = None;
+        cx.spawn(async move |workspace, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    termior_explorer::list_directory(&path).map(|entries| (path, entries))
+                })
+                .await;
+            let _ = workspace.update(cx, |this, cx| {
+                let Some(state) = this.sftp_browsers.get_mut(&tab_id) else {
+                    return;
+                };
+                if state.generation != generation {
+                    return;
+                }
+                state.loading = false;
+                match result {
+                    Ok((path, entries)) => {
+                        if state.path != path {
+                            state.scroll.set_offset(gpui::point(px(0.), px(0.)));
+                        }
+                        state.path = path;
+                        state.entries = entries;
+                        state.selected = None;
+                    }
+                    Err(error) => state.error = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn choose_sftp_local_directory(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        cx.spawn(async move |workspace, cx| {
+            if let Some(folder) = rfd::AsyncFileDialog::new()
+                .set_title("选择本地目录")
+                .pick_folder()
+                .await
+            {
+                let _ = workspace.update(cx, |this, cx| {
+                    this.scan_sftp_local(tab_id, folder.path().to_path_buf(), cx)
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn upload_browser_paths(
+        &mut self,
+        tab_id: TabId,
+        paths: Vec<PathBuf>,
+        remote_directory: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self
+            .model
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.remote.as_ref())
+            .map(|r| r.profile.clone())
+        else {
+            return;
+        };
+        if !self.remote_runtime_connected(tab_id, cx) {
+            return;
+        }
+        cx.spawn_in(window, async move |workspace, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    paths
+                        .into_iter()
+                        .map(|path| {
+                            let metadata =
+                                std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+                            if metadata.file_type().is_symlink() {
+                                return Err("请上传实际文件或目录，暂不拖放符号链接".into());
+                            }
+                            let local_path = path
+                                .to_str()
+                                .ok_or("本地文件名不是有效 Unicode")?
+                                .to_owned();
+                            let transfer = Transfer {
+                                upload: true,
+                                local_path,
+                                remote_path: remote_directory.clone(),
+                                recursive: metadata.is_dir(),
+                                resume: false,
+                            };
+                            // Validate before presenting or creating any jobs.
+                            transfer.batch().map_err(|e| e.to_string())?;
+                            Ok(transfer)
+                        })
+                        .collect::<Result<Vec<_>, String>>()
+                })
+                .await;
+            let _ = workspace.update_in(cx, |this, window, cx| match result {
+                Ok(transfers) => {
+                    this.confirm_browser_transfers(tab_id, profile, transfers, window, cx)
+                }
+                Err(error) => {
+                    this.command_message = Some(error);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn download_browser_entry(
+        &mut self,
+        drag: &RemoteFileDrag,
+        local_directory: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self
+            .model
+            .tabs
+            .iter()
+            .find(|t| t.id == drag.tab_id)
+            .and_then(|t| t.remote.as_ref())
+            .map(|r| r.profile.clone())
+        else {
+            return;
+        };
+        if !self.remote_runtime_connected(drag.tab_id, cx) {
+            return;
+        }
+        let Some(local_path) = local_directory.to_str() else {
+            self.command_message = Some("本地路径不是有效 Unicode".into());
+            cx.notify();
+            return;
+        };
+        self.confirm_browser_transfers(
+            drag.tab_id,
+            profile,
+            vec![Transfer {
+                upload: false,
+                local_path: local_path.into(),
+                remote_path: drag.path.clone(),
+                recursive: drag.is_dir,
+                resume: false,
+            }],
+            window,
+            cx,
+        );
+    }
+
+    fn confirm_browser_transfers(
+        &mut self,
+        source_tab: TabId,
+        profile: Profile,
+        transfers: Vec<Transfer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if transfers.is_empty() {
+            return;
+        }
+        if let Some(error) = transfers.iter().find_map(|transfer| transfer.batch().err()) {
+            self.command_message = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        let description = transfers
+            .iter()
+            .map(|t| {
+                if t.upload {
+                    format!("上传 {} → {}:{}", t.local_path, profile.host, t.remote_path)
+                } else {
+                    format!("下载 {}:{} → {}", profile.host, t.remote_path, t.local_path)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "确认文件传输",
+            Some(&format!(
+                "{description}\n\n同名文件可能被覆盖；文件夹递归传输。取消可能留下部分文件。"
+            )),
+            &[PromptButton::ok("开始传输"), PromptButton::cancel("取消")],
+            cx,
+        );
+        cx.spawn_in(window, async move |workspace, cx| {
+            if !matches!(answer.await, Ok(0)) {
+                return;
+            }
+            let _ = workspace.update_in(cx, |this, window, cx| {
+                // A confirmation cannot resurrect a closed/disconnected source session.
+                if !this.remote_runtime_connected(source_tab, cx) {
+                    return;
+                }
+                let mut jobs = Vec::new();
+                for transfer in transfers {
+                    this.connect_remote(
+                        Connection {
+                            profile: profile.clone(),
+                            kind: SessionKind::Sftp,
+                            transfer: Some(transfer),
+                        },
+                        window,
+                        cx,
+                    );
+                    if let Some(id) = this.model.active {
+                        jobs.push(id);
+                    }
+                }
+                if let Some(browser) = this.sftp_browsers.get_mut(&source_tab) {
+                    browser.transfers.extend(jobs);
+                    if browser.transfers.len() > 32 {
+                        browser.transfers.drain(..browser.transfers.len() - 32);
+                    }
+                }
+                this.activate_runtime(source_tab, cx);
+                this.focus_active_pane(window, cx);
+                this.persist_workspace();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn sftp_browser_content(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some((tab_id, _, remote_path)) = self.active_remote_explorer_context() else {
+            return div().into_any_element();
+        };
+        let Some(state) = self.sftp_browsers.get(&tab_id) else {
+            return div()
+                .p_4()
+                .child("SFTP 尚未连接。点击上方“重新连接”打开文件浏览器。")
+                .into_any_element();
+        };
+        let local_root = state.path.clone();
+        let local_drop = local_root.clone();
+        let local_refresh = local_root.clone();
+        let local_up = local_root.parent().map(Path::to_path_buf);
+        let local_upload_root = remote_path.clone();
+        let local_selected = state.selected.clone();
+        let remote_download_root = local_root.clone();
+        let remote_selected = self
+            .remote_explorers
+            .get(&tab_id)
+            .and_then(|s| s.listing.as_ref())
+            .and_then(|l| {
+                l.entries
+                    .iter()
+                    .find(|e| self.remote_explorer_selected.as_deref() == Some(&e.path))
+            })
+            .cloned();
+        let mut local = div()
+            .flex()
+            .flex_col()
+            .w(relative(0.42))
+            .min_w(px(180.))
+            .h_full()
+            .min_h_0()
+            .px_2()
+            .border_r_1()
+            .border_color(ui::border(&self.palette))
+            .child(
+                div()
+                    .h(px(30.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .text_sm()
+                    .child("本地文件"),
+            )
+            .child(
+                div()
+                    .h(px(28.))
+                    .flex()
+                    .gap_1()
+                    .flex_shrink_0()
+                    .child(
+                        ui::button("sftp-local-up", "上级", ButtonKind::Subtle, &self.palette)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(path) = &local_up {
+                                    this.scan_sftp_local(tab_id, path.clone(), cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        ui::button(
+                            "sftp-local-choose",
+                            "选择目录…",
+                            ButtonKind::Subtle,
+                            &self.palette,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.choose_sftp_local_directory(tab_id, cx)
+                        })),
+                    )
+                    .child(
+                        ui::button(
+                            "sftp-local-refresh",
+                            "刷新",
+                            ButtonKind::Subtle,
+                            &self.palette,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.scan_sftp_local(tab_id, local_refresh.clone(), cx)
+                        })),
+                    )
+                    .child(
+                        ui::button(
+                            "sftp-local-upload",
+                            "上传 →",
+                            ButtonKind::Subtle,
+                            &self.palette,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                if let Some(path) = &local_selected {
+                                    this.upload_browser_paths(
+                                        tab_id,
+                                        vec![path.clone()],
+                                        local_upload_root.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            },
+                        )),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(28.))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(local_root.to_string_lossy().into_owned()),
+            )
+            .child(
+                div()
+                    .h(px(22.))
+                    .flex_shrink_0()
+                    .text_xs()
+                    .child(if state.loading {
+                        "正在读取本地目录…"
+                    } else {
+                        "双击文件夹进入 · 拖放上传"
+                    }),
+            )
+            .child(file_columns(&self.palette));
+        if let Some(error) = &state.error {
+            local = local.child(div().text_xs().child(error.clone()));
+        }
+        let wash = ui::selected_wash(&self.palette);
+        let mut rows = div()
+            .id("sftp-local-files")
+            .debug_selector(|| "sftp-local-files".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&state.scroll)
+            .drag_over::<RemoteFileDrag>(move |style, _, _, _| style.bg(wash))
+            .on_drop(cx.listener(move |this, drag: &RemoteFileDrag, window, cx| {
+                cx.stop_propagation();
+                if drag.tab_id == tab_id {
+                    this.download_browser_entry(drag, local_drop.clone(), window, cx);
+                }
+            }));
+        for (index, entry) in state.entries.iter().enumerate() {
+            let path = entry.path.clone();
+            let drop_path = path.clone();
+            let is_dir = entry.is_dir;
+            let name = entry.name.clone();
+            let drag_label = name.clone();
+            let drag = LocalFileDrag { path: path.clone() };
+            rows = rows.child(
+                div()
+                    .id(("sftp-local-file", index))
+                    .debug_selector(move || format!("sftp-local-file-{index}"))
+                    .h(px(28.))
+                    .flex_shrink_0()
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_xs()
+                    .cursor_pointer()
+                    .when(state.selected.as_ref() == Some(&path), |row| row.bg(wash))
+                    .child(explorer_icon(
+                        remote_icon_kind(&name, is_dir),
+                        false,
+                        &self.palette,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(name),
+                    )
+                    .child(div().w(px(68.)).flex_shrink_0().child(if entry.is_symlink {
+                        "链接"
+                    } else if is_dir {
+                        "文件夹"
+                    } else {
+                        "文件"
+                    }))
+                    .child(
+                        div()
+                            .w(px(90.))
+                            .flex_shrink_0()
+                            .text_right()
+                            .child(display_size(Some(entry.size), is_dir)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            if let Some(state) = this.sftp_browsers.get_mut(&tab_id) {
+                                state.selected = Some(path.clone());
+                                state.local_focused = true;
+                            }
+                            window.focus(&this.focus_handle, cx);
+                            if is_dir && event.click_count == 2 {
+                                this.scan_sftp_local(tab_id, path.clone(), cx);
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .on_drag(drag, move |_, _, _, cx| {
+                        cx.new(|_| FileDragPreview(drag_label.clone()))
+                    })
+                    .when(is_dir, |row| {
+                        row.drag_over::<RemoteFileDrag>(move |style, _, _, _| style.bg(wash))
+                            .on_drop(cx.listener(move |this, drag: &RemoteFileDrag, window, cx| {
+                                cx.stop_propagation();
+                                if drag.tab_id == tab_id {
+                                    this.download_browser_entry(
+                                        drag,
+                                        drop_path.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }))
+                    }),
+            );
+        }
+        local = local.child(rows).child(
+            div()
+                .py_1()
+                .text_xs()
+                .child(format!("{} 项 · 拖到右侧上传", state.entries.len())),
+        );
+        let remote_drop = remote_path.clone();
+        let remote_external = remote_path.clone();
+        let remote = div()
+            .id("sftp-remote-pane")
+            .debug_selector(|| "sftp-remote-pane".into())
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .px_2()
+            .drag_over::<LocalFileDrag>(move |style, _, _, _| style.bg(wash))
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.bg(wash))
+            .on_drop(cx.listener(move |this, drag: &LocalFileDrag, window, cx| {
+                cx.stop_propagation();
+                this.upload_browser_paths(
+                    tab_id,
+                    vec![drag.path.clone()],
+                    remote_drop.clone(),
+                    window,
+                    cx,
+                );
+            }))
+            .on_drop(
+                cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
+                    cx.stop_propagation();
+                    this.upload_browser_paths(
+                        tab_id,
+                        paths.0.to_vec(),
+                        remote_external.clone(),
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .child(
+                div()
+                    .h(px(30.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_sm().child("远程文件 · SFTP"))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                ui::button(
+                                    "sftp-remote-path",
+                                    "转到路径…",
+                                    ButtonKind::Subtle,
+                                    &self.palette,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.begin_name_command(
+                                            CommandMode::RemotePath,
+                                            PathBuf::new(),
+                                            None,
+                                            &remote_path,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            )
+                            .child(
+                                ui::button(
+                                    "sftp-download",
+                                    "← 下载",
+                                    ButtonKind::Subtle,
+                                    &self.palette,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        if let Some(entry) = &remote_selected {
+                                            this.download_browser_entry(
+                                                &RemoteFileDrag {
+                                                    tab_id,
+                                                    path: entry.path.clone(),
+                                                    is_dir: entry.is_dir,
+                                                    name: entry.name.clone(),
+                                                },
+                                                remote_download_root.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    },
+                                )),
+                            ),
+                    ),
+            )
+            .children(self.remote_explorer_content(cx));
+        let mut browser = div().size_full().flex().flex_col().min_h_0();
+        if !state.connected {
+            browser = browser.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .child("已断开 · 点击重新连接后继续文件操作"),
+            );
+        }
+        if self.command_mode != CommandMode::Browse {
+            browser = browser.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_1()
+                    .border_color(gpui_color(self.palette.accent))
+                    .text_sm()
+                    .child(format!(
+                        "{}: {}{}|  · Enter 确认 / Esc 取消",
+                        self.command_mode.label(),
+                        self.command_input,
+                        self.command_marked_text
+                    )),
+            );
+        }
+        if let Some(message) = &self.command_message {
+            browser = browser.child(div().px_2().text_xs().child(message.clone()));
+        }
+        browser = browser.child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h_0()
+                .child(local)
+                .child(remote),
+        );
+        let mut transfers = div()
+            .id("sftp-transfer-summary")
+            .max_h(px(100.))
+            .overflow_y_scroll()
+            .flex_shrink_0();
+        for id in state
+            .transfers
+            .iter()
+            .rev()
+            .filter(|id| self.model.tab(**id).is_some())
+        {
+            let id = *id;
+            let Some(job) = self
+                .model
+                .tab(id)
+                .and_then(|t| t.remote.as_ref())
+                .and_then(|r| r.transfer.as_ref())
+            else {
+                continue;
+            };
+            let terminal = self.tabs.iter().find(|t| t.id == id).and_then(|t| {
+                t.panes.values().find_map(|p| {
+                    if let PaneContent::Terminal(t) = p {
+                        Some(t.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+            let status = terminal
+                .as_ref()
+                .map(|t| {
+                    let t = t.read(cx);
+                    if !t.has_exited() {
+                        "传输中"
+                    } else if t.exit_code() == Some(0) {
+                        "已完成"
+                    } else {
+                        "失败 / 已取消"
+                    }
+                })
+                .unwrap_or(
+                    if self.pending_terminals.iter().any(|(tab, _)| *tab == id) {
+                        "正在启动…"
+                    } else {
+                        "启动失败 · 查看详情"
+                    },
+                );
+            let running = terminal.as_ref().is_some_and(|t| !t.read(cx).has_exited());
+            let title = format!(
+                "{} · {} · {}",
+                if job.upload {
+                    "↑ 上传"
+                } else {
+                    "↓ 下载"
+                },
+                if job.upload {
+                    Path::new(&job.local_path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    termior_ssh::sftp::file_name(&job.remote_path).into()
+                },
+                status
+            );
+            transfers = transfers.child(
+                div()
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .text_xs()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(title),
+                    )
+                    .child(
+                        ui::button(
+                            ("sftp-job-view", id.0),
+                            "查看进度",
+                            ButtonKind::Subtle,
+                            &self.palette,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.activate_runtime(id, cx);
+                                this.focus_active_pane(window, cx);
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .when(running, |row| {
+                        row.child(
+                            ui::button(
+                                ("sftp-job-cancel", id.0),
+                                "取消",
+                                ButtonKind::Ghost,
+                                &self.palette,
+                            )
+                            .on_click(cx.listener(
+                                move |_, _, _, cx| {
+                                    if let Some(terminal) = &terminal {
+                                        terminal.update(cx, |t, _| t.disconnect());
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    }),
+            );
+        }
+        browser.child(transfers).into_any_element()
+    }
+}
+
+pub(super) fn file_columns(palette: &ResolvedPalette) -> Div {
+    div()
+        .h(px(26.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .px_1()
+        .gap_1()
+        .text_xs()
+        .border_b_1()
+        .border_color(ui::border(palette))
+        .child(div().flex_1().child("名称"))
+        .child(div().w(px(68.)).flex_shrink_0().child("类型"))
+        .child(div().w(px(90.)).flex_shrink_0().text_right().child("大小"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Modifiers, TestAppContext};
+
+    fn workspace(cx: &mut Context<WorkspaceView>, root: PathBuf) -> WorkspaceView {
+        crate::updater::init(cx);
+        let mut view = WorkspaceView::new(root.clone(), false, cx);
+        view.data_dir = None;
+        view.model = WorkspaceState::new(root);
+        view.model.sidebar_visible = true;
+        view.model.sidebar_panel = SidebarPanel::Ssh;
+        view.model.composer_visible = false;
+        view.tabs.clear();
+        view.ssh_profiles.connections = vec![Profile {
+            name: "test session".into(),
+            host: "127.0.0.1".into(),
+            port: Some(9),
+            ..Profile::default()
+        }];
+        view
+    }
+
+    fn install_browser(view: &mut WorkspaceView, root: &Path) -> TabId {
+        let profile = view.ssh_profiles.connections[0].clone();
+        let id = view.model.new_tab(TabKind::Terminal, "SFTP test", false);
+        view.model.active_tab_mut().unwrap().remote = Some(Connection {
+            profile: profile.clone(),
+            kind: SessionKind::Sftp,
+            transfer: None,
+        });
+        view.explorer_view_tab = Some(id);
+        view.tabs.push(AppTab {
+            id,
+            panes: single_pane(PaneContent::Placeholder("".into())),
+        });
+        view.sftp_browsers.insert(
+            id,
+            LocalBrowserState {
+                connected: true,
+                transfers: Vec::new(),
+                local_focused: false,
+                path: root.to_path_buf(),
+                entries: termior_explorer::list_directory(root).unwrap(),
+                selected: None,
+                scroll: ScrollHandle::new(),
+                generation: 0,
+                loading: false,
+                error: None,
+            },
+        );
+        view.remote_explorer_paths.insert(id, "/".into());
+        view.remote_explorers.insert(
+            id,
+            RemoteExplorerState {
+                client: termior_ssh::sftp::Client::new(profile).unwrap(),
+                scroll: ScrollHandle::new(),
+                listing: Some(termior_ssh::sftp::RemoteListing {
+                    cwd: "/".into(),
+                    entries: vec![
+                        termior_ssh::sftp::RemoteEntry {
+                            name: "folder".into(),
+                            path: "/folder".into(),
+                            is_dir: true,
+                            is_symlink: false,
+                            size: None,
+                        },
+                        termior_ssh::sftp::RemoteEntry {
+                            name: "file.txt".into(),
+                            path: "/file.txt".into(),
+                            is_dir: false,
+                            is_symlink: false,
+                            size: Some(30),
+                        },
+                    ],
+                }),
+                request: None,
+                pending: None,
+                error: None,
+                status: "Connected".into(),
+            },
+        );
+        id
+    }
+
+    #[gpui::test]
+    fn saved_session_single_click_selects_double_click_connects(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| workspace(cx, root.path().to_path_buf()));
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let bounds = cx.debug_bounds("ssh-saved-0").unwrap();
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Left, Modifiers::default());
+        view.update(cx, |v, _| {
+            assert_eq!(v.ssh_selected.as_deref(), Some("test session"));
+            assert!(v.model.tabs.is_empty(), "single click must not connect");
+            // Suppress actual PTY creation; verify the real mouse handler creates exactly one shell tab.
+            let mut model = v.model.clone();
+            let next = model.new_tab(TabKind::Terminal, "", false);
+            v.pending_terminals.insert((next, PaneId(1)));
+        });
+        cx.simulate_event(MouseDownEvent {
+            position: bounds.center(),
+            button: MouseButton::Left,
+            click_count: 2,
+            modifiers: Modifiers::default(),
+            first_mouse: false,
+        });
+        view.update(cx, |v, _| {
+            assert_eq!(v.model.tabs.len(), 1);
+            assert_eq!(
+                v.model.active_tab().unwrap().remote.as_ref().unwrap().kind,
+                SessionKind::Shell
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn session_context_menu_is_targeted_and_dismisses_without_connecting(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| workspace(cx, root.path().to_path_buf()));
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let bounds = cx.debug_bounds("ssh-saved-0").unwrap();
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Right, Modifiers::default());
+        view.update(cx, |v, _| {
+            assert_eq!(
+                v.ssh_context_menu.as_ref().unwrap().profile.name,
+                "test session"
+            );
+            assert!(v.model.tabs.is_empty());
+        });
+        cx.simulate_keystrokes("escape");
+        view.update(cx, |v, _| assert!(v.ssh_context_menu.is_none()));
+    }
+
+    #[gpui::test]
+    fn browser_is_two_columns_without_a_terminal_and_close_releases_state(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("local.txt"), "data").unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut v = workspace(cx, root.path().to_path_buf());
+            install_browser(&mut v, root.path());
+            v
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let local = cx.debug_bounds("sftp-local-files").unwrap();
+        let remote = cx.debug_bounds("sftp-remote-pane").unwrap();
+        assert!(local.size.height > px(100.));
+        assert!(remote.size.height > px(100.));
+        assert!(local.right() <= remote.left());
+        assert!(remote.right() <= px(1200.));
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let id = v.model.active.unwrap();
+                assert!(v.active_terminal().is_none());
+                assert!(v.remote_runtime_connected(id, cx));
+                assert!(!v.can_split_active(SplitDirection::Right, window));
+                v.close_tab(id, window, cx);
+                assert!(!v.remote_explorers.contains_key(&id));
+                assert!(!v.sftp_browsers.contains_key(&id));
+                assert!(v.remote_auth_sessions.is_empty());
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn drag_download_confirmation_keeps_destination_and_cannot_revive_closed_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut v = workspace(cx, root.path().to_path_buf());
+            install_browser(&mut v, root.path());
+            v
+        });
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let id = v.model.active.unwrap();
+                v.download_browser_entry(
+                    &RemoteFileDrag {
+                        tab_id: id,
+                        path: "/folder".into(),
+                        name: "folder".into(),
+                        is_dir: true,
+                    },
+                    root.path().to_path_buf(),
+                    window,
+                    cx,
+                );
+            })
+        });
+        let (_, detail) = cx
+            .pending_prompt()
+            .expect("drag must require transfer confirmation");
+        assert!(detail.contains("/folder"));
+        assert!(detail.contains(root.path().to_str().unwrap()));
+        assert!(detail.contains("递归"));
+        cx.update(|window, cx| {
+            view.update(cx, |v, cx| v.close_tab(v.model.active.unwrap(), window, cx))
+        });
+        cx.simulate_prompt_answer("开始传输");
+        cx.run_until_parked();
+        view.update(cx, |v, _| {
+            assert!(
+                v.model.tabs.is_empty(),
+                "confirmation must not revive a closed source"
+            )
+        });
+    }
+    #[gpui::test]
+    fn cross_pane_drag_routes_upload_and_download_to_hovered_directory(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("destination")).unwrap();
+        std::fs::write(root.path().join("local.txt"), "data").unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut v = workspace(cx, root.path().to_path_buf());
+            install_browser(&mut v, root.path());
+            v
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let local_file = cx.debug_bounds("sftp-local-file-1").unwrap().center();
+        let remote_folder = cx.debug_bounds("remote-file-/folder").unwrap().center();
+        cx.simulate_mouse_down(local_file, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            local_file + gpui::point(px(15.), px(0.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(remote_folder, Some(MouseButton::Left), Modifiers::default());
+        cx.simulate_mouse_up(remote_folder, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        let (_, detail) = cx
+            .pending_prompt()
+            .expect("dropping a local file starts upload confirmation");
+        assert!(detail.contains("上传"));
+        assert!(detail.contains("local.txt"));
+        assert!(
+            detail.contains(":/folder"),
+            "hovered directory, not its parent: {detail}"
+        );
+        cx.simulate_prompt_answer("取消");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let remote_file = cx.debug_bounds("remote-file-/file.txt").unwrap().center();
+        let local_folder = cx.debug_bounds("sftp-local-file-0").unwrap().center();
+        cx.simulate_mouse_down(remote_file, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            remote_file + gpui::point(px(15.), px(0.)),
+            Some(MouseButton::Left),
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(local_folder, Some(MouseButton::Left), Modifiers::default());
+        cx.simulate_mouse_up(local_folder, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        let (_, detail) = cx
+            .pending_prompt()
+            .expect("dropping a remote file starts download confirmation");
+        assert!(detail.contains("下载"));
+        assert!(detail.contains("/file.txt"));
+        assert!(
+            detail.contains("destination"),
+            "hovered local directory: {detail}"
+        );
+        cx.simulate_prompt_answer("取消");
+        cx.run_until_parked();
+        view.update(cx, |v, _| {
+            assert_eq!(
+                v.model.tabs.len(),
+                1,
+                "cancelled drags must not create jobs"
+            )
+        });
+    }
+    #[gpui::test]
+    fn accepted_transfer_keeps_browser_visible_and_tracks_background_job(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut v = workspace(cx, root.path().to_path_buf());
+            install_browser(&mut v, root.path());
+            v
+        });
+        let source = cx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                let source = v.model.active.unwrap();
+                let mut model = v.model.clone();
+                let job = model.new_tab(TabKind::Terminal, "", false);
+                v.pending_terminals.insert((job, PaneId(1)));
+                v.remote_explorers.get_mut(&source).unwrap().request =
+                    Some(RemoteExplorerRequest {
+                        id: 1,
+                        path: Some("/".into()),
+                        control: termior_ssh::sftp::RequestControl::default(),
+                    });
+                v.download_browser_entry(
+                    &RemoteFileDrag {
+                        tab_id: source,
+                        path: "/file.txt".into(),
+                        is_dir: false,
+                        name: "file.txt".into(),
+                    },
+                    root.path().to_path_buf(),
+                    window,
+                    cx,
+                );
+                source
+            })
+        });
+        cx.simulate_prompt_answer("开始传输");
+        cx.run_until_parked();
+        view.update(cx, |v, cx| {
+            assert_eq!(v.model.active, Some(source));
+            assert_eq!(v.model.tabs.len(), 2);
+            let jobs = &v.sftp_browsers[&source].transfers;
+            assert_eq!(jobs.len(), 1);
+            let transfer = v
+                .model
+                .tab(jobs[0])
+                .unwrap()
+                .remote
+                .as_ref()
+                .unwrap()
+                .transfer
+                .as_ref()
+                .unwrap();
+            assert_eq!(transfer.remote_path, "/file.txt");
+            assert!(!transfer.upload);
+            assert!(v.active_terminal().is_none());
+            assert!(v.remote_runtime_connected(source, cx));
+        });
+    }
+}

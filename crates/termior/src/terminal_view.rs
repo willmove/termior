@@ -273,6 +273,7 @@ impl TerminalView {
             let exit_code = exit_rx.await.ok().flatten();
             let _ = this.update(cx, |view, cx| {
                 view.exited = true;
+                view.bridge.release_auth();
                 view.exit_code = exit_code;
                 cx.emit(TerminalViewEvent::Exited(exit_code));
                 cx.notify();

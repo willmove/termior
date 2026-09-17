@@ -27,8 +27,18 @@ impl Drop for Server {
 }
 
 fn run(connection: Connection, password: Option<&str>, shell: bool) -> (Option<i32>, String) {
+    run_with_auth(connection, password, shell, None)
+}
+
+fn run_with_auth(
+    connection: Connection,
+    password: Option<&str>,
+    shell: bool,
+    auth_session: Option<termior_ssh::auth::Session>,
+) -> (Option<i32>, String) {
     let mut bridge = TerminalBridge::spawn(&PtySessionConfig {
         remote: Some(connection),
+        auth_session,
         ..Default::default()
     })
     .unwrap();
@@ -114,16 +124,45 @@ fn ssh_and_sftp_real_roundtrip() {
         known_hosts_file: dir.path().join("known_hosts").display().to_string(),
         ..Profile::default()
     };
-    // The same production OpenSSH batch service powers the active-tab Remote
-    // Explorer. Exercise its structured list/mutate path against the fixture,
-    // including names that must never be routed through a remote shell.
+    // The production Explorer retains one SFTP subsystem for all these requests.
+    use futures::executor::block_on;
+    use termior_ssh::sftp::{Client, Error as SftpError, RequestControl};
+    let explorer = Client::new(profile.clone()).unwrap();
+    let count = |name: &str| {
+        std::fs::read_to_string(dir.path().join(name))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
     std::fs::write(dir.path().join("remote/existing file.txt"), b"existing").unwrap();
-    let listing = termior_ssh::sftp::list(&profile, "/").unwrap();
+    std::fs::write(dir.path().join("remote/literal ; [1] file.txt"), b"literal").unwrap();
+    #[cfg(unix)]
+    std::fs::write(dir.path().join("remote/literal -> target.txt"), b"literal").unwrap();
+    let listing = block_on(explorer.list("/", false, RequestControl::default())).unwrap();
     assert_eq!(listing.cwd, "/");
     assert!(listing
         .entries
         .iter()
         .any(|entry| entry.name == "existing file.txt" && !entry.is_dir));
+    assert!(listing
+        .entries
+        .iter()
+        .any(|entry| entry.name == "literal ; [1] file.txt"));
+    #[cfg(unix)]
+    assert!(listing
+        .entries
+        .iter()
+        .any(|entry| entry.name == "literal -> target.txt"));
+    assert_eq!(count("connections.log"), 1);
+    let scans = count("listings.log");
+    block_on(explorer.list("/", false, RequestControl::default())).unwrap();
+    assert_eq!(
+        count("listings.log"),
+        scans,
+        "cached directory does not issue READDIR"
+    );
+    block_on(explorer.list("/", true, RequestControl::default())).unwrap();
+    assert_eq!(count("listings.log"), scans + 1, "refresh bypasses cache");
     for operation in [
         termior_ssh::sftp::Operation::CreateDirectory {
             path: "/远程 folder".into(),
@@ -136,22 +175,120 @@ fn ssh_and_sftp_real_roundtrip() {
             to: "/远程 folder/final file.txt".into(),
         },
     ] {
-        termior_ssh::sftp::execute(&profile, &operation).unwrap();
+        block_on(explorer.execute(&operation, RequestControl::default())).unwrap();
     }
-    let listing = termior_ssh::sftp::list(&profile, "/远程 folder").unwrap();
+    let root = block_on(explorer.list("/", false, RequestControl::default())).unwrap();
+    assert!(
+        root.entries.iter().any(|entry| entry.name == "远程 folder"),
+        "mutation invalidates cached parent"
+    );
+    let listing =
+        block_on(explorer.list("/远程 folder", false, RequestControl::default())).unwrap();
     assert!(listing
         .entries
         .iter()
         .any(|entry| entry.name == "final file.txt"));
-    termior_ssh::sftp::execute(
-        &profile,
+    block_on(explorer.execute(
         &termior_ssh::sftp::Operation::RemoveDirectory {
             path: "/远程 folder".into(),
             recursive: true,
         },
-    )
+        RequestControl::default(),
+    ))
     .unwrap();
     assert!(!dir.path().join("remote/远程 folder").exists());
+    let error = block_on(explorer.execute(
+        &termior_ssh::sftp::Operation::CreateFile {
+            path: "/existing file.txt".into(),
+        },
+        RequestControl::default(),
+    ))
+    .unwrap_err();
+    assert!(matches!(error, SftpError::Status(..)), "{error}");
+    assert_eq!(
+        std::fs::read(dir.path().join("remote/existing file.txt")).unwrap(),
+        b"existing"
+    );
+    assert!(block_on(explorer.list("/missing", true, RequestControl::default())).is_err());
+    block_on(explorer.list("/", true, RequestControl::default())).unwrap();
+    assert_eq!(
+        count("connections.log"),
+        1,
+        "navigation, mutations and ordinary errors reuse authentication"
+    );
+
+    // A hung READDIR must be cancellable, reap its transport, and permit an
+    // explicit retry without replaying any mutations.
+    std::fs::create_dir(dir.path().join("remote/slow")).unwrap();
+    let control = RequestControl::default();
+    let task_control = control.clone();
+    let task_client = explorer.clone();
+    let pending =
+        std::thread::spawn(move || block_on(task_client.list("/slow", true, task_control)));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !std::fs::read_to_string(dir.path().join("listings.log"))
+        .unwrap()
+        .contains("/slow")
+    {
+        assert!(Instant::now() < deadline, "slow request reached server");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let start = Instant::now();
+    control.cancel();
+    assert!(matches!(pending.join().unwrap(), Err(SftpError::Cancelled)));
+    assert!(start.elapsed() < Duration::from_secs(2));
+    block_on(explorer.list("/", true, RequestControl::default())).unwrap();
+    assert_eq!(count("connections.log"), 2);
+    let start = Instant::now();
+    assert!(matches!(
+        block_on(explorer.list(
+            "/slow",
+            true,
+            RequestControl::with_timeout(Duration::from_millis(250))
+        )),
+        Err(SftpError::Timeout)
+    ));
+    assert!(start.elapsed() < Duration::from_secs(2));
+    block_on(explorer.list("/", true, RequestControl::default())).unwrap();
+    assert_eq!(count("connections.log"), 3);
+    explorer.close();
+    assert!(matches!(
+        block_on(explorer.list("/", false, RequestControl::default())),
+        Err(SftpError::Cancelled)
+    ));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while count("disconnected.log") < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "close must tear down the idle SSH transport"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let disposable = Client::new(profile.clone()).unwrap();
+    block_on(disposable.list("/", true, RequestControl::default())).unwrap();
+    drop(disposable);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while count("disconnected.log") < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "dropping the final handle must tear down SSH"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut untrusted = profile.clone();
+    untrusted.known_hosts_file = dir.path().join("wrong_hosts").display().to_string();
+    let rejected = block_on(Client::new(untrusted).unwrap().list(
+        "/",
+        true,
+        RequestControl::default(),
+    ))
+    .unwrap_err();
+    assert!(
+        rejected
+            .to_string()
+            .contains("REMOTE HOST IDENTIFICATION HAS CHANGED"),
+        "host-key diagnostic is retained in-app: {rejected}"
+    );
     let (code, output) = run(
         Connection {
             profile: profile.clone(),
@@ -176,7 +313,70 @@ fn ssh_and_sftp_real_roundtrip() {
     assert_eq!(code, Some(0), "{output}");
     let source = dir.path().join("上传 [1] file.txt");
     if std::env::var_os("TERMIOR_SSH_ASKPASS_EXE").is_some() {
+        use futures::StreamExt;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use termior_ssh::auth::{Answer, ChallengeKind, Session};
         use termior_ssh::credentials::{self, Kind};
+        let mut shared_profile = profile.clone();
+        shared_profile.authentication = Authentication::Password;
+        let (auth, mut prompts) = Session::new(shared_profile.clone()).unwrap();
+        let prompt_count = Arc::new(AtomicUsize::new(0));
+        let observed = prompt_count.clone();
+        let responder = std::thread::spawn(move || {
+            block_on(async move {
+                while let Some(prompt) = prompts.next().await {
+                    assert_eq!(prompt.kind, ChallengeKind::Password);
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    prompt
+                        .reply
+                        .send(Answer::Secret {
+                            value: "fixture-password".to_owned().into(),
+                            remember: false,
+                        })
+                        .unwrap();
+                }
+            })
+        });
+        let shared_explorer =
+            Client::with_auth(shared_profile.clone(), Some(auth.clone())).unwrap();
+        let pending_explorer = shared_explorer.clone();
+        let listing = std::thread::spawn(move || {
+            block_on(pending_explorer.list(
+                "/",
+                true,
+                RequestControl::with_timeout(Duration::from_secs(20)),
+            ))
+        });
+        for _ in 0..2 {
+            let (code, output) = run_with_auth(
+                Connection {
+                    profile: shared_profile.clone(),
+                    kind: SessionKind::Shell,
+                    transfer: None,
+                },
+                None,
+                true,
+                Some(auth.clone()),
+            );
+            assert_eq!(code, Some(0), "shared authentication: {output}");
+            assert!(
+                !output.contains("password:") && !output.contains("fixture-password"),
+                "terminal must not ask for or echo the shared password"
+            );
+        }
+        listing.join().unwrap().unwrap();
+        assert_eq!(
+            prompt_count.load(Ordering::SeqCst),
+            1,
+            "PTY, Explorer and another tab share one password"
+        );
+        shared_explorer.close();
+        drop(shared_explorer);
+        drop(auth);
+        responder.join().unwrap();
         for kind in [Kind::Password, Kind::Passphrase] {
             let mut saved = profile.clone();
             saved.use_saved_credentials = true;
@@ -190,6 +390,50 @@ fn ssh_and_sftp_real_roundtrip() {
             }
             credentials::save(&saved, kind, "fixture-password").unwrap();
             let _cleanup = SavedCredential(saved.clone(), kind);
+            // A fresh coordinator (as after app restart) reads the opt-in vault
+            // without raising a UI challenge, for both PTY and Explorer.
+            let (saved_auth, mut prompts) = Session::new(saved.clone()).unwrap();
+            let broker_explorer =
+                Client::with_auth(saved.clone(), Some(saved_auth.clone())).unwrap();
+            block_on(broker_explorer.list(
+                "/",
+                true,
+                RequestControl::with_timeout(Duration::from_secs(20)),
+            ))
+            .unwrap();
+            let (code, output) = run_with_auth(
+                Connection {
+                    profile: saved.clone(),
+                    kind: SessionKind::Shell,
+                    transfer: None,
+                },
+                None,
+                true,
+                Some(saved_auth.clone()),
+            );
+            assert_eq!(code, Some(0), "saved shared {kind:?}: {output}");
+            assert!(
+                prompts.try_recv().is_err(),
+                "saved credentials must not prompt"
+            );
+            broker_explorer.close();
+            drop(saved_auth);
+            let saved_explorer = Client::new(saved.clone()).unwrap();
+            let connections = count("connections.log");
+            for _ in 0..2 {
+                block_on(saved_explorer.list(
+                    "/",
+                    true,
+                    RequestControl::with_timeout(Duration::from_secs(20)),
+                ))
+                .unwrap();
+            }
+            assert_eq!(
+                count("connections.log"),
+                connections + 1,
+                "saved {kind:?}: Explorer reuses authentication"
+            );
+            saved_explorer.close();
             // Two separate connections must both authenticate without any PTY input.
             for _ in 0..2 {
                 let (code, output) = run(

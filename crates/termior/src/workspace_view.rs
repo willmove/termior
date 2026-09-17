@@ -1,3 +1,6 @@
+mod sftp_browser;
+use sftp_browser::{LocalBrowserState, SessionMenu};
+
 use crate::{
     ai_diff_view::{AiDiffAction, AiDiffView},
     app_identity,
@@ -19,11 +22,11 @@ use gpui::{
     AnimationExt as _, AnyElement, AnyWindowHandle, App, Bounds, Context, CursorStyle, Decorations,
     Div, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, HitboxBehavior,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    PromptButton, PromptLevel, ResizeEdge, Role, SharedString, Size, Stateful, Task, Tiling,
-    UTF16Selection, Window, WindowAppearance, WindowBounds, WindowControlArea,
+    PromptButton, PromptLevel, ResizeEdge, Role, ScrollHandle, SharedString, Size, Stateful, Task,
+    Tiling, UTF16Selection, Window, WindowAppearance, WindowBounds, WindowControlArea,
 };
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     ops::Range,
     path::{Path, PathBuf},
     process::Command,
@@ -167,6 +170,7 @@ enum CommandMode {
     GitCreateBranch,
     GitSwitchBranch,
     PreviewUrl,
+    RemotePath,
 }
 
 impl CommandMode {
@@ -183,6 +187,7 @@ impl CommandMode {
             Self::GitCreateBranch => "Create branch",
             Self::GitSwitchBranch => "Switch branch",
             Self::PreviewUrl => "Web preview URL",
+            Self::RemotePath => "远程路径",
         }
     }
 }
@@ -193,10 +198,43 @@ struct ExplorerContextMenu {
     position: Point<Pixels>,
 }
 
-#[derive(Debug, Clone)]
 struct RemoteExplorerState {
-    tab_id: TabId,
-    listing: termior_ssh::sftp::RemoteListing,
+    client: termior_ssh::sftp::Client,
+    scroll: ScrollHandle,
+    listing: Option<termior_ssh::sftp::RemoteListing>,
+    request: Option<RemoteExplorerRequest>,
+    pending: Option<(String, bool)>,
+    error: Option<String>,
+    status: String,
+}
+impl Drop for RemoteExplorerState {
+    fn drop(&mut self) {
+        self.client.close();
+    }
+}
+struct RemoteExplorerRequest {
+    id: u64,
+    // None is a mutation, never superseded by navigation.
+    path: Option<String>,
+    control: termior_ssh::sftp::RequestControl,
+}
+// Only retain the latest destination; repeated refreshes share the in-flight request.
+fn coalesce_remote_scan(
+    active: Option<&str>,
+    pending: &mut Option<(String, bool)>,
+    path: String,
+    force: bool,
+) {
+    if active == Some(path.as_str()) {
+        // A transfer can invalidate the directory during its current scan.
+        // Preserve that explicit post-transfer rescan, but drop stale navigation.
+        if !pending.as_ref().is_some_and(|(p, f)| p == &path && *f) {
+            *pending = None;
+        }
+    } else {
+        let force = force || pending.as_ref().is_some_and(|(p, f)| p == &path && *f);
+        *pending = Some((path, force));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +338,9 @@ pub struct WorkspaceView {
     main_window: Option<gpui::AnyWindowHandle>,
     ssh_profiles: termior_ssh::Profiles,
     ssh_profiles_error: Option<String>,
+    ssh_selected: Option<String>,
+    ssh_context_menu: Option<SessionMenu>,
+    sftp_browsers: HashMap<TabId, LocalBrowserState>,
     ssh_manager_window: Option<gpui::WindowHandle<crate::ssh_view::SshView>>,
     model: WorkspaceState,
     tabs: Vec<AppTab>,
@@ -311,15 +352,14 @@ pub struct WorkspaceView {
     explorer: Option<FileIndex>,
     explorer_tree: TreeState,
     explorer_watcher: Option<WorkspaceWatcher>,
-    remote_explorer: Option<RemoteExplorerState>,
+    remote_explorers: HashMap<TabId, RemoteExplorerState>,
+    remote_auth_sessions: HashMap<TabId, termior_ssh::auth::Session>,
+    explorer_view_tab: Option<TabId>,
     remote_explorer_paths: HashMap<TabId, String>,
     remote_terminal_cwds: HashMap<TabId, String>,
     remote_explorer_selected: Option<String>,
-    remote_explorer_loading: bool,
+    remote_explorer_scroll_drag: Option<(TabId, f32)>,
     remote_explorer_generation: u64,
-    remote_operation_generation: u64,
-    remote_explorer_dirty: HashSet<TabId>,
-    remote_explorer_error: Option<String>,
     remote_pending_name_parent: Option<String>,
     remote_pending_rename_target: Option<String>,
     explorer_requested_root: PathBuf,
@@ -607,6 +647,9 @@ impl WorkspaceView {
             main_window: None,
             ssh_profiles: termior_ssh::Profiles::default(),
             ssh_profiles_error: None,
+            ssh_selected: None,
+            ssh_context_menu: None,
+            sftp_browsers: HashMap::new(),
             ssh_manager_window: None,
             tabs,
             themes,
@@ -617,15 +660,14 @@ impl WorkspaceView {
             explorer: None,
             explorer_tree,
             explorer_watcher: None,
-            remote_explorer: None,
+            remote_explorers: HashMap::new(),
+            remote_auth_sessions: HashMap::new(),
+            explorer_view_tab: None,
             remote_explorer_paths: HashMap::new(),
             remote_terminal_cwds: HashMap::new(),
             remote_explorer_selected: None,
-            remote_explorer_loading: false,
+            remote_explorer_scroll_drag: None,
             remote_explorer_generation: 0,
-            remote_operation_generation: 0,
-            remote_explorer_dirty: HashSet::new(),
-            remote_explorer_error: None,
             remote_pending_name_parent: None,
             remote_pending_rename_target: None,
             explorer_requested_root: initial_project_root,
@@ -1042,60 +1084,335 @@ impl WorkspaceView {
         path: String,
         cx: &mut Context<Self>,
     ) {
-        self.remote_explorer_generation = self.remote_explorer_generation.saturating_add(1);
-        let generation = self.remote_explorer_generation;
-        if !self.remote_runtime_connected(tab_id) {
-            self.remote_explorer_loading = false;
-            self.remote_explorer_error =
-                Some("Reconnect the SSH/SFTP tab to browse remote files.".into());
+        self.scan_remote_directory(tab_id, profile, path, false, cx);
+    }
+
+    fn ensure_remote_auth(
+        &mut self,
+        tab_id: TabId,
+        profile: &termior_ssh::Profile,
+        cx: &mut Context<Self>,
+    ) -> Result<termior_ssh::auth::Session, String> {
+        if let Some(session) = self
+            .remote_auth_sessions
+            .get(&tab_id)
+            .filter(|s| s.matches(profile))
+        {
+            return Ok(session.clone());
+        }
+        if let Some(session) = self
+            .remote_auth_sessions
+            .values()
+            .find(|s| s.matches(profile))
+            .cloned()
+        {
+            self.remote_auth_sessions.insert(tab_id, session.clone());
+            return Ok(session);
+        }
+        let (session, mut requests) =
+            termior_ssh::auth::Session::new(profile.clone()).map_err(|e| e.to_string())?;
+        self.remote_auth_sessions.insert(tab_id, session.clone());
+        cx.spawn(async move |workspace, cx| {
+            while let Some(challenge) = requests.next().await {
+                let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.open_remote_auth_prompt(challenge, cx)
+                });
+            }
+        })
+        .detach();
+        Ok(session)
+    }
+
+    fn open_remote_auth_prompt(
+        &mut self,
+        challenge: termior_ssh::auth::Challenge,
+        cx: &mut Context<Self>,
+    ) {
+        let cancelled = challenge.cancelled.clone();
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        let dir = self.data_dir.clone();
+        let bounds = WindowBounds::Windowed(Bounds::centered(None, size(px(620.), px(440.)), cx));
+        match cx.open_window(app_identity::window_options(bounds), |window, cx| {
+            let view = cx.new(|cx| crate::ssh_view::SshView::new_shared_prompt(challenge, dir, cx));
+            window.set_window_title("SSH 身份认证 · 终端与文件浏览器共用");
+            window.on_window_should_close(cx, |window, _| {
+                window.remove_window();
+                false
+            });
+            window.focus(&view.read(cx).focus_handle(cx), cx);
+            window.activate_window();
+            view
+        }) {
+            Ok(handle) => {
+                if let Ok(view) = handle.entity(cx) {
+                    cx.subscribe(
+                        &view,
+                        |this, _, _: &crate::ssh_view::ProfilesChanged, cx| {
+                            this.reload_ssh_profiles();
+                            cx.notify();
+                            if let Some(manager) = this.ssh_manager_window {
+                                let _ = manager.update(cx, |view, _, cx| {
+                                    view.refresh_credential_preferences(cx)
+                                });
+                            }
+                        },
+                    )
+                    .detach();
+                }
+                cx.spawn(async move |_, cx| loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    let cancelled = cancelled.load(Ordering::Acquire);
+                    if handle
+                        .update(cx, |_, window, _| {
+                            if cancelled {
+                                window.remove_window();
+                            }
+                        })
+                        .is_err()
+                        || cancelled
+                    {
+                        break;
+                    }
+                })
+                .detach();
+            }
+            Err(error) => {
+                self.command_message = Some(format!("无法打开 SSH 认证窗口：{error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    fn ensure_remote_explorer(
+        &mut self,
+        tab_id: TabId,
+        profile: termior_ssh::Profile,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.remote_explorers.contains_key(&tab_id) {
+            return true;
+        }
+        let auth = match self.ensure_remote_auth(tab_id, &profile, cx) {
+            Ok(auth) => auth,
+            Err(error) => {
+                self.command_message = Some(format!("SSH authentication: {error}"));
+                return false;
+            }
+        };
+        match termior_ssh::sftp::Client::with_auth(profile, Some(auth)) {
+            Ok(client) => {
+                self.remote_explorers.insert(
+                    tab_id,
+                    RemoteExplorerState {
+                        client,
+                        scroll: ScrollHandle::new(),
+                        listing: None,
+                        request: None,
+                        pending: None,
+                        error: None,
+                        status: "Ready".into(),
+                    },
+                );
+                true
+            }
+            Err(error) => {
+                self.command_message = Some(error.to_string());
+                false
+            }
+        }
+    }
+
+    fn scan_remote_directory(
+        &mut self,
+        tab_id: TabId,
+        profile: termior_ssh::Profile,
+        path: String,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.remote_runtime_connected(tab_id, cx) {
             cx.notify();
             return;
         }
         if termior_ssh::quote_sftp_path(&path).is_err() {
-            self.remote_explorer_loading = false;
-            self.remote_explorer_error = Some("Invalid remote path".into());
+            self.command_message = Some("Invalid remote path".into());
             cx.notify();
             return;
         }
-        self.remote_explorer_loading = true;
-        self.remote_explorer_error = None;
+        if !self.ensure_remote_explorer(tab_id, profile.clone(), cx) {
+            cx.notify();
+            return;
+        }
+        self.remote_explorer_paths.insert(tab_id, path.clone());
+        let state = self.remote_explorers.get_mut(&tab_id).unwrap();
+        if let Some(request) = &state.request {
+            coalesce_remote_scan(request.path.as_deref(), &mut state.pending, path, force);
+            cx.notify();
+            return;
+        }
+        self.remote_explorer_generation += 1;
+        let id = self.remote_explorer_generation;
+        let control = termior_ssh::sftp::RequestControl::default();
+        state.request = Some(RemoteExplorerRequest {
+            id,
+            path: Some(path.clone()),
+            control: control.clone(),
+        });
+        state.error = None;
+        state.status = control.status();
+        let client = state.client.clone();
         self.remote_explorer_selected = None;
-        let task_profile = profile.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { termior_ssh::sftp::list(&task_profile, &path) });
+        self.watch_remote_progress(tab_id, id, cx);
         cx.spawn(async move |workspace, cx| {
-            let result = task.await;
+            let result = client.list(&path, force, control).await;
             let _ = workspace.update(cx, |workspace, cx| {
-                if generation != workspace.remote_explorer_generation {
+                let Some(state) = workspace.remote_explorers.get_mut(&tab_id) else {
+                    return;
+                };
+                if state.request.as_ref().map(|r| r.id) != Some(id) {
                     return;
                 }
-                workspace.remote_explorer_loading = false;
-                if workspace.model.active != Some(tab_id) {
-                    return;
-                }
+                state.request = None;
+                let pending = state.pending.take();
                 match result {
                     Ok(listing) => {
-                        workspace
-                            .remote_explorer_paths
-                            .insert(tab_id, listing.cwd.clone());
-                        workspace.remote_explorer = Some(RemoteExplorerState {
-                            tab_id,
-                            listing,
-                        });
-                        workspace.remote_explorer_error = None;
+                        if pending.is_none() {
+                            let changed_directory = state
+                                .listing
+                                .as_ref()
+                                .map_or(true, |previous| previous.cwd != listing.cwd);
+                            workspace
+                                .remote_explorer_paths
+                                .insert(tab_id, listing.cwd.clone());
+                            state.listing = Some(listing);
+                            if changed_directory {
+                                state.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+                            }
+                        }
+                        state.status = "Connected · remote SFTP".into();
                     }
                     Err(error) => {
-                        workspace.remote_explorer = None;
-                        workspace.remote_explorer_error = Some(format!(
-                            "Remote Explorer: {error}. Check the SSH/SFTP authentication prompt and connection settings."
-                        ));
+                        state.error = Some(format!("Remote Explorer: {error}. Refresh to retry."));
+                        state.status = "Request stopped".into();
+                        cx.notify();
+                        return; // Never auto-retry failed authentication.
                     }
+                }
+                if let Some((path, force)) = pending {
+                    workspace.scan_remote_directory(tab_id, profile, path, force, cx);
                 }
                 cx.notify();
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    fn watch_remote_progress(&self, tab_id: TabId, id: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |workspace, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            let keep_running = workspace
+                .update(cx, |workspace, cx| {
+                    let Some(state) = workspace.remote_explorers.get_mut(&tab_id) else {
+                        return false;
+                    };
+                    let Some(request) = state.request.as_ref().filter(|r| r.id == id) else {
+                        return false;
+                    };
+                    let status = request.control.status();
+                    if state.status != status {
+                        state.status = status;
+                        cx.notify();
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !keep_running {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn cancel_remote_explorer(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
+        if let Some(state) = self.remote_explorers.get_mut(&tab_id) {
+            state.pending = None;
+            if let Some(request) = &state.request {
+                request.control.cancel();
+            }
+        }
+        cx.notify();
+    }
+
+    fn close_remote_explorer(&mut self, tab_id: TabId) {
+        if let Some(browser) = self.sftp_browsers.get_mut(&tab_id) {
+            browser.connected = false;
+        }
+        self.remote_explorers.remove(&tab_id);
+        self.remote_auth_sessions.remove(&tab_id);
+        self.remote_explorer_paths.remove(&tab_id);
+        self.remote_terminal_cwds.remove(&tab_id);
+        if self
+            .remote_explorer_scroll_drag
+            .is_some_and(|(drag_tab, _)| drag_tab == tab_id)
+        {
+            self.remote_explorer_scroll_drag = None;
+        }
+    }
+
+    fn begin_remote_explorer_scroll_drag(&mut self, tab_id: TabId, pointer_y: Pixels) {
+        let Some(scroll) = self
+            .remote_explorers
+            .get(&tab_id)
+            .map(|state| state.scroll.clone())
+        else {
+            return;
+        };
+        let bounds = scroll.bounds();
+        let (thumb_top, thumb_height) = scroll_thumb_geometry(
+            f32::from(bounds.size.height).max(1.0),
+            f32::from(scroll.max_offset().y),
+            f32::from(scroll.offset().y),
+        );
+        let pointer = f32::from(pointer_y - bounds.top());
+        let pointer_offset = if pointer >= thumb_top && pointer <= thumb_top + thumb_height {
+            pointer - thumb_top
+        } else {
+            thumb_height / 2.0
+        };
+        self.remote_explorer_scroll_drag = Some((tab_id, pointer_offset));
+        self.scroll_remote_explorer_to_pointer(tab_id, pointer_y, pointer_offset);
+    }
+
+    fn scroll_remote_explorer_to_pointer(
+        &self,
+        tab_id: TabId,
+        pointer_y: Pixels,
+        pointer_offset: f32,
+    ) {
+        let Some(scroll) = self
+            .remote_explorers
+            .get(&tab_id)
+            .map(|state| &state.scroll)
+        else {
+            return;
+        };
+        let bounds = scroll.bounds();
+        let viewport_height = f32::from(bounds.size.height).max(1.0);
+        let max_offset = f32::from(scroll.max_offset().y).max(0.0);
+        let (_, thumb_height) =
+            scroll_thumb_geometry(viewport_height, max_offset, f32::from(scroll.offset().y));
+        let pointer = f32::from(pointer_y - bounds.top());
+        let ratio = ((pointer - pointer_offset) / (viewport_height - thumb_height).max(1.0))
+            .clamp(0.0, 1.0);
+        let offset = scroll.offset();
+        scroll.set_offset(gpui::point(offset.x, px(-max_offset * ratio)));
     }
 
     fn active_remote_explorer_context(&self) -> Option<(TabId, termior_ssh::Profile, String)> {
@@ -1113,15 +1430,18 @@ impl WorkspaceView {
         Some((tab.id, remote.profile.clone(), path))
     }
 
-    fn remote_runtime_connected(&self, tab_id: TabId) -> bool {
+    fn remote_runtime_connected(&self, tab_id: TabId, cx: &App) -> bool {
+        if let Some(browser) = self.sftp_browsers.get(&tab_id) {
+            return browser.connected;
+        }
         self.tabs
             .iter()
             .find(|runtime| runtime.id == tab_id)
             .is_some_and(|runtime| {
-                runtime
-                    .panes
-                    .values()
-                    .any(|pane| matches!(pane, PaneContent::Terminal(_)))
+                runtime.panes.values().any(|pane| match pane {
+                    PaneContent::Terminal(terminal) => !terminal.read(cx).has_exited(),
+                    _ => false,
+                })
             })
     }
 
@@ -1129,69 +1449,73 @@ impl WorkspaceView {
         let Some((tab_id, profile, path)) = self.active_remote_explorer_context() else {
             return false;
         };
-        if !self.remote_runtime_connected(tab_id) {
-            self.remote_explorer_generation = self.remote_explorer_generation.saturating_add(1);
-            self.remote_explorer = None;
-            self.remote_explorer_error =
-                Some("Reconnect the SSH/SFTP tab to browse remote files.".into());
-            cx.notify();
-            return true;
-        }
-        self.schedule_remote_explorer_scan(tab_id, profile, path, cx);
+        self.scan_remote_directory(tab_id, profile, path, true, cx);
         true
     }
 
     fn run_remote_explorer_operation(
         &mut self,
+        tab_id: TabId,
         profile: termior_ssh::Profile,
         operation: termior_ssh::sftp::Operation,
         success: String,
         cx: &mut Context<Self>,
-    ) {
-        let Some((tab_id, _, refresh_path)) = self.active_remote_explorer_context() else {
-            return;
-        };
-        if !self.remote_runtime_connected(tab_id) {
+    ) -> bool {
+        if !self.remote_runtime_connected(tab_id, cx) {
             self.command_message = Some("Reconnect the SSH/SFTP tab first.".into());
             cx.notify();
-            return;
+            return false;
         }
-        self.remote_operation_generation = self.remote_operation_generation.saturating_add(1);
-        let generation = self.remote_operation_generation;
-        self.remote_explorer_loading = true;
-        self.command_message = Some("Running remote SFTP operation…".into());
-        let task_profile = profile.clone();
-        let task = cx
-            .background_executor()
-            .spawn(async move { termior_ssh::sftp::execute(&task_profile, &operation) });
+        if !self.ensure_remote_explorer(tab_id, profile.clone(), cx) {
+            cx.notify();
+            return false;
+        }
+        let state = self.remote_explorers.get_mut(&tab_id).unwrap();
+        if state.request.is_some() {
+            self.command_message =
+                Some("Wait for the current remote request, or cancel it first.".into());
+            cx.notify();
+            return false;
+        }
+        self.remote_explorer_generation += 1;
+        let id = self.remote_explorer_generation;
+        let control = termior_ssh::sftp::RequestControl::default();
+        state.request = Some(RemoteExplorerRequest {
+            id,
+            path: None,
+            control: control.clone(),
+        });
+        state.error = None;
+        state.status = control.status();
+        let client = state.client.clone();
+        self.watch_remote_progress(tab_id, id, cx);
         cx.spawn(async move |workspace, cx| {
-            let result = task.await;
+            let result = client.execute(&operation, control).await;
             let _ = workspace.update(cx, |workspace, cx| {
-                if generation != workspace.remote_operation_generation {
-                    return;
-                }
-                if workspace.model.active != Some(tab_id) {
-                    workspace.remote_explorer_dirty.insert(tab_id);
-                    if let Err(error) = result {
-                        log::warn!("background remote Explorer operation failed: {error}");
-                    }
-                    return;
-                }
-                workspace.remote_explorer_loading = false;
+                let Some(state) = workspace.remote_explorers.get_mut(&tab_id) else { return; };
+                if state.request.as_ref().map(|r| r.id) != Some(id) { return; }
+                state.request = None;
+                state.listing = None; // Interrupted writes can have partial effects.
+                let pending = state.pending.take();
                 match result {
                     Ok(()) => {
-                        workspace.command_message = Some(success);
-                        workspace.schedule_remote_explorer_scan(tab_id, profile, refresh_path, cx);
+                        state.status = success.clone();
+                        if workspace.model.active == Some(tab_id) { workspace.command_message = Some(success); }
+                        let path = pending.map(|(path, _)| path)
+                            .or_else(|| workspace.remote_explorer_paths.get(&tab_id).cloned())
+                            .unwrap_or_else(|| ".".into());
+                        workspace.scan_remote_directory(tab_id, profile, path, true, cx);
                     }
                     Err(error) => {
-                        workspace.command_message =
-                            Some(format!("Remote operation failed: {error}"));
+                        state.error = Some(format!("Remote operation: {error}. Refresh to inspect the result before retrying."));
+                        state.status = "Operation stopped".into();
                     }
                 }
                 cx.notify();
             });
-        })
-        .detach();
+        }).detach();
+        cx.notify();
+        true
     }
 
     fn apply_explorer_index(&mut self, index: FileIndex, cx: &mut Context<Self>) {
@@ -1429,6 +1753,20 @@ impl WorkspaceView {
         window_handle: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .model
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .is_some_and(|tab| {
+                tab.remote
+                    .as_ref()
+                    .is_some_and(sftp_browser::is_browser_connection)
+            })
+        {
+            self.start_sftp_browser(tab_id, cx);
+            return;
+        }
         if !self.pending_terminals.insert((tab_id, pane_id)) {
             return;
         }
@@ -1441,13 +1779,28 @@ impl WorkspaceView {
             ShellDetection::Manual { path } if !path.trim().is_empty() => Some(path.clone()),
             ShellDetection::Manual { .. } => None,
         };
+        let remote = self
+            .model
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.remote.clone());
+        let auth_session = match remote
+            .as_ref()
+            .map(|remote| self.ensure_remote_auth(tab_id, &remote.profile, cx))
+            .transpose()
+        {
+            Ok(session) => session,
+            Err(error) => {
+                self.pending_terminals.remove(&(tab_id, pane_id));
+                self.command_message = Some(format!("SSH authentication unavailable: {error}"));
+                cx.notify();
+                return;
+            }
+        };
         let config = termior_terminal::PtySessionConfig {
-            remote: self
-                .model
-                .tabs
-                .iter()
-                .find(|tab| tab.id == tab_id)
-                .and_then(|tab| tab.remote.clone()),
+            remote,
+            auth_session,
             shell_program,
             shell_integration: true,
             inherit_environment: !private,
@@ -1606,6 +1959,7 @@ impl WorkspaceView {
                 return;
             }
         }
+        self.close_remote_explorer(id);
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
             tab.panes
                 .insert(pane, PaneContent::Placeholder("正在连接…".into()));
@@ -1623,6 +1977,20 @@ impl WorkspaceView {
             Ok(profiles) => {
                 self.ssh_profiles = profiles.unwrap_or_default();
                 self.ssh_profiles_error = None;
+                // The prompt can change the preference without reopening the manager.
+                for tab in &mut self.model.tabs {
+                    if let Some(remote) = &mut tab.remote {
+                        if let Some(saved) = self.ssh_profiles.connections.iter().find(|p| {
+                            p.name == remote.profile.name
+                                && termior_ssh::credentials::same_target(p, &remote.profile)
+                        }) {
+                            remote.profile.use_saved_credentials = saved.use_saved_credentials;
+                            if let Some(session) = self.remote_auth_sessions.get(&tab.id) {
+                                session.set_remember(saved.use_saved_credentials);
+                            }
+                        }
+                    }
+                }
             }
             Err(error) => {
                 self.ssh_profiles_error = Some(error.to_string());
@@ -1665,6 +2033,9 @@ impl WorkspaceView {
             cx,
         );
         self.persist_workspace();
+        if self.active_is_sftp_browser() {
+            window.focus(&self.focus_handle, cx);
+        }
         window.activate_window();
         cx.notify();
     }
@@ -2253,7 +2624,7 @@ impl WorkspaceView {
         if tab
             .remote
             .as_ref()
-            .is_some_and(|remote| remote.transfer.is_some())
+            .is_some_and(|remote| remote.kind == termior_ssh::SessionKind::Sftp)
         {
             return false;
         }
@@ -2317,6 +2688,7 @@ impl WorkspaceView {
     fn close_chrome_menus(&mut self) {
         self.new_tab_menu = None;
         self.pane_context_menu = None;
+        self.ssh_context_menu = None;
         self.explorer_context_menu = None;
     }
 
@@ -2406,6 +2778,9 @@ impl WorkspaceView {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
             tab.panes.remove(&pane_id);
         }
+        if !self.remote_runtime_connected(tab_id, cx) {
+            self.close_remote_explorer(tab_id);
+        }
         self.focus_active_pane(window, cx);
         cx.notify();
     }
@@ -2425,6 +2800,9 @@ impl WorkspaceView {
             for pane_id in removed {
                 tab.panes.remove(&pane_id);
             }
+        }
+        if !self.remote_runtime_connected(tab_id, cx) {
+            self.close_remote_explorer(tab_id);
         }
         self.focus_active_pane(window, cx);
         cx.notify();
@@ -2458,7 +2836,9 @@ impl WorkspaceView {
         for pane_id in pane_ids {
             self.remove_terminal_agent(id, pane_id);
         }
+        self.close_remote_explorer(id);
         self.model.tabs.remove(index);
+        self.sftp_browsers.remove(&id);
         self.tabs.retain(|tab| tab.id != id);
         if self.model.active == Some(id) {
             self.model.active = if self.model.tabs.is_empty() {
@@ -2496,7 +2876,12 @@ impl WorkspaceView {
                 for pane_id in pane_ids {
                     self.remove_terminal_agent(id, pane_id);
                 }
+                self.close_remote_explorer(id);
+                self.sftp_browsers.remove(&id);
                 self.tabs.retain(|tab| tab.id != id);
+            }
+            if !self.remote_runtime_connected(id, cx) {
+                self.close_remote_explorer(id);
             }
             if let Some(active) = self.model.active {
                 self.activate_runtime(active, cx);
@@ -2514,30 +2899,47 @@ impl WorkspaceView {
         // No per-pane activation hook is needed now that the embedded WebView is gone
         // (ADR 0002): preview tabs render a placeholder and have no surface to show/hide.
         self.follow_active_tab_project(cx);
+        if let Some(browser) = self.sftp_browsers.get(&id) {
+            self.scan_sftp_local(id, browser.path.clone(), cx);
+        }
     }
 
     /// Explorer/Git 跟随活动 Tab 的项目文件夹；同根则不动，避免无意义重扫。
     /// 切 Tab 重扫复用可取消/世代作废扫描，过期结果不会覆盖新根。
     /// 无活动 Tab 时 `active_project_dir()` 回落兑底根，与状态栏 pill 保持一致。
     fn follow_active_tab_project(&mut self, cx: &mut Context<Self>) {
-        if let Some((tab_id, profile, path)) = self.active_remote_explorer_context() {
-            if !self.remote_runtime_connected(tab_id) {
-                self.remote_explorer_generation = self.remote_explorer_generation.saturating_add(1);
-                self.remote_explorer = None;
-                self.remote_explorer_loading = false;
-                self.remote_explorer_error =
-                    Some("Reconnect the SSH/SFTP tab to browse remote files.".into());
-                cx.notify();
-                return;
+        // Some callers switch the model before activate_runtime. Track the view
+        // owner separately so unfinished names never cross local/remote tabs.
+        if self.explorer_view_tab != self.model.active {
+            self.explorer_view_tab = self.model.active;
+            self.explorer_context_menu = None;
+            self.ssh_context_menu = None;
+            self.remote_pending_name_parent = None;
+            self.remote_pending_rename_target = None;
+            self.remote_explorer_selected = None;
+            if matches!(
+                self.command_mode,
+                CommandMode::CreateFile
+                    | CommandMode::CreateDirectory
+                    | CommandMode::Rename
+                    | CommandMode::Move
+                    | CommandMode::RemotePath
+            ) {
+                self.command_mode = CommandMode::Browse;
+                self.command_input.clear();
+                self.command_marked_text.clear();
             }
-            let already_showing = self.remote_explorer.as_ref().is_some_and(|state| {
-                state.tab_id == tab_id
-                    && (state.listing.cwd == path || (path == "." && !state.listing.cwd.is_empty()))
-            });
-            let dirty = self.remote_explorer_dirty.remove(&tab_id);
-            if dirty || !already_showing {
+        }
+        if let Some((tab_id, profile, path)) = self.active_remote_explorer_context() {
+            // Tab switching must not reopen a failed authentication prompt.
+            if self
+                .remote_explorers
+                .get(&tab_id)
+                .map_or(true, |state| state.error.is_none())
+            {
                 self.schedule_remote_explorer_scan(tab_id, profile, path, cx);
             }
+            cx.notify();
             return;
         }
         let project_dir = self.model.active_project_dir().to_path_buf();
@@ -2558,13 +2960,55 @@ impl WorkspaceView {
         window_handle: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) {
-        if self
+        if let Some(remote) = self
             .model
             .tabs
             .iter()
-            .any(|tab| tab.id == tab_id && tab.remote.is_some())
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.remote.clone())
         {
-            // Preserve output and authentication errors. Reconnection is always explicit.
+            if remote.transfer.is_some() {
+                // Successful or interrupted transfers can both modify directories.
+                for tab in &self.model.tabs {
+                    if tab
+                        .remote
+                        .as_ref()
+                        .is_some_and(|r| r.profile == remote.profile)
+                    {
+                        if let Some(state) = self.remote_explorers.get_mut(&tab.id) {
+                            state.client.invalidate();
+                            state.listing = None;
+                            if state.request.is_some() {
+                                let path = self
+                                    .remote_explorer_paths
+                                    .get(&tab.id)
+                                    .cloned()
+                                    .unwrap_or_else(|| ".".into());
+                                state.pending = Some((path, true));
+                            }
+                        }
+                    }
+                }
+                if let Some((id, profile, path)) = self.active_remote_explorer_context() {
+                    if profile == remote.profile {
+                        if let Some(browser) = self.sftp_browsers.get(&id) {
+                            self.scan_sftp_local(id, browser.path.clone(), cx);
+                        }
+                    }
+                    if profile == remote.profile
+                        && !self
+                            .remote_explorers
+                            .get(&id)
+                            .is_some_and(|s| s.request.is_some())
+                    {
+                        self.scan_remote_directory(id, profile, path, true, cx);
+                    }
+                }
+            }
+            // Preserve output but terminate the background SFTP transport.
+            if !self.remote_runtime_connected(tab_id, cx) {
+                self.close_remote_explorer(tab_id);
+            }
             cx.notify();
             return;
         }
@@ -2633,7 +3077,7 @@ impl WorkspaceView {
     }
 
     fn focus_active_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminal_area_hidden() {
+        if self.terminal_area_hidden() || self.active_is_sftp_browser() {
             window.focus(&self.focus_handle, cx);
             return;
         }
@@ -3093,7 +3537,7 @@ impl WorkspaceView {
         let Some((tab_id, profile, root)) = self.active_remote_explorer_context() else {
             return;
         };
-        if !self.remote_runtime_connected(tab_id) {
+        if !self.remote_runtime_connected(tab_id, cx) {
             self.command_message = Some("Reconnect the SSH/SFTP tab first.".into());
             cx.notify();
             return;
@@ -3171,8 +3615,12 @@ impl WorkspaceView {
                 self.refresh_remote_explorer(cx);
                 self.command_message = Some("Remote Explorer refresh scheduled".into());
             }
-            ExplorerContextAction::Open
-            | ExplorerContextAction::Reveal
+            ExplorerContextAction::Open => {
+                if matches!(target, ExplorerContextTarget::RemoteDirectory(_)) {
+                    self.scan_remote_directory(tab_id, profile, path, false, cx);
+                }
+            }
+            ExplorerContextAction::Reveal
             | ExplorerContextAction::AttachToAi
             | ExplorerContextAction::FindFile
             | ExplorerContextAction::SearchContent => {}
@@ -3188,6 +3636,9 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(tab_id) = self.model.active else {
+            return;
+        };
         let answer = window.prompt(
             PromptLevel::Warning,
             "Delete remote item",
@@ -3216,6 +3667,7 @@ impl WorkspaceView {
                     termior_ssh::sftp::Operation::RemoveFile { path: path.clone() }
                 };
                 workspace.run_remote_explorer_operation(
+                    tab_id,
                     profile,
                     operation,
                     format!("Deleted remote {path}"),
@@ -3530,12 +3982,18 @@ impl WorkspaceView {
     }
 
     fn terminal_area_hidden(&self) -> bool {
+        if self.active_is_sftp_browser() {
+            return false;
+        }
         self.model
             .active_tab()
             .is_some_and(|tab| tab.kind == TabKind::Terminal && tab.terminal_hidden)
     }
 
     fn toggle_terminal_area(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_is_sftp_browser() {
+            return;
+        }
         let Some(tab) = self.model.active_tab_mut() else {
             return;
         };
@@ -4069,6 +4527,13 @@ impl WorkspaceView {
         if input.is_empty() {
             return;
         }
+        if self.command_mode == CommandMode::RemotePath {
+            if let Some((id, profile, _)) = self.active_remote_explorer_context() {
+                self.scan_remote_directory(id, profile, input, false, cx);
+                self.command_mode = CommandMode::Browse;
+            }
+            return;
+        }
         if self.command_mode == CommandMode::SearchContent {
             self.start_content_search(input, cx);
             return;
@@ -4080,7 +4545,7 @@ impl WorkspaceView {
                 | CommandMode::Rename
                 | CommandMode::Move
         ) {
-            if let Some((_, profile, root)) = self.active_remote_explorer_context() {
+            if let Some((tab_id, profile, root)) = self.active_remote_explorer_context() {
                 let parent = self.remote_pending_name_parent.clone().unwrap_or(root);
                 let operation = match self.command_mode {
                     CommandMode::CreateFile => termior_ssh::sftp::join(&parent, &input)
@@ -4120,12 +4585,15 @@ impl WorkspaceView {
                 };
                 match operation {
                     Ok(operation) => {
-                        self.run_remote_explorer_operation(
+                        if !self.run_remote_explorer_operation(
+                            tab_id,
                             profile,
                             operation,
                             "Remote operation completed".into(),
                             cx,
-                        );
+                        ) {
+                            return;
+                        }
                         self.command_mode = CommandMode::Browse;
                         self.command_input.clear();
                         self.command_marked_text.clear();
@@ -4139,6 +4607,7 @@ impl WorkspaceView {
         }
         let completed_mode = self.command_mode;
         let result = match self.command_mode {
+            CommandMode::RemotePath => return,
             CommandMode::FindFile => {
                 let path = self.explorer.as_ref().and_then(|index| {
                     index
@@ -4396,11 +4865,65 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.command_mode != CommandMode::Browse
-            || self.model.sidebar_panel != SidebarPanel::Explorer
-            || !self.model.sidebar_visible
+            || (!self.active_is_sftp_browser()
+                && (self.model.sidebar_panel != SidebarPanel::Explorer
+                    || !self.model.sidebar_visible))
             || !self.focus_handle.is_focused(window)
         {
             return false;
+        }
+        if let Some((tab_id, profile, path)) = self.active_remote_explorer_context() {
+            // Never route remote Explorer navigation into the retained local tree.
+            let key = event.keystroke.key.as_str();
+            if key == "escape" {
+                self.cancel_remote_explorer(tab_id, cx);
+                return true;
+            }
+            if key == "left" {
+                if let Some(parent) = termior_ssh::sftp::parent(&path) {
+                    self.schedule_remote_explorer_scan(tab_id, profile, parent, cx);
+                }
+                return true;
+            }
+            let entries = self
+                .remote_explorers
+                .get(&tab_id)
+                .and_then(|state| state.listing.as_ref())
+                .filter(|listing| listing.cwd == path || path == ".")
+                .map(|listing| listing.entries.clone())
+                .unwrap_or_default();
+            if entries.is_empty() {
+                return matches!(
+                    key,
+                    "up" | "down" | "home" | "end" | "right" | "enter" | "return" | "space"
+                );
+            }
+            let selected = self
+                .remote_explorer_selected
+                .as_ref()
+                .and_then(|path| entries.iter().position(|entry| &entry.path == path))
+                .unwrap_or(0);
+            let index = match key {
+                "up" => selected.saturating_sub(1),
+                "down" => (selected + 1).min(entries.len() - 1),
+                "home" => 0,
+                "end" => entries.len() - 1,
+                "right" | "enter" | "return" | "space" => {
+                    if entries[selected].is_dir {
+                        self.schedule_remote_explorer_scan(
+                            tab_id,
+                            profile,
+                            entries[selected].path.clone(),
+                            cx,
+                        );
+                    }
+                    return true;
+                }
+                _ => return false,
+            };
+            self.remote_explorer_selected = Some(entries[index].path.clone());
+            cx.notify();
+            return true;
         }
         let mut entries = self
             .explorer
@@ -4473,7 +4996,16 @@ impl WorkspaceView {
     }
 
     fn global_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && self.ssh_context_menu.take().is_some() {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.handle_command_key(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.handle_sftp_local_key(event, window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -4758,11 +5290,14 @@ impl WorkspaceView {
 
     fn remote_explorer_content(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (tab_id, profile, requested_path) = self.active_remote_explorer_context()?;
-        let listing = self
-            .remote_explorer
-            .as_ref()
-            .filter(|state| state.tab_id == tab_id)
-            .map(|state| &state.listing);
+        let detailed = self.active_is_sftp_browser();
+        let drop_wash = ui::selected_wash(&self.palette);
+        let state = self.remote_explorers.get(&tab_id);
+        let scroll = state.map(|state| state.scroll.clone()).unwrap_or_default();
+        let loading = state.is_some_and(|state| state.request.is_some());
+        let listing = state
+            .and_then(|state| state.listing.as_ref())
+            .filter(|listing| listing.cwd == requested_path || requested_path == ".");
         let root = listing
             .map(|listing| listing.cwd.as_str())
             .unwrap_or(requested_path.as_str());
@@ -4773,6 +5308,7 @@ impl WorkspaceView {
             .flex_row()
             .gap_1()
             .mb_1()
+            .when(detailed, |bar| bar.h(px(28.)).flex_shrink_0().mb_0())
             .child(explorer_tool_button(
                 "remote-explorer-up",
                 Icon::ChevronUp,
@@ -4811,7 +5347,17 @@ impl WorkspaceView {
                 |this, cx| {
                     this.refresh_remote_explorer(cx);
                 },
-            ));
+            ))
+            .when(loading, |toolbar| {
+                toolbar.child(explorer_tool_button(
+                    "remote-explorer-cancel",
+                    Icon::Close,
+                    "Cancel remote request",
+                    &self.palette,
+                    cx,
+                    move |this, cx| this.cancel_remote_explorer(tab_id, cx),
+                ))
+            });
 
         let rows = listing
             .map(|listing| {
@@ -4824,10 +5370,23 @@ impl WorkspaceView {
                         let right_path = path.clone();
                         let is_dir = entry.is_dir;
                         let selected = self.remote_explorer_selected.as_deref() == Some(&path);
+                        let drag = sftp_browser::RemoteFileDrag {
+                            tab_id,
+                            path: path.clone(),
+                            is_dir,
+                            name: entry.name.clone(),
+                        };
+                        let drop_path = path.clone();
+                        let external_drop_path = path.clone();
+                        let debug_path = path.clone();
                         let profile = profile.clone();
                         div()
                             .id(SharedString::from(format!("remote-file-{path}")))
+                            .debug_selector(move || format!("remote-file-{debug_path}"))
                             .w_full()
+                            .when(detailed, |row| {
+                                row.h(px(28.)).flex_shrink_0().flex().items_center()
+                            })
                             .px_1()
                             .py(px(2.0))
                             .rounded_sm()
@@ -4838,6 +5397,8 @@ impl WorkspaceView {
                                 div()
                                     .flex()
                                     .flex_row()
+                                    .w_full()
+                                    .min_w_0()
                                     .items_center()
                                     .gap_1()
                                     .whitespace_nowrap()
@@ -4846,13 +5407,40 @@ impl WorkspaceView {
                                         false,
                                         &self.palette,
                                     ))
-                                    .child(SharedString::from(entry.name)),
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .child(SharedString::from(entry.name)),
+                                    )
+                                    .when(detailed, |row| {
+                                        row.child(div().w(px(68.)).flex_shrink_0().child(
+                                            if entry.is_symlink {
+                                                "链接"
+                                            } else if is_dir {
+                                                "文件夹"
+                                            } else {
+                                                "文件"
+                                            },
+                                        ))
+                                        .child(
+                                            div().w(px(90.)).flex_shrink_0().text_right().child(
+                                                sftp_browser::display_size(entry.size, is_dir),
+                                            ),
+                                        )
+                                    }),
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                     this.explorer_context_menu = None;
-                                    if is_dir {
+                                    if let Some(browser) = this.sftp_browsers.get_mut(&tab_id) {
+                                        browser.local_focused = false;
+                                    }
+                                    this.remote_explorer_selected = Some(path.clone());
+                                    window.focus(&this.focus_handle, cx);
+                                    if is_dir && event.click_count == 2 {
                                         this.remote_explorer_paths.insert(tab_id, path.clone());
                                         this.schedule_remote_explorer_scan(
                                             tab_id,
@@ -4867,10 +5455,47 @@ impl WorkspaceView {
                                     cx.notify();
                                 }),
                             )
+                            .when(detailed, |row| {
+                                row.on_drag(drag, |drag, _, _, cx| {
+                                    cx.new(|_| sftp_browser::FileDragPreview(drag.name.clone()))
+                                })
+                            })
+                            .when(detailed && is_dir, |row| {
+                                row.drag_over::<sftp_browser::LocalFileDrag>(
+                                    move |style, _, _, _| style.bg(drop_wash),
+                                )
+                                .on_drop(cx.listener(
+                                    move |this, drag: &sftp_browser::LocalFileDrag, window, cx| {
+                                        cx.stop_propagation();
+                                        this.upload_browser_paths(
+                                            tab_id,
+                                            vec![drag.path.clone()],
+                                            drop_path.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                ))
+                                .on_drop(cx.listener(
+                                    move |this, paths: &gpui::ExternalPaths, window, cx| {
+                                        cx.stop_propagation();
+                                        this.upload_browser_paths(
+                                            tab_id,
+                                            paths.0.to_vec(),
+                                            external_drop_path.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                ))
+                            })
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                     cx.stop_propagation();
+                                    if let Some(browser) = this.sftp_browsers.get_mut(&tab_id) {
+                                        browser.local_focused = false;
+                                    }
                                     this.remote_explorer_selected = Some(right_path.clone());
                                     this.show_explorer_context_menu(
                                         if is_dir {
@@ -4896,28 +5521,90 @@ impl WorkspaceView {
         } else {
             format!("{}@{}", profile.user, profile.host)
         };
+        let scrollbar_scroll = scroll.clone();
+        let scrollbar_thumb = ui::alpha(self.palette.foreground, 0.55);
+        let scrollbar = div()
+            .id("remote-explorer-scrollbar")
+            .debug_selector(|| "remote-explorer-scrollbar".into())
+            .w(px(10.0))
+            .h_full()
+            .flex_shrink_0()
+            .cursor_pointer()
+            .bg(ui::alpha(self.palette.foreground, 0.08))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.begin_remote_explorer_scroll_drag(tab_id, event.position.y);
+                    cx.notify();
+                }),
+            )
+            .child(
+                canvas(
+                    |bounds, _, _| bounds,
+                    move |bounds, _, window, _| {
+                        let (top, height) = scroll_thumb_geometry(
+                            f32::from(bounds.size.height),
+                            f32::from(scrollbar_scroll.max_offset().y),
+                            f32::from(scrollbar_scroll.offset().y),
+                        );
+                        window.paint_quad(gpui::fill(
+                            Bounds::new(
+                                bounds.origin + gpui::point(px(2.0), px(top)),
+                                size(px(6.0), px(height)),
+                            ),
+                            scrollbar_thumb,
+                        ));
+                    },
+                )
+                .size_full(),
+            );
         Some(
             div()
                 .flex()
                 .flex_col()
                 .size_full()
+                .when(detailed, |content| content.flex_1().min_h_0())
                 .child(toolbar)
                 .child(
                     div()
                         .px_1()
                         .pb_1()
+                        .when(detailed, |row| {
+                            row.h(px(28.))
+                                .flex_shrink_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                        })
                         .text_xs()
                         .text_color(ui::muted(&self.palette))
                         .child(SharedString::from(format!(
                             "{host_label}:{root}{}",
-                            if self.remote_explorer_loading {
+                            if loading {
                                 "  · loading…"
                             } else {
                                 "  · remote"
                             }
                         ))),
                 )
-                .children(self.remote_explorer_error.clone().map(|error| {
+                .child(
+                    div()
+                        .px_1()
+                        .pb_1()
+                        .when(detailed, |row| {
+                            row.h(px(22.))
+                                .flex_shrink_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                        })
+                        .text_xs()
+                        .text_color(ui::muted(&self.palette))
+                        .child(SharedString::from(
+                            state.map(|s| s.status.clone()).unwrap_or_else(|| {
+                                "Reconnect the SSH/SFTP tab to browse remote files.".into()
+                            }),
+                        )),
+                )
+                .children(state.and_then(|state| state.error.clone()).map(|error| {
                     div()
                         .px_1()
                         .py_1()
@@ -4925,30 +5612,69 @@ impl WorkspaceView {
                         .text_color(gpui_color(self.palette.status[3]))
                         .child(SharedString::from(error))
                 }))
+                .when(detailed, |content| {
+                    content.child(sftp_browser::file_columns(&self.palette))
+                })
                 .child(
                     div()
-                        .id("remote-explorer-scroll")
+                        .flex()
+                        .flex_row()
                         .flex_1()
                         .min_h(px(0.0))
-                        .overflow_x_scroll()
-                        .overflow_y_scroll()
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                this.show_explorer_context_menu(
-                                    target.clone(),
-                                    event.position,
-                                    window,
-                                    cx,
-                                );
-                            }),
+                        .min_w(px(0.0))
+                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                            if event.pressed_button == Some(MouseButton::Left) {
+                                if let Some((drag_tab, pointer_offset)) =
+                                    this.remote_explorer_scroll_drag
+                                {
+                                    if drag_tab == tab_id {
+                                        this.scroll_remote_explorer_to_pointer(
+                                            tab_id,
+                                            event.position.y,
+                                            pointer_offset,
+                                        );
+                                        cx.notify();
+                                    }
+                                }
+                            } else if event.pressed_button != Some(MouseButton::Left) {
+                                this.remote_explorer_scroll_drag = None;
+                            }
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, _| this.remote_explorer_scroll_drag = None),
                         )
-                        .children(rows)
-                        .children(
-                            (listing.is_some_and(|listing| listing.entries.is_empty())
-                                && !self.remote_explorer_loading)
-                                .then(|| empty_hint("Remote directory is empty", &self.palette)),
-                        ),
+                        .child(
+                            div()
+                                .id("remote-explorer-scroll")
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .h_full()
+                                .overflow_x_scroll()
+                                .overflow_y_scroll()
+                                .track_scroll(&scroll)
+                                .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        this.show_explorer_context_menu(
+                                            target.clone(),
+                                            event.position,
+                                            window,
+                                            cx,
+                                        );
+                                    }),
+                                )
+                                .children(rows)
+                                .children(
+                                    (listing.is_some_and(|listing| listing.entries.is_empty())
+                                        && !loading)
+                                        .then(|| {
+                                            empty_hint("Remote directory is empty", &self.palette)
+                                        }),
+                                ),
+                        )
+                        .child(scrollbar),
                 )
                 .into_any_element(),
         )
@@ -4984,123 +5710,16 @@ impl WorkspaceView {
                 .child(SharedString::from(message))
         });
         let content = match self.model.sidebar_panel {
-            SidebarPanel::Ssh => {
-                let mut panel = div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_2()
-                    .child(div().text_sm().child("SSH / SFTP 会话"))
-                    .child(
-                        ui::button("ssh-manage", "管理连接…", ButtonKind::Subtle, &self.palette)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.open_ssh_manager(window, cx)
-                                }),
-                            ),
-                    );
-                if let Some(error) = &self.ssh_profiles_error {
-                    panel = panel.child(
-                        div()
-                            .text_xs()
-                            .child(SharedString::from(format!("配置读取失败：{error}"))),
-                    );
-                } else if self.ssh_profiles.connections.is_empty() {
-                    panel = panel.child(div().text_xs().child("暂无连接，点击管理连接添加。"));
-                }
-                for (i, profile) in self.ssh_profiles.connections.iter().enumerate() {
-                    let ssh = profile.clone();
-                    let sftp = profile.clone();
-                    panel = panel.child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                ui::button(
-                                    ("ssh-saved", i),
-                                    SharedString::from(profile.name.clone()),
-                                    ButtonKind::Ghost,
-                                    &self.palette,
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        this.connect_remote(
-                                            termior_ssh::Connection {
-                                                profile: ssh.clone(),
-                                                kind: termior_ssh::SessionKind::Shell,
-                                                transfer: None,
-                                            },
-                                            window,
-                                            cx,
-                                        )
-                                    },
-                                )),
-                            )
-                            .child(div().text_xs().child(SharedString::from(format!(
-                                "{}@{}",
-                                profile.user, profile.host
-                            ))))
-                            .child(
-                                ui::button(
-                                    ("sftp-saved", i),
-                                    "打开 SFTP",
-                                    ButtonKind::Subtle,
-                                    &self.palette,
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        this.connect_remote(
-                                            termior_ssh::Connection {
-                                                profile: sftp.clone(),
-                                                kind: termior_ssh::SessionKind::Sftp,
-                                                transfer: None,
-                                            },
-                                            window,
-                                            cx,
-                                        )
-                                    },
-                                )),
-                            ),
-                    );
-                }
-                let sessions: Vec<_> = self
-                    .model
-                    .tabs
-                    .iter()
-                    .filter(|tab| tab.remote.is_some())
-                    .collect();
-                if !sessions.is_empty() {
-                    panel = panel.child(div().mt_3().text_xs().child("已打开会话"));
-                    for (i, tab) in sessions.into_iter().enumerate() {
-                        let id = tab.id;
-                        panel = panel.child(
-                            ui::button(
-                                ("ssh-open", i),
-                                SharedString::from(tab.title.clone()),
-                                if self.model.active == Some(id) {
-                                    ButtonKind::Primary
-                                } else {
-                                    ButtonKind::Ghost
-                                },
-                                &self.palette,
-                            )
-                            .overflow_hidden()
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.activate_runtime(id, cx);
-                                    this.focus_active_pane(window, cx);
-                                    cx.notify();
-                                },
-                            )),
-                        );
-                    }
-                }
-                panel.into_any_element()
-            }
+            SidebarPanel::Ssh => self.ssh_session_list(cx),
 
             SidebarPanel::Explorer => {
-                if let Some(remote) = self.remote_explorer_content(cx) {
+                if self.active_is_sftp_browser() {
+                    div()
+                        .p_2()
+                        .text_xs()
+                        .child("SFTP 文件浏览已在主区域打开。左侧会话列表可切换或新建连接。")
+                        .into_any_element()
+                } else if let Some(remote) = self.remote_explorer_content(cx) {
                     remote
                 } else {
                     let toolbar = div()
@@ -6271,22 +6890,25 @@ impl gpui::Render for WorkspaceView {
             let runtime_ids: Vec<TabId> = self.tabs.iter().map(|tab| tab.id).collect();
             paired_tab_layout(&self.model, &runtime_ids).cloned()
         };
-        let active_content = active_layout
-            .and_then(|layout| {
-                let id = self.model.active?;
-                let tab = self.tabs.iter().find(|tab| tab.id == id)?;
-                Some(self.layout_element(&layout.root, &tab.panes, layout.focused, cx))
-            })
-            .unwrap_or_else(|| {
-                empty_state_message(
-                    Icon::Terminal,
-                    ui_text::empty::NO_TABS,
-                    Some(SharedString::from(ui_text::empty::NO_TABS_DETAIL)),
-                    &p,
-                )
-                .into_any_element()
-            });
-
+        let active_content = if self.active_is_sftp_browser() {
+            self.sftp_browser_content(cx)
+        } else {
+            active_layout
+                .and_then(|layout| {
+                    let id = self.model.active?;
+                    let tab = self.tabs.iter().find(|tab| tab.id == id)?;
+                    Some(self.layout_element(&layout.root, &tab.panes, layout.focused, cx))
+                })
+                .unwrap_or_else(|| {
+                    empty_state_message(
+                        Icon::Terminal,
+                        ui_text::empty::NO_TABS,
+                        Some(SharedString::from(ui_text::empty::NO_TABS_DETAIL)),
+                        &p,
+                    )
+                    .into_any_element()
+                })
+        };
         let sidebar = if self.model.sidebar_visible {
             div()
                 .flex()
@@ -6547,6 +7169,7 @@ impl gpui::Render for WorkspaceView {
                     )
             })
             .collect::<Vec<_>>();
+        let ssh_context_menu = self.ssh_session_menu(cx);
         let explorer_context_menu = self.explorer_context_menu.clone().map(|menu| {
             anchored().position(menu.position).child(
                 menu_panel(&p)
@@ -6788,10 +7411,11 @@ impl gpui::Render for WorkspaceView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event, _window, cx| {
+                    let closed_ssh = this.ssh_context_menu.take().is_some();
                     let closed_explorer = this.explorer_context_menu.take().is_some();
                     let closed_new_tab = this.new_tab_menu.take().is_some();
                     let closed_pane = this.pane_context_menu.take().is_some();
-                    if closed_explorer || closed_new_tab || closed_pane {
+                    if closed_ssh || closed_explorer || closed_new_tab || closed_pane {
                         cx.notify();
                     }
                 }),
@@ -6981,8 +7605,9 @@ impl gpui::Render for WorkspaceView {
                                     .is_some_and(|tab| tab.remote.is_some()),
                                 |area| {
                                     let running = self
-                                        .active_terminal()
-                                        .is_some_and(|terminal| !terminal.read(cx).has_exited());
+                                        .model
+                                        .active
+                                        .is_some_and(|id| self.remote_runtime_connected(id, cx));
                                     area.child(
                                         div()
                                             .flex()
@@ -7033,6 +7658,10 @@ impl gpui::Render for WorkspaceView {
                                                     &p,
                                                 )
                                                 .on_click(cx.listener(|this, _, _, cx| {
+                                                    if let Some(id) = this.model.active {
+                                                        this.close_remote_explorer(id);
+                                                        cx.notify();
+                                                    }
                                                     if let Some(terminal) =
                                                         this.active_terminal().cloned()
                                                     {
@@ -7167,7 +7796,8 @@ impl gpui::Render for WorkspaceView {
                             .when(
                                 self.model
                                     .active_tab()
-                                    .is_some_and(|tab| tab.kind == TabKind::Terminal),
+                                    .is_some_and(|tab| tab.kind == TabKind::Terminal)
+                                    && !self.active_is_sftp_browser(),
                                 |row| {
                                     row.child(
                                         ui::icon_button(
@@ -7219,6 +7849,7 @@ impl gpui::Render for WorkspaceView {
                             ),
                     ),
             )
+            .children(ssh_context_menu)
             .children(explorer_context_menu)
             .children(new_tab_menu)
             .children(pane_context_menu);
@@ -7559,6 +8190,7 @@ fn explorer_context_actions(target: &ExplorerContextTarget) -> &'static [Explore
                 ExplorerContextAction::Refresh,
             ],
             ExplorerContextTargetKind::Directory => &[
+                ExplorerContextAction::Open,
                 ExplorerContextAction::CreateFile,
                 ExplorerContextAction::CreateDirectory,
                 ExplorerContextAction::UploadFile,
@@ -7688,6 +8320,27 @@ fn sidebar_button(
             listener(workspace, cx);
         }),
     )
+}
+
+fn scroll_thumb_geometry(
+    viewport_height: f32,
+    max_offset: f32,
+    scroll_offset_y: f32,
+) -> (f32, f32) {
+    let viewport_height = viewport_height.max(0.0);
+    if viewport_height == 0.0 {
+        return (0.0, 0.0);
+    }
+    let max_offset = max_offset.max(0.0);
+    let thumb_height = (viewport_height * viewport_height / (viewport_height + max_offset))
+        .max(24.0)
+        .min(viewport_height);
+    let thumb_top = if max_offset > 0.0 {
+        (-scroll_offset_y / max_offset).clamp(0.0, 1.0) * (viewport_height - thumb_height)
+    } else {
+        0.0
+    };
+    (thumb_top, thumb_height)
 }
 
 fn path_breadcrumb(path: &str) -> String {
@@ -8022,6 +8675,53 @@ fn paired_tab_layout<'a>(
 #[cfg(test)]
 mod explorer_ui_tests {
     use super::*;
+
+    #[test]
+    fn remote_navigation_coalesces_and_keeps_only_latest_destination() {
+        let mut pending = None;
+        coalesce_remote_scan(Some("/a"), &mut pending, "/a".into(), true);
+        assert!(pending.is_none(), "refresh shares the active listing");
+        coalesce_remote_scan(Some("/a"), &mut pending, "/b".into(), false);
+        coalesce_remote_scan(Some("/a"), &mut pending, "/c".into(), true);
+        coalesce_remote_scan(Some("/a"), &mut pending, "/c".into(), false);
+        assert_eq!(pending, Some(("/c".into(), true)));
+        coalesce_remote_scan(Some("/a"), &mut pending, "/a".into(), false);
+        assert!(
+            pending.is_none(),
+            "returning to the active path drops stale navigation"
+        );
+        coalesce_remote_scan(None, &mut pending, "/a".into(), false);
+        assert_eq!(
+            pending,
+            Some(("/a".into(), false)),
+            "navigation waits for mutation completion"
+        );
+        pending = Some(("/a".into(), true));
+        coalesce_remote_scan(Some("/a"), &mut pending, "/a".into(), false);
+        assert_eq!(
+            pending,
+            Some(("/a".into(), true)),
+            "post-transfer invalidation must survive navigation coalescing"
+        );
+    }
+
+    #[test]
+    fn remote_explorer_scrollbar_thumb_tracks_scroll_range() {
+        let (top, height) = scroll_thumb_geometry(400.0, 1200.0, 0.0);
+        assert_eq!(top, 0.0);
+        assert_eq!(height, 100.0);
+
+        let (top, height) = scroll_thumb_geometry(400.0, 1200.0, -600.0);
+        assert_eq!(top, 150.0);
+        assert_eq!(height, 100.0);
+
+        let (top, height) = scroll_thumb_geometry(400.0, 1200.0, -1200.0);
+        assert_eq!(top, 300.0);
+        assert_eq!(height, 100.0);
+
+        let (top, height) = scroll_thumb_geometry(400.0, 0.0, 0.0);
+        assert_eq!((top, height), (0.0, 400.0));
+    }
 
     #[test]
     fn utf16_offsets_never_split_a_code_point() {

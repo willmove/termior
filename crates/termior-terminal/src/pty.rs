@@ -31,6 +31,8 @@ pub enum SpawnError {
 pub struct PtySessionConfig {
     /// Explicit user-owned remote session; never passed through a local shell.
     pub remote: Option<termior_ssh::Connection>,
+    /// Desktop-managed common authentication for terminal and Explorer.
+    pub auth_session: Option<termior_ssh::auth::Session>,
     /// None 时按平台探测默认 shell。
     pub shell: Option<ShellKind>,
     /// Optional executable path/name. Manual shell settings use this field.
@@ -58,6 +60,7 @@ impl Default for PtySessionConfig {
     fn default() -> Self {
         Self {
             remote: None,
+            auth_session: None,
             shell: None,
             shell_program: None,
             shell_integration: false,
@@ -89,6 +92,7 @@ pub struct PtySession {
     is_wsl: bool,
     /// 保持 shell integration 脚本文件存活；drop 时随会话清理。
     _integration_dir: Option<tempfile::TempDir>,
+    _auth_session: Option<termior_ssh::auth::Session>,
     #[cfg(windows)]
     _job: WindowsJob,
 }
@@ -199,6 +203,7 @@ impl PtySession {
             shell_kind: kind,
             is_wsl: wsl.is_some(),
             _integration_dir: integration_dir,
+            _auth_session: config.auth_session.clone(),
             #[cfg(windows)]
             _job: job,
         })
@@ -250,9 +255,18 @@ impl PtySession {
 
     /// 尝试 kill 子进程。
     pub fn kill(&mut self) -> Result<(), SpawnError> {
-        self.killer
+        let result = self
+            .killer
             .kill()
-            .map_err(|e| SpawnError::Spawn(format!("kill: {e}")))
+            .map_err(|e| SpawnError::Spawn(format!("kill: {e}")));
+        self.release_auth();
+        result
+    }
+    pub fn release_auth(&mut self) {
+        self._auth_session = None;
+        if self.remote {
+            self._integration_dir = None;
+        }
     }
 }
 
@@ -367,6 +381,14 @@ fn build_command(
             .invocation(remote.kind)
             .map_err(|error| SpawnError::Spawn(error.to_string()))?;
         let mut cmd = CommandBuilder::new(invocation.program);
+        if config.auth_session.is_some()
+            && remote.profile.authentication != termior_ssh::Authentication::Agent
+        {
+            cmd.args([
+                "-o",
+                "PreferredAuthentications=publickey,password,keyboard-interactive",
+            ]);
+        }
         let mut batch_dir = None;
         if let Some(transfer) = &remote.transfer {
             if remote.kind != termior_ssh::SessionKind::Sftp {
@@ -389,7 +411,7 @@ fn build_command(
         cmd.args(&invocation.args);
         cmd.env("TERM", "xterm-256color");
         cmd.env("TERM_PROGRAM", "Termior");
-        if remote.profile.use_saved_credentials {
+        if remote.profile.use_saved_credentials || config.auth_session.is_some() {
             // Only non-secret metadata crosses the environment boundary. The helper
             // reads the OS vault and replies over OpenSSH's private stdout pipe.
             if batch_dir.is_none() {
@@ -410,6 +432,18 @@ fn build_command(
                 "TERMIOR_SSH_ASKPASS_STATE",
                 batch_dir.as_ref().unwrap().path(),
             );
+            cmd.env(
+                "TERMIOR_SSH_ASKPASS_CANCEL_DIR",
+                batch_dir.as_ref().unwrap().path(),
+            );
+            if let Some(session) = &config.auth_session {
+                let endpoint = session.register(batch_dir.as_ref().unwrap().path())?;
+                cmd.env(
+                    "TERMIOR_SSH_AUTH_ENDPOINT",
+                    serde_json::to_string(&endpoint)
+                        .map_err(|e| SpawnError::Spawn(e.to_string()))?,
+                );
+            }
         } else {
             cmd.env("SSH_ASKPASS_REQUIRE", "never");
         }

@@ -153,6 +153,9 @@ impl TerminalBridge {
     pub fn kill(&mut self) -> Result<(), SpawnError> {
         self.session.kill()
     }
+    pub fn release_auth(&mut self) {
+        self.session.release_auth();
+    }
 
     /// 线程安全的 PTY 写句柄（键盘转发用）。
     pub fn writer(&self) -> WriterHandle {

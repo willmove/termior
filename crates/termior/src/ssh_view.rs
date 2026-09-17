@@ -20,6 +20,60 @@ pub struct ProfilesChanged;
 impl gpui::EventEmitter<ProfilesChanged> for SshView {}
 
 type ConnectCallback = Box<dyn Fn(Connection, &mut App)>;
+
+// Read the latest settings, never overwrite a manager edit with the prompt's
+// snapshot. The JSON stores only the opt-in flag; the secret goes to the OS vault.
+fn save_prompt_preference(
+    dir: Option<&std::path::Path>,
+    profile: &Profile,
+    kind: termior_ssh::credentials::Kind,
+    secret: &str,
+    remember: bool,
+) -> Result<(), String> {
+    use termior_ssh::credentials;
+    if secret.is_empty() || secret.len() > 1023 || secret.contains(['\0', '\r', '\n']) {
+        return Err("密码/口令不能为空、超过 1023 字节或包含换行。".into());
+    }
+    let Some(dir) = dir else {
+        return if remember {
+            Err("应用数据目录不可用；可取消记住密码，仅用于本次连接。".into())
+        } else {
+            Ok(())
+        };
+    };
+    let mut profiles = Profiles::load(dir).map_err(|e| e.to_string())?;
+    let Some(saved) = profiles
+        .connections
+        .iter_mut()
+        .find(|saved| saved.name == profile.name && credentials::same_target(saved, profile))
+    else {
+        return if remember {
+            Err("连接配置已删除或更改；请取消记住密码，或更新连接管理后重试。".into())
+        } else {
+            Ok(())
+        };
+    };
+    let was_remembered = saved.use_saved_credentials;
+    if !remember && !was_remembered {
+        return Ok(()); // Session-only login needs neither a vault nor a settings write.
+    }
+    saved.use_saved_credentials = remember;
+    if remember {
+        credentials::save(profile, kind, secret)?;
+    }
+    profiles.save(dir).map_err(|e| e.to_string())?;
+    if !remember
+        && was_remembered
+        && !profiles
+            .connections
+            .iter()
+            .any(|saved| saved.use_saved_credentials && credentials::same_target(saved, profile))
+    {
+        credentials::delete_all(profile)?;
+    }
+    Ok(())
+}
+
 pub struct SshView {
     profiles: Profiles,
     dir: Option<PathBuf>,
@@ -27,6 +81,7 @@ pub struct SshView {
     values: [String; 9],
     remember: bool,
     auth_prompt: Option<String>,
+    shared_auth: Option<termior_ssh::auth::Challenge>,
     scroll: gpui::ScrollHandle,
     input_layouts: Rc<RefCell<Vec<Option<InputLayout>>>>,
     dragging_scroll: bool,
@@ -48,10 +103,98 @@ pub struct SshView {
 impl Drop for SshView {
     fn drop(&mut self) {
         self.clear_secrets();
+        if let Some(challenge) = self.shared_auth.take() {
+            let _ = challenge.reply.send(termior_ssh::auth::Answer::Cancel);
+        }
     }
 }
 
 impl SshView {
+    /// Keep an already-open manager from writing a stale list after sidebar deletion.
+    /// Preserve unrelated form edits, but discard the form for a removed profile.
+    pub fn refresh_saved_profiles(&mut self, cx: &mut Context<Self>) {
+        let selected_name = self
+            .selected
+            .and_then(|i| self.profiles.connections.get(i))
+            .map(|p| p.name.clone());
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        match Profiles::load(dir) {
+            Ok(profiles) => {
+                self.selected = selected_name
+                    .as_ref()
+                    .and_then(|name| profiles.connections.iter().position(|p| &p.name == name));
+                self.profiles = profiles;
+                if selected_name.is_some() && self.selected.is_none() {
+                    self.clear_secrets();
+                    self.values = Default::default();
+                    self.cursor = 0;
+                    self.marked = None;
+                    self.select_all = false;
+                    self.pending_transfer = None;
+                    self.confirm_delete = false;
+                    self.status = "会话配置已删除".into();
+                }
+            }
+            Err(error) => {
+                self.load_failed = true;
+                self.status = error.to_string();
+            }
+        }
+        cx.notify();
+    }
+    /// Open the requested saved connection, including when reusing the manager window.
+    pub fn edit_saved(&mut self, name: &str, rename: bool, cx: &mut Context<Self>) {
+        if let Some(dir) = &self.dir {
+            match Profiles::load(dir) {
+                Ok(profiles) => self.profiles = profiles,
+                Err(error) => {
+                    self.status = error.to_string();
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        if let Some(index) = self
+            .profiles
+            .connections
+            .iter()
+            .position(|p| p.name == name)
+        {
+            self.field = if rename { 0 } else { 1 };
+            self.select(index);
+            self.select_all = rename;
+            self.scroll.set_offset(gpui::point(px(0.), px(0.)));
+            self.status = if rename {
+                "修改连接名称后点击保存"
+            } else {
+                "编辑会话后点击保存"
+            }
+            .into();
+        }
+        cx.notify();
+    }
+    pub fn refresh_credential_preferences(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        let Ok(latest) = Profiles::load(dir) else {
+            return;
+        };
+        for (index, profile) in self.profiles.connections.iter_mut().enumerate() {
+            if let Some(saved) = latest.connections.iter().find(|p| {
+                p.name == profile.name && termior_ssh::credentials::same_target(p, profile)
+            }) {
+                // Preserve an explicitly edited, not-yet-saved checkbox.
+                if self.selected == Some(index) && self.remember == profile.use_saved_credentials {
+                    self.remember = saved.use_saved_credentials;
+                }
+                profile.use_saved_credentials = saved.use_saved_credentials;
+            }
+        }
+        cx.notify();
+    }
     fn clear_secrets(&mut self) {
         self.values[7].zeroize();
         self.values[8].zeroize();
@@ -73,6 +216,7 @@ impl SshView {
             values: Default::default(),
             remember: false,
             auth_prompt: None,
+            shared_auth: None,
             scroll: gpui::ScrollHandle::new(),
             input_layouts: Rc::new(RefCell::new(vec![None; 9])),
             dragging_scroll: false,
@@ -97,7 +241,69 @@ impl SshView {
         view.field = 7;
         view
     }
-    fn submit_prompt(&self) -> ! {
+    pub fn new_shared_prompt(
+        challenge: termior_ssh::auth::Challenge,
+        dir: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::new(dir, Box::new(|_, _| {}), cx);
+        view.auth_prompt = Some(format!(
+            "{} · {}\n{}",
+            challenge.profile.name, challenge.profile.host, challenge.prompt
+        ));
+        view.remember = challenge.remember;
+        view.status = challenge.error.clone().unwrap_or_default();
+        view.shared_auth = Some(challenge);
+        view.field = 7;
+        view
+    }
+    fn cancel_prompt(&mut self, window: &mut Window) {
+        if let Some(challenge) = self.shared_auth.take() {
+            let _ = challenge.reply.send(termior_ssh::auth::Answer::Cancel);
+            self.clear_secrets();
+            window.remove_window();
+        } else {
+            std::process::exit(1);
+        }
+    }
+    fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use termior_ssh::auth::{Answer, ChallengeKind};
+        if let Some(challenge) = self.shared_auth.as_ref() {
+            if challenge
+                .cancelled
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.cancel_prompt(window);
+                return;
+            }
+            if let Some(kind) = challenge.kind.credential() {
+                if let Err(error) = save_prompt_preference(
+                    self.dir.as_deref(),
+                    &challenge.profile,
+                    kind,
+                    &self.values[7],
+                    self.remember,
+                ) {
+                    self.status = error;
+                    cx.notify();
+                    return;
+                }
+                cx.emit(ProfilesChanged);
+            }
+            let answer = match challenge.kind {
+                ChallengeKind::Confirm => Answer::Confirm(true),
+                ChallengeKind::Info => Answer::Acknowledge,
+                _ => Answer::Secret {
+                    value: zeroize::Zeroizing::new(std::mem::take(&mut self.values[7])),
+                    remember: self.remember,
+                },
+            };
+            let challenge = self.shared_auth.take().unwrap();
+            let _ = challenge.reply.send(answer);
+            self.clear_secrets();
+            window.remove_window();
+            return;
+        }
         use std::io::Write;
         let mut out = std::io::stdout().lock();
         let ok = writeln!(out, "{}", self.values[7])
@@ -189,7 +395,7 @@ impl SshView {
             .and_then(|i| self.profiles.connections.get(i))
             .cloned();
         if !self.remember && (!self.values[7].is_empty() || !self.values[8].is_empty()) {
-            return Err("请勾选系统凭据库保存，或清空密码/口令后在连接终端输入".into());
+            return Err("请勾选记住密码，或清空密码/口令后在统一认证窗口输入".into());
         }
         let mut updated = self.profiles.clone();
         let index = self.selected.unwrap_or(updated.connections.len());
@@ -227,13 +433,15 @@ impl SshView {
         }
         Ok(())
     }
-    fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = &event.keystroke;
         if self.auth_prompt.is_some() && key.key == "escape" {
-            std::process::exit(1);
+            self.cancel_prompt(window);
+            return;
         }
         if self.auth_prompt.is_some() && key.key == "enter" {
-            self.submit_prompt();
+            self.submit_prompt(window, cx);
+            return;
         }
         if key.key == "tab" {
             self.field = if self.auth_prompt.is_some() {
@@ -469,7 +677,8 @@ impl Render for SshView {
             .flex_1()
             .min_w_0()
             .h_auto()
-            .flex_shrink_0();
+            .flex_shrink_0()
+            .when(self.auth_prompt.is_some(), |form| form.flex_none());
         for (i, label) in [
             "连接名称",
             "主机 / IP / SSH config 别名",
@@ -638,8 +847,19 @@ impl Render for SshView {
                 );
         }
         if let Some(prompt) = &self.auth_prompt {
+            let kind = self.shared_auth.as_ref().map(|challenge| challenge.kind);
+            let has_secret = !matches!(
+                kind,
+                Some(
+                    termior_ssh::auth::ChallengeKind::Confirm
+                        | termior_ssh::auth::ChallengeKind::Info
+                )
+            );
+            let can_remember = kind.is_some_and(|kind| kind.credential().is_some());
             return div()
+                .id("ssh-auth-prompt")
                 .size_full()
+                .overflow_y_scroll()
                 .p_4()
                 .bg(ui::color(p.background))
                 .text_color(ui::color(p.foreground))
@@ -649,14 +869,49 @@ impl Render for SshView {
                 .track_focus(&self.focus)
                 .on_key_down(cx.listener(Self::key))
                 .child(div().text_sm().child(SharedString::from(prompt.clone())))
-                .child(form)
+                .when(has_secret, |element| element.child(form))
+                .when(can_remember, |element| {
+                    element
+                        .child(
+                            ui::button(
+                                "remember-auth",
+                                if self.remember {
+                                    "☑ 记住密码（保存到系统凭据库）"
+                                } else {
+                                    "☐ 记住密码（保存到系统凭据库）"
+                                },
+                                ButtonKind::Subtle,
+                                &p,
+                            )
+                            .debug_selector(|| "remember-auth".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.remember = !this.remember;
+                                cx.notify();
+                            })),
+                        )
+                        .child(
+                            div().text_xs().child(
+                                "未勾选：仅在此主机的当前连接中复用；关闭最后一个会话后清除。",
+                            ),
+                        )
+                })
+                .when(!self.status.is_empty(), |element| {
+                    element.child(
+                        div()
+                            .text_sm()
+                            .child(SharedString::from(self.status.clone())),
+                    )
+                })
                 .child(
                     ui::button("submit", "确认", ButtonKind::Primary, &p)
-                        .on_click(cx.listener(|this, _, _, _| this.submit_prompt())),
+                        .debug_selector(|| "submit".into())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.submit_prompt(window, cx)),
+                        ),
                 )
                 .child(
                     ui::button("cancel", "取消", ButtonKind::Ghost, &p)
-                        .on_click(|_, _, _| std::process::exit(1)),
+                        .on_click(cx.listener(|this, _, window, _| this.cancel_prompt(window))),
                 )
                 .into_any_element();
         }
@@ -689,7 +944,7 @@ impl Render for SshView {
             );
         }
         form = form.child(auth).child(
-            ui::button("remember", if self.remember { "☑ 使用系统凭据库保存密码和私钥口令" } else { "☐ 使用系统凭据库保存密码和私钥口令" }, ButtonKind::Subtle, &p).whitespace_normal().justify_start()
+            ui::button("remember", if self.remember { "☑ 记住密码和私钥口令（系统凭据库）" } else { "☐ 记住密码和私钥口令（系统凭据库）" }, ButtonKind::Subtle, &p).whitespace_normal().justify_start()
                 .on_click(cx.listener(|this, _, _, cx| { this.remember = !this.remember; cx.notify(); }))
         ).child(
             ui::button("forget", "清除该连接的已保存凭据", ButtonKind::Ghost, &p).on_click(cx.listener(|this, _, _, cx| {
@@ -1045,6 +1300,116 @@ mod tests {
     use gpui::TestAppContext;
 
     #[test]
+    fn shared_prompt_offers_remember_only_for_identified_credentials() {
+        use termior_ssh::auth::{Answer, Challenge, ChallengeKind};
+        for kind in [
+            ChallengeKind::Password,
+            ChallengeKind::Other,
+            ChallengeKind::Confirm,
+        ] {
+            let (reply, answers) = std::sync::mpsc::sync_channel(1);
+            let prompt = Challenge {
+                profile: Profile {
+                    name: "fixture".into(),
+                    host: "host.example".into(),
+                    ..Default::default()
+                },
+                prompt: "Authentication".into(),
+                kind,
+                remember: false,
+                error: None,
+                reply,
+                cancelled: Default::default(),
+            };
+            let mut cx = TestAppContext::single();
+            let (view, vcx) =
+                cx.add_window_view(|_, cx| SshView::new_shared_prompt(prompt, None, cx));
+            vcx.simulate_resize(gpui::size(px(620.), px(440.)));
+            vcx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            assert_eq!(
+                vcx.debug_bounds("remember-auth").is_some(),
+                kind == ChallengeKind::Password
+            );
+            if kind == ChallengeKind::Password {
+                let button = vcx.debug_bounds("remember-auth").unwrap();
+                vcx.simulate_click(button.center(), gpui::Modifiers::default());
+                view.update(vcx, |v, _| assert!(v.remember));
+                vcx.simulate_click(button.center(), gpui::Modifiers::default());
+            }
+            view.update(vcx, |v, _| v.values[7] = "test-secret".into());
+            let submit = vcx.debug_bounds("submit").unwrap();
+            vcx.simulate_click(submit.center(), gpui::Modifiers::default());
+            match answers
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+            {
+                Answer::Secret { value, remember } => {
+                    assert_eq!(&*value, "test-secret");
+                    assert!(!remember);
+                }
+                Answer::Confirm(true) => assert_eq!(kind, ChallengeKind::Confirm),
+                _ => panic!("unexpected authentication answer"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes an isolated test entry to the system credential vault"]
+    fn first_prompt_remember_persists_only_opt_in_and_can_be_cleared() {
+        use termior_ssh::credentials::{self, Kind};
+        let dir = tempfile::tempdir().unwrap();
+        let profile = Profile {
+            name: "prompt-test".into(),
+            host: "fixture.invalid".into(),
+            known_hosts_file: dir.path().join("trust").display().to_string(),
+            ..Default::default()
+        };
+        let mut profiles = Profiles::default();
+        profiles.connections.push(profile.clone());
+        profiles.save(dir.path()).unwrap();
+        struct Cleanup(Profile);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = credentials::delete_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(profile.clone());
+        save_prompt_preference(
+            Some(dir.path()),
+            &profile,
+            Kind::Password,
+            "unique-fixture-secret",
+            true,
+        )
+        .unwrap();
+        assert!(Profiles::load(dir.path()).unwrap().connections[0].use_saved_credentials);
+        assert_eq!(
+            &**credentials::load(&profile, Kind::Password)
+                .unwrap()
+                .as_ref()
+                .unwrap(),
+            "unique-fixture-secret"
+        );
+        let json = std::fs::read_to_string(dir.path().join("Termior-ssh.json")).unwrap();
+        assert!(!json.contains("unique-fixture-secret"));
+        save_prompt_preference(
+            Some(dir.path()),
+            &profile,
+            Kind::Password,
+            "session-only",
+            false,
+        )
+        .unwrap();
+        assert!(!Profiles::load(dir.path()).unwrap().connections[0].use_saved_credentials);
+        assert!(credentials::load(&profile, Kind::Password)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn save_button_persists_and_notifies_the_sidebar() {
         let dir = tempfile::tempdir().unwrap();
         let mut cx = TestAppContext::single();
@@ -1187,6 +1552,53 @@ mod tests {
             assert_eq!(updated.connect_timeout_secs, 42);
             assert_eq!(updated.known_hosts_file, "/trust/hosts");
             assert_eq!(updated.name, "renamed");
+        });
+    }
+    #[test]
+    fn sidebar_delete_refresh_keeps_other_edits_and_never_restores_deleted_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Profile {
+            name: "first".into(),
+            host: "first.test".into(),
+            ..Profile::default()
+        };
+        let second = Profile {
+            name: "second".into(),
+            host: "second.test".into(),
+            ..Profile::default()
+        };
+        Profiles {
+            version: 1,
+            connections: vec![first, second.clone()],
+        }
+        .save(dir.path())
+        .unwrap();
+        let mut cx = TestAppContext::single();
+        let view =
+            cx.new(|cx| SshView::new(Some(dir.path().to_path_buf()), Box::new(|_, _| {}), cx));
+        view.update(&mut cx, |view, cx| {
+            view.edit_saved("second", true, cx);
+            assert_eq!(view.selected, Some(1));
+            assert_eq!(view.field, 0);
+            assert!(view.select_all);
+            view.values[0] = "unsaved rename".into();
+            Profiles {
+                version: 1,
+                connections: vec![second],
+            }
+            .save(dir.path())
+            .unwrap();
+            view.refresh_saved_profiles(cx);
+            assert_eq!(view.selected, Some(0));
+            assert_eq!(view.values[0], "unsaved rename");
+            view.save().unwrap();
+            let saved = Profiles::load(dir.path()).unwrap();
+            assert_eq!(saved.connections.len(), 1);
+            assert_eq!(saved.connections[0].name, "unsaved rename");
+            Profiles::default().save(dir.path()).unwrap();
+            view.refresh_saved_profiles(cx);
+            assert!(view.selected.is_none());
+            assert!(view.values.iter().all(String::is_empty));
         });
     }
 }

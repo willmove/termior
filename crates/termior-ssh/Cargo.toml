@@ -13,5 +13,10 @@ keyring.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
 tempfile.workspace = true
+futures.workspace = true
+interprocess = "=2.4.2"
+
+[target.'cfg(windows)'.dependencies]
+widestring = "1"
 
 [dev-dependencies]

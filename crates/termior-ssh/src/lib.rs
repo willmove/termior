@@ -1,6 +1,7 @@
 //! OpenSSH profiles and OS credential-vault integration. Profiles never contain secrets.
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod credentials;
 pub mod sftp;
 

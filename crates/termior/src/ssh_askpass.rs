@@ -53,9 +53,30 @@ fn resolved_destination(profile: &Profile) -> (String, String, bool) {
 }
 
 pub fn run() -> ! {
+    // Background Explorer cancellation also dismisses a pending native trust/
+    // credential prompt, even if ssh has already exited before process cleanup.
+    if let Some(dir) = std::env::var_os("TERMIOR_SSH_ASKPASS_CANCEL_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        std::thread::spawn(move || loop {
+            if !dir.is_dir() {
+                std::process::exit(1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+    }
     let Some(prompt) = std::env::args().nth(1) else {
         std::process::exit(1)
     };
+    if let Some(endpoint) = std::env::var_os("TERMIOR_SSH_AUTH_ENDPOINT") {
+        let endpoint =
+            serde_json::from_str::<termior_ssh::auth::Endpoint>(&endpoint.to_string_lossy())
+                .unwrap_or_else(|_| std::process::exit(1));
+        let mode = std::env::var("SSH_ASKPASS_PROMPT").unwrap_or_default();
+        match termior_ssh::auth::request(&endpoint, &prompt, &mode) {
+            Ok(Some(secret)) => reply(&secret),
+            _ => std::process::exit(1), // Never fall back to a second prompt.
+        }
+    }
     let profile: Profile = std::env::var("TERMIOR_SSH_ASKPASS_PROFILE")
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
