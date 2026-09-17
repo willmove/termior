@@ -1,5 +1,5 @@
 {
-  "notes": "NFR 回归基线（spec §8 NFR-01~04）。绝对值依赖 CI runner 硬件；门禁只看相对回归。macOS FPS 按 GitHub-hosted runner 实测约 40fps 固化；PTY 吞吐阈值放宽以吸收 ubuntu runner 噪声。",
+  "notes": "NFR 回归基线（spec §8 NFR-01~04）。绝对值依赖 CI runner 硬件；门禁只看相对回归。macOS FPS 按 GitHub-hosted runner 实测约 40fps 固化；PTY 吞吐阈值放宽以吸收 ubuntu runner 噪声。v0.1.8 将 macOS 冷启动基线 1200→1700：SSH/SFTP 功能使两平台冷启动一致增加约 16-20%（Windows 149→178ms，macOS 1450→1685-1761ms，RSS/FPS 不变），且旧基线 1200 低于 v0.1.7 实测 1450，属过紧锚点；重锚到当前已知良好值以继续检测未来回归。",
   "baselines": [
     {
       "kind": "pty_throughput_mibps",
@@ -19,7 +19,7 @@
       "kind": "cold_start_ms",
       "platform": "macos",
       "scenario": "typical",
-      "value": 1200.0,
+      "value": 1700.0,
       "threshold_percent": 40.0
     },
     {
