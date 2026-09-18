@@ -670,6 +670,10 @@ impl TerminalView {
             self.paste_clipboard(cx);
             return;
         }
+        if is_select_all_shortcut(&ev.keystroke) {
+            self.select_all(cx);
+            return;
+        }
         let bytes = keystroke_to_pty_bytes(&ev.keystroke, *self.term.mode());
         if ev.keystroke.key_char.is_some()
             && !modifiers.control
@@ -1971,6 +1975,16 @@ fn is_paste_shortcut(keystroke: &gpui::Keystroke) -> bool {
     } else {
         (modifiers.control && modifiers.shift && !modifiers.alt && key == "v")
             || (!modifiers.control && modifiers.shift && key == "insert")
+    }
+}
+
+fn is_select_all_shortcut(keystroke: &gpui::Keystroke) -> bool {
+    let key = keystroke.key.to_ascii_lowercase();
+    let modifiers = keystroke.modifiers;
+    if cfg!(target_os = "macos") {
+        modifiers.platform && !modifiers.control && !modifiers.alt && key == "a"
+    } else {
+        modifiers.control && modifiers.shift && !modifiers.alt && key == "a"
     }
 }
 

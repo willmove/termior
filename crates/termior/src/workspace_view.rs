@@ -7615,18 +7615,49 @@ impl gpui::Render for WorkspaceView {
                                             .gap_2()
                                             .px_2()
                                             .py_1()
-                                            .child(if running {
-                                                "远程会话运行中 / 认证中"
-                                            } else {
-                                                match self.active_terminal().and_then(|terminal| {
-                                                    terminal.read(cx).exit_code()
-                                                }) {
-                                                    Some(0) => "已正常完成",
-                                                    Some(_) => {
-                                                        "连接 / 传输失败或已取消（详见输出）"
+                                            .child({
+                                                // 会话状态以圆点颜色表达：绿=运行中/已连接，
+                                                // 灰=未连接或已正常结束，红=失败/异常。
+                                                let (state, dot_color) = if running {
+                                                    (
+                                                        "远程会话运行中 / 认证中",
+                                                        ui::color(p.status[1]),
+                                                    )
+                                                } else {
+                                                    match self.active_terminal().and_then(
+                                                        |terminal| terminal.read(cx).exit_code(),
+                                                    ) {
+                                                        Some(0) => (
+                                                            "已正常完成",
+                                                            ui::alpha(p.foreground, 0.35),
+                                                        ),
+                                                        Some(_) => (
+                                                            "连接 / 传输失败或已取消（详见输出）",
+                                                            ui::color(p.status[3]),
+                                                        ),
+                                                        None => (
+                                                            "远程会话未连接",
+                                                            ui::alpha(p.foreground, 0.35),
+                                                        ),
                                                     }
-                                                    None => "远程会话未连接",
-                                                }
+                                                };
+                                                div()
+                                                    .id("remote-status-dot")
+                                                    .size_2()
+                                                    .rounded_full()
+                                                    .bg(dot_color)
+                                                    .tooltip({
+                                                        let palette = p.clone();
+                                                        let label: SharedString =
+                                                            state.to_string().into();
+                                                        move |_window, cx| {
+                                                            Tooltip::view(
+                                                                label.clone(),
+                                                                &palette,
+                                                                cx,
+                                                            )
+                                                        }
+                                                    })
                                             })
                                             .child(
                                                 ui::button(
@@ -8404,6 +8435,41 @@ enum TerminalMenuAction {
     Find,
 }
 
+/// 菜单项右侧的快捷键提示，须与 terminal_view 的按键处理及键位表保持一致
+/// （查找走全局键位表 `InlineSearch`：Ctrl+F / ⌘F）。
+fn terminal_menu_shortcut(action: TerminalMenuAction) -> &'static str {
+    match action {
+        TerminalMenuAction::Copy => {
+            if cfg!(target_os = "macos") {
+                "⌘C"
+            } else {
+                "Ctrl+Shift+C"
+            }
+        }
+        TerminalMenuAction::Paste => {
+            if cfg!(target_os = "macos") {
+                "⌘V"
+            } else {
+                "Ctrl+Shift+V"
+            }
+        }
+        TerminalMenuAction::SelectAll => {
+            if cfg!(target_os = "macos") {
+                "⌘A"
+            } else {
+                "Ctrl+Shift+A"
+            }
+        }
+        TerminalMenuAction::Find => {
+            if cfg!(target_os = "macos") {
+                "⌘F"
+            } else {
+                "Ctrl+F"
+            }
+        }
+    }
+}
+
 fn terminal_menu_item(
     label: &'static str,
     id: &'static str,
@@ -8413,6 +8479,7 @@ fn terminal_menu_item(
     p: &ResolvedPalette,
     cx: &mut Context<WorkspaceView>,
 ) -> impl IntoElement {
+    let shortcut = terminal_menu_shortcut(action);
     let hover_bg = ui::hover_wash(p);
     let focus_ring = ui::focus_ring(p);
     let activate =
@@ -8442,7 +8509,16 @@ fn terminal_menu_item(
         .role(Role::Button)
         .aria_label(label)
         .focus_visible(move |style| style.border_1().border_color(focus_ring))
-        .child(label)
+        .child(
+            div()
+                .flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(label)
+                .child(div().text_color(ui::muted(p)).child(shortcut)),
+        )
         .when(enabled, |item| {
             let click = activate.clone();
             item.cursor_pointer()
