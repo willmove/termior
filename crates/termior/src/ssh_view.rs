@@ -7,14 +7,21 @@ use gpui::{
 };
 use std::{cell::RefCell, ops::Range, path::PathBuf, rc::Rc};
 
+use termior_ssh::{Authentication, Connection, Profile, Profiles, SessionKind};
+use termior_ui_kit::tokens::{font_size, height, space};
+use zeroize::Zeroize;
+
 #[derive(Clone)]
 struct InputLayout {
     line: gpui::ShapedLine,
     bounds: Bounds<Pixels>,
     offset: Pixels,
 }
-use termior_ssh::{Authentication, Connection, Profile, Profiles, SessionKind};
-use zeroize::Zeroize;
+
+/// 输入行文字度量：字号来自 token，行高与光标高配套，
+/// 让文字在 REGULAR（28px）高的输入框里垂直居中。
+const INPUT_LINE_HEIGHT: f32 = 20.0;
+const INPUT_CARET_HEIGHT: f32 = 16.0;
 
 pub struct ProfilesChanged;
 impl gpui::EventEmitter<ProfilesChanged> for SshView {}
@@ -78,7 +85,7 @@ pub struct SshView {
     profiles: Profiles,
     dir: Option<PathBuf>,
     selected: Option<usize>,
-    values: [String; 9],
+    values: [String; 10],
     remember: bool,
     auth_prompt: Option<String>,
     shared_auth: Option<termior_ssh::auth::Challenge>,
@@ -218,7 +225,7 @@ impl SshView {
             auth_prompt: None,
             shared_auth: None,
             scroll: gpui::ScrollHandle::new(),
-            input_layouts: Rc::new(RefCell::new(vec![None; 9])),
+            input_layouts: Rc::new(RefCell::new(vec![None; 10])),
             dragging_scroll: false,
             auth: Authentication::Auto,
             field: 0,
@@ -340,6 +347,7 @@ impl SshView {
             port,
             identity_file: self.values[4].clone(),
             jump_host: self.values[5].trim().into(),
+            group: self.values[9].trim().into(),
             authentication: self.auth,
             ..self
                 .selected
@@ -349,6 +357,28 @@ impl SshView {
         };
         profile.validate().map_err(|error| error.to_string())?;
         Ok(profile)
+    }
+    /// 左栏连接按钮；`index` 是 connections 的真实下标，分组渲染不改变它。
+    fn profile_button(
+        &self,
+        index: usize,
+        p: &termior_theme::ResolvedPalette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        ui::button(
+            ("profile", index),
+            SharedString::from(self.profiles.connections[index].name.clone()),
+            if self.selected == Some(index) {
+                ButtonKind::Primary
+            } else {
+                ButtonKind::Ghost
+            },
+            p,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.select(index);
+            cx.notify();
+        }))
     }
     fn select(&mut self, index: usize) {
         self.clear_secrets();
@@ -363,6 +393,7 @@ impl SshView {
             String::new(),
             String::new(),
             String::new(),
+            p.group.clone(),
         ];
         self.pending_transfer = None;
         self.auth = p.authentication;
@@ -400,10 +431,12 @@ impl SshView {
         let mut updated = self.profiles.clone();
         let index = self.selected.unwrap_or(updated.connections.len());
         if index == updated.connections.len() {
-            updated.connections.push(profile);
+            updated.connections.push(profile.clone());
         } else {
-            updated.connections[index] = profile;
+            updated.connections[index] = profile.clone();
         }
+        // 表单里可以直接输入新分组名；保存前确保它进入分组列表。
+        updated.upsert_group(&profile.group);
         updated.validate().map_err(|e| e.to_string())?;
         if self.remember {
             use termior_ssh::credentials::{self, Kind};
@@ -447,7 +480,7 @@ impl SshView {
             self.field = if self.auth_prompt.is_some() {
                 7
             } else {
-                (self.field + if key.modifiers.shift { 8 } else { 1 }) % 9
+                (self.field + if key.modifiers.shift { 9 } else { 1 }) % 10
             };
             self.marked = None;
             self.select_all = false;
@@ -629,8 +662,8 @@ impl Render for SshView {
         let mut list = div()
             .flex()
             .flex_col()
-            .gap_2()
-            .w(px(190.))
+            .gap(px(space::SM))
+            .w(px(180.))
             .flex_shrink_0()
             .when(narrow, |d| d.w_full().flex_row().flex_wrap());
         list = list.child(
@@ -652,33 +685,36 @@ impl Render for SshView {
                 },
             )),
         );
-        for (i, profile) in self.profiles.connections.iter().enumerate() {
+        // 未分组连接在前；分组名作为静态小标签行（含空分组），管理窗口不做折叠。
+        let partition =
+            termior_ssh::group_connections(&self.profiles.connections, &self.profiles.groups);
+        for index in &partition.ungrouped {
+            list = list.child(self.profile_button(*index, &p, cx));
+        }
+        for (group, members) in &partition.groups {
             list = list.child(
-                ui::button(
-                    ("profile", i),
-                    SharedString::from(profile.name.clone()),
-                    if self.selected == Some(i) {
-                        ButtonKind::Primary
-                    } else {
-                        ButtonKind::Ghost
-                    },
-                    &p,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.select(i);
-                    cx.notify();
-                })),
+                div()
+                    .pl(px(space::XS))
+                    .pt(px(space::XS))
+                    .text_size(px(font_size::MICRO))
+                    .text_color(ui::muted(&p))
+                    .child(SharedString::from(group.clone())),
             );
+            for index in members {
+                list = list.child(self.profile_button(*index, &p, cx));
+            }
         }
         let mut form = div()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap(px(space::MD))
             .flex_1()
             .min_w_0()
             .h_auto()
             .flex_shrink_0()
             .when(self.auth_prompt.is_some(), |form| form.flex_none());
+        // 两列紧凑排布；行的顺序与 Tab 键序（0..=8）保持一致。
+        let mut cells: Vec<Option<gpui::Div>> = (0..10).map(|_| None).collect();
         for (i, label) in [
             "连接名称",
             "主机 / IP / SSH config 别名",
@@ -689,6 +725,7 @@ impl Render for SshView {
             "SFTP 远程路径（上传目标 / 下载源）",
             "登录密码（留空保留已保存密码）",
             "私钥口令（留空保留已保存口令）",
+            "分组（可选，留空为未分组）",
         ]
         .into_iter()
         .enumerate()
@@ -696,14 +733,14 @@ impl Render for SshView {
             if self.auth_prompt.is_some() && i != 7 {
                 continue;
             }
-            let display = if i >= 7 {
+            let display = if matches!(i, 7 | 8) {
                 "•".repeat(self.values[i].encode_utf16().count())
             } else {
                 self.values[i].clone()
             };
             let caret = if self.field != i {
                 0
-            } else if i >= 7 {
+            } else if matches!(i, 7 | 8) {
                 "•".len()
                     * self.values[i][..self.cursor.min(self.values[i].len())]
                         .encode_utf16()
@@ -717,135 +754,169 @@ impl Render for SshView {
             let foreground = ui::color(p.foreground);
             let accent = ui::color(p.accent);
             let selection = ui::selected_wash(&p);
-            form = form
-                .child(
-                    div()
-                        .text_sm()
-                        .flex_shrink_0()
-                        .child(if self.auth_prompt.is_some() {
+            cells[i] = Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::XS))
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().text_size(px(font_size::BODY)).flex_shrink_0().child(
+                        if self.auth_prompt.is_some() {
                             "认证响应"
                         } else {
                             label
-                        }),
-                )
-                .child(
-                    termior_ui_kit::input_field(&p, self.field == i)
-                        .relative()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .id(("field", i))
-                        .role(Role::TextInput)
-                        .aria_label(label)
-                        .h(px(38.))
-                        .flex_shrink_0()
-                        .py_0()
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .child(
-                            canvas(
-                                |_, _, _| (),
-                                move |bounds, _, window, cx| {
-                                    let run = gpui::TextRun {
-                                        len: display.len(),
-                                        font: window.text_style().font(),
-                                        color: foreground.into(),
-                                        background_color: None,
-                                        underline: None,
-                                        strikethrough: None,
-                                    };
-                                    let line = window.text_system().shape_line(
-                                        display.into(),
-                                        px(14.),
-                                        &[run],
-                                        None,
-                                    );
-                                    let caret_x = line.x_for_index(caret);
-                                    let offset = if active {
-                                        (caret_x - bounds.size.width + px(4.)).max(px(0.))
-                                    } else {
-                                        px(0.)
-                                    };
-                                    let origin = bounds.origin
-                                        + gpui::point(-offset, (bounds.size.height - px(22.)) / 2.);
-                                    if selected {
-                                        window.paint_quad(gpui::fill(
-                                            Bounds::new(origin, gpui::size(line.width(), px(22.))),
-                                            selection,
-                                        ));
-                                    }
-                                    let _ = line.paint(
-                                        origin,
-                                        px(22.),
-                                        gpui::TextAlign::Left,
-                                        None,
-                                        window,
-                                        cx,
-                                    );
-                                    if active {
-                                        window.paint_quad(gpui::fill(
-                                            Bounds::new(
-                                                origin + gpui::point(caret_x, px(1.)),
-                                                gpui::size(px(2.), px(20.)),
-                                            ),
-                                            accent,
-                                        ));
-                                    }
-                                    layouts.borrow_mut()[i] = Some(InputLayout {
-                                        line,
-                                        bounds,
-                                        offset,
-                                    });
-                                },
-                            )
-                            .w_full()
-                            .h_full(),
-                        )
-                        .when(self.field == i, |field| {
-                            let focus = focus.clone();
-                            let entity = entity.clone();
-                            field.child(
+                        },
+                    ))
+                    .child(
+                        termior_ui_kit::input_field(&p, self.field == i)
+                            .relative()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .id(("field", i))
+                            .role(Role::TextInput)
+                            .aria_label(label)
+                            .h(px(height::REGULAR))
+                            .flex_shrink_0()
+                            .py_0()
+                            .px(px(space::MD))
+                            .flex()
+                            .items_center()
+                            .child(
                                 canvas(
-                                    |bounds, _, _| bounds,
+                                    |_, _, _| (),
                                     move |bounds, _, window, cx| {
-                                        window.handle_input(
-                                            &focus,
-                                            ElementInputHandler::new(bounds, entity.clone()),
+                                        let run = gpui::TextRun {
+                                            len: display.len(),
+                                            font: window.text_style().font(),
+                                            color: foreground.into(),
+                                            background_color: None,
+                                            underline: None,
+                                            strikethrough: None,
+                                        };
+                                        let line = window.text_system().shape_line(
+                                            display.into(),
+                                            px(font_size::BODY),
+                                            &[run],
+                                            None,
+                                        );
+                                        let caret_x = line.x_for_index(caret);
+                                        let offset = if active {
+                                            (caret_x - bounds.size.width + px(4.)).max(px(0.))
+                                        } else {
+                                            px(0.)
+                                        };
+                                        let origin = bounds.origin
+                                            + gpui::point(
+                                                -offset,
+                                                (bounds.size.height - px(INPUT_LINE_HEIGHT)) / 2.,
+                                            );
+                                        if selected {
+                                            window.paint_quad(gpui::fill(
+                                                Bounds::new(
+                                                    origin,
+                                                    gpui::size(line.width(), px(INPUT_LINE_HEIGHT)),
+                                                ),
+                                                selection,
+                                            ));
+                                        }
+                                        let _ = line.paint(
+                                            origin,
+                                            px(INPUT_LINE_HEIGHT),
+                                            gpui::TextAlign::Left,
+                                            None,
+                                            window,
                                             cx,
                                         );
+                                        if active {
+                                            window.paint_quad(gpui::fill(
+                                                Bounds::new(
+                                                    origin
+                                                        + gpui::point(
+                                                            caret_x,
+                                                            px((INPUT_LINE_HEIGHT
+                                                                - INPUT_CARET_HEIGHT)
+                                                                / 2.),
+                                                        ),
+                                                    gpui::size(px(2.), px(INPUT_CARET_HEIGHT)),
+                                                ),
+                                                accent,
+                                            ));
+                                        }
+                                        layouts.borrow_mut()[i] = Some(InputLayout {
+                                            line,
+                                            bounds,
+                                            offset,
+                                        });
                                     },
                                 )
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .size_full(),
+                                .w_full()
+                                .h_full(),
                             )
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                this.field = i;
-                                this.cursor = this.input_layouts.borrow()[i]
-                                    .as_ref()
-                                    .map(|layout| {
-                                        let byte = layout.line.closest_index_for_x(
-                                            event.position.x - layout.bounds.left() + layout.offset,
-                                        );
-                                        if i >= 7 {
-                                            byte_index(&this.values[i], byte / "•".len())
-                                        } else {
-                                            byte
-                                        }
-                                    })
-                                    .unwrap_or(this.values[i].len());
-                                this.select_all = false;
-                                this.marked = None;
-                                window.focus(&this.focus, cx);
-                                cx.notify();
-                            }),
-                        ),
-                );
+                            .when(self.field == i, |field| {
+                                let focus = focus.clone();
+                                let entity = entity.clone();
+                                field.child(
+                                    canvas(
+                                        |bounds, _, _| bounds,
+                                        move |bounds, _, window, cx| {
+                                            window.handle_input(
+                                                &focus,
+                                                ElementInputHandler::new(bounds, entity.clone()),
+                                                cx,
+                                            );
+                                        },
+                                    )
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .size_full(),
+                                )
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(
+                                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                        this.field = i;
+                                        this.cursor = this.input_layouts.borrow()[i]
+                                            .as_ref()
+                                            .map(|layout| {
+                                                let byte = layout.line.closest_index_for_x(
+                                                    event.position.x - layout.bounds.left()
+                                                        + layout.offset,
+                                                );
+                                                if matches!(i, 7 | 8) {
+                                                    byte_index(&this.values[i], byte / "•".len())
+                                                } else {
+                                                    byte
+                                                }
+                                            })
+                                            .unwrap_or(this.values[i].len());
+                                        this.select_all = false;
+                                        this.marked = None;
+                                        window.focus(&this.focus, cx);
+                                        cx.notify();
+                                    },
+                                ),
+                            ),
+                    ),
+            );
         }
+        let mut grid = div().flex().flex_col().gap(px(space::SM));
+        let rows: [&[usize]; 5] = [&[0, 1], &[2, 3], &[4, 5], &[6, 9], &[7, 8]];
+        for row in rows {
+            if !row.iter().any(|i| cells[*i].is_some()) {
+                continue;
+            }
+            let mut fields = div().flex().items_start().gap(px(space::SM));
+            for &i in row {
+                if let Some(cell) = cells[i].take() {
+                    fields = fields.child(cell);
+                }
+            }
+            grid = grid.child(fields);
+        }
+        form = form.child(grid);
         if let Some(prompt) = &self.auth_prompt {
             let kind = self.shared_auth.as_ref().map(|challenge| challenge.kind);
             let has_secret = !matches!(
@@ -860,15 +931,19 @@ impl Render for SshView {
                 .id("ssh-auth-prompt")
                 .size_full()
                 .overflow_y_scroll()
-                .p_4()
+                .p(px(space::LG))
                 .bg(ui::color(p.background))
                 .text_color(ui::color(p.foreground))
                 .flex()
                 .flex_col()
-                .gap_3()
+                .gap(px(space::MD))
                 .track_focus(&self.focus)
                 .on_key_down(cx.listener(Self::key))
-                .child(div().text_sm().child(SharedString::from(prompt.clone())))
+                .child(
+                    div()
+                        .text_size(px(font_size::BODY))
+                        .child(SharedString::from(prompt.clone())),
+                )
                 .when(has_secret, |element| element.child(form))
                 .when(can_remember, |element| {
                     element
@@ -890,15 +965,18 @@ impl Render for SshView {
                             })),
                         )
                         .child(
-                            div().text_xs().child(
-                                "未勾选：仅在此主机的当前连接中复用；关闭最后一个会话后清除。",
-                            ),
+                            div()
+                                .text_size(px(font_size::MICRO))
+                                .text_color(ui::muted(&p))
+                                .child(
+                                    "未勾选：仅在此主机的当前连接中复用；关闭最后一个会话后清除。",
+                                ),
                         )
                 })
                 .when(!self.status.is_empty(), |element| {
                     element.child(
                         div()
-                            .text_sm()
+                            .text_size(px(font_size::BODY))
                             .child(SharedString::from(self.status.clone())),
                     )
                 })
@@ -915,7 +993,7 @@ impl Render for SshView {
                 )
                 .into_any_element();
         }
-        let mut auth = div().flex().flex_wrap().gap_1();
+        let mut auth = div().flex().flex_wrap().gap(px(space::XS));
         for (i, (value, label)) in [
             (Authentication::Auto, "自动"),
             (Authentication::Password, "密码 / MFA"),
@@ -944,22 +1022,31 @@ impl Render for SshView {
             );
         }
         form = form.child(auth).child(
-            ui::button("remember", if self.remember { "☑ 记住密码和私钥口令（系统凭据库）" } else { "☐ 记住密码和私钥口令（系统凭据库）" }, ButtonKind::Subtle, &p).whitespace_normal().justify_start()
-                .on_click(cx.listener(|this, _, _, cx| { this.remember = !this.remember; cx.notify(); }))
-        ).child(
-            ui::button("forget", "清除该连接的已保存凭据", ButtonKind::Ghost, &p).on_click(cx.listener(|this, _, _, cx| {
-                this.status = this.profile().and_then(|p| {
-                    termior_ssh::credentials::delete(&p, termior_ssh::credentials::Kind::Password)?;
-                    termior_ssh::credentials::delete(&p, termior_ssh::credentials::Kind::Passphrase)
-                }).map(|_| { this.clear_secrets(); this.cursor = this.cursor.min(this.values[this.field].len()); "已清除系统凭据".into() }).unwrap_or_else(|e| e);
-                cx.notify();
-            }))
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(space::XS))
+                .child(
+                    ui::button("remember", if self.remember { "☑ 记住密码和私钥口令（系统凭据库）" } else { "☐ 记住密码和私钥口令（系统凭据库）" }, ButtonKind::Subtle, &p).whitespace_normal().justify_start()
+                        .on_click(cx.listener(|this, _, _, cx| { this.remember = !this.remember; cx.notify(); }))
+                )
+                .child(
+                    ui::button("forget", "清除该连接的已保存凭据", ButtonKind::Ghost, &p).on_click(cx.listener(|this, _, _, cx| {
+                        this.status = this.profile().and_then(|p| {
+                            termior_ssh::credentials::delete(&p, termior_ssh::credentials::Kind::Password)?;
+                            termior_ssh::credentials::delete(&p, termior_ssh::credentials::Kind::Passphrase)
+                        }).map(|_| { this.clear_secrets(); this.cursor = this.cursor.min(this.values[this.field].len()); "已清除系统凭据".into() }).unwrap_or_else(|e| e);
+                        cx.notify();
+                    }))
+                ),
         ).child(
             div()
-                .text_xs()
+                .text_size(px(font_size::MICRO))
+                .text_color(ui::muted(&p))
                 .child("密码和私钥口令仅保存到系统凭据库；私钥继续使用原文件或 SSH Agent。首次指纹及 MFA 仍需确认。"),
         );
-        let mut actions = div().flex().flex_wrap().gap_2().child(
+        let mut actions = div().flex().flex_wrap().gap(px(space::XS)).child(
             ui::button("save", "保存", ButtonKind::Subtle, &p)
                 .debug_selector(|| "ssh-save".into())
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -1069,7 +1156,7 @@ impl Render for SshView {
         let transfers = div()
             .flex()
             .flex_wrap()
-            .gap_2()
+            .gap(px(space::XS))
             .child(
                 ui::button(
                     "recursive",
@@ -1132,7 +1219,7 @@ impl Render for SshView {
         let scrollbar = div()
             .id("ssh-scrollbar")
             .debug_selector(|| "ssh-scrollbar".into())
-            .w(px(12.))
+            .w(px(space::LG))
             .h_full()
             .flex_shrink_0()
             .cursor_pointer()
@@ -1160,8 +1247,8 @@ impl Render for SshView {
                             };
                             window.paint_quad(gpui::fill(
                                 gpui::Bounds::new(
-                                    bounds.origin + gpui::point(px(2.), px(top)),
-                                    gpui::size(px(8.), px(th)),
+                                    bounds.origin + gpui::point(px(space::HAIR), px(top)),
+                                    gpui::size(px(space::MD), px(th)),
                                 ),
                                 thumb,
                             ));
@@ -1173,14 +1260,14 @@ impl Render for SshView {
         div().id("ssh-manager").role(Role::Group).aria_label("SSH 连接管理").track_focus(&self.focus).on_key_down(cx.listener(Self::key))
             .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| { if this.dragging_scroll && e.pressed_button == Some(MouseButton::Left) { this.scroll_pointer(e.position.y); cx.notify(); } else { this.dragging_scroll = false; } }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.dragging_scroll = false))
-            .size_full().p_4().bg(ui::color(p.background)).text_color(ui::color(p.foreground)).flex().flex_col().gap_3()
-            .child(div().text_lg().flex_shrink_0().child("SSH / SFTP 连接管理"))
-            .child(div().flex().flex_1().min_h_0().gap_2()
+            .size_full().p(px(space::LG)).bg(ui::color(p.background)).text_color(ui::color(p.foreground)).flex().flex_col().gap(px(space::MD))
+            .child(div().text_size(px(font_size::HEADING)).flex_shrink_0().child("SSH / SFTP 连接管理"))
+            .child(div().flex().flex_1().min_h_0().gap(px(space::XS))
                 .child(div().id("ssh-scroll").flex_1().min_w_0().h_full().overflow_y_scroll().track_scroll(&self.scroll)
-                    .child(div().flex().items_start().gap_4().when(narrow, |d| d.flex_col()).child(list.flex_shrink_0()).child(form.when(narrow, |d| d.w_full()).child(actions).child(transfers)
-                        .child(div().text_sm().child(SharedString::from(self.status.clone())))
+                    .child(div().flex().items_start().gap(px(space::LG)).when(narrow, |d| d.flex_col()).child(list.flex_shrink_0()).child(form.when(narrow, |d| d.w_full()).child(actions).child(transfers)
+                        .child(div().text_size(px(font_size::BODY)).child(SharedString::from(self.status.clone())))
                         .children(confirmation)
-                        .child(div().text_xs().child("SFTP：ls / cd 浏览；put / get 上传下载；Ctrl+C 取消；help 查看命令。")))))
+                        .child(div().text_size(px(font_size::MICRO)).text_color(ui::muted(&p)).child("SFTP：ls / cd 浏览；put / get 上传下载；Ctrl+C 取消；help 查看命令。")))))
                 .child(scrollbar)).into_any_element()
     }
 }
@@ -1279,9 +1366,11 @@ impl EntityInputHandler for SshView {
         Some(Bounds::new(
             gpui::point(
                 layout.bounds.left() + layout.line.x_for_index(caret) - layout.offset,
-                layout.bounds.top() + (layout.bounds.size.height - px(22.)) / 2. + px(1.),
+                layout.bounds.top()
+                    + (layout.bounds.size.height - px(INPUT_LINE_HEIGHT)) / 2.
+                    + px((INPUT_LINE_HEIGHT - INPUT_CARET_HEIGHT) / 2.),
             ),
-            gpui::size(px(2.), px(20.)),
+            gpui::size(px(2.), px(INPUT_CARET_HEIGHT)),
         ))
     }
     fn character_index_for_point(
@@ -1450,7 +1539,7 @@ mod tests {
     fn small_window_scroll_reaches_credentials_and_keeps_inputs_full_height() {
         let mut cx = TestAppContext::single();
         let (view, vcx) = cx.add_window_view(|_, cx| SshView::new(None, Box::new(|_, _| {}), cx));
-        for (width, height) in [(480., 320.), (860., 450.)] {
+        for (width, height) in [(480., 320.), (860., 380.)] {
             vcx.simulate_resize(gpui::size(px(width), px(height)));
             vcx.update(|window, cx| {
                 window.refresh();
@@ -1476,7 +1565,10 @@ mod tests {
             view.update(vcx, |v, _| {
                 let layouts = v.input_layouts.borrow();
                 let last = layouts[8].as_ref().expect("password input painted");
-                assert!(last.bounds.size.height >= px(30.));
+                // REGULAR 输入框去掉边框后的完整内容高度。
+                assert!(
+                    last.bounds.size.height >= px(termior_ui_kit::tokens::height::REGULAR - 2.)
+                );
                 assert!(last.bounds.bottom() <= v.scroll.bounds().bottom());
                 assert!(last.bounds.right() <= v.scroll.bounds().right());
             });
@@ -1568,8 +1660,8 @@ mod tests {
             ..Profile::default()
         };
         Profiles {
-            version: 1,
             connections: vec![first, second.clone()],
+            ..Profiles::default()
         }
         .save(dir.path())
         .unwrap();
@@ -1583,8 +1675,8 @@ mod tests {
             assert!(view.select_all);
             view.values[0] = "unsaved rename".into();
             Profiles {
-                version: 1,
                 connections: vec![second],
+                ..Profiles::default()
             }
             .save(dir.path())
             .unwrap();
@@ -1599,6 +1691,30 @@ mod tests {
             view.refresh_saved_profiles(cx);
             assert!(view.selected.is_none());
             assert!(view.values.iter().all(String::is_empty));
+        });
+    }
+    #[test]
+    fn group_field_roundtrips_and_upserts_new_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cx = TestAppContext::single();
+        let view =
+            cx.new(|cx| SshView::new(Some(dir.path().to_path_buf()), Box::new(|_, _| {}), cx));
+        view.update(&mut cx, |view, _| {
+            view.values[0] = "server".into();
+            view.values[1] = "example.test".into();
+            view.values[9] = "  Prod ".into();
+            view.save().unwrap();
+            let saved = Profiles::load(dir.path()).unwrap();
+            assert_eq!(saved.groups, vec!["Prod".to_owned()]);
+            assert_eq!(saved.connections[0].group, "Prod");
+            view.select(0);
+            assert_eq!(view.values[9], "Prod");
+            // 清空分组字段保存 → 归入未分组；分组本身保留。
+            view.values[9].clear();
+            view.save().unwrap();
+            let saved = Profiles::load(dir.path()).unwrap();
+            assert_eq!(saved.connections[0].group, "");
+            assert_eq!(saved.groups, vec!["Prod".to_owned()], "空分组持久保留");
         });
     }
 }

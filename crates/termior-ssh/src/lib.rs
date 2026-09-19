@@ -46,6 +46,9 @@ pub struct Profile {
     pub known_hosts_file: String,
     pub connect_timeout_secs: u32,
     pub keepalive_secs: u32,
+    /// Group name from `Profiles::groups`. Empty means ungrouped.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub group: String,
 }
 
 impl Default for Profile {
@@ -62,6 +65,7 @@ impl Default for Profile {
             known_hosts_file: String::new(),
             connect_timeout_secs: 15,
             keepalive_secs: 30,
+            group: String::new(),
         }
     }
 }
@@ -166,6 +170,13 @@ fn safe_identifier(value: &str, punctuation: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || punctuation.contains(c))
 }
 
+fn valid_group_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.chars().any(char::is_control)
+        && name.trim() == name
+}
+
 impl Profile {
     pub fn validate(&self) -> Result<(), Error> {
         if self.name.trim().is_empty()
@@ -215,6 +226,11 @@ impl Profile {
                     .any(|hop| hop.is_empty() || !safe_identifier(hop, ".-_:@[]")))
         {
             return Err(invalid("Invalid jump host chain"));
+        }
+        if !self.group.is_empty() && !valid_group_name(&self.group) {
+            return Err(invalid(
+                "Group name must be 1–64 bytes without control characters or surrounding whitespace",
+            ));
         }
         Ok(())
     }
@@ -310,36 +326,102 @@ impl Profile {
     }
 }
 
+/// Schema version of `Termior-ssh.json`. v1 predated connection groups.
+pub const PROFILES_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profiles {
     pub version: u32,
+    /// Persisted group names in display order. Groups exist independently of
+    /// connections: empty groups are legal and outlive their members.
+    #[serde(default)]
+    pub groups: Vec<String>,
     pub connections: Vec<Profile>,
 }
 impl Default for Profiles {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: PROFILES_VERSION,
+            groups: Vec::new(),
             connections: Vec::new(),
         }
     }
 }
+/// Render-time partition of connections: ungrouped indices first, then every
+/// stored group (including empty ones) in `groups` order.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConnectionGroups {
+    pub ungrouped: Vec<usize>,
+    pub groups: Vec<(String, Vec<usize>)>,
+}
+pub fn group_connections(connections: &[Profile], groups: &[String]) -> ConnectionGroups {
+    let mut partition = ConnectionGroups {
+        ungrouped: Vec::new(),
+        groups: groups
+            .iter()
+            .map(|name| (name.clone(), Vec::new()))
+            .collect(),
+    };
+    for (index, profile) in connections.iter().enumerate() {
+        if profile.group.is_empty() {
+            partition.ungrouped.push(index);
+        } else if let Some((_, members)) = partition
+            .groups
+            .iter_mut()
+            .find(|(name, _)| *name == profile.group)
+        {
+            members.push(index);
+        } else {
+            // A missing group reference cannot pass validation, but render totally.
+            partition.ungrouped.push(index);
+        }
+    }
+    partition
+}
 impl Profiles {
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != 1 {
+        if self.version != PROFILES_VERSION {
             return Err(invalid("Unsupported SSH profiles version"));
+        }
+        let mut group_names = std::collections::HashSet::new();
+        for group in &self.groups {
+            if !valid_group_name(group) {
+                return Err(invalid(
+                    "SSH group names must be 1–64 bytes without control characters or surrounding whitespace",
+                ));
+            }
+            if !group_names.insert(group) {
+                return Err(invalid("SSH group names must be unique"));
+            }
         }
         let mut names = std::collections::HashSet::new();
         for profile in &self.connections {
             profile.validate()?;
+            if !profile.group.is_empty() && !group_names.contains(&profile.group) {
+                return Err(invalid(&format!(
+                    "Connection “{}” refers to missing group “{}”",
+                    profile.name, profile.group
+                )));
+            }
             if !names.insert(&profile.name) {
                 return Err(invalid("SSH connection names must be unique"));
             }
         }
         Ok(())
     }
+    /// Ensure a group exists so a connection may reference it, preserving order.
+    pub fn upsert_group(&mut self, group: &str) {
+        if !group.is_empty() && !self.groups.iter().any(|name| name == group) {
+            self.groups.push(group.to_owned());
+        }
+    }
     pub fn load(dir: &Path) -> Result<Self, Error> {
-        let value: Self = termior_store::JsonStore::new(dir, "Termior-ssh.json").load()?;
+        let mut value: Self = termior_store::JsonStore::new(dir, "Termior-ssh.json").load()?;
+        // v1 files predate groups; every v2 field has a serde default.
+        if value.version == 1 {
+            value.version = PROFILES_VERSION;
+        }
         value.validate()?;
         Ok(value)
     }
@@ -452,5 +534,93 @@ mod tests {
         profiles.connections.push(profile());
         assert!(profiles.save(dir.path()).is_err());
         assert_eq!(Profiles::load(dir.path()).unwrap().connections.len(), 1);
+    }
+    #[test]
+    fn v1_files_migrate_to_v2_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Termior-ssh.json"),
+            r#"{"version":1,"connections":[{"use_saved_credentials":false,"name":"legacy","host":"server","user":"","port":null,"authentication":"auto","identity_file":"","jump_host":"","known_hosts_file":"","connect_timeout_secs":15,"keepalive_secs":30}]}"#,
+        )
+        .unwrap();
+        let migrated = Profiles::load(dir.path()).unwrap();
+        assert_eq!(migrated.version, PROFILES_VERSION);
+        assert!(migrated.groups.is_empty());
+        assert_eq!(migrated.connections[0].group, "");
+        let future = r#"{"version":3,"connections":[]}"#;
+        std::fs::write(dir.path().join("Termior-ssh.json"), future).unwrap();
+        assert!(Profiles::load(dir.path()).is_err());
+    }
+    #[test]
+    fn groups_persist_without_members_and_upsert_preserves_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profiles = Profiles::default();
+        profiles.upsert_group("生产");
+        profiles.upsert_group("测试");
+        profiles.upsert_group("生产");
+        let mut member = profile();
+        member.group = "测试".into();
+        profiles.connections.push(member);
+        profiles.save(dir.path()).unwrap();
+        let reloaded = Profiles::load(dir.path()).unwrap();
+        assert_eq!(reloaded.groups, vec!["生产".to_owned(), "测试".to_owned()]);
+        assert_eq!(reloaded.connections[0].group, "测试");
+    }
+    #[test]
+    fn ungrouped_profiles_serialize_without_a_group_key() {
+        let json = serde_json::to_string(&profile()).unwrap();
+        assert!(!json.contains("group"));
+        let mut grouped = profile();
+        grouped.group = "prod".into();
+        let json = serde_json::to_string(&grouped).unwrap();
+        assert!(json.contains(r#""group":"prod""#));
+    }
+    #[test]
+    fn group_validation_rejects_bad_and_dangling_names() {
+        let mut profiles = Profiles::default();
+        for bad in ["", " leading", "trailing ", "x\ny", &"x".repeat(65)] {
+            profiles.groups = vec![bad.into()];
+            assert!(profiles.validate().is_err(), "{bad:?}");
+        }
+        profiles.groups = vec!["prod".into(), "prod".into()];
+        assert!(profiles.validate().is_err());
+        profiles.groups = vec!["prod".into()];
+        let mut member = profile();
+        member.group = "missing".into();
+        profiles.connections.push(member);
+        let error = profiles.validate().unwrap_err().to_string();
+        assert!(error.contains("missing group"), "{error}");
+        assert!(profiles.save(tempfile::tempdir().unwrap().path()).is_err());
+    }
+    #[test]
+    fn group_connections_keeps_order_and_empty_groups() {
+        let ungrouped = profile();
+        let mut a = profile();
+        a.name = "a".into();
+        a.group = "web".into();
+        let mut b = profile();
+        b.name = "b".into();
+        b.group = "db".into();
+        let mut c = profile();
+        c.name = "c".into();
+        c.group = "web".into();
+        let partition = group_connections(
+            &[ungrouped, a, b, c],
+            &["empty".into(), "web".into(), "db".into()],
+        );
+        assert_eq!(partition.ungrouped, vec![0]);
+        assert_eq!(
+            partition.groups,
+            vec![
+                ("empty".to_owned(), vec![]),
+                ("web".to_owned(), vec![1, 3]),
+                ("db".to_owned(), vec![2]),
+            ]
+        );
+        assert_eq!(
+            group_connections(&[], &[]),
+            ConnectionGroups::default(),
+            "no groups means a flat list"
+        );
     }
 }

@@ -1,5 +1,5 @@
 mod sftp_browser;
-use sftp_browser::{LocalBrowserState, SessionMenu};
+use sftp_browser::{GroupMenu, LocalBrowserState, SessionMenu};
 
 use crate::{
     ai_diff_view::{AiDiffAction, AiDiffView},
@@ -171,6 +171,8 @@ enum CommandMode {
     GitSwitchBranch,
     PreviewUrl,
     RemotePath,
+    NewGroup,
+    RenameGroup,
 }
 
 impl CommandMode {
@@ -188,6 +190,8 @@ impl CommandMode {
             Self::GitSwitchBranch => "Switch branch",
             Self::PreviewUrl => "Web preview URL",
             Self::RemotePath => "远程路径",
+            Self::NewGroup => "新建分组",
+            Self::RenameGroup => "重命名分组",
         }
     }
 }
@@ -340,6 +344,9 @@ pub struct WorkspaceView {
     ssh_profiles_error: Option<String>,
     ssh_selected: Option<String>,
     ssh_context_menu: Option<SessionMenu>,
+    ssh_group_menu: Option<GroupMenu>,
+    /// 运行时的分组折叠状态（按分组名记忆，不持久化；默认全展开）。
+    ssh_collapsed_groups: std::collections::HashSet<String>,
     sftp_browsers: HashMap<TabId, LocalBrowserState>,
     ssh_manager_window: Option<gpui::WindowHandle<crate::ssh_view::SshView>>,
     model: WorkspaceState,
@@ -384,6 +391,10 @@ pub struct WorkspaceView {
     command_message: Option<String>,
     pending_name_parent: Option<PathBuf>,
     pending_rename_target: Option<PathBuf>,
+    /// 分组命令栏的载荷：新建分组时要分配的连接名（None 表示仅创建空分组）。
+    pending_group_profile: Option<String>,
+    /// 分组命令栏的载荷：重命名分组时的旧分组名。
+    pending_group_rename: Option<String>,
     explorer_context_menu: Option<ExplorerContextMenu>,
     /// 标签栏新建下拉的锚点；`None` 表示关闭。
     new_tab_menu: Option<Point<Pixels>>,
@@ -649,6 +660,8 @@ impl WorkspaceView {
             ssh_profiles_error: None,
             ssh_selected: None,
             ssh_context_menu: None,
+            ssh_group_menu: None,
+            ssh_collapsed_groups: Default::default(),
             sftp_browsers: HashMap::new(),
             ssh_manager_window: None,
             tabs,
@@ -686,6 +699,8 @@ impl WorkspaceView {
             command_message: None,
             pending_name_parent: None,
             pending_rename_target: None,
+            pending_group_profile: None,
+            pending_group_rename: None,
             explorer_context_menu: None,
             new_tab_menu: None,
             pane_context_menu: None,
@@ -1977,6 +1992,8 @@ impl WorkspaceView {
             Ok(profiles) => {
                 self.ssh_profiles = profiles.unwrap_or_default();
                 self.ssh_profiles_error = None;
+                self.ssh_collapsed_groups
+                    .retain(|name| self.ssh_profiles.groups.iter().any(|g| g == name));
                 // The prompt can change the preference without reopening the manager.
                 for tab in &mut self.model.tabs {
                     if let Some(remote) = &mut tab.remote {
@@ -2059,7 +2076,7 @@ impl WorkspaceView {
                 });
             });
         });
-        let bounds = Bounds::centered(None, size(px(860.), px(700.)), cx);
+        let bounds = Bounds::centered(None, size(px(860.), px(620.)), cx);
         match cx.open_window(
             app_identity::window_options(WindowBounds::Windowed(bounds)),
             |window, cx| {
@@ -2689,6 +2706,7 @@ impl WorkspaceView {
         self.new_tab_menu = None;
         self.pane_context_menu = None;
         self.ssh_context_menu = None;
+        self.ssh_group_menu = None;
         self.explorer_context_menu = None;
     }
 
@@ -4487,6 +4505,31 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn begin_group_command(
+        &mut self,
+        mode: CommandMode,
+        prefill: &str,
+        profile: Option<String>,
+        rename: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.command_mode = mode;
+        self.command_input = prefill.to_owned();
+        self.command_marked_text.clear();
+        self.command_message = Some(match mode {
+            CommandMode::NewGroup => "输入新分组名，然后回车".into(),
+            CommandMode::RenameGroup => "修改分组名，回车确认；与现有分组重名则合并".into(),
+            _ => String::new(),
+        });
+        self.pending_group_profile = profile;
+        self.pending_group_rename = rename;
+        self.ssh_context_menu = None;
+        self.ssh_group_menu = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
     fn handle_command_key(
         &mut self,
         event: &KeyDownEvent,
@@ -4507,6 +4550,8 @@ impl WorkspaceView {
                 self.content_searching = false;
                 self.pending_name_parent = None;
                 self.pending_rename_target = None;
+                self.pending_group_profile = None;
+                self.pending_group_rename = None;
             }
             "backspace" => {
                 self.command_marked_text.clear();
@@ -4532,6 +4577,29 @@ impl WorkspaceView {
                 self.scan_remote_directory(id, profile, input, false, cx);
                 self.command_mode = CommandMode::Browse;
             }
+            return;
+        }
+        if matches!(
+            self.command_mode,
+            CommandMode::NewGroup | CommandMode::RenameGroup
+        ) {
+            let mode = self.command_mode;
+            let profile = self.pending_group_profile.clone();
+            let rename = self.pending_group_rename.clone();
+            match mode {
+                CommandMode::NewGroup => self.create_group(input, profile, cx),
+                CommandMode::RenameGroup => {
+                    if let Some(old) = rename {
+                        self.rename_group(old, input, cx);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            self.command_mode = CommandMode::Browse;
+            self.command_input.clear();
+            self.command_marked_text.clear();
+            self.pending_group_profile = None;
+            self.pending_group_rename = None;
             return;
         }
         if self.command_mode == CommandMode::SearchContent {
@@ -4690,6 +4758,9 @@ impl WorkspaceView {
                 }
             }
             CommandMode::Move => Err("Move is only available in a remote Explorer".to_owned()),
+            CommandMode::NewGroup | CommandMode::RenameGroup => {
+                unreachable!("group commands complete before command dispatch")
+            }
             CommandMode::GitCommit => self.git_repository().and_then(|repo| {
                 repo.commit(&input)
                     .map(|_| ())
@@ -4996,7 +5067,9 @@ impl WorkspaceView {
     }
 
     fn global_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if event.keystroke.key == "escape" && self.ssh_context_menu.take().is_some() {
+        if event.keystroke.key == "escape"
+            && (self.ssh_context_menu.take().is_some() | self.ssh_group_menu.take().is_some())
+        {
             cx.stop_propagation();
             cx.notify();
             return;
@@ -7170,6 +7243,7 @@ impl gpui::Render for WorkspaceView {
             })
             .collect::<Vec<_>>();
         let ssh_context_menu = self.ssh_session_menu(cx);
+        let ssh_group_menu = self.ssh_group_menu(cx);
         let explorer_context_menu = self.explorer_context_menu.clone().map(|menu| {
             anchored().position(menu.position).child(
                 menu_panel(&p)
@@ -7412,10 +7486,16 @@ impl gpui::Render for WorkspaceView {
                 MouseButton::Left,
                 cx.listener(|this, _event, _window, cx| {
                     let closed_ssh = this.ssh_context_menu.take().is_some();
+                    let closed_group = this.ssh_group_menu.take().is_some();
                     let closed_explorer = this.explorer_context_menu.take().is_some();
                     let closed_new_tab = this.new_tab_menu.take().is_some();
                     let closed_pane = this.pane_context_menu.take().is_some();
-                    if closed_ssh || closed_explorer || closed_new_tab || closed_pane {
+                    if closed_ssh
+                        || closed_group
+                        || closed_explorer
+                        || closed_new_tab
+                        || closed_pane
+                    {
                         cx.notify();
                     }
                 }),
@@ -7881,6 +7961,7 @@ impl gpui::Render for WorkspaceView {
                     ),
             )
             .children(ssh_context_menu)
+            .children(ssh_group_menu)
             .children(explorer_context_menu)
             .children(new_tab_menu)
             .children(pane_context_menu);

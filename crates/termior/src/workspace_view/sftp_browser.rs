@@ -7,9 +7,50 @@ pub(super) fn is_browser_connection(connection: &Connection) -> bool {
     connection.kind == SessionKind::Sftp && connection.transfer.is_none()
 }
 
+/// 连接/分组变更的统一落盘路径：load → mutate → 原子 save → 同步两个视图。
+/// 成功时以 `message` 提示，失败时把错误写进命令栏消息。
+async fn apply_profiles_mutation(
+    workspace: gpui::WeakEntity<WorkspaceView>,
+    cx: &mut gpui::AsyncApp,
+    dir: Option<PathBuf>,
+    message: String,
+    mutate: impl FnOnce(&mut termior_ssh::Profiles) -> Result<(), String>,
+) {
+    let result = (|| -> Result<(), String> {
+        let dir = dir.as_ref().ok_or("应用数据目录不可用")?;
+        let mut profiles = termior_ssh::Profiles::load(dir).map_err(|e| e.to_string())?;
+        mutate(&mut profiles)?;
+        profiles.save(dir).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    let _ = workspace.update(cx, |this, cx| {
+        this.reload_ssh_profiles();
+        if let Some(handle) = this.ssh_manager_window {
+            let _ = handle.update(cx, |view, _, cx| view.refresh_saved_profiles(cx));
+        }
+        this.command_message = Some(result.map(|_| message).unwrap_or_else(|e| e));
+        cx.notify();
+    });
+}
+
 #[derive(Clone)]
 pub(super) struct SessionMenu {
     profile: Profile,
+    position: Point<Pixels>,
+    /// 第二阶段面板：为连接挑选目标分组。
+    phase: SessionMenuPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionMenuPhase {
+    Session,
+    GroupPicker,
+}
+
+/// 分组表头的右键菜单目标。
+#[derive(Clone)]
+pub(super) struct GroupMenu {
+    name: String,
     position: Point<Pixels>,
 }
 
@@ -110,88 +151,44 @@ impl WorkspaceView {
                     .text_xs()
                     .child(format!("配置读取失败：{error}")),
             );
-        } else if self.ssh_profiles.connections.is_empty() {
+        } else if self.ssh_profiles.connections.is_empty() && self.ssh_profiles.groups.is_empty() {
             panel = panel.child(div().px_2().text_xs().child("暂无连接，点击管理添加。"));
         }
-        for (index, profile) in self.ssh_profiles.connections.iter().enumerate() {
-            let left = profile.clone();
-            let right = profile.clone();
-            let label = profile.name.clone();
-            let selected = self.ssh_selected.as_deref() == Some(&profile.name);
-            let tooltip = if profile.user.is_empty() {
-                profile.host.clone()
-            } else {
-                format!("{}@{}", profile.user, profile.host)
-            };
-            let wash = ui::hover_wash(&self.palette);
-            let tooltip_palette = self.palette.clone();
-            panel = panel.child(
-                div()
-                    .id(("ssh-saved", index))
-                    .debug_selector(move || format!("ssh-saved-{index}"))
-                    .h(px(28.))
-                    .flex_shrink_0()
-                    .w_full()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_sm()
-                    .cursor_pointer()
-                    .overflow_hidden()
-                    .hover(move |style| style.bg(wash))
-                    .when(selected, |row| row.bg(ui::selected_wash(&self.palette)))
-                    .child(ui::icon(
-                        Icon::Terminal,
-                        icon_size::SM,
-                        gpui_color(self.palette.accent),
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .child(label),
-                    )
-                    .tooltip(move |_, cx| Tooltip::view(tooltip.clone(), &tooltip_palette, cx))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            this.ssh_selected = Some(left.name.clone());
-                            this.ssh_context_menu = None;
-                            window.focus(&this.focus_handle, cx);
-                            if event.click_count == 2 {
-                                this.connect_remote(
-                                    Connection {
-                                        profile: left.clone(),
-                                        kind: SessionKind::Shell,
-                                        transfer: None,
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            }
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.explorer_context_menu = None;
-                            this.pane_context_menu = None;
-                            this.ssh_selected = Some(right.name.clone());
-                            this.ssh_context_menu = Some(SessionMenu {
-                                profile: right.clone(),
-                                position: event.position,
-                            });
-                            window.focus(&this.focus_handle, cx);
-                            cx.notify();
-                        }),
-                    ),
-            );
+        // 未分组连接在前（无表头），分组按持久化顺序随后；分组不改变存储顺序。
+        let partition = termior_ssh::group_connections(
+            &self.ssh_profiles.connections,
+            &self.ssh_profiles.groups,
+        );
+        for index in &partition.ungrouped {
+            panel = panel.child(self.saved_session_row(*index, false, cx));
         }
+        for (group_index, (group, members)) in partition.groups.iter().enumerate() {
+            let collapsed = self.ssh_collapsed_groups.contains(group);
+            panel = panel.child(self.group_header_row(
+                group_index,
+                group,
+                members.len(),
+                collapsed,
+                cx,
+            ));
+            if !collapsed {
+                for index in members {
+                    panel = panel.child(self.saved_session_row(*index, true, cx));
+                }
+            }
+        }
+        panel = panel.child(
+            ui::button(
+                "ssh-new-group",
+                "＋ 新建分组",
+                ButtonKind::Subtle,
+                &self.palette,
+            )
+            .debug_selector(|| "ssh-new-group".into())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.begin_group_command(CommandMode::NewGroup, "", None, None, window, cx);
+            })),
+        );
         let sessions: Vec<_> = self
             .model
             .tabs
@@ -231,24 +228,338 @@ impl WorkspaceView {
         panel.into_any_element()
     }
 
+    /// 保存连接的单行；`grouped` 时缩进一层。索引是 connections 的真实下标，
+    /// `ssh-saved-{index}` 选择器为测试保持稳定。
+    fn saved_session_row(
+        &self,
+        index: usize,
+        grouped: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let profile = self.ssh_profiles.connections[index].clone();
+        let left = profile.clone();
+        let right = profile.clone();
+        let label = profile.name.clone();
+        let selected = self.ssh_selected.as_deref() == Some(&profile.name);
+        let tooltip = if profile.user.is_empty() {
+            profile.host.clone()
+        } else {
+            format!("{}@{}", profile.user, profile.host)
+        };
+        let wash = ui::hover_wash(&self.palette);
+        let tooltip_palette = self.palette.clone();
+        div()
+            .id(("ssh-saved", index))
+            .debug_selector(move || format!("ssh-saved-{index}"))
+            .h(px(28.))
+            .flex_shrink_0()
+            .w_full()
+            .px_2()
+            .when(grouped, |row| row.pl(px(20.)))
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_sm()
+            .cursor_pointer()
+            .overflow_hidden()
+            .hover(move |style| style.bg(wash))
+            .when(selected, |row| row.bg(ui::selected_wash(&self.palette)))
+            .child(ui::icon(
+                Icon::Terminal,
+                icon_size::SM,
+                gpui_color(self.palette.accent),
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(label),
+            )
+            .tooltip(move |_, cx| Tooltip::view(tooltip.clone(), &tooltip_palette, cx))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.ssh_selected = Some(left.name.clone());
+                    this.ssh_context_menu = None;
+                    this.ssh_group_menu = None;
+                    window.focus(&this.focus_handle, cx);
+                    if event.click_count == 2 {
+                        this.connect_remote(
+                            Connection {
+                                profile: left.clone(),
+                                kind: SessionKind::Shell,
+                                transfer: None,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.explorer_context_menu = None;
+                    this.pane_context_menu = None;
+                    this.ssh_group_menu = None;
+                    this.ssh_selected = Some(right.name.clone());
+                    this.ssh_context_menu = Some(SessionMenu {
+                        profile: right.clone(),
+                        position: event.position,
+                        phase: SessionMenuPhase::Session,
+                    });
+                    window.focus(&this.focus_handle, cx);
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// 分组表头：折叠开关 + 名称 + 成员数；右键打开分组菜单。
+    fn group_header_row(
+        &self,
+        group_index: usize,
+        group: &str,
+        member_count: usize,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let foreground = ui::muted(&self.palette);
+        let wash = ui::hover_wash(&self.palette);
+        let name = group.to_owned();
+        let menu_name = group.to_owned();
+        div()
+            .id(("ssh-group", group_index))
+            .debug_selector(move || format!("ssh-group-{group_index}"))
+            .h(px(tokens::height::COMPACT))
+            .mt(px(tokens::space::SM))
+            .flex_shrink_0()
+            .w_full()
+            .px_2()
+            .flex()
+            .items_center()
+            .gap(px(tokens::space::XS))
+            .text_size(px(tokens::font_size::MICRO))
+            .text_color(foreground)
+            .cursor_pointer()
+            .overflow_hidden()
+            .hover(move |style| style.bg(wash))
+            .child(ui::icon(
+                if collapsed {
+                    Icon::ChevronRight
+                } else {
+                    Icon::ChevronDown
+                },
+                icon_size::SM,
+                foreground,
+            ))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(name.clone()),
+            )
+            .child(div().flex_shrink_0().child(format!("{member_count}")))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.ssh_context_menu = None;
+                    this.ssh_group_menu = None;
+                    if !this.ssh_collapsed_groups.remove(&name) {
+                        this.ssh_collapsed_groups.insert(name.clone());
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.explorer_context_menu = None;
+                    this.pane_context_menu = None;
+                    this.ssh_context_menu = None;
+                    this.ssh_group_menu = Some(GroupMenu {
+                        name: menu_name.clone(),
+                        position: event.position,
+                    });
+                    window.focus(&this.focus_handle, cx);
+                    cx.notify();
+                }),
+            )
+    }
+
     pub(super) fn ssh_session_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.ssh_context_menu.clone()?;
         let mut panel = menu_panel(&self.palette).id("ssh-session-menu").w(px(200.));
-        for (index, label) in [
-            "连接 SSH",
-            "以 SFTP 连接",
-            "重命名…",
-            "编辑会话…",
-            "删除会话…",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let profile = menu.profile.clone();
+        match menu.phase {
+            SessionMenuPhase::Session => {
+                for (index, label) in [
+                    "连接 SSH",
+                    "以 SFTP 连接",
+                    "重命名…",
+                    "编辑会话…",
+                    "移动到分组…",
+                    "删除会话…",
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let profile = menu.profile.clone();
+                    let position = menu.position;
+                    let wash = ui::hover_wash(&self.palette);
+                    panel = panel.child(
+                        div()
+                            .id(("ssh-menu", index))
+                            .debug_selector(move || format!("ssh-menu-item-{index}"))
+                            .px_3()
+                            .py_1()
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(wash))
+                            .child(label)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    match index {
+                                        0 | 1 => {
+                                            this.ssh_context_menu = None;
+                                            this.connect_remote(
+                                                Connection {
+                                                    profile: profile.clone(),
+                                                    kind: if index == 0 {
+                                                        SessionKind::Shell
+                                                    } else {
+                                                        SessionKind::Sftp
+                                                    },
+                                                    transfer: None,
+                                                },
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                        2 | 3 => {
+                                            this.ssh_context_menu = None;
+                                            this.open_ssh_manager(window, cx);
+                                            if let Some(handle) = this.ssh_manager_window {
+                                                let _ = handle.update(cx, |view, _, cx| {
+                                                    view.edit_saved(&profile.name, index == 2, cx)
+                                                });
+                                            }
+                                        }
+                                        4 => {
+                                            this.ssh_context_menu = Some(SessionMenu {
+                                                profile: profile.clone(),
+                                                position,
+                                                phase: SessionMenuPhase::GroupPicker,
+                                            });
+                                        }
+                                        _ => {
+                                            this.ssh_context_menu = None;
+                                            this.delete_saved_session(profile.clone(), window, cx);
+                                        }
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                    );
+                }
+            }
+            SessionMenuPhase::GroupPicker => {
+                let mut targets: Vec<(String, bool)> =
+                    vec![(String::new(), menu.profile.group.is_empty())];
+                for group in &self.ssh_profiles.groups {
+                    targets.push((group.clone(), *group == menu.profile.group));
+                }
+                for (index, (group, current)) in targets.iter().enumerate() {
+                    let target = group.clone();
+                    let profile_name = menu.profile.name.clone();
+                    let wash = ui::hover_wash(&self.palette);
+                    panel = panel.child(
+                        div()
+                            .id(("ssh-group-target", index))
+                            .debug_selector(move || format!("ssh-group-target-{index}"))
+                            .px_3()
+                            .py_1()
+                            .text_sm()
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(wash))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(if target.is_empty() {
+                                "未分组".to_string()
+                            } else {
+                                target.clone()
+                            })
+                            .when(*current, |item| {
+                                item.text_color(gpui_color(self.palette.accent)).child("✓")
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    let target = target.clone();
+                                    this.ssh_context_menu = None;
+                                    this.move_session_to_group(profile_name.clone(), target, cx);
+                                    cx.notify();
+                                }),
+                            ),
+                    );
+                }
+                let profile_name = menu.profile.name.clone();
+                let wash = ui::hover_wash(&self.palette);
+                panel = panel.child(
+                    div()
+                        .id("ssh-group-new")
+                        .debug_selector(|| "ssh-group-new".into())
+                        .px_3()
+                        .py_1()
+                        .text_sm()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(wash))
+                        .child("新建分组…")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                let profile_name = profile_name.clone();
+                                this.begin_group_command(
+                                    CommandMode::NewGroup,
+                                    "",
+                                    Some(profile_name),
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        ),
+                );
+            }
+        }
+        Some(
+            anchored()
+                .position(menu.position)
+                .child(panel)
+                .into_any_element(),
+        )
+    }
+
+    pub(super) fn ssh_group_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.ssh_group_menu.clone()?;
+        let mut panel = menu_panel(&self.palette).id("ssh-group-menu").w(px(200.));
+        for (index, label) in ["重命名分组…", "删除分组"].into_iter().enumerate() {
+            let name = menu.name.clone();
             let wash = ui::hover_wash(&self.palette);
             panel = panel.child(
                 div()
-                    .id(("ssh-menu", index))
+                    .id(("ssh-group-action", index))
+                    .debug_selector(move || format!("ssh-group-action-{index}"))
                     .px_3()
                     .py_1()
                     .text_sm()
@@ -259,30 +570,21 @@ impl WorkspaceView {
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
+                            let name = name.clone();
                             this.ssh_context_menu = None;
-                            match index {
-                                0 | 1 => this.connect_remote(
-                                    Connection {
-                                        profile: profile.clone(),
-                                        kind: if index == 0 {
-                                            SessionKind::Shell
-                                        } else {
-                                            SessionKind::Sftp
-                                        },
-                                        transfer: None,
-                                    },
+                            this.ssh_group_menu = None;
+                            if index == 0 {
+                                let payload = name.clone();
+                                this.begin_group_command(
+                                    CommandMode::RenameGroup,
+                                    &name,
+                                    None,
+                                    Some(payload),
                                     window,
                                     cx,
-                                ),
-                                2 | 3 => {
-                                    this.open_ssh_manager(window, cx);
-                                    if let Some(handle) = this.ssh_manager_window {
-                                        let _ = handle.update(cx, |view, _, cx| {
-                                            view.edit_saved(&profile.name, index == 2, cx)
-                                        });
-                                    }
-                                }
-                                _ => this.delete_saved_session(profile.clone(), window, cx),
+                                );
+                            } else {
+                                this.delete_group(name, window, cx);
                             }
                             cx.notify();
                         }),
@@ -295,6 +597,147 @@ impl WorkspaceView {
                 .child(panel)
                 .into_any_element(),
         )
+    }
+
+    fn move_session_to_group(&mut self, name: String, group: String, cx: &mut Context<Self>) {
+        let message = if group.is_empty() {
+            format!("“{name}”已移出分组")
+        } else {
+            format!("“{name}”已移入分组“{group}”")
+        };
+        self.mutate_saved_profiles(
+            message,
+            move |profiles| {
+                let index = profiles
+                    .connections
+                    .iter()
+                    .position(|p| p.name == name)
+                    .ok_or("会话配置已变化，请重试")?;
+                profiles.upsert_group(&group);
+                profiles.connections[index].group = group;
+                Ok(())
+            },
+            cx,
+        );
+    }
+
+    /// 新建分组；`assign` 给出连接名时同时把它移入新分组（来自连接的右键菜单）。
+    pub(super) fn create_group(
+        &mut self,
+        group: String,
+        assign: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let message = match &assign {
+            Some(name) => format!("“{name}”已移入分组“{group}”"),
+            None if self.ssh_profiles.groups.contains(&group) => {
+                format!("分组“{group}”已存在")
+            }
+            None => format!("已新建分组“{group}”"),
+        };
+        self.mutate_saved_profiles(
+            message,
+            move |profiles| {
+                profiles.upsert_group(&group);
+                if let Some(name) = assign {
+                    let index = profiles
+                        .connections
+                        .iter()
+                        .position(|p| p.name == name)
+                        .ok_or("会话配置已变化，请重试")?;
+                    profiles.connections[index].group = group;
+                }
+                Ok(())
+            },
+            cx,
+        );
+    }
+
+    pub(super) fn rename_group(&mut self, old: String, new: String, cx: &mut Context<Self>) {
+        let message = format!("分组“{old}”已重命名为“{new}”");
+        self.mutate_saved_profiles(
+            message,
+            move |profiles| {
+                if old == new {
+                    return Ok(());
+                }
+                if !profiles.groups.contains(&old) {
+                    return Err("分组已不存在，请刷新后重试".into());
+                }
+                // 与现有分组重名即合并：成员全部并入既有分组，旧名移除。
+                if profiles.groups.contains(&new) {
+                    profiles.groups.retain(|name| *name != old);
+                } else if let Some(slot) = profiles.groups.iter_mut().find(|name| **name == old) {
+                    *slot = new.clone();
+                }
+                for connection in &mut profiles.connections {
+                    if connection.group == old {
+                        connection.group = new.clone();
+                    }
+                }
+                Ok(())
+            },
+            cx,
+        );
+    }
+
+    fn delete_group(&mut self, group: String, window: &mut Window, cx: &mut Context<Self>) {
+        let members = self
+            .ssh_profiles
+            .connections
+            .iter()
+            .filter(|p| p.group == group)
+            .count();
+        let detail = if members == 0 {
+            format!("删除空分组“{group}”？")
+        } else {
+            format!("删除分组“{group}”？其中 {members} 个连接将归入未分组。")
+        };
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "删除分组",
+            Some(&detail),
+            &[PromptButton::ok("删除"), PromptButton::cancel("取消")],
+            cx,
+        );
+        let dir = self.data_dir.clone();
+        let label = group.clone();
+        cx.spawn(async move |workspace, cx| {
+            if !matches!(answer.await, Ok(0)) {
+                return;
+            }
+            apply_profiles_mutation(
+                workspace,
+                cx,
+                dir,
+                format!("分组“{label}”已删除"),
+                move |profiles| {
+                    profiles.groups.retain(|name| *name != group);
+                    for connection in &mut profiles.connections {
+                        if connection.group == group {
+                            connection.group.clear();
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+        })
+        .detach();
+    }
+
+    /// 读取-修改-原子保存 `Termior-ssh.json`，随后同步侧栏与打开的管理窗口。
+    fn mutate_saved_profiles(
+        &mut self,
+        message: String,
+        mutate: impl FnOnce(&mut termior_ssh::Profiles) -> Result<(), String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = self.data_dir.clone();
+        cx.spawn(async move |workspace, cx| {
+            apply_profiles_mutation(workspace, cx, dir, message, mutate).await;
+        })
+        .detach();
     }
 
     fn delete_saved_session(
@@ -1316,6 +1759,246 @@ mod tests {
         });
         cx.simulate_keystrokes("escape");
         view.update(cx, |v, _| assert!(v.ssh_context_menu.is_none()));
+    }
+
+    /// 磁盘-backed 夹具：写入 profiles 文件并让视图从磁盘加载。
+    fn disk_workspace(
+        cx: &mut Context<WorkspaceView>,
+        root: PathBuf,
+        profiles: termior_ssh::Profiles,
+    ) -> WorkspaceView {
+        profiles.save(&root).unwrap();
+        let mut view = workspace(cx, root.clone());
+        view.data_dir = Some(root);
+        view.reload_ssh_profiles();
+        view
+    }
+
+    #[gpui::test]
+    fn grouped_sessions_render_under_headers_and_keep_empty_groups(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let (_view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = workspace(cx, root.path().to_path_buf());
+            view.ssh_profiles.groups = vec!["空分组".into(), "Web".into()];
+            view.ssh_profiles.connections.push(Profile {
+                name: "web server".into(),
+                host: "10.0.0.1".into(),
+                group: "Web".into(),
+                ..Profile::default()
+            });
+            view
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let ungrouped = cx.debug_bounds("ssh-saved-0").unwrap();
+        let empty = cx.debug_bounds("ssh-group-0").expect("空分组也要渲染表头");
+        let web = cx.debug_bounds("ssh-group-1").unwrap();
+        let member = cx.debug_bounds("ssh-saved-1").unwrap();
+        assert!(ungrouped.origin.y < empty.origin.y, "未分组在最前");
+        assert!(empty.origin.y < web.origin.y, "分组按存储顺序排列");
+        assert!(web.origin.y < member.origin.y, "成员在分组表头之后");
+    }
+
+    #[gpui::test]
+    fn group_header_click_toggles_collapse(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = workspace(cx, root.path().to_path_buf());
+            view.ssh_profiles.groups = vec!["Web".into()];
+            view.ssh_profiles.connections.push(Profile {
+                name: "web server".into(),
+                host: "10.0.0.1".into(),
+                group: "Web".into(),
+                ..Profile::default()
+            });
+            view
+        });
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(cx.debug_bounds("ssh-saved-1").is_some());
+        let header = cx.debug_bounds("ssh-group-0").unwrap().center();
+        cx.simulate_mouse_down(header, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        view.update(cx, |v, _| {
+            assert!(v.ssh_collapsed_groups.contains("Web"));
+        });
+        assert!(
+            cx.debug_bounds("ssh-saved-1").is_none(),
+            "折叠后成员行不渲染"
+        );
+        assert!(cx.debug_bounds("ssh-group-0").is_some(), "折叠后表头保留");
+        cx.simulate_mouse_down(header, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        assert!(cx.debug_bounds("ssh-saved-1").is_some(), "再次点击展开");
+    }
+
+    #[gpui::test]
+    fn move_to_group_menu_persists_the_assignment(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let profiles = termior_ssh::Profiles {
+            groups: vec!["Web".into()],
+            connections: vec![Profile {
+                name: "test session".into(),
+                host: "127.0.0.1".into(),
+                port: Some(9),
+                ..Profile::default()
+            }],
+            ..termior_ssh::Profiles::default()
+        };
+        let (view, cx) =
+            cx.add_window_view(|_, cx| disk_workspace(cx, root.path().to_path_buf(), profiles));
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let row = cx.debug_bounds("ssh-saved-0").unwrap().center();
+        cx.simulate_mouse_down(row, MouseButton::Right, Modifiers::default());
+        view.update(cx, |v, _| {
+            assert_eq!(
+                v.ssh_context_menu.as_ref().unwrap().phase,
+                SessionMenuPhase::Session
+            );
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let move_item = cx
+            .debug_bounds("ssh-menu-item-4")
+            .expect("菜单包含「移动到分组…」")
+            .center();
+        cx.simulate_mouse_down(move_item, MouseButton::Left, Modifiers::default());
+        view.update(cx, |v, _| {
+            assert_eq!(
+                v.ssh_context_menu.as_ref().unwrap().phase,
+                SessionMenuPhase::GroupPicker
+            );
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        // 目标 0 是「未分组」，1 是 Web。
+        let web = cx.debug_bounds("ssh-group-target-1").unwrap().center();
+        cx.simulate_mouse_down(web, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        let saved = termior_ssh::Profiles::load(root.path()).unwrap();
+        assert_eq!(saved.connections[0].group, "Web");
+        view.update(cx, |v, _| {
+            assert_eq!(v.ssh_profiles.connections[0].group, "Web");
+            assert!(v.ssh_context_menu.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn group_menu_renames_and_deletes_groups(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let profiles = termior_ssh::Profiles {
+            groups: vec!["Web".into()],
+            connections: vec![Profile {
+                name: "test session".into(),
+                host: "127.0.0.1".into(),
+                group: "Web".into(),
+                ..Profile::default()
+            }],
+            ..termior_ssh::Profiles::default()
+        };
+        let (view, cx) =
+            cx.add_window_view(|_, cx| disk_workspace(cx, root.path().to_path_buf(), profiles));
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let header = cx.debug_bounds("ssh-group-0").unwrap().center();
+        cx.simulate_mouse_down(header, MouseButton::Right, Modifiers::default());
+        view.update(cx, |v, _| {
+            assert_eq!(v.ssh_group_menu.as_ref().unwrap().name, "Web");
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let rename = cx.debug_bounds("ssh-group-action-0").unwrap().center();
+        cx.simulate_mouse_down(rename, MouseButton::Left, Modifiers::default());
+        view.update(cx, |v, _| {
+            assert_eq!(v.command_mode, CommandMode::RenameGroup);
+            assert_eq!(v.pending_group_rename.as_deref(), Some("Web"));
+            assert_eq!(v.command_input, "Web");
+            v.command_input = "Prod".into();
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let saved = termior_ssh::Profiles::load(root.path()).unwrap();
+        assert_eq!(saved.groups, vec!["Prod".to_owned()]);
+        assert_eq!(saved.connections[0].group, "Prod");
+        view.update(cx, |v, _| {
+            assert_eq!(v.command_mode, CommandMode::Browse);
+        });
+        // 删除分组：成员归入未分组，分组本身消失。
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let header = cx.debug_bounds("ssh-group-0").unwrap().center();
+        cx.simulate_mouse_down(header, MouseButton::Right, Modifiers::default());
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let delete = cx.debug_bounds("ssh-group-action-1").unwrap().center();
+        cx.simulate_mouse_down(delete, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        let (_, detail) = cx.pending_prompt().expect("删除分组需要确认");
+        assert!(detail.contains("1 个连接"), "{detail}");
+        cx.simulate_prompt_answer("删除");
+        cx.run_until_parked();
+        let saved = termior_ssh::Profiles::load(root.path()).unwrap();
+        assert!(saved.groups.is_empty());
+        assert_eq!(saved.connections[0].group, "");
+        view.update(cx, |v, _| {
+            assert!(v.ssh_profiles.groups.is_empty());
+            assert!(v.ssh_collapsed_groups.is_empty(), "reload 清理失效折叠名");
+        });
+    }
+
+    #[gpui::test]
+    fn new_group_button_creates_empty_group_via_command_bar(cx: &mut TestAppContext) {
+        let root = tempfile::tempdir().unwrap();
+        let profiles = termior_ssh::Profiles {
+            connections: vec![Profile {
+                name: "test session".into(),
+                host: "127.0.0.1".into(),
+                ..Profile::default()
+            }],
+            ..termior_ssh::Profiles::default()
+        };
+        let (view, cx) =
+            cx.add_window_view(|_, cx| disk_workspace(cx, root.path().to_path_buf(), profiles));
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+        let button = cx.debug_bounds("ssh-new-group").unwrap().center();
+        cx.simulate_mouse_down(button, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(button, MouseButton::Left, Modifiers::default());
+        view.update(cx, |v, _| {
+            assert_eq!(v.command_mode, CommandMode::NewGroup);
+            assert_eq!(v.pending_group_profile, None);
+            v.command_input = "Prod".into();
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let saved = termior_ssh::Profiles::load(root.path()).unwrap();
+        assert_eq!(saved.groups, vec!["Prod".to_owned()]);
+        assert_eq!(saved.connections.len(), 1);
+        assert_eq!(saved.connections[0].group, "", "新建空分组不动既有连接");
+        view.update(cx, |v, _| {
+            assert_eq!(v.ssh_profiles.groups, vec!["Prod".to_owned()]);
+            assert_eq!(v.command_mode, CommandMode::Browse);
+        });
     }
 
     #[gpui::test]
