@@ -174,14 +174,23 @@ impl SettingsView {
             discovered_shells: Vec::new(),
         };
         view.refresh_credential_state();
-        // shell 探测含 wsl.exe 子进程，异步跑完再刷新下拉（FR-TERM-05）。
+        // shell 探测两段式：原生条目（PATH 检查，即时）先到，WSL 枚举
+        // （wsl.exe 子进程，带超时）完成后再追加（FR-TERM-05）。
         let discover_task = cx.spawn(async move |view, cx| {
-            let shells = cx
+            let native = cx
                 .background_executor()
-                .spawn(async move { termior_terminal::discover_shells() })
+                .spawn(async move { termior_terminal::discover_native_shells() })
                 .await;
             let _ = view.update(cx, |view, cx| {
-                view.discovered_shells = shells;
+                view.discovered_shells = native;
+                cx.notify();
+            });
+            let wsl = cx
+                .background_executor()
+                .spawn(async move { termior_terminal::discover_wsl_shells() })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.discovered_shells.extend(wsl);
                 cx.notify();
             });
         });

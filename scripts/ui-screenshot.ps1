@@ -11,6 +11,7 @@
 .EXAMPLE
     ./scripts/ui-screenshot.ps1 -Label before
     ./scripts/ui-screenshot.ps1 -Theme "tokyo-night" -Appearance dark -Maximized -Settings
+    ./scripts/ui-screenshot.ps1 -ShellPicker
 #>
 param(
     # Prefix for the output file names, e.g. "before" -> before-main.png.
@@ -22,6 +23,9 @@ param(
     [switch]$Maximized,
     # Also open the settings window (Ctrl+,) and capture it.
     [switch]$Settings,
+    # Seed terminal.shell_prompt and capture an extra shot with the new-terminal
+    # shell picker open (Ctrl+T): <Label>-shell-picker.png.
+    [switch]$ShellPicker,
     [int]$TimeoutSeconds = 30
 )
 
@@ -29,6 +33,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type @"
 using System;
@@ -123,16 +128,19 @@ $dataDir = Join-Path $runRoot "data"
 
 # Seed the theme instead of clicking through the UI, so a run is reproducible.
 # Schema v2: fixed appearance uses theme_id; FollowSystem uses the light/dark pair.
+# Sparse terminal objects are legal: TerminalSettings fills missing fields from defaults.
 $lightTheme = if ($Theme -match '-light$' -or $Appearance -eq 'light') { $Theme } else { 'default-light' }
 $darkTheme = if ($Theme -match '-light$') { ($Theme -replace '-light$', '') } else { $Theme }
-$settingsJson = @{
+$seed = @{
     version          = 2
     appearance       = $Appearance
     theme_id         = $Theme
     light_theme_id   = $lightTheme
     dark_theme_id    = $darkTheme
     editor_theme_id  = 'default'
-} | ConvertTo-Json
+}
+if ($ShellPicker) { $seed.terminal = @{ shell_prompt = $true } }
+$settingsJson = $seed | ConvertTo-Json
 [System.IO.File]::WriteAllText((Join-Path $dataDir "Termior-settings.json"), $settingsJson)
 
 $app = $null
@@ -151,6 +159,17 @@ try {
     # make the screenshot useless for reviewing chrome.
     Start-Sleep -Seconds 3
     Save-WindowShot $main (Join-Path $shotDir "$Label-main.png")
+
+    if ($ShellPicker) {
+        # Ctrl+T with terminal.shell_prompt seeded opens the shell picker instead of a
+        # new default terminal. Shell discovery (incl. wsl.exe) runs in the background,
+        # so wait before grabbing.
+        [void][Shot]::SetForegroundWindow($main)
+        Start-Sleep -Milliseconds 400
+        [System.Windows.Forms.SendKeys]::SendWait("^t")
+        Start-Sleep -Seconds 3
+        Save-WindowShot $main (Join-Path $shotDir "$Label-shell-picker.png")
+    }
 
     if ($Settings) {
         $windows = Wait-ForWindow $app 2 15
