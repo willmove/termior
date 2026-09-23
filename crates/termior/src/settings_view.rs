@@ -114,6 +114,9 @@ pub struct SettingsView {
     /// 后台探测的本机 shell 列表（shell 下拉与 WSL 勾选用）；含 wsl.exe
     /// 子进程调用，异步填充。
     discovered_shells: Vec<DiscoveredShell>,
+    /// 内容区滚动容器句柄 + 拖拽滚动条状态（配置项多时右侧出现滚动条）。
+    scroll: gpui::ScrollHandle,
+    dragging_scroll: bool,
     _updater_subscription: gpui::Subscription,
 }
 
@@ -172,6 +175,8 @@ impl SettingsView {
             save_generation: 0,
             settings_dirty: false,
             discovered_shells: Vec::new(),
+            scroll: gpui::ScrollHandle::new(),
+            dragging_scroll: false,
         };
         view.refresh_credential_state();
         // shell 探测两段式：原生条目（PATH 检查，即时）先到，WSL 枚举
@@ -3203,6 +3208,18 @@ impl gpui::Render for SettingsView {
                     }
                 }),
             )
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                if this.dragging_scroll && e.pressed_button == Some(MouseButton::Left) {
+                    termior_ui_kit::scroll_to_pointer(&this.scroll, e.position.y);
+                    cx.notify();
+                } else {
+                    this.dragging_scroll = false;
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.dragging_scroll = false),
+            )
             .flex()
             .size_full()
             .bg(crate::ui::color(p.background))
@@ -3239,19 +3256,42 @@ impl gpui::Render for SettingsView {
                     .flex_col()
                     .child(
                         div()
-                            .id("settings-scroll")
+                            .flex()
                             .flex_1()
-                            .overflow_y_scroll()
-                            .px_6()
-                            .py_5()
+                            .min_h_0()
                             .child(
-                                div().flex().justify_center().w_full().child(
-                                    div()
-                                        .w_full()
-                                        .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
-                                        .text_sm()
-                                        .child(self.page_body(cx)),
-                                ),
+                                div()
+                                    .id("settings-scroll")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll)
+                                    .px_6()
+                                    .py_5()
+                                    .child(
+                                        div().flex().justify_center().w_full().child(
+                                            div()
+                                                .w_full()
+                                                .max_w(px(SETTINGS_CONTENT_MAX_WIDTH))
+                                                .text_sm()
+                                                .child(self.page_body(cx)),
+                                        ),
+                                    ),
+                            )
+                            .child(
+                                termior_ui_kit::scrollbar("settings-scrollbar", &self.scroll, &p)
+                                    .debug_selector(|| "settings-scrollbar".into())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                                            this.dragging_scroll = true;
+                                            termior_ui_kit::scroll_to_pointer(
+                                                &this.scroll,
+                                                e.position.y,
+                                            );
+                                            cx.notify();
+                                        }),
+                                    ),
                             ),
                     )
                     .when(!self.status.is_empty(), |root| {
@@ -3687,5 +3727,46 @@ mod edit_tests {
             );
             assert!(bounds.size.height > px(0.0));
         });
+    }
+
+    #[test]
+    fn content_pane_shows_a_scrollbar_when_the_page_overflows() {
+        let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
+        let (view, vcx) = cx.add_window_view(|_, cx| {
+            SettingsView::new(Settings::default(), None, None, None, None, cx)
+        });
+        // 偏矮的窗格让配置页必然放不下；滚动条必须出现在内容区右缘。
+        vcx.simulate_resize(gpui::size(px(880.), px(360.)));
+        for page in [
+            SettingsPage::General,
+            SettingsPage::Models,
+            SettingsPage::Themes,
+            SettingsPage::Shortcuts,
+            SettingsPage::Agents,
+        ] {
+            view.update(vcx, |v, cx| v.set_page(page, cx));
+            vcx.update(|window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+            });
+            let bar = vcx
+                .debug_bounds("settings-scrollbar")
+                .expect("scrollbar column");
+            assert!(
+                bar.size.height > px(100.),
+                "{page:?} scrollbar spans the pane"
+            );
+            assert!(
+                bar.right() <= px(880.) && bar.right() > px(800.),
+                "{page:?} scrollbar sits at the right edge: {bar:?}"
+            );
+            view.update(vcx, |v, _| {
+                assert!(
+                    v.scroll.max_offset().y > px(0.),
+                    "{page:?} overflows and needs the scrollbar"
+                );
+            });
+        }
     }
 }

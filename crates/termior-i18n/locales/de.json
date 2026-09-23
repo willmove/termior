@@ -796,5 +796,9 @@
   "ws.wait_remote_request": "Auf die aktuelle Remote-Anfrage warten oder sie zuerst abbrechen.",
   "ws.web_preview": "Web-Vorschau",
   "ws.working_tree_discarded": "Working-Tree-Änderungen verworfen",
-  "ws.workspace": "Arbeitsbereich"
+  "ws.workspace": "Arbeitsbereich",
+  "ssh.field.tags": "Tags (optional, kommagetrennt)",
+  "ssh.field.notes": "Notizen (optional)",
+  "ssh.advanced.collapsed": "▸ Erweitert",
+  "ssh.advanced.expanded": "▾ Erweitert"
 }

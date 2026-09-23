@@ -796,5 +796,9 @@
   "ws.wait_remote_request": "請等待目前的遠端請求完成,或先取消它。",
   "ws.web_preview": "Web 預覽",
   "ws.working_tree_discarded": "已捨棄工作目錄變更",
-  "ws.workspace": "工作區"
+  "ws.workspace": "工作區",
+  "ssh.field.tags": "標籤（可選，逗號分隔）",
+  "ssh.field.notes": "備註（可選）",
+  "ssh.advanced.collapsed": "▸ 進階選項",
+  "ssh.advanced.expanded": "▾ 進階選項"
 }

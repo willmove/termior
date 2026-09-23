@@ -796,5 +796,9 @@
   "ws.wait_remote_request": "Esperar la solicitud remota actual o cancelarla primero.",
   "ws.web_preview": "Vista previa web",
   "ws.working_tree_discarded": "Cambios del árbol de trabajo descartados",
-  "ws.workspace": "Espacio de trabajo"
+  "ws.workspace": "Espacio de trabajo",
+  "ssh.field.tags": "Etiquetas (opcional, separadas por comas)",
+  "ssh.field.notes": "Notas (opcional)",
+  "ssh.advanced.collapsed": "▸ Opciones avanzadas",
+  "ssh.advanced.expanded": "▾ Opciones avanzadas"
 }

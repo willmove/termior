@@ -796,5 +796,9 @@
   "ws.wait_remote_request": "Wait for the current remote request, or cancel it first.",
   "ws.web_preview": "Web preview",
   "ws.working_tree_discarded": "Working-tree changes discarded",
-  "ws.workspace": "Workspace"
+  "ws.workspace": "Workspace",
+  "ssh.field.tags": "Tags (optional, comma-separated)",
+  "ssh.field.notes": "Notes (optional)",
+  "ssh.advanced.collapsed": "▸ Advanced",
+  "ssh.advanced.expanded": "▾ Advanced"
 }

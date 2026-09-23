@@ -796,5 +796,9 @@
   "ws.wait_remote_request": "現在のリモートリクエストの完了を待つか、先にキャンセルしてください。",
   "ws.web_preview": "Web プレビュー",
   "ws.working_tree_discarded": "作業ツリーの変更を破棄しました",
-  "ws.workspace": "ワークスペース"
+  "ws.workspace": "ワークスペース",
+  "ssh.field.tags": "タグ（任意・カンマ区切り）",
+  "ssh.field.notes": "メモ（任意）",
+  "ssh.advanced.collapsed": "▸ 詳細設定",
+  "ssh.advanced.expanded": "▾ 詳細設定"
 }

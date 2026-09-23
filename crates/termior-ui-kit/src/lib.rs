@@ -25,6 +25,8 @@ mod list;
 #[cfg(feature = "gpui-kit")]
 mod menu;
 #[cfg(feature = "gpui-kit")]
+mod scroll;
+#[cfg(feature = "gpui-kit")]
 pub mod theme;
 #[cfg(feature = "gpui-kit")]
 pub mod titlebar;
@@ -41,3 +43,5 @@ pub use input::input_field;
 pub use list::{list_row, list_row_meta};
 #[cfg(feature = "gpui-kit")]
 pub use menu::{menu_hint, menu_item, menu_panel, menu_separator};
+#[cfg(feature = "gpui-kit")]
+pub use scroll::{scroll_to_pointer, scrollbar};

@@ -23,6 +23,10 @@ struct InputLayout {
 const INPUT_LINE_HEIGHT: f32 = 20.0;
 const INPUT_CARET_HEIGHT: f32 = 16.0;
 
+/// Tab 键序 = 表单视觉顺序：名称 → 分组/标签 → 主机/端口 → 用户/私钥 →
+/// 密码/口令 →（高级：跳板机、远程路径）→ 备注。高级折叠时跳过其中两项。
+const FIELD_TAB_ORDER: [usize; 12] = [0, 9, 10, 1, 3, 2, 4, 7, 8, 5, 6, 11];
+
 pub struct ProfilesChanged;
 impl gpui::EventEmitter<ProfilesChanged> for SshView {}
 
@@ -85,13 +89,19 @@ pub struct SshView {
     profiles: Profiles,
     dir: Option<PathBuf>,
     selected: Option<usize>,
-    values: [String; 10],
+    /// 表单缓冲区，下标即字段：
+    /// `[0 name, 1 host, 2 user, 3 port, 4 identity, 5 jump_host,
+    ///   6 sftp_remote_path, 7 password, 8 passphrase, 9 group,
+    ///   10 tags, 11 notes]`（7、8 是密钥，输入后 zeroize）。
+    values: [String; 12],
     remember: bool,
     auth_prompt: Option<String>,
     shared_auth: Option<termior_ssh::auth::Challenge>,
     scroll: gpui::ScrollHandle,
     input_layouts: Rc<RefCell<Vec<Option<InputLayout>>>>,
     dragging_scroll: bool,
+    /// “高级选项”（跳板机 / SFTP 远程路径 / 传输选项）默认折叠。
+    advanced_open: bool,
     recursive: bool,
     resume: bool,
     pending_transfer: Option<Connection>,
@@ -225,8 +235,9 @@ impl SshView {
             auth_prompt: None,
             shared_auth: None,
             scroll: gpui::ScrollHandle::new(),
-            input_layouts: Rc::new(RefCell::new(vec![None; 10])),
+            input_layouts: Rc::new(RefCell::new(vec![None; 12])),
             dragging_scroll: false,
+            advanced_open: false,
             auth: Authentication::Auto,
             field: 0,
             cursor: 0,
@@ -323,15 +334,18 @@ impl SshView {
             .is_ok();
         std::process::exit(if ok { 0 } else { 1 });
     }
-    fn scroll_pointer(&self, y: gpui::Pixels) {
-        let bounds = self.scroll.bounds();
-        let height = f32::from(bounds.size.height).max(1.0);
-        let max = f32::from(self.scroll.max_offset().y);
-        let thumb = (height * height / (height + max)).max(24.0).min(height);
-        let ratio = ((f32::from(y - bounds.top()) - thumb / 2.0) / (height - thumb).max(1.0))
-            .clamp(0.0, 1.0);
-        self.scroll
-            .set_offset(gpui::point(px(0.), px(-max * ratio)));
+    fn next_field(&self, backward: bool) -> usize {
+        if self.auth_prompt.is_some() {
+            return 7;
+        }
+        let reachable: Vec<usize> = FIELD_TAB_ORDER
+            .iter()
+            .copied()
+            .filter(|i| self.advanced_open || !matches!(i, 5 | 6))
+            .collect();
+        let n = reachable.len();
+        let at = reachable.iter().position(|i| *i == self.field).unwrap_or(0);
+        reachable[(at + if backward { n - 1 } else { 1 }) % n]
     }
     fn profile(&self) -> Result<Profile, String> {
         let port = if self.values[3].trim().is_empty() {
@@ -353,6 +367,9 @@ impl SshView {
             identity_file: self.values[4].clone(),
             jump_host: self.values[5].trim().into(),
             group: self.values[9].trim().into(),
+            tags: parse_tags(&self.values[10]),
+            notes: self.values[11].trim().into(),
+            sftp_remote_path: self.values[6].trim().into(),
             authentication: self.auth,
             ..self
                 .selected
@@ -395,10 +412,12 @@ impl SshView {
             p.port.map(|p| p.to_string()).unwrap_or_default(),
             p.identity_file.clone(),
             p.jump_host.clone(),
-            String::new(),
+            p.sftp_remote_path.clone(),
             String::new(),
             String::new(),
             p.group.clone(),
+            p.tags.join(", "),
+            p.notes.clone(),
         ];
         self.pending_transfer = None;
         self.auth = p.authentication;
@@ -483,11 +502,7 @@ impl SshView {
             return;
         }
         if key.key == "tab" {
-            self.field = if self.auth_prompt.is_some() {
-                7
-            } else {
-                (self.field + if key.modifiers.shift { 9 } else { 1 }) % 10
-            };
+            self.field = self.next_field(key.modifiers.shift);
             self.marked = None;
             self.select_all = false;
             self.cursor = self.values[self.field].len();
@@ -655,6 +670,34 @@ fn byte_index(text: &str, offset: usize) -> usize {
     }
     text.len()
 }
+
+/// 表单里的标签输入以逗号（含全角）分隔；保存前解析并去掉空项。
+fn parse_tags(input: &str) -> Vec<String> {
+    input
+        .split([',', '，'])
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// 把字段单元格按行组装成竖排表单段；行内从左到右，单元格 flex_1 平分宽度。
+fn field_rows(rows: &[&[usize]], cells: &mut [Option<gpui::Div>]) -> gpui::Div {
+    let mut grid = div().flex().flex_col().gap(px(space::SM));
+    for row in rows {
+        if !row.iter().any(|i| cells[*i].is_some()) {
+            continue;
+        }
+        let mut fields = div().flex().items_start().gap(px(space::SM));
+        for &i in *row {
+            if let Some(cell) = cells[i].take() {
+                fields = fields.child(cell);
+            }
+        }
+        grid = grid.child(fields);
+    }
+    grid
+}
 impl Focusable for SshView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -720,8 +763,8 @@ impl Render for SshView {
             .h_auto()
             .flex_shrink_0()
             .when(self.auth_prompt.is_some(), |form| form.flex_none());
-        // 两列紧凑排布；行的顺序与 Tab 键序（0..=8）保持一致。
-        let mut cells: Vec<Option<gpui::Div>> = (0..10).map(|_| None).collect();
+        // 单元格先按字段下标构建，行布局由 field_rows 按 visual order 组装。
+        let mut cells: Vec<Option<gpui::Div>> = (0..12).map(|_| None).collect();
         for (i, label) in [
             t!("ssh.field.name"),
             t!("ssh.field.host"),
@@ -733,6 +776,8 @@ impl Render for SshView {
             t!("ssh.field.password"),
             t!("ssh.field.passphrase"),
             t!("ssh.field.group"),
+            t!("ssh.field.tags"),
+            t!("ssh.field.notes"),
         ]
         .into_iter()
         .enumerate()
@@ -909,20 +954,8 @@ impl Render for SshView {
                     ),
             );
         }
-        let mut grid = div().flex().flex_col().gap(px(space::SM));
-        let rows: [&[usize]; 5] = [&[0, 1], &[2, 3], &[4, 5], &[6, 9], &[7, 8]];
-        for row in rows {
-            if !row.iter().any(|i| cells[*i].is_some()) {
-                continue;
-            }
-            let mut fields = div().flex().items_start().gap(px(space::SM));
-            for &i in row {
-                if let Some(cell) = cells[i].take() {
-                    fields = fields.child(cell);
-                }
-            }
-            grid = grid.child(fields);
-        }
+        // 基本区：名称独占一行；分组+标签、主机+端口、用户+私钥、密码+口令两列。
+        let grid = field_rows(&[&[0], &[9, 10], &[1, 3], &[2, 4], &[7, 8]], &mut cells);
         form = form.child(grid);
         if let Some(prompt) = &self.auth_prompt {
             let kind = self.shared_auth.as_ref().map(|challenge| challenge.kind);
@@ -1088,6 +1121,122 @@ impl Render for SshView {
                     .text_color(ui::muted(&p))
                     .child(t!("ssh.credentials_hint")),
             );
+        let transfers = div()
+            .flex()
+            .flex_wrap()
+            .gap(px(space::XS))
+            .child(
+                ui::button(
+                    "recursive",
+                    if self.recursive {
+                        t!("ssh.transfer.recursive.on")
+                    } else {
+                        t!("ssh.transfer.recursive.off")
+                    },
+                    ButtonKind::Subtle,
+                    &p,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.recursive = !this.recursive;
+                    this.pending_transfer = None;
+                    cx.notify();
+                })),
+            )
+            .child(
+                ui::button(
+                    "resume",
+                    if self.resume {
+                        t!("ssh.transfer.resume.on")
+                    } else {
+                        t!("ssh.transfer.resume.off")
+                    },
+                    ButtonKind::Subtle,
+                    &p,
+                )
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.resume = !this.resume;
+                    this.pending_transfer = None;
+                    cx.notify();
+                })),
+            )
+            .child(
+                ui::button(
+                    "upload",
+                    t!("ssh.transfer.upload_button"),
+                    ButtonKind::Subtle,
+                    &p,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.choose_transfer(true, cx))),
+            )
+            .child(
+                ui::button(
+                    "download",
+                    t!("ssh.transfer.download_button"),
+                    ButtonKind::Subtle,
+                    &p,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.choose_transfer(false, cx))),
+            );
+        let confirmation = self.pending_transfer.is_some().then(|| {
+            ui::button(
+                "start-transfer",
+                t!("ssh.transfer.confirm"),
+                ButtonKind::Primary,
+                &p,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(connection) = this.pending_transfer.take() {
+                    (this.connect)(connection, cx);
+                    this.status = t!("ssh.status.transfer_started").to_string();
+                }
+                cx.notify();
+            }))
+        });
+        // 高级选项：跳板机、SFTP 远程路径与传输工具默认折叠，保持基本表单紧凑。
+        let advanced = div()
+            .flex()
+            .flex_col()
+            .gap(px(space::SM))
+            .child(
+                ui::button(
+                    "advanced-toggle",
+                    if self.advanced_open {
+                        t!("ssh.advanced.expanded")
+                    } else {
+                        t!("ssh.advanced.collapsed")
+                    },
+                    ButtonKind::Subtle,
+                    &p,
+                )
+                .debug_selector(|| "ssh-advanced-toggle".into())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.advanced_open = !this.advanced_open;
+                    cx.notify();
+                })),
+            )
+            .when(self.advanced_open, |section| {
+                section
+                    .child(field_rows(&[&[5], &[6]], &mut cells))
+                    .child(transfers)
+                    .children(confirmation)
+                    .child(
+                        div()
+                            .text_size(px(font_size::MICRO))
+                            .text_color(ui::muted(&p))
+                            .child(t!("ssh.sftp_hint")),
+                    )
+            });
+        // 备注收尾；状态行与动作按钮固定在表单最下方。
+        form = form
+            .child(advanced)
+            .child(field_rows(&[&[11]], &mut cells))
+            .when(!self.status.is_empty(), |element| {
+                element.child(
+                    div()
+                        .text_size(px(font_size::BODY))
+                        .child(SharedString::from(self.status.clone())),
+                )
+            });
         let mut actions = div().flex().flex_wrap().gap(px(space::XS)).child(
             ui::button("save", t!("action.save"), ButtonKind::Subtle, &p)
                 .debug_selector(|| "ssh-save".into())
@@ -1197,119 +1346,16 @@ impl Render for SshView {
                 cx.notify();
             })),
         );
-        let transfers = div()
-            .flex()
-            .flex_wrap()
-            .gap(px(space::XS))
-            .child(
-                ui::button(
-                    "recursive",
-                    if self.recursive {
-                        t!("ssh.transfer.recursive.on")
-                    } else {
-                        t!("ssh.transfer.recursive.off")
-                    },
-                    ButtonKind::Subtle,
-                    &p,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.recursive = !this.recursive;
-                    this.pending_transfer = None;
-                    cx.notify();
-                })),
-            )
-            .child(
-                ui::button(
-                    "resume",
-                    if self.resume {
-                        t!("ssh.transfer.resume.on")
-                    } else {
-                        t!("ssh.transfer.resume.off")
-                    },
-                    ButtonKind::Subtle,
-                    &p,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.resume = !this.resume;
-                    this.pending_transfer = None;
-                    cx.notify();
-                })),
-            )
-            .child(
-                ui::button(
-                    "upload",
-                    t!("ssh.transfer.upload_button"),
-                    ButtonKind::Subtle,
-                    &p,
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.choose_transfer(true, cx))),
-            )
-            .child(
-                ui::button(
-                    "download",
-                    t!("ssh.transfer.download_button"),
-                    ButtonKind::Subtle,
-                    &p,
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.choose_transfer(false, cx))),
-            );
-        let confirmation = self.pending_transfer.is_some().then(|| {
-            ui::button(
-                "start-transfer",
-                t!("ssh.transfer.confirm"),
-                ButtonKind::Primary,
-                &p,
-            )
-            .on_click(cx.listener(|this, _, _, cx| {
-                if let Some(connection) = this.pending_transfer.take() {
-                    (this.connect)(connection, cx);
-                    this.status = t!("ssh.status.transfer_started").to_string();
-                }
-                cx.notify();
-            }))
-        });
-        let scroll = self.scroll.clone();
-        let thumb = ui::alpha(p.foreground, 0.5);
-        let scrollbar = div()
-            .id("ssh-scrollbar")
+        form = form.child(actions);
+        let scrollbar = termior_ui_kit::scrollbar("ssh-scrollbar", &self.scroll, &p)
             .debug_selector(|| "ssh-scrollbar".into())
-            .w(px(space::LG))
-            .h_full()
-            .flex_shrink_0()
-            .cursor_pointer()
-            .bg(ui::alpha(p.foreground, 0.08))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
                     this.dragging_scroll = true;
-                    this.scroll_pointer(event.position.y);
+                    termior_ui_kit::scroll_to_pointer(&this.scroll, event.position.y);
                     cx.notify();
                 }),
-            )
-            .child(
-                canvas(
-                    |bounds, _, _| bounds,
-                    move |bounds, _, window, _| {
-                        let h = f32::from(bounds.size.height);
-                        let max = f32::from(scroll.max_offset().y);
-                        if h > 0.0 {
-                            let th = (h * h / (h + max)).max(24.0).min(h);
-                            let top = if max > 0.0 {
-                                (-f32::from(scroll.offset().y) / max).clamp(0., 1.) * (h - th)
-                            } else {
-                                0.
-                            };
-                            window.paint_quad(gpui::fill(
-                                gpui::Bounds::new(
-                                    bounds.origin + gpui::point(px(space::HAIR), px(top)),
-                                    gpui::size(px(space::MD), px(th)),
-                                ),
-                                thumb,
-                            ));
-                        }
-                    },
-                )
-                .size_full(),
             );
         div()
             .id("ssh-manager")
@@ -1319,7 +1365,7 @@ impl Render for SshView {
             .on_key_down(cx.listener(Self::key))
             .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
                 if this.dragging_scroll && e.pressed_button == Some(MouseButton::Left) {
-                    this.scroll_pointer(e.position.y);
+                    termior_ui_kit::scroll_to_pointer(&this.scroll, e.position.y);
                     cx.notify();
                 } else {
                     this.dragging_scroll = false;
@@ -1363,23 +1409,7 @@ impl Render for SshView {
                                     .gap(px(space::LG))
                                     .when(narrow, |d| d.flex_col())
                                     .child(list.flex_shrink_0())
-                                    .child(
-                                        form.when(narrow, |d| d.w_full())
-                                            .child(actions)
-                                            .child(transfers)
-                                            .child(
-                                                div()
-                                                    .text_size(px(font_size::BODY))
-                                                    .child(SharedString::from(self.status.clone())),
-                                            )
-                                            .children(confirmation)
-                                            .child(
-                                                div()
-                                                    .text_size(px(font_size::MICRO))
-                                                    .text_color(ui::muted(&p))
-                                                    .child(t!("ssh.sftp_hint")),
-                                            ),
-                                    ),
+                                    .child(form.when(narrow, |d| d.w_full())),
                             ),
                     )
                     .child(scrollbar),
@@ -1395,7 +1425,7 @@ impl EntityInputHandler for SshView {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        if self.field >= 7 {
+        if matches!(self.field, 7 | 8) {
             return None;
         }
         let value = &self.values[self.field];
@@ -1471,7 +1501,7 @@ impl EntityInputHandler for SshView {
     ) -> Option<Bounds<Pixels>> {
         let layouts = self.input_layouts.borrow();
         let layout = layouts[self.field].as_ref()?;
-        let caret = if self.field >= 7 {
+        let caret = if matches!(self.field, 7 | 8) {
             self.values[self.field][..self.cursor]
                 .encode_utf16()
                 .count()
@@ -1831,6 +1861,63 @@ mod tests {
             let saved = Profiles::load(dir.path()).unwrap();
             assert_eq!(saved.connections[0].group, "");
             assert_eq!(saved.groups, vec!["Prod".to_owned()], "空分组持久保留");
+        });
+    }
+    #[test]
+    fn tags_notes_and_remote_path_roundtrip_through_the_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cx = TestAppContext::single();
+        let view =
+            cx.new(|cx| SshView::new(Some(dir.path().to_path_buf()), Box::new(|_, _| {}), cx));
+        view.update(&mut cx, |view, _| {
+            view.values[0] = "server".into();
+            view.values[1] = "example.test".into();
+            view.values[6] = "/srv/data".into();
+            view.values[10] = " prod， 数据库 , ".into();
+            view.values[11] = " 临时备注 ".into();
+            view.save().unwrap();
+            let saved = Profiles::load(dir.path()).unwrap();
+            assert_eq!(
+                saved.connections[0].tags,
+                vec!["prod".to_owned(), "数据库".to_owned()]
+            );
+            assert_eq!(saved.connections[0].notes, "临时备注");
+            assert_eq!(saved.connections[0].sftp_remote_path, "/srv/data");
+            view.select(0);
+            assert_eq!(view.values[10], "prod, 数据库");
+            assert_eq!(view.values[11], "临时备注");
+            assert_eq!(view.values[6], "/srv/data");
+        });
+    }
+    #[test]
+    fn advanced_section_hides_jump_host_and_remote_path_until_opened() {
+        let mut cx = TestAppContext::single();
+        let (view, vcx) = cx.add_window_view(|_, cx| SshView::new(None, Box::new(|_, _| {}), cx));
+        vcx.simulate_resize(gpui::size(px(860.), px(620.)));
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        view.update(vcx, |v, _| {
+            assert!(!v.advanced_open);
+            assert!(v.input_layouts.borrow()[5].is_none(), "跳板机默认折叠");
+            assert!(
+                v.input_layouts.borrow()[6].is_none(),
+                "SFTP 远程路径默认折叠"
+            );
+        });
+        let toggle = vcx
+            .debug_bounds("ssh-advanced-toggle")
+            .expect("高级选项开关");
+        vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        view.update(vcx, |v, _| {
+            assert!(v.advanced_open);
+            assert!(v.input_layouts.borrow()[5].is_some());
+            assert!(v.input_layouts.borrow()[6].is_some());
         });
     }
 }

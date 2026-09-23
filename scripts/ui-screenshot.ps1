@@ -12,6 +12,8 @@
     ./scripts/ui-screenshot.ps1 -Label before
     ./scripts/ui-screenshot.ps1 -Theme "tokyo-night" -Appearance dark -Maximized -Settings
     ./scripts/ui-screenshot.ps1 -ShellPicker
+    ./scripts/ui-screenshot.ps1 -Settings -SettingsSize 780x420
+    ./scripts/ui-screenshot.ps1 -SshManager
 #>
 param(
     # Prefix for the output file names, e.g. "before" -> before-main.png.
@@ -23,6 +25,12 @@ param(
     [switch]$Maximized,
     # Also open the settings window (Ctrl+,) and capture it.
     [switch]$Settings,
+    # Resize the settings window to WxH (physical px) before capturing, e.g. "780x420",
+    # to review the content scrollbar on a pane the page cannot fit into.
+    [string]$SettingsSize = "",
+    # Seed Termior-ssh.json with fixture connections, open the SSH manager
+    # (TERMIOR_OPEN_SSH_MANAGER) and capture it: <Label>-ssh-manager.png.
+    [switch]$SshManager,
     # Seed terminal.shell_prompt and capture an extra shot with the new-terminal
     # shell picker open (Ctrl+T): <Label>-shell-picker.png.
     [switch]$ShellPicker,
@@ -48,6 +56,8 @@ public static class Shot {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(
+        IntPtr hWnd, IntPtr after, int x, int y, int w, int h, uint flags);
     [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(
         IntPtr hWnd, int attr, out RECT value, int size);
 
@@ -74,6 +84,27 @@ public static class Shot {
 # invisible resize border and pad the capture with desktop pixels.
 $DWMWA_EXTENDED_FRAME_BOUNDS = 9
 $SW_MAXIMIZE = 3
+# SetWindowPos flags: keep position, z-order and activation as-is.
+$SWP_NOSIZE = 0x1; $SWP_NOMOVE = 0x2; $SWP_NOZORDER = 0x4; $SWP_NOACTIVATE = 0x10
+
+function Resize-Window([IntPtr]$handle, [int]$width, [int]$height) {
+    # Also pin the position: captures are more reproducible and the window stays
+    # clear of taskbars/docks than wherever the compositer placed it.
+    [void][Shot]::SetWindowPos($handle, [IntPtr]::Zero, 60, 60, $width, $height,
+        $SWP_NOZORDER -bor $SWP_NOACTIVATE)
+}
+
+function Raise-Window([IntPtr]$handle) {
+    # SetForegroundWindow alone is rejected when the script's own process is not the
+    # foreground one (agent-spawned shells), leaving the target under other windows and
+    # the capture full of unrelated pixels. Toggle TOPMOST to force it above everything.
+    $HWND_TOPMOST = [IntPtr](-1); $HWND_NOTOPMOST = [IntPtr](-2)
+    $fixed = $SWP_NOSIZE -bor $SWP_NOMOVE -bor $SWP_NOACTIVATE
+    [void][Shot]::SetWindowPos($handle, $HWND_TOPMOST, 0, 0, 0, 0, $fixed -bor 0x0040)
+    Start-Sleep -Milliseconds 250
+    [void][Shot]::SetWindowPos($handle, $HWND_NOTOPMOST, 0, 0, 0, 0, $fixed)
+    [void][Shot]::SetForegroundWindow($handle)
+}
 
 function Get-ProcessWindow([int]$processId) {
     , @([Shot]::WindowsOf([uint32]$processId))
@@ -92,7 +123,7 @@ function Wait-ForWindow([System.Diagnostics.Process]$process, [int]$expected, [i
 }
 
 function Save-WindowShot([IntPtr]$handle, [string]$path) {
-    [void][Shot]::SetForegroundWindow($handle)
+    Raise-Window $handle
     Start-Sleep -Milliseconds 700
 
     $rect = New-Object Shot+RECT
@@ -143,12 +174,60 @@ if ($ShellPicker) { $seed.terminal = @{ shell_prompt = $true } }
 $settingsJson = $seed | ConvertTo-Json
 [System.IO.File]::WriteAllText((Join-Path $dataDir "Termior-settings.json"), $settingsJson)
 
-$app = $null
-try {
-    $env:TERMIOR_DATA_DIR = $dataDir
-    $env:TERMIOR_WORKSPACE = $repoRoot
-    if ($Settings) { $env:TERMIOR_OPEN_SETTINGS = "1" }
-    $app = Start-Process -FilePath $binary -WorkingDirectory $repoRoot -PassThru
+if ($SshManager) {
+    # v3 fixture connections: one grouped with tags/notes, one ungrouped with a
+    # remembered SFTP remote path, so the list and the form have content to review.
+    # Keep this file ASCII-only (matching the other scripts): powershell.exe 5.1
+    # misparses UTF-8 without a BOM, so fixture text stays English.
+    $sshSeed = @{
+        version     = 3
+        groups      = @("prod", "test")
+        connections = @(
+            @{
+                use_saved_credentials = $false
+                name                  = "prod-web-01"
+                host                  = "web01.example.com"
+                user                  = "deploy"
+                port                  = 22
+                authentication        = "auto"
+                identity_file         = ""
+                jump_host             = ""
+                known_hosts_file      = ""
+                connect_timeout_secs  = 15
+                keepalive_secs        = 30
+                group                 = "prod"
+                tags                  = @("prod", "web")
+                notes                 = "nginx frontend; check disk space before releasing"
+            },
+            @{
+                use_saved_credentials = $false
+                name                  = "bastion"
+                host                  = "bastion.example.com"
+                user                  = ""
+                port                  = 2222
+                authentication        = "key"
+                identity_file         = "C:/Users/dev/.ssh/id_ed25519"
+                jump_host             = ""
+                known_hosts_file      = ""
+                connect_timeout_secs  = 15
+                keepalive_secs        = 30
+                group                 = ""
+                sftp_remote_path      = "/srv/backup"
+            }
+        )
+    }
+    [System.IO.File]::WriteAllText(
+        (Join-Path $dataDir "Termior-ssh.json"),
+        ($sshSeed | ConvertTo-Json -Depth 5))
+}
+
+    $app = $null
+    try {
+        $env:TERMIOR_DATA_DIR = $dataDir
+        $env:TERMIOR_WORKSPACE = $repoRoot
+        if ($Settings) { $env:TERMIOR_OPEN_SETTINGS = "1" }
+        if ($SshManager) { $env:TERMIOR_OPEN_SSH_MANAGER = "1" }
+        $app = Start-Process -FilePath $binary -WorkingDirectory $repoRoot -PassThru
 
     $main = (Wait-ForWindow $app 1 $TimeoutSeconds)[0]
     if ($Maximized) {
@@ -175,14 +254,27 @@ try {
         $windows = Wait-ForWindow $app 2 15
         $settingsWindow = $windows | Where-Object { $_ -ne $main } | Select-Object -First 1
         if (-not $settingsWindow) { throw "Settings window did not appear" }
+        if ($SettingsSize -match '^(\d+)x(\d+)$') {
+            Resize-Window $settingsWindow ([int]$Matches[1]) ([int]$Matches[2])
+            Start-Sleep -Milliseconds 900
+        }
         Start-Sleep -Milliseconds 800
         Save-WindowShot $settingsWindow (Join-Path $shotDir "$Label-settings.png")
+    }
+
+    if ($SshManager) {
+        $windows = Wait-ForWindow $app 2 15
+        $managerWindow = $windows | Where-Object { $_ -ne $main } | Select-Object -First 1
+        if (-not $managerWindow) { throw "SSH manager window did not appear" }
+        Start-Sleep -Milliseconds 800
+        Save-WindowShot $managerWindow (Join-Path $shotDir "$Label-ssh-manager.png")
     }
 }
 finally {
     Remove-Item Env:\TERMIOR_DATA_DIR -ErrorAction SilentlyContinue
     Remove-Item Env:\TERMIOR_WORKSPACE -ErrorAction SilentlyContinue
     Remove-Item Env:\TERMIOR_OPEN_SETTINGS -ErrorAction SilentlyContinue
+    Remove-Item Env:\TERMIOR_OPEN_SSH_MANAGER -ErrorAction SilentlyContinue
     if ($app -and -not $app.HasExited) {
         Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
         [void]$app.WaitForExit(5000)

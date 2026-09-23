@@ -49,6 +49,15 @@ pub struct Profile {
     /// Group name from `Profiles::groups`. Empty means ungrouped.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group: String,
+    /// Free-form labels for future filtering (v3). Single line, no commas.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Free-form single-line reminder (v3). Never rendered outside the editor.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
+    /// Remembered default directory for SFTP sessions and transfers (v3).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sftp_remote_path: String,
 }
 
 impl Default for Profile {
@@ -66,6 +75,9 @@ impl Default for Profile {
             connect_timeout_secs: 15,
             keepalive_secs: 30,
             group: String::new(),
+            tags: Vec::new(),
+            notes: String::new(),
+            sftp_remote_path: String::new(),
         }
     }
 }
@@ -232,6 +244,27 @@ impl Profile {
                 "Group name must be 1–64 bytes without control characters or surrounding whitespace",
             ));
         }
+        if self.tags.len() > 16
+            || self.tags.iter().any(|tag| {
+                tag.is_empty()
+                    || tag.len() > 64
+                    || tag.contains(',')
+                    || tag.chars().any(char::is_control)
+            })
+        {
+            return Err(invalid(
+                "Tags: at most 16, each 1–64 bytes, no commas or control characters",
+            ));
+        }
+        if self.notes.len() > 2048 || self.notes.chars().any(char::is_control) {
+            return Err(invalid("Notes must be at most 2048 bytes on a single line"));
+        }
+        if self.sftp_remote_path.len() > 1024 || self.sftp_remote_path.chars().any(char::is_control)
+        {
+            return Err(invalid(
+                "SFTP remote path cannot contain control characters",
+            ));
+        }
         Ok(())
     }
 
@@ -326,8 +359,9 @@ impl Profile {
     }
 }
 
-/// Schema version of `Termior-ssh.json`. v1 predated connection groups.
-pub const PROFILES_VERSION: u32 = 2;
+/// Schema version of `Termior-ssh.json`. v1 predated connection groups;
+/// v3 added per-connection tags, notes and the remembered SFTP remote path.
+pub const PROFILES_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -418,8 +452,9 @@ impl Profiles {
     }
     pub fn load(dir: &Path) -> Result<Self, Error> {
         let mut value: Self = termior_store::JsonStore::new(dir, "Termior-ssh.json").load()?;
-        // v1 files predate groups; every v2 field has a serde default.
-        if value.version == 1 {
+        // v1 predated groups; v3 fields (tags/notes/sftp_remote_path) all have
+        // serde defaults, so every older file upgrades in place.
+        if value.version < PROFILES_VERSION {
             value.version = PROFILES_VERSION;
         }
         value.validate()?;
@@ -536,7 +571,7 @@ mod tests {
         assert_eq!(Profiles::load(dir.path()).unwrap().connections.len(), 1);
     }
     #[test]
-    fn v1_files_migrate_to_v2_on_load() {
+    fn v1_and_v2_files_migrate_to_v3_on_load() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Termior-ssh.json"),
@@ -547,9 +582,59 @@ mod tests {
         assert_eq!(migrated.version, PROFILES_VERSION);
         assert!(migrated.groups.is_empty());
         assert_eq!(migrated.connections[0].group, "");
-        let future = r#"{"version":3,"connections":[]}"#;
+        assert_eq!(migrated.connections[0].tags, Vec::<String>::new());
+        assert_eq!(migrated.connections[0].notes, "");
+        assert_eq!(migrated.connections[0].sftp_remote_path, "");
+        std::fs::write(
+            dir.path().join("Termior-ssh.json"),
+            r#"{"version":2,"groups":["prod"],"connections":[{"use_saved_credentials":false,"name":"v2","host":"server","user":"","port":null,"authentication":"auto","identity_file":"","jump_host":"","known_hosts_file":"","connect_timeout_secs":15,"keepalive_secs":30,"group":"prod"}]}"#,
+        )
+        .unwrap();
+        let migrated = Profiles::load(dir.path()).unwrap();
+        assert_eq!(migrated.version, PROFILES_VERSION);
+        assert_eq!(migrated.connections[0].group, "prod");
+        let future = r#"{"version":4,"connections":[]}"#;
         std::fs::write(dir.path().join("Termior-ssh.json"), future).unwrap();
         assert!(Profiles::load(dir.path()).is_err());
+    }
+    #[test]
+    fn tags_notes_and_remote_path_roundtrip_with_validation() {
+        let mut p = profile();
+        p.tags = vec!["prod".into(), "数据库".into()];
+        p.notes = "笔记本".into();
+        p.sftp_remote_path = "/srv/data".into();
+        let dir = tempfile::tempdir().unwrap();
+        Profiles {
+            connections: vec![p.clone()],
+            ..Profiles::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        assert_eq!(Profiles::load(dir.path()).unwrap().connections[0], p);
+        for bad in [
+            Profile {
+                tags: vec!["a,b".into()],
+                ..profile()
+            },
+            Profile {
+                tags: vec!["x".repeat(65)],
+                ..profile()
+            },
+            Profile {
+                tags: (0..17).map(|i| i.to_string()).collect(),
+                ..profile()
+            },
+            Profile {
+                notes: "a\nb".into(),
+                ..profile()
+            },
+            Profile {
+                sftp_remote_path: "a\tb".into(),
+                ..profile()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
     }
     #[test]
     fn groups_persist_without_members_and_upsert_preserves_order() {

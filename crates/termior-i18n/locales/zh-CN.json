@@ -796,5 +796,9 @@
   "ws.wait_remote_request": "请等待当前远程请求完成，或先将其取消。",
   "ws.web_preview": "Web 预览",
   "ws.working_tree_discarded": "已丢弃工作区更改",
-  "ws.workspace": "工作区"
+  "ws.workspace": "工作区",
+  "ssh.field.tags": "标签（可选，逗号分隔）",
+  "ssh.field.notes": "备注（可选）",
+  "ssh.advanced.collapsed": "▸ 高级选项",
+  "ssh.advanced.expanded": "▾ 高级选项"
 }
