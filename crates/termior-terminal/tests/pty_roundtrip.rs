@@ -185,3 +185,54 @@ fn spawn_with_explicit_size() {
     assert!(r.is_ok(), "resize failed: {r:?}");
     drop(bridge);
 }
+
+/// Windows PowerShell 5.1 的有效执行策略默认是 Restricted（安装器从不写
+/// LocalMachine 策略），会拦截 `-File` 加载 shell integration 注入脚本，
+/// 用户会看到 UnauthorizedAccess 报错。spawn 必须带 `-ExecutionPolicy Bypass`
+/// （仅本进程），并保持可交互。
+#[cfg(windows)]
+#[test]
+fn windows_powershell_integration_not_blocked_by_execution_policy() {
+    let config = PtySessionConfig {
+        shell: Some(termior_terminal_core::ShellKind::PowerShell),
+        shell_integration: true,
+        ..Default::default()
+    };
+    let mut bridge = TerminalBridge::spawn(&config).expect("windows powershell PTY");
+    let writer = bridge.writer();
+    let mut rx = bridge.take_output().expect("output channel");
+
+    let initial = collect_via_emulator_until(
+        &mut rx,
+        writer.clone(),
+        shell_is_ready,
+        Duration::from_secs(20),
+    );
+    assert!(
+        shell_is_ready(&initial),
+        "Windows PowerShell did not become interactive: {initial:?}"
+    );
+    assert!(
+        !initial.contains("UnauthorizedAccess")
+            && !initial.contains("about_Execution_Policies")
+            && !initial.contains("禁止运行脚本"),
+        "shell integration wrapper was blocked by execution policy: {initial:?}"
+    );
+
+    writer
+        .write_all(b"echo termior_powershell51_alive\r\n")
+        .expect("write marker command");
+    let output = collect_via_emulator_until(
+        &mut rx,
+        writer,
+        |output| output.matches("termior_powershell51_alive").count() >= 2,
+        Duration::from_secs(10),
+    );
+    assert!(
+        output.matches("termior_powershell51_alive").count() >= 2,
+        "Windows PowerShell did not execute the marker (integration wrapper likely failed): {output:?}"
+    );
+
+    let _ = bridge.kill();
+}
+

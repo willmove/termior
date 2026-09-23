@@ -666,9 +666,16 @@ fn apply_integration(
         ShellKind::Pwsh | ShellKind::PowerShell => {
             // `-File` alone exits after running the wrapper. Flags must precede the script path;
             // tokens after `-File <path>` are script arguments rather than host options.
+            //
+            // `-ExecutionPolicy Bypass` 只作用于本进程：Windows 客户端默认策略是
+            // Restricted，会拦截 `-File` 加载注入脚本（Windows PowerShell 5.1 无
+            // 安装器写策略，必然踩中；PS7 也可能在未设 RemoteSigned 的机器上踩中）。
+            // 与 VS Code shell integration 的做法一致。
             let profile = tempdir.join("profile.ps1");
             cmd.arg("-NoProfile");
             cmd.arg("-NoExit");
+            cmd.arg("-ExecutionPolicy");
+            cmd.arg("Bypass");
             cmd.arg("-File");
             cmd.arg(profile);
         }
@@ -996,14 +1003,30 @@ mod tests {
         let (command, integration_dir) =
             build_command(ShellKind::Pwsh, "pwsh", true, &config).unwrap();
         let args = argv(&command);
-        assert_eq!(&args[..4], ["pwsh", "-NoProfile", "-NoExit", "-File"]);
+        // Bypass 必须在 -File 之前：Windows 默认 Restricted 策略会拦截注入脚本。
+        assert_eq!(
+            &args[..6],
+            ["pwsh", "-NoProfile", "-NoExit", "-ExecutionPolicy", "Bypass", "-File"]
+        );
         assert_eq!(
             args.len(),
-            5,
+            7,
             "PowerShell host flags must not be duplicated"
         );
-        assert!(args[4].ends_with("profile.ps1"));
+        assert!(args[6].ends_with("profile.ps1"));
         assert!(integration_dir.is_some());
+    }
+
+    #[test]
+    fn windows_powershell_integration_also_carries_bypass() {
+        // 5.1 是踩中 Restricted 策略的主路径：选「Windows PowerShell」时同样要带 Bypass。
+        let config = PtySessionConfig::default();
+        let (command, _) =
+            build_command(ShellKind::PowerShell, "powershell", true, &config).unwrap();
+        let args = argv(&command);
+        assert_eq!(&args[..2], ["powershell", "-NoProfile"]);
+        assert!(args.contains(&"-ExecutionPolicy".to_string()));
+        assert!(args.contains(&"Bypass".to_string()));
     }
 
     #[test]
