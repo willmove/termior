@@ -309,7 +309,10 @@ mod tests {
             native_shell_label(r"C:\Program Files\Git\bin\bash.exe"),
             t!("shell.name.git_bash")
         );
-        assert_eq!(native_shell_label(r"C:\cygwin\bin\bash.exe"), t!("shell.name.bash"));
+        assert_eq!(
+            native_shell_label(r"C:\cygwin\bin\bash.exe"),
+            t!("shell.name.bash")
+        );
         // 未知程序退化到文件名。
         assert_eq!(native_shell_label(r"C:\tools\nu.exe"), "nu.exe");
     }

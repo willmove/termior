@@ -1144,11 +1144,7 @@ impl SettingsView {
 
     /// shell 下拉选择：写回 shell_detection / wsl_distribution（映射见
     /// `shell_select::apply_option`），主窗口经防抖保存路径同步。
-    fn select_shell(
-        &mut self,
-        option: crate::shell_select::ShellOption,
-        cx: &mut Context<Self>,
-    ) {
+    fn select_shell(&mut self, option: crate::shell_select::ShellOption, cx: &mut Context<Self>) {
         crate::shell_select::apply_option(&option, &mut self.settings);
         self.select_menu = None;
         self.schedule_save(cx);
@@ -1661,21 +1657,19 @@ impl SettingsView {
         let shell_menu_open = self.select_menu == Some(SelectMenu::Shell);
         let selection = shell_select::selected_option(&self.settings, &self.discovered_shells);
         let shell_menu = shell_menu_open.then(|| {
-            let mut items: Vec<gpui::Stateful<gpui::Div>> = vec![
-                Self::select_option(
-                    t!("settings.terminal.shell.auto"),
-                    "shell-option-default",
-                    selection == ShellOption::Default,
-                    &self.palette,
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.select_shell(ShellOption::Default, cx);
-                    }),
-                ),
-            ];
+            let mut items: Vec<gpui::Stateful<gpui::Div>> = vec![Self::select_option(
+                t!("settings.terminal.shell.auto"),
+                "shell-option-default",
+                selection == ShellOption::Default,
+                &self.palette,
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.select_shell(ShellOption::Default, cx);
+                }),
+            )];
             for (index, shell) in self.discovered_shells.iter().enumerate() {
                 let option = ShellOption::from(shell);
                 let selected = option == selection;
@@ -1722,30 +1716,28 @@ impl SettingsView {
         });
         let shell_prompt = self.settings.terminal.shell_prompt;
 
-        let mut rows: Vec<AnyElement> = vec![
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(
-                    Self::select_button(
-                        t!("settings.terminal.shell"),
-                        shell_select::selection_value(&selection, &self.settings),
-                        "shell-select",
-                        shell_menu_open,
-                        &self.palette,
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle_select_menu(SelectMenu::Shell, cx);
-                        }),
-                    ),
+        let mut rows: Vec<AnyElement> = vec![div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                Self::select_button(
+                    t!("settings.terminal.shell"),
+                    shell_select::selection_value(&selection, &self.settings),
+                    "shell-select",
+                    shell_menu_open,
+                    &self.palette,
                 )
-                .when_some(shell_menu, |select, menu| select.child(menu))
-                .into_any_element(),
-        ];
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_select_menu(SelectMenu::Shell, cx);
+                    }),
+                ),
+            )
+            .when_some(shell_menu, |select, menu| select.child(menu))
+            .into_any_element()];
         if selection == ShellOption::Manual {
             rows.push(self.edit_row(
                 t!("settings.terminal.shell.manual_path"),
@@ -1793,7 +1785,11 @@ impl SettingsView {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(div().text_sm().child(t!("settings.terminal.shell_prompt_label")))
+                .child(
+                    div()
+                        .text_sm()
+                        .child(t!("settings.terminal.shell_prompt_label")),
+                )
                 .child(
                     div()
                         .text_xs()

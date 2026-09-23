@@ -1896,7 +1896,10 @@ impl WorkspaceView {
             Some(termior_terminal::DiscoveredShell::Wsl { distribution }) => {
                 (None, Some(distribution.clone()))
             }
-            None => (settings_shell_program, self.settings.wsl_distribution.clone()),
+            None => (
+                settings_shell_program,
+                self.settings.wsl_distribution.clone(),
+            ),
         };
         let remote = self
             .model
@@ -4470,9 +4473,7 @@ impl WorkspaceView {
         let main_window = window.window_handle();
         let entity = cx.entity();
         cx.spawn(async move |_, cx| {
-            cx.background_executor()
-                .timer(Duration::from_secs(2))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(2)).await;
             let _ = main_window.update(cx, |_, window, cx| {
                 entity.update(cx, |workspace, cx| {
                     println!(
@@ -4507,9 +4508,7 @@ impl WorkspaceView {
                     }
                 });
             });
-            cx.background_executor()
-                .timer(Duration::from_secs(3))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(3)).await;
             entity.update(cx, |workspace, _| {
                 println!(
                     "TERMIOR_SHELL_TABS={} menu_open={}",
@@ -6957,12 +6956,10 @@ impl gpui::Render for WorkspaceView {
                     )
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(
-                            |this, event: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                this.request_new_terminal(Some(event.position), window, cx);
-                            },
-                        ),
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.request_new_terminal(Some(event.position), window, cx);
+                        }),
                     ),
             )
             .child(
@@ -7519,46 +7516,44 @@ impl gpui::Render for WorkspaceView {
         });
         // 新建终端 shell 选择器（`shell_prompt` 开启时替代直接创建）：默认项 +
         // 后台探测到的 shell（含 WSL 发行版）。列表异步刷新，先渲染已有缓存。
-        let shell_menu = self.shell_menu.map(|position| {
-            anchored().position(position).child(
-                menu_panel(&p)
-                    .id("shell-picker-menu")
-                    .w(px(280.0))
-                    .child(
-                        div()
-                            .id("shell-picker-title")
-                            .px_2()
-                            .py_1()
-                            .text_xs()
-                            .text_color(ui::muted(&p))
-                            .child(t!("ws.choose_shell")),
-                    )
-                    .child(shell_menu_item(
-                        crate::shell_select::ShellOption::Default,
-                        "shell-menu-default",
-                        &p,
-                        cx,
-                    ))
-                    .children(
-                        self.discovered_shells
-                            .iter()
-                            .enumerate()
-                            .map(|(index, shell)| {
+        let shell_menu =
+            self.shell_menu.map(|position| {
+                anchored().position(position).child(
+                    menu_panel(&p)
+                        .id("shell-picker-menu")
+                        .w(px(280.0))
+                        .child(
+                            div()
+                                .id("shell-picker-title")
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .text_color(ui::muted(&p))
+                                .child(t!("ws.choose_shell")),
+                        )
+                        .child(shell_menu_item(
+                            crate::shell_select::ShellOption::Default,
+                            "shell-menu-default",
+                            &p,
+                            cx,
+                        ))
+                        .children(self.discovered_shells.iter().enumerate().map(
+                            |(index, shell)| {
                                 shell_menu_item(
                                     crate::shell_select::ShellOption::from(shell),
                                     SharedString::from(format!("shell-menu-{index}")),
                                     &p,
                                     cx,
                                 )
-                            }),
-                    )
-                    .with_animation(
-                        "shell-menu-fade-in",
-                        Animation::new(UI_FADE_IN).with_easing(ease_in_out),
-                        |style, delta| style.opacity(delta),
-                    ),
-            )
-        });
+                            },
+                        ))
+                        .with_animation(
+                            "shell-menu-fade-in",
+                            Animation::new(UI_FADE_IN).with_easing(ease_in_out),
+                            |style, delta| style.opacity(delta),
+                        ),
+                )
+            });
         let pane_context_menu = self.pane_context_menu.clone().map(|menu| {
             anchored().position(menu.position).child(
                 menu_panel(&p)
@@ -7724,26 +7719,26 @@ impl gpui::Render for WorkspaceView {
             .on_mouse_move(cx.listener(Self::move_titlebar))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::stop_panel_resizes))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::stop_titlebar_move))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _event, _window, cx| {
-                        let closed_ssh = this.ssh_context_menu.take().is_some();
-                        let closed_group = this.ssh_group_menu.take().is_some();
-                        let closed_explorer = this.explorer_context_menu.take().is_some();
-                        let closed_new_tab = this.new_tab_menu.take().is_some();
-                        let closed_shell = this.shell_menu.take().is_some();
-                        let closed_pane = this.pane_context_menu.take().is_some();
-                        if closed_ssh
-                            || closed_group
-                            || closed_explorer
-                            || closed_new_tab
-                            || closed_shell
-                            || closed_pane
-                        {
-                            cx.notify();
-                        }
-                    }),
-                )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    let closed_ssh = this.ssh_context_menu.take().is_some();
+                    let closed_group = this.ssh_group_menu.take().is_some();
+                    let closed_explorer = this.explorer_context_menu.take().is_some();
+                    let closed_new_tab = this.new_tab_menu.take().is_some();
+                    let closed_shell = this.shell_menu.take().is_some();
+                    let closed_pane = this.pane_context_menu.take().is_some();
+                    if closed_ssh
+                        || closed_group
+                        || closed_explorer
+                        || closed_new_tab
+                        || closed_shell
+                        || closed_pane
+                    {
+                        cx.notify();
+                    }
+                }),
+            )
             .flex()
             .flex_col()
             .size_full()

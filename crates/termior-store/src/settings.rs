@@ -485,7 +485,10 @@ mod tests {
         let json = r#"{ "terminal": { "shell_prompt": true } }"#;
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert!(settings.terminal.shell_prompt);
-        assert_eq!(settings.terminal.font_family, default_settings().terminal.font_family);
+        assert_eq!(
+            settings.terminal.font_family,
+            default_settings().terminal.font_family
+        );
         assert_eq!(settings.terminal.font_size, 14);
         assert_eq!(settings.terminal.shell_detection, ShellDetection::Auto);
     }

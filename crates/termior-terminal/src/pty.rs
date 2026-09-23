@@ -1006,7 +1006,14 @@ mod tests {
         // Bypass 必须在 -File 之前：Windows 默认 Restricted 策略会拦截注入脚本。
         assert_eq!(
             &args[..6],
-            ["pwsh", "-NoProfile", "-NoExit", "-ExecutionPolicy", "Bypass", "-File"]
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NoExit",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File"
+            ]
         );
         assert_eq!(
             args.len(),

@@ -235,4 +235,3 @@ fn windows_powershell_integration_not_blocked_by_execution_policy() {
 
     let _ = bridge.kill();
 }
-
