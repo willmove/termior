@@ -61,7 +61,7 @@ use termior_ui::{
     MIN_COMPOSER_HEIGHT,
 };
 use termior_ui_kit::{
-    empty_hint, empty_state_message, icon, menu_panel, menu_separator, text as ui_text,
+    empty_hint, empty_state_message, icon, menu_panel, menu_separator,
     titlebar::{draws_own_window_controls, handles_own_window_control_clicks, window_controls},
     tokens::{self, icon_size},
     Icon, LayoutNode, PaneId, SplitDirection, Tooltip,
@@ -176,22 +176,22 @@ enum CommandMode {
 }
 
 impl CommandMode {
-    fn label(self) -> &'static str {
+    fn label(self) -> SharedString {
         match self {
-            Self::Browse => "Browse",
-            Self::FindFile => "Find file",
-            Self::SearchContent => "Search content",
-            Self::CreateFile => "Create file",
-            Self::CreateDirectory => "Create directory",
-            Self::Rename => "Rename",
-            Self::Move => "Move remote item",
-            Self::GitCommit => "Git commit",
-            Self::GitCreateBranch => "Create branch",
-            Self::GitSwitchBranch => "Switch branch",
-            Self::PreviewUrl => "Web preview URL",
-            Self::RemotePath => "远程路径",
-            Self::NewGroup => "新建分组",
-            Self::RenameGroup => "重命名分组",
+            Self::Browse => t!("ws.cmd_browse"),
+            Self::FindFile => t!("ws.cmd_find_file"),
+            Self::SearchContent => t!("ws.cmd_search_content"),
+            Self::CreateFile => t!("ws.cmd_create_file"),
+            Self::CreateDirectory => t!("ws.cmd_create_directory"),
+            Self::Rename => t!("ws.cmd_rename"),
+            Self::Move => t!("ws.cmd_move"),
+            Self::GitCommit => t!("ws.cmd_git_commit"),
+            Self::GitCreateBranch => t!("ws.cmd_git_create_branch"),
+            Self::GitSwitchBranch => t!("ws.cmd_git_switch_branch"),
+            Self::PreviewUrl => t!("ws.cmd_preview_url"),
+            Self::RemotePath => t!("ws.cmd_remote_path"),
+            Self::NewGroup => t!("ws.cmd_new_group"),
+            Self::RenameGroup => t!("ws.cmd_rename_group"),
         }
     }
 }
@@ -398,6 +398,11 @@ pub struct WorkspaceView {
     explorer_context_menu: Option<ExplorerContextMenu>,
     /// 标签栏新建下拉的锚点；`None` 表示关闭。
     new_tab_menu: Option<Point<Pixels>>,
+    /// 新建终端 shell 选择器的锚点（`settings.terminal.shell_prompt` 开启时
+    /// 新建终端入口先弹它）；`None` 表示关闭。
+    shell_menu: Option<Point<Pixels>>,
+    /// 选择器展示的本机 shell 列表（后台探测，含 WSL 发行版）。
+    discovered_shells: Vec<termior_terminal::DiscoveredShell>,
     pane_context_menu: Option<PaneContextMenu>,
     sidebar_resizing: bool,
     /// Composer 面板拖拽调整尺寸进行中（方向取决于当前停靠位置）。
@@ -434,6 +439,10 @@ pub struct WorkspaceView {
 impl WorkspaceView {
     pub fn new(root: PathBuf, system_is_dark: bool, cx: &mut Context<Self>) -> Self {
         let (settings, data_dir, migration_error) = load_settings();
+        // 界面语言要在任何视图渲染前确定：显式设置优先，其次系统语言。
+        // 测试二进制跳过（保持默认英文槽位），避免断言依赖宿主机语言。
+        #[cfg(not(test))]
+        termior_i18n::init(settings.language.as_deref());
         let completion_completer = build_completer_from_settings(&settings);
         let completion_enabled = settings.autocomplete_enabled && completion_completer.is_some();
         let themes = data_dir
@@ -548,28 +557,34 @@ impl WorkspaceView {
                                     })
                                     .unwrap_or_else(|| {
                                         PaneContent::Placeholder(
-                                            ui_text::empty::MARKDOWN_SOURCE_UNAVAILABLE.into(),
+                                            t!("empty.markdown_source_unavailable").into(),
                                         )
                                     }),
                                 TabKind::Terminal | TabKind::Preview => {
                                     PaneContent::Placeholder(if tab.remote.is_some() {
-                                        "远程会话未连接。使用上方「重新连接」恢复。".into()
+                                        t!("ws.remote_disconnected").into()
                                     } else {
-                                        format!("Restoring {}…", tab.title)
+                                        tf!("ws.tab_restoring", "title" => tab.title.clone()).into()
                                     })
                                 }
                                 TabKind::AiDiff | TabKind::GitDiff | TabKind::GitCommitFile => {
-                                    PaneContent::Placeholder(format!(
-                                        "{} · {}",
-                                        tab.title,
-                                        ui_text::empty::DIFF_REOPEN_HINT
-                                    ))
+                                    PaneContent::Placeholder(
+                                        tf!(
+                                            "ws.tab_with_hint",
+                                            "title" => tab.title.clone(),
+                                            "hint" => t!("empty.diff_reopen_hint")
+                                        )
+                                        .into(),
+                                    )
                                 }
-                                TabKind::GitHistory => PaneContent::Placeholder(format!(
-                                    "{} · {}",
-                                    tab.title,
-                                    ui_text::empty::GIT_HISTORY_SIDEBAR
-                                )),
+                                TabKind::GitHistory => PaneContent::Placeholder(
+                                    tf!(
+                                        "ws.tab_with_hint",
+                                        "title" => tab.title.clone(),
+                                        "hint" => t!("empty.git_history_sidebar")
+                                    )
+                                    .into(),
+                                ),
                             },
                         )
                     })
@@ -609,7 +624,7 @@ impl WorkspaceView {
             |workspace, _composer, status: &AgentStatus, cx| {
                 workspace.queue_agent_update(
                     "builtin-agent",
-                    "Built-in Agent",
+                    &t!("ws.builtin_agent"),
                     None,
                     NotificationTarget::Composer,
                     *status,
@@ -646,7 +661,7 @@ impl WorkspaceView {
         notification_router.set_enabled(settings.agent_notifications);
         notification_router.update_agent(AgentIndicator {
             id: "builtin-agent".into(),
-            title: "Built-in Agent".into(),
+            title: t!("ws.builtin_agent").to_string(),
             status: AgentStatus::Finished,
             tab_id: None,
         });
@@ -703,6 +718,8 @@ impl WorkspaceView {
             pending_group_rename: None,
             explorer_context_menu: None,
             new_tab_menu: None,
+            shell_menu: None,
+            discovered_shells: Vec::new(),
             pane_context_menu: None,
             sidebar_resizing: false,
             composer_resizing: false,
@@ -756,6 +773,7 @@ impl WorkspaceView {
                     cwd,
                     private,
                     Some(window.window_handle()),
+                    None,
                     cx,
                 );
             }
@@ -922,14 +940,14 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let path = self.model.root.join("preview-smoke.md");
-        self.open_editor(path.clone(), cx);
+        self.open_editor(path.clone(), window, cx);
         self.request_preview(window, cx);
         cx.spawn_in(window, async move |workspace, cx| {
             // Keep the window alive long enough for GPUI to layout and paint the new native view.
             cx.background_executor()
                 .timer(Duration::from_millis(300))
                 .await;
-            let result = workspace.update_in(cx, |workspace, _, cx| {
+            let result = workspace.update_in(cx, |workspace, window, cx| {
                 let active_kind = workspace.model.active_tab().map(|tab| tab.kind);
                 let preview_source = workspace
                     .model
@@ -947,7 +965,7 @@ impl WorkspaceView {
                             _ => None,
                         })
                     });
-                workspace.open_editor(path, cx);
+                workspace.open_editor(path, window, cx);
                 let reopened_kind = workspace.model.active_tab().map(|tab| tab.kind);
                 let shared_source = preview_source
                     .zip(workspace.active_editor().cloned())
@@ -979,7 +997,7 @@ impl WorkspaceView {
             self.explorer_index_incomplete = false;
             self.explorer = None;
             self.explorer_skips_expanded = false;
-            self.explorer_error = Some(ui_text::explorer::ROOT_INVALID.into());
+            self.explorer_error = Some(t!("explorer.root_invalid").into());
             cx.notify();
             return;
         }
@@ -1022,7 +1040,7 @@ impl WorkspaceView {
                             workspace.explorer = None;
                             workspace.explorer_skips_expanded = false;
                             workspace.explorer_deep_indexing = false;
-                            workspace.explorer_error = Some(ui_text::explorer::ROOT_INVALID.into());
+                            workspace.explorer_error = Some(t!("explorer.root_invalid").into());
                             workspace.finish_explorer_scan(cx);
                         }
                     }
@@ -1054,7 +1072,7 @@ impl WorkspaceView {
                                 // Keep any shallow results; only fail hard if we have none.
                                 if workspace.explorer.is_none() {
                                     workspace.explorer_error =
-                                        Some(ui_text::explorer::ROOT_INVALID.into());
+                                        Some(t!("explorer.root_invalid").into());
                                 }
                                 workspace.explorer_deep_indexing = false;
                                 workspace.finish_explorer_scan(cx);
@@ -1151,7 +1169,7 @@ impl WorkspaceView {
         let bounds = WindowBounds::Windowed(Bounds::centered(None, size(px(620.), px(440.)), cx));
         match cx.open_window(app_identity::window_options(bounds), |window, cx| {
             let view = cx.new(|cx| crate::ssh_view::SshView::new_shared_prompt(challenge, dir, cx));
-            window.set_window_title("SSH 身份认证 · 终端与文件浏览器共用");
+            window.set_window_title(&t!("ws.ssh_auth_window_title"));
             window.on_window_should_close(cx, |window, _| {
                 window.remove_window();
                 false
@@ -1196,7 +1214,8 @@ impl WorkspaceView {
                 .detach();
             }
             Err(error) => {
-                self.command_message = Some(format!("无法打开 SSH 认证窗口：{error}"));
+                self.command_message =
+                    Some(tf!("ws.ssh_auth_window_failed", "error" => error).to_string());
                 cx.notify();
             }
         }
@@ -1214,7 +1233,8 @@ impl WorkspaceView {
         let auth = match self.ensure_remote_auth(tab_id, &profile, cx) {
             Ok(auth) => auth,
             Err(error) => {
-                self.command_message = Some(format!("SSH authentication: {error}"));
+                self.command_message =
+                    Some(tf!("ws.ssh_authentication_error", "error" => error).to_string());
                 return false;
             }
         };
@@ -1229,7 +1249,7 @@ impl WorkspaceView {
                         request: None,
                         pending: None,
                         error: None,
-                        status: "Ready".into(),
+                        status: t!("ws.remote_status_ready").to_string(),
                     },
                 );
                 true
@@ -1254,7 +1274,7 @@ impl WorkspaceView {
             return;
         }
         if termior_ssh::quote_sftp_path(&path).is_err() {
-            self.command_message = Some("Invalid remote path".into());
+            self.command_message = Some(t!("ws.invalid_remote_path").to_string());
             cx.notify();
             return;
         }
@@ -1308,11 +1328,12 @@ impl WorkspaceView {
                                 state.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
                             }
                         }
-                        state.status = "Connected · remote SFTP".into();
+                        state.status = t!("ws.remote_status_connected").to_string();
                     }
                     Err(error) => {
-                        state.error = Some(format!("Remote Explorer: {error}. Refresh to retry."));
-                        state.status = "Request stopped".into();
+                        state.error =
+                            Some(tf!("ws.remote_explorer_error", "error" => error).to_string());
+                        state.status = t!("ws.remote_status_request_stopped").to_string();
                         cx.notify();
                         return; // Never auto-retry failed authentication.
                     }
@@ -1477,7 +1498,7 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.remote_runtime_connected(tab_id, cx) {
-            self.command_message = Some("Reconnect the SSH/SFTP tab first.".into());
+            self.command_message = Some(t!("ws.reconnect_first").to_string());
             cx.notify();
             return false;
         }
@@ -1487,8 +1508,7 @@ impl WorkspaceView {
         }
         let state = self.remote_explorers.get_mut(&tab_id).unwrap();
         if state.request.is_some() {
-            self.command_message =
-                Some("Wait for the current remote request, or cancel it first.".into());
+            self.command_message = Some(t!("ws.wait_remote_request").to_string());
             cx.notify();
             return false;
         }
@@ -1507,28 +1527,37 @@ impl WorkspaceView {
         cx.spawn(async move |workspace, cx| {
             let result = client.execute(&operation, control).await;
             let _ = workspace.update(cx, |workspace, cx| {
-                let Some(state) = workspace.remote_explorers.get_mut(&tab_id) else { return; };
-                if state.request.as_ref().map(|r| r.id) != Some(id) { return; }
+                let Some(state) = workspace.remote_explorers.get_mut(&tab_id) else {
+                    return;
+                };
+                if state.request.as_ref().map(|r| r.id) != Some(id) {
+                    return;
+                }
                 state.request = None;
                 state.listing = None; // Interrupted writes can have partial effects.
                 let pending = state.pending.take();
                 match result {
                     Ok(()) => {
                         state.status = success.clone();
-                        if workspace.model.active == Some(tab_id) { workspace.command_message = Some(success); }
-                        let path = pending.map(|(path, _)| path)
+                        if workspace.model.active == Some(tab_id) {
+                            workspace.command_message = Some(success);
+                        }
+                        let path = pending
+                            .map(|(path, _)| path)
                             .or_else(|| workspace.remote_explorer_paths.get(&tab_id).cloned())
                             .unwrap_or_else(|| ".".into());
                         workspace.scan_remote_directory(tab_id, profile, path, true, cx);
                     }
                     Err(error) => {
-                        state.error = Some(format!("Remote operation: {error}. Refresh to inspect the result before retrying."));
-                        state.status = "Operation stopped".into();
+                        state.error =
+                            Some(tf!("ws.remote_operation_error", "error" => error).to_string());
+                        state.status = t!("ws.remote_status_operation_stopped").to_string();
                     }
                 }
                 cx.notify();
             });
-        }).detach();
+        })
+        .detach();
         cx.notify();
         true
     }
@@ -1664,7 +1693,7 @@ impl WorkspaceView {
         // process. Await the async dialog instead and hop back into the view.
         cx.spawn_in(window, async move |workspace, cx| {
             let Some(folder) = rfd::AsyncFileDialog::new()
-                .set_title("Open a Termior workspace")
+                .set_title(t!("ws.open_workspace_dialog").to_string())
                 .pick_folder()
                 .await
             else {
@@ -1731,12 +1760,73 @@ impl WorkspaceView {
     }
 
     fn create_terminal(&mut self, private: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_terminal_with_shell(private, None, window, cx);
+    }
+
+    /// 新建终端入口（+ 按钮 / Ctrl+T / 新建菜单项）。`settings.terminal.shell_prompt`
+    /// 开启时先弹 shell 选择器（锚点优先取触发点，否则窗口中央），本次选择
+    /// 不改默认；关闭时直接按默认创建。
+    fn request_new_terminal(
+        &mut self,
+        position: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.settings.terminal.shell_prompt {
+            self.create_terminal(false, window, cx);
+            return;
+        }
+        self.close_chrome_menus();
+        let anchor = position.unwrap_or_else(|| {
+            let viewport = window.viewport_size();
+            gpui::point(viewport.width / 2.0, viewport.height / 2.0)
+        });
+        self.shell_menu = Some(anchor);
+        // shell 列表可能过期（安装/卸载/新增 WSL 发行版），每次打开都刷新。
+        self.refresh_discovered_shells(cx);
+        cx.notify();
+    }
+
+    /// 后台探测本机 shell：原生条目即时回填；WSL 枚举（wsl.exe 子进程，
+    /// 带超时）完成后再追加，避免个别环境下 wsl.exe 慢/挂时整个列表空转。
+    fn refresh_discovered_shells(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let native = cx
+                .background_executor()
+                .spawn(async move { termior_terminal::discover_native_shells() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.discovered_shells = native;
+                cx.notify();
+            });
+            let wsl = cx
+                .background_executor()
+                .spawn(async move { termior_terminal::discover_wsl_shells() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.discovered_shells.extend(wsl);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 以指定 shell 创建终端（选择器选中项）；`shell = None` 走设置默认。
+    /// override 的 Native 会清空 `wsl_distribution`、Wsl 会覆盖之，避免
+    /// 「全局 WSL + 手选原生 shell」拼出矛盾组合。
+    fn create_terminal_with_shell(
+        &mut self,
+        private: bool,
+        shell: Option<termior_terminal::DiscoveredShell>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.model.new_tab(
             TabKind::Terminal,
             if private {
-                "Private terminal"
+                t!("ws.tab_private_terminal")
             } else {
-                "Terminal"
+                t!("ws.tab_terminal")
             },
             private,
         );
@@ -1744,7 +1834,7 @@ impl WorkspaceView {
         self.tabs.push(AppTab {
             id,
             panes: single_pane(PaneContent::Placeholder(
-                ui_text::empty::STARTING_TERMINAL.into(),
+                t!("empty.starting_terminal").into(),
             )),
         });
         self.activate_runtime(id, cx);
@@ -1754,11 +1844,13 @@ impl WorkspaceView {
             cwd,
             private,
             Some(window.window_handle()),
+            shell,
             cx,
         );
         cx.notify();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_terminal_into(
         &mut self,
         tab_id: TabId,
@@ -1766,6 +1858,7 @@ impl WorkspaceView {
         cwd: Option<PathBuf>,
         private: bool,
         window_handle: Option<AnyWindowHandle>,
+        shell_override: Option<termior_terminal::DiscoveredShell>,
         cx: &mut Context<Self>,
     ) {
         if self
@@ -1789,10 +1882,21 @@ impl WorkspaceView {
         let terminal_settings = self.settings.terminal.clone();
         let keymap = self.settings.keymap.clone();
         let workspace_auth = self.workspace_auth.clone();
-        let shell_program = match &terminal_settings.shell_detection {
+        // shell 选择：选择器的本次手选覆盖默认（Native 清空 WSL、Wsl 覆盖）；
+        // 无覆盖时按设置推导（FR-TERM-05）。
+        let settings_shell_program = match &terminal_settings.shell_detection {
             ShellDetection::Auto => None,
             ShellDetection::Manual { path } if !path.trim().is_empty() => Some(path.clone()),
             ShellDetection::Manual { .. } => None,
+        };
+        let (shell_program, wsl_distribution) = match &shell_override {
+            Some(termior_terminal::DiscoveredShell::Native { program }) => {
+                (Some(program.clone()), None)
+            }
+            Some(termior_terminal::DiscoveredShell::Wsl { distribution }) => {
+                (None, Some(distribution.clone()))
+            }
+            None => (settings_shell_program, self.settings.wsl_distribution.clone()),
         };
         let remote = self
             .model
@@ -1808,7 +1912,8 @@ impl WorkspaceView {
             Ok(session) => session,
             Err(error) => {
                 self.pending_terminals.remove(&(tab_id, pane_id));
-                self.command_message = Some(format!("SSH authentication unavailable: {error}"));
+                self.command_message =
+                    Some(tf!("ws.ssh_auth_unavailable", "error" => error).to_string());
                 cx.notify();
                 return;
             }
@@ -1821,7 +1926,7 @@ impl WorkspaceView {
             inherit_environment: !private,
             cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
             workspace_auth: Some(workspace_auth),
-            wsl_distribution: self.settings.wsl_distribution.clone(),
+            wsl_distribution,
             ..Default::default()
         };
         let spawn_task = cx
@@ -1835,10 +1940,14 @@ impl WorkspaceView {
                         workspace.pending_terminals.remove(&(tab_id, pane_id));
                         if let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                             if let Some(pane) = tab.panes.get_mut(&pane_id) {
-                                *pane = PaneContent::Placeholder(format!(
-                                    "{} ({error})",
-                                    ui_text::empty::TERMINAL_FAILED
-                                ));
+                                *pane = PaneContent::Placeholder(
+                                    tf!(
+                                        "ws.terminal_failed_detail",
+                                        "reason" => t!("empty.terminal_failed"),
+                                        "error" => error
+                                    )
+                                    .into(),
+                                );
                             }
                         }
                         cx.notify();
@@ -1865,8 +1974,9 @@ impl WorkspaceView {
                     .tabs
                     .iter()
                     .find(|tab| tab.id == tab_id)
-                    .map(|tab| format!("{} · terminal agent", tab.title))
-                    .unwrap_or_else(|| format!("Terminal {} agent", tab_id.0));
+                    .map(|tab| tf!("ws.terminal_agent_title", "title" => tab.title.clone()))
+                    .unwrap_or_else(|| tf!("ws.terminal_agent_fallback", "id" => tab_id.0))
+                    .to_string();
                 cx.subscribe(
                     &entity,
                     move |workspace, _terminal, state: &AgentState, cx| {
@@ -1913,7 +2023,7 @@ impl WorkspaceView {
                                         if tab.remote.is_none() {
                                             tab.title = title
                                                 .clone()
-                                                .unwrap_or_else(|| "Terminal".to_owned());
+                                                .unwrap_or_else(|| t!("ws.tab_terminal").into());
                                         }
                                     }
                                     TerminalViewEvent::Bell => {
@@ -1977,9 +2087,17 @@ impl WorkspaceView {
         self.close_remote_explorer(id);
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
             tab.panes
-                .insert(pane, PaneContent::Placeholder("正在连接…".into()));
+                .insert(pane, PaneContent::Placeholder(t!("ws.connecting").into()));
         }
-        self.spawn_terminal_into(id, pane, Some(cwd), false, Some(window.window_handle()), cx);
+        self.spawn_terminal_into(
+            id,
+            pane,
+            Some(cwd),
+            false,
+            Some(window.window_handle()),
+            None,
+            cx,
+        );
     }
 
     fn reload_ssh_profiles(&mut self) {
@@ -2024,11 +2142,11 @@ impl WorkspaceView {
         let title = format!(
             "{} · {}",
             if connection.transfer.is_some() {
-                "SFTP 传输"
+                t!("ws.sftp_transfer")
             } else if connection.kind == termior_ssh::SessionKind::Shell {
-                "SSH"
+                SharedString::from("SSH")
             } else {
-                "SFTP"
+                SharedString::from("SFTP")
             },
             connection.profile.name
         );
@@ -2038,7 +2156,7 @@ impl WorkspaceView {
         }
         self.tabs.push(AppTab {
             id,
-            panes: single_pane(PaneContent::Placeholder("正在连接…".into())),
+            panes: single_pane(PaneContent::Placeholder(t!("ws.connecting").into())),
         });
         self.activate_runtime(id, cx);
         self.spawn_terminal_into(
@@ -2047,6 +2165,7 @@ impl WorkspaceView {
             Some(self.model.active_project_dir().to_path_buf()),
             false,
             Some(window.window_handle()),
+            None,
             cx,
         );
         self.persist_workspace();
@@ -2081,7 +2200,7 @@ impl WorkspaceView {
             app_identity::window_options(WindowBounds::Windowed(bounds)),
             |window, cx| {
                 let view = cx.new(|cx| crate::ssh_view::SshView::new(dir, connect, cx));
-                window.set_window_title("SSH / SFTP · Termior");
+                window.set_window_title(&t!("ws.ssh_manager_title"));
                 window.on_window_should_close(cx, |window, _| {
                     window.remove_window();
                     false
@@ -2103,12 +2222,17 @@ impl WorkspaceView {
                 }
                 self.ssh_manager_window = Some(handle);
             }
-            Err(error) => self.command_message = Some(format!("SSH manager: {error}")),
+            Err(error) => {
+                self.command_message =
+                    Some(tf!("ws.ssh_manager_error", "error" => error).to_string())
+            }
         }
     }
 
-    fn create_editor(&mut self, cx: &mut Context<Self>) {
-        let id = self.model.new_tab(TabKind::Editor, "Untitled", false);
+    fn create_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self
+            .model
+            .new_tab(TabKind::Editor, t!("ws.tab_untitled"), false);
         let (completer, completion_enabled) = self.completion_config();
         let editor = cx.new(EditorView::untitled);
         editor.update(cx, |editor, _| {
@@ -2124,10 +2248,11 @@ impl WorkspaceView {
             panes: single_pane(PaneContent::Editor(editor)),
         });
         self.activate_runtime(id, cx);
+        self.focus_active_pane(window, cx);
         cx.notify();
     }
 
-    fn open_editor(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    fn open_editor(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let resource = path.to_string_lossy().into_owned();
         if let Some(id) = self
             .model
@@ -2139,14 +2264,15 @@ impl WorkspaceView {
             .map(|tab| tab.id)
         {
             self.activate_runtime(id, cx);
+            self.focus_active_pane(window, cx);
             cx.notify();
             return;
         }
         let title = path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("Editor")
-            .to_owned();
+            .map(str::to_owned)
+            .unwrap_or_else(|| t!("ws.tab_editor").into());
         let entity = self
             .model
             .tabs
@@ -2183,6 +2309,8 @@ impl WorkspaceView {
             panes: single_pane(PaneContent::Editor(entity)),
         });
         self.activate_runtime(id, cx);
+        // 打开后立即聚焦编辑器，保证可以立即输入（含从 Markdown 预览切回源码）。
+        self.focus_active_pane(window, cx);
         cx.notify();
     }
 
@@ -2219,9 +2347,7 @@ impl WorkspaceView {
         self.command_mode = CommandMode::PreviewUrl;
         self.command_input.clear();
         self.command_marked_text.clear();
-        self.command_message = Some(
-            "No local dev server was detected. Enter an http(s) URL, then press Enter.".into(),
-        );
+        self.command_message = Some(t!("ws.no_dev_server").to_string());
         self.model.sidebar_visible = true;
         window.focus(&self.focus_handle, cx);
         cx.notify();
@@ -2251,10 +2377,11 @@ impl WorkspaceView {
         let source_title = path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("Markdown");
+            .map(str::to_owned)
+            .unwrap_or_else(|| t!("ws.tab_markdown").into());
         let id = self.model.new_tab(
             TabKind::Markdown,
-            format!("Preview · {source_title}"),
+            tf!("ws.tab_preview", "title" => source_title),
             false,
         );
         if let Some(tab) = self.model.active_tab_mut() {
@@ -2270,7 +2397,9 @@ impl WorkspaceView {
     }
 
     fn create_preview_url(&mut self, url: String, _window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.model.new_tab(TabKind::Preview, "Web Preview", false);
+        let id = self
+            .model
+            .new_tab(TabKind::Preview, t!("ws.tab_web_preview"), false);
         if let Some(tab) = self.model.active_tab_mut() {
             tab.resource = Some(url.clone());
         }
@@ -2310,7 +2439,7 @@ impl WorkspaceView {
                     self.focus_active_pane(window, cx);
                     cx.notify();
                 } else if let Some(resource) = resource {
-                    self.open_editor(PathBuf::from(resource), cx);
+                    self.open_editor(PathBuf::from(resource), window, cx);
                 }
             }
             Some(TabKind::Editor) => {
@@ -2338,8 +2467,8 @@ impl WorkspaceView {
         let title = Path::new(&summary.path)
             .file_name()
             .and_then(|name| name.to_str())
-            .map(|name| format!("AI Diff · {name}"))
-            .unwrap_or_else(|| "AI Diff".into());
+            .map(|name| tf!("ws.tab_ai_diff", "name" => name))
+            .unwrap_or_else(|| t!("ws.tab_ai_diff_plain"));
         let proposal_id = summary.id.clone();
         let entity = cx.new(|_| AiDiffView::new(summary));
         cx.subscribe(&entity, |workspace, diff, action: &AiDiffAction, cx| {
@@ -2394,12 +2523,12 @@ impl WorkspaceView {
                 repo.diff_file(&path, group == ChangeGroup::Staged)
                     .map_err(|error| error.to_string())
             })
-            .unwrap_or_else(|error| format!("Could not load diff: {error}"));
+            .unwrap_or_else(|error| tf!("ws.diff_load_failed", "error" => error).to_string());
         let title = Path::new(&path)
             .file_name()
             .and_then(|name| name.to_str())
-            .map(|name| format!("Git Diff · {name}"))
-            .unwrap_or_else(|| "Git Diff".into());
+            .map(|name| tf!("ws.tab_git_diff", "name" => name))
+            .unwrap_or_else(|| t!("ws.tab_git_diff_plain"));
         let entity = cx.new(|_| GitDiffView::working(path.clone(), group, patch));
         cx.subscribe(&entity, |workspace, diff, action: &GitDiffAction, cx| {
             workspace.handle_git_diff_action(&diff, action.clone(), cx)
@@ -2429,34 +2558,34 @@ impl WorkspaceView {
                     path,
                     ChangeGroup::Unstaged,
                     repo.stage_hunk(&patch)
-                        .map(|_| "Hunk staged".to_owned())
+                        .map(|_| t!("ws.hunk_staged").to_string())
                         .map_err(|error| error.to_string()),
                 ),
                 GitDiffAction::UnstageHunk { path, patch } => (
                     path,
                     ChangeGroup::Staged,
                     repo.unstage_hunk(&patch)
-                        .map(|_| "Hunk unstaged".to_owned())
+                        .map(|_| t!("ws.hunk_unstaged").to_string())
                         .map_err(|error| error.to_string()),
                 ),
                 GitDiffAction::StageFile(path) => {
                     let result = repo
                         .stage_file(&path)
-                        .map(|_| "File staged".to_owned())
+                        .map(|_| t!("ws.file_staged").to_string())
                         .map_err(|error| error.to_string());
                     (path, ChangeGroup::Staged, result)
                 }
                 GitDiffAction::UnstageFile(path) => {
                     let result = repo
                         .unstage_file(&path)
-                        .map(|_| "File unstaged".to_owned())
+                        .map(|_| t!("ws.file_unstaged").to_string())
                         .map_err(|error| error.to_string());
                     (path, ChangeGroup::Unstaged, result)
                 }
                 GitDiffAction::DiscardFile(path) => {
                     let result = repo
                         .discard_file(&path)
-                        .map(|_| "Working-tree changes discarded".to_owned())
+                        .map(|_| t!("ws.working_tree_discarded").to_string())
                         .map_err(|error| error.to_string());
                     (path, ChangeGroup::Unstaged, result)
                 }
@@ -2532,8 +2661,7 @@ impl WorkspaceView {
                     {
                         cx.open_url(&url);
                     } else {
-                        workspace.command_message =
-                            Some("No supported origin URL for this commit".into());
+                        workspace.command_message = Some(t!("ws.no_origin_url").to_string());
                     }
                 }
             },
@@ -2541,7 +2669,7 @@ impl WorkspaceView {
         .detach();
         let id = self
             .model
-            .new_tab(TabKind::GitHistory, "Git History", false);
+            .new_tab(TabKind::GitHistory, t!("ws.tab_git_history"), false);
         self.tabs.push(AppTab {
             id,
             panes: single_pane(PaneContent::GitHistory(entity.clone())),
@@ -2576,12 +2704,14 @@ impl WorkspaceView {
                 repo.diff_commit_file(&commit, &path)
                     .map_err(|error| error.to_string())
             })
-            .unwrap_or_else(|error| format!("Could not load commit diff: {error}"));
+            .unwrap_or_else(|error| {
+                tf!("ws.commit_diff_load_failed", "error" => error).to_string()
+            });
         let title = Path::new(&path)
             .file_name()
             .and_then(|name| name.to_str())
-            .map(|name| format!("Commit · {name}"))
-            .unwrap_or_else(|| "Commit File".into());
+            .map(|name| tf!("ws.tab_commit", "name" => name))
+            .unwrap_or_else(|| t!("ws.tab_commit_plain"));
         let entity = cx.new(|_| GitDiffView::commit_file(path, patch));
         let id = self.model.new_tab(TabKind::GitCommitFile, title, false);
         if let Some(tab) = self.model.active_tab_mut() {
@@ -2664,25 +2794,18 @@ impl WorkspaceView {
             .and_then(|tab| tab.remote.as_ref())
             .is_some_and(|remote| remote.transfer.is_some())
         {
-            return "文件传输不能通过分栏重复执行。请在连接管理中创建并确认新的传输。".into();
+            return t!("ws.split_transfer_unavailable").to_string();
         }
         if self.model.active_tab().is_none() {
-            return "Open a tab before splitting a pane.".into();
+            return t!("ws.split_no_tab").to_string();
         }
         if self.active_pane_count() >= MAX_PANES_PER_TAB {
-            return format!("This tab has reached the limit of {MAX_PANES_PER_TAB} panes.");
+            return tf!("ws.split_pane_limit", "count" => MAX_PANES_PER_TAB).to_string();
         }
         match direction {
-            Some(SplitDirection::Right) => {
-                "The focused pane is too narrow to split right. Resize the window or close another pane."
-                    .into()
-            }
-            Some(SplitDirection::Down) => {
-                "The focused pane is too short to split down. Resize the window or close another pane."
-                    .into()
-            }
-            None => "The focused pane is too small to split. Resize the window or close another pane."
-                .into(),
+            Some(SplitDirection::Right) => t!("ws.split_too_narrow").to_string(),
+            Some(SplitDirection::Down) => t!("ws.split_too_short").to_string(),
+            None => t!("ws.split_too_small").to_string(),
         }
     }
 
@@ -2693,7 +2816,7 @@ impl WorkspaceView {
     ) {
         self.enqueue_toast(
             Notification {
-                title: "Cannot split pane".into(),
+                title: t!("ws.split_unavailable_title").to_string(),
                 body: self.split_unavailable_message(direction),
                 target: NotificationTarget::Global,
                 status: AgentStatus::Attention,
@@ -2704,6 +2827,7 @@ impl WorkspaceView {
 
     fn close_chrome_menus(&mut self) {
         self.new_tab_menu = None;
+        self.shell_menu = None;
         self.pane_context_menu = None;
         self.ssh_context_menu = None;
         self.ssh_group_menu = None;
@@ -2743,9 +2867,9 @@ impl WorkspaceView {
                 PaneContent::Editor(editor)
             }
             Some(TabKind::Terminal) => {
-                PaneContent::Placeholder(ui_text::empty::STARTING_SPLIT_TERMINAL.into())
+                PaneContent::Placeholder(t!("empty.starting_split_terminal").into())
             }
-            _ => PaneContent::Placeholder(ui_text::empty::SPLIT_VIEW.into()),
+            _ => PaneContent::Placeholder(t!("empty.split_view").into()),
         };
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == active) {
             tab.panes.insert(pane_id, pane);
@@ -2764,6 +2888,7 @@ impl WorkspaceView {
                 cwd,
                 private,
                 Some(window.window_handle()),
+                None,
                 cx,
             );
         } else {
@@ -2777,8 +2902,8 @@ impl WorkspaceView {
         if self.active_pane_count() <= 1 {
             self.enqueue_toast(
                 Notification {
-                    title: "Cannot close pane".into(),
-                    body: "This is the only pane in the tab.".into(),
+                    title: t!("ws.close_pane_title").to_string(),
+                    body: t!("ws.only_pane").to_string(),
                     target: NotificationTarget::Global,
                     status: AgentStatus::Attention,
                 },
@@ -3159,11 +3284,11 @@ impl WorkspaceView {
                     .unwrap_or_else(|| editor.title().to_owned());
                 format!("{path} · {}:{}", line + 1, column + 1)
             }
-            Some(PaneContent::Markdown(_)) => "Markdown preview".into(),
-            Some(PaneContent::Preview(_)) => "Web preview".into(),
-            Some(PaneContent::AiDiff(_)) => "AI diff".into(),
-            Some(PaneContent::GitDiff(_)) => "Git diff".into(),
-            Some(PaneContent::GitHistory(_)) => "Git history".into(),
+            Some(PaneContent::Markdown(_)) => t!("ws.context_markdown_preview").to_string(),
+            Some(PaneContent::Preview(_)) => t!("ws.web_preview").to_string(),
+            Some(PaneContent::AiDiff(_)) => t!("ws.context_ai_diff").to_string(),
+            Some(PaneContent::GitDiff(_)) => t!("ws.context_git_diff").to_string(),
+            Some(PaneContent::GitHistory(_)) => t!("ws.context_git_history").to_string(),
             Some(PaneContent::Placeholder(message)) => message.clone(),
             None => path_breadcrumb(cwd),
         }
@@ -3177,8 +3302,8 @@ impl WorkspaceView {
     ) {
         self.close_chrome_menus();
         match action {
-            NewTabAction::Terminal => self.create_terminal(false, window, cx),
-            NewTabAction::Editor => self.create_editor(cx),
+            NewTabAction::Terminal => self.request_new_terminal(None, window, cx),
+            NewTabAction::Editor => self.create_editor(window, cx),
             NewTabAction::Ssh => self.open_ssh_manager(window, cx),
         }
     }
@@ -3224,7 +3349,7 @@ impl WorkspaceView {
                 },
                 notification: Notification {
                     title: title.to_owned(),
-                    body: agent_status_message(status).to_owned(),
+                    body: agent_status_message(status).to_string(),
                     target,
                     status,
                 },
@@ -3354,7 +3479,7 @@ impl WorkspaceView {
         let count = skipped.len();
         let expanded = self.explorer_skips_expanded;
         let chevron = if expanded { "▾" } else { "▸" };
-        let summary = format!("{chevron} {}", ui_text::explorer::skipped_summary(count));
+        let summary = format!("{chevron} {}", tn!(count, "explorer.skipped"));
         let details = expanded.then(|| {
             div()
                 .flex()
@@ -3449,7 +3574,7 @@ impl WorkspaceView {
         match action {
             ExplorerContextAction::Open => {
                 if let ExplorerContextTarget::File(path) = target {
-                    self.open_editor(path, cx);
+                    self.open_editor(path, window, cx);
                 }
             }
             ExplorerContextAction::CreateFile | ExplorerContextAction::CreateDirectory => {
@@ -3522,8 +3647,8 @@ impl WorkspaceView {
                     target.kind() == ExplorerContextTargetKind::File,
                 )
                 .err()
-                .map(|error| format!("Could not reveal path: {error}"))
-                .or_else(|| Some(format!("Revealed {}", path.display())));
+                .map(|error| tf!("ws.reveal_failed", "error" => error).to_string())
+                .or_else(|| Some(tf!("ws.revealed", "path" => path.display()).to_string()));
             }
             ExplorerContextAction::AttachToAi => {
                 if let ExplorerContextTarget::File(path) = target {
@@ -3539,7 +3664,7 @@ impl WorkspaceView {
             | ExplorerContextAction::Download => return,
             ExplorerContextAction::Refresh => {
                 self.refresh_workspace_data(cx);
-                self.command_message = Some("Explorer refresh scheduled".into());
+                self.command_message = Some(t!("ws.explorer_refresh_scheduled").to_string());
             }
         }
         cx.notify();
@@ -3556,7 +3681,7 @@ impl WorkspaceView {
             return;
         };
         if !self.remote_runtime_connected(tab_id, cx) {
-            self.command_message = Some("Reconnect the SSH/SFTP tab first.".into());
+            self.command_message = Some(t!("ws.reconnect_first").to_string());
             cx.notify();
             return;
         }
@@ -3631,7 +3756,7 @@ impl WorkspaceView {
             }
             ExplorerContextAction::Refresh => {
                 self.refresh_remote_explorer(cx);
-                self.command_message = Some("Remote Explorer refresh scheduled".into());
+                self.command_message = Some(t!("ws.remote_refresh_scheduled").to_string());
             }
             ExplorerContextAction::Open => {
                 if matches!(target, ExplorerContextTarget::RemoteDirectory(_)) {
@@ -3659,16 +3784,16 @@ impl WorkspaceView {
         };
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Delete remote item",
-            Some(&format!(
-                "Permanently delete {path}{}?",
-                if is_dir {
-                    " and all of its contents"
-                } else {
-                    ""
-                }
-            )),
-            &[PromptButton::ok("Delete"), PromptButton::cancel("Cancel")],
+            &t!("ws.delete_remote_title"),
+            Some(&if is_dir {
+                tf!("ws.delete_remote_confirm_dir", "path" => path.clone())
+            } else {
+                tf!("ws.delete_remote_confirm_file", "path" => path.clone())
+            }),
+            &[
+                PromptButton::ok(t!("ws.dialog_delete")),
+                PromptButton::cancel(t!("ws.dialog_cancel")),
+            ],
             cx,
         );
         cx.spawn(async move |workspace, cx| {
@@ -3688,7 +3813,7 @@ impl WorkspaceView {
                     tab_id,
                     profile,
                     operation,
-                    format!("Deleted remote {path}"),
+                    tf!("ws.delete_remote_done", "path" => path.clone()).to_string(),
                     cx,
                 );
             });
@@ -3706,9 +3831,9 @@ impl WorkspaceView {
     ) {
         cx.spawn_in(window, async move |workspace, cx| {
             let dialog = rfd::AsyncFileDialog::new().set_title(if directory {
-                "Choose a folder to upload"
+                t!("ws.upload_folder_dialog").to_string()
             } else {
-                "Choose a file to upload"
+                t!("ws.upload_file_dialog").to_string()
             });
             let selected = if directory {
                 dialog.pick_folder().await
@@ -3720,8 +3845,8 @@ impl WorkspaceView {
             };
             let local_path = selected.path().to_string_lossy().into_owned();
             let confirmed = rfd::AsyncMessageDialog::new()
-                .set_title("Upload to remote host")
-                .set_description("Existing remote files with the same name may be overwritten.")
+                .set_title(t!("ws.upload_confirm_title").to_string())
+                .set_description(t!("ws.upload_confirm_body").to_string())
                 .set_level(rfd::MessageLevel::Warning)
                 .set_buttons(rfd::MessageButtons::OkCancel)
                 .show()
@@ -3757,7 +3882,7 @@ impl WorkspaceView {
     ) {
         cx.spawn_in(window, async move |workspace, cx| {
             let Some(selected) = rfd::AsyncFileDialog::new()
-                .set_title("Choose a download folder")
+                .set_title(t!("ws.download_folder_dialog").to_string())
                 .pick_folder()
                 .await
             else {
@@ -3765,8 +3890,8 @@ impl WorkspaceView {
             };
             let local_path = selected.path().to_string_lossy().into_owned();
             let confirmed = rfd::AsyncMessageDialog::new()
-                .set_title("Download from remote host")
-                .set_description("Existing local files with the same name may be overwritten.")
+                .set_title(t!("ws.download_confirm_title").to_string())
+                .set_description(t!("ws.download_confirm_body").to_string())
                 .set_level(rfd::MessageLevel::Warning)
                 .set_buttons(rfd::MessageButtons::OkCancel)
                 .show()
@@ -3832,8 +3957,8 @@ impl WorkspaceView {
                 tab.title = path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .unwrap_or("Editor")
-                    .to_owned();
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| t!("ws.tab_editor").into());
                 tab.resource = Some(path.to_string_lossy().into_owned());
             }
             if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
@@ -3869,12 +3994,12 @@ impl WorkspaceView {
 
     fn delete_selected_with_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self.explorer_tree.selected().map(Path::to_path_buf) else {
-            self.command_message = Some("Select a file or directory first".into());
+            self.command_message = Some(t!("ws.select_first").to_string());
             cx.notify();
             return;
         };
         if self.has_dirty_editor_under(&path, cx) {
-            self.command_message = Some("Save open files under this path before deleting".into());
+            self.command_message = Some(t!("ws.save_before_delete").to_string());
             cx.notify();
             return;
         }
@@ -3882,30 +4007,30 @@ impl WorkspaceView {
             .strip_prefix(self.explorer_tree.root())
             .map(Path::to_path_buf)
         else {
-            self.command_message = Some("Selected path is outside the Explorer root".into());
+            self.command_message = Some(t!("ws.path_outside_root").to_string());
             cx.notify();
             return;
         };
 
-        let detail = format!("Delete {}?", path.display());
+        let detail = tf!("ws.delete_confirm", "path" => path.display()).to_string();
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Delete Explorer item",
+            &t!("ws.delete_title"),
             Some(&detail),
-            &[PromptButton::ok("Delete"), PromptButton::cancel("Cancel")],
+            &[
+                PromptButton::ok(t!("ws.dialog_delete")),
+                PromptButton::cancel(t!("ws.dialog_cancel")),
+            ],
             cx,
         );
         let recursive_prompt = (path.is_dir() && dir_is_non_empty(&path)).then(|| {
             (
-                "Delete non-empty directory".to_owned(),
-                format!(
-                    "{} and all of its contents will be permanently deleted.",
-                    path.display()
-                ),
+                t!("ws.delete_nonempty_title").to_string(),
+                tf!("ws.delete_nonempty_body", "path" => path.display()).to_string(),
             )
         });
         let window_handle = window.window_handle();
-        self.command_message = Some("Waiting for delete confirmation…".into());
+        self.command_message = Some(t!("ws.delete_waiting").to_string());
         cx.spawn(async move |workspace, cx| {
             let first_confirmed = matches!(answer.await, Ok(0));
             let confirmed = match (first_confirmed, recursive_prompt) {
@@ -3916,8 +4041,8 @@ impl WorkspaceView {
                             &title,
                             Some(&detail),
                             &[
-                                PromptButton::ok("Delete all"),
-                                PromptButton::cancel("Cancel"),
+                                PromptButton::ok(t!("ws.delete_all")),
+                                PromptButton::cancel(t!("ws.dialog_cancel")),
                             ],
                             cx,
                         )
@@ -3932,7 +4057,7 @@ impl WorkspaceView {
             };
             let _ = workspace.update(cx, |workspace, cx| {
                 if !confirmed {
-                    workspace.command_message = Some("Delete canceled".into());
+                    workspace.command_message = Some(t!("ws.delete_canceled").to_string());
                     cx.notify();
                     return;
                 }
@@ -3940,11 +4065,13 @@ impl WorkspaceView {
                     Ok(()) => {
                         workspace.close_tabs_for_deleted_path(&path, cx);
                         workspace.explorer_tree.clear_selection();
-                        workspace.command_message = Some(format!("Deleted {}", path.display()));
+                        workspace.command_message =
+                            Some(tf!("ws.deleted", "path" => path.display()).to_string());
                         workspace.refresh_workspace_data(cx);
                     }
                     Err(error) => {
-                        workspace.command_message = Some(format!("Delete failed: {error}"));
+                        workspace.command_message =
+                            Some(tf!("ws.delete_failed", "error" => error).to_string());
                     }
                 }
                 cx.notify();
@@ -4333,6 +4460,68 @@ impl WorkspaceView {
         .detach();
     }
 
+    /// Shell picker smoke (`TERMIOR_SHELL_PICKER_SMOKE=1`).
+    ///
+    /// 协议（stdout 行，供冒烟脚本采集）：等首终端落定后打印
+    /// `TERMIOR_SHELL_SETTINGS …`（解析出的 shell 设置），触发新建终端
+    /// 选择器；5 秒后打印 `TERMIOR_SHELL_MENU open=… items=…` 与逐条
+    /// `TERMIOR_SHELL_ITEM[i]`（后台探测结果），随后退出。判定不依赖截图目测。
+    pub(crate) fn start_shell_picker_probe(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let main_window = window.window_handle();
+        let entity = cx.entity();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(2))
+                .await;
+            let _ = main_window.update(cx, |_, window, cx| {
+                entity.update(cx, |workspace, cx| {
+                    println!(
+                        "TERMIOR_SHELL_SETTINGS prompt={} detection={:?} wsl={:?} appearance={:?}",
+                        workspace.settings.terminal.shell_prompt,
+                        workspace.settings.terminal.shell_detection,
+                        workspace.settings.wsl_distribution,
+                        workspace.settings.appearance
+                    );
+                    workspace.request_new_terminal(None, window, cx);
+                });
+            });
+            cx.background_executor()
+                .timer(Duration::from_secs(10))
+                .await;
+            entity.update(cx, |workspace, _| {
+                println!(
+                    "TERMIOR_SHELL_MENU open={} items={}",
+                    workspace.shell_menu.is_some(),
+                    workspace.discovered_shells.len()
+                );
+                for (index, shell) in workspace.discovered_shells.iter().enumerate() {
+                    println!("TERMIOR_SHELL_ITEM[{index}]={shell:?}");
+                }
+            });
+            // 端到端：模拟选中第一个条目（菜单项处理 = 关菜单 + 以该 shell 建终端）。
+            let _ = main_window.update(cx, |_, window, cx| {
+                entity.update(cx, |workspace, cx| {
+                    if let Some(shell) = workspace.discovered_shells.first().cloned() {
+                        workspace.shell_menu = None;
+                        workspace.create_terminal_with_shell(false, Some(shell), window, cx);
+                    }
+                });
+            });
+            cx.background_executor()
+                .timer(Duration::from_secs(3))
+                .await;
+            entity.update(cx, |workspace, _| {
+                println!(
+                    "TERMIOR_SHELL_TABS={} menu_open={}",
+                    workspace.model.tabs.len(),
+                    workspace.shell_menu.is_some()
+                );
+            });
+            cx.update(|cx| cx.quit());
+        })
+        .detach();
+    }
+
     fn open_settings_window(&self, cx: &mut Context<Self>) -> gpui::WindowHandle<SettingsView> {
         let settings = self.settings.clone();
         let migration_error = self.migration_error.clone();
@@ -4417,6 +4606,10 @@ impl WorkspaceView {
 
     fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         crate::updater::set_enabled(settings.automatic_updates, cx);
+        // 设置保存回调（含语言切换）：同步 i18n 运行时，notify 触发整窗重渲染。
+        // 测试二进制跳过，与 `WorkspaceView::new` 的门控保持一致。
+        #[cfg(not(test))]
+        termior_i18n::init(settings.language.as_deref());
         self.settings = settings;
         if let Some(library) = self.data_dir.as_ref().and_then(|dir| {
             termior_store::DataFiles::new(dir)
@@ -4492,10 +4685,10 @@ impl WorkspaceView {
         self.command_input = prefill.to_owned();
         self.command_marked_text.clear();
         self.command_message = Some(match mode {
-            CommandMode::CreateFile => "Type a file name, then press Enter".into(),
-            CommandMode::CreateDirectory => "Type a directory name, then press Enter".into(),
-            CommandMode::Rename => "Edit the name, then press Enter".into(),
-            CommandMode::Move => "Enter the destination remote path, then press Enter".into(),
+            CommandMode::CreateFile => t!("ws.hint_create_file").to_string(),
+            CommandMode::CreateDirectory => t!("ws.hint_create_directory").to_string(),
+            CommandMode::Rename => t!("ws.hint_rename").to_string(),
+            CommandMode::Move => t!("ws.hint_move").to_string(),
             _ => String::new(),
         });
         self.pending_name_parent = Some(parent);
@@ -4518,8 +4711,8 @@ impl WorkspaceView {
         self.command_input = prefill.to_owned();
         self.command_marked_text.clear();
         self.command_message = Some(match mode {
-            CommandMode::NewGroup => "输入新分组名，然后回车".into(),
-            CommandMode::RenameGroup => "修改分组名，回车确认；与现有分组重名则合并".into(),
+            CommandMode::NewGroup => t!("ws.hint_new_group").to_string(),
+            CommandMode::RenameGroup => t!("ws.hint_rename_group").to_string(),
             _ => String::new(),
         });
         self.pending_group_profile = profile;
@@ -4624,9 +4817,7 @@ impl WorkspaceView {
                         .remote_pending_rename_target
                         .clone()
                         .ok_or_else(|| {
-                            termior_ssh::Error::Invalid(
-                                "Select a remote file or directory first".into(),
-                            )
+                            termior_ssh::Error::Invalid(t!("ws.select_remote_first").to_string())
                         })
                         .and_then(|from| {
                             termior_ssh::sftp::join(&parent, &input)
@@ -4636,9 +4827,7 @@ impl WorkspaceView {
                         .remote_pending_rename_target
                         .clone()
                         .ok_or_else(|| {
-                            termior_ssh::Error::Invalid(
-                                "Select a remote file or directory first".into(),
-                            )
+                            termior_ssh::Error::Invalid(t!("ws.select_remote_first").to_string())
                         })
                         .and_then(|from| {
                             let to = if input.starts_with('/') {
@@ -4657,7 +4846,7 @@ impl WorkspaceView {
                             tab_id,
                             profile,
                             operation,
-                            "Remote operation completed".into(),
+                            t!("ws.remote_operation_completed").to_string(),
                             cx,
                         ) {
                             return;
@@ -4684,10 +4873,10 @@ impl WorkspaceView {
                         .map(|hit| index.root().join(&hit.path))
                 });
                 if let Some(path) = path {
-                    self.open_editor(path, cx);
+                    self.open_editor(path, window, cx);
                     Ok(())
                 } else {
-                    Err("No matching file".to_owned())
+                    Err(t!("ws.no_matching_file").to_string())
                 }
             }
             CommandMode::SearchContent => {
@@ -4710,7 +4899,7 @@ impl WorkspaceView {
                 };
                 result.map(|path| {
                     self.explorer_tree.select(path.clone());
-                    self.open_editor(path, cx);
+                    self.open_editor(path, window, cx);
                 })
             }
             CommandMode::CreateDirectory => {
@@ -4737,7 +4926,7 @@ impl WorkspaceView {
                     .or_else(|| self.explorer_tree.selected().map(Path::to_path_buf));
                 match selected {
                     Some(path) if self.has_dirty_editor_under(&path, cx) => {
-                        Err("Save open files under this path before renaming".to_owned())
+                        Err(t!("ws.save_before_rename").to_string())
                     }
                     Some(path) => {
                         let relative = path
@@ -4754,10 +4943,10 @@ impl WorkspaceView {
                                 })
                         })
                     }
-                    None => Err("Select a file or directory first".to_owned()),
+                    None => Err(t!("ws.select_first").to_string()),
                 }
             }
-            CommandMode::Move => Err("Move is only available in a remote Explorer".to_owned()),
+            CommandMode::Move => Err(t!("ws.move_remote_only").to_string()),
             CommandMode::NewGroup | CommandMode::RenameGroup => {
                 unreachable!("group commands complete before command dispatch")
             }
@@ -4783,13 +4972,12 @@ impl WorkspaceView {
             Ok(()) => {
                 if completed_mode == CommandMode::SearchContent {
                     self.command_message = Some(match self.content_matches.len() {
-                        0 => "No content matches".into(),
-                        1 => "1 content match".into(),
-                        count => format!("{count} content matches"),
+                        0 => t!("ws.no_content_matches").to_string(),
+                        count => tn!(count, "ws.content_matches").to_string(),
                     });
                     self.command_marked_text.clear();
                 } else {
-                    self.command_message = Some("Done".into());
+                    self.command_message = Some(t!("ws.done").to_string());
                     self.command_mode = CommandMode::Browse;
                     self.command_input.clear();
                     self.command_marked_text.clear();
@@ -4818,7 +5006,7 @@ impl WorkspaceView {
         let generation = self.content_search_generation;
         self.content_matches.clear();
         self.content_searching = true;
-        self.command_message = Some("Searching workspace…".into());
+        self.command_message = Some(t!("ws.searching_workspace").to_string());
         let paths = self
             .explorer
             .as_ref()
@@ -4849,15 +5037,10 @@ impl WorkspaceView {
                             return false;
                         }
                         workspace.content_matches.push(hit);
-                        workspace.command_message = Some(format!(
-                            "Searching… {} match{}",
-                            workspace.content_matches.len(),
-                            if workspace.content_matches.len() == 1 {
-                                ""
-                            } else {
-                                "es"
-                            }
-                        ));
+                        workspace.command_message = Some(
+                            tn!(workspace.content_matches.len(), "ws.searching_progress")
+                                .to_string(),
+                        );
                         cx.notify();
                         true
                     })
@@ -4873,9 +5056,10 @@ impl WorkspaceView {
                 }
                 workspace.content_searching = false;
                 workspace.command_message = Some(match result {
-                    Ok(_) if workspace.content_matches.is_empty() => "No content matches".into(),
-                    Ok(_) if workspace.content_matches.len() == 1 => "1 content match".into(),
-                    Ok(_) => format!("{} content matches", workspace.content_matches.len()),
+                    Ok(_) if workspace.content_matches.is_empty() => {
+                        t!("ws.no_content_matches").to_string()
+                    }
+                    Ok(_) => tn!(workspace.content_matches.len(), "ws.content_matches").to_string(),
                     Err(error) => error,
                 });
                 cx.notify();
@@ -4913,12 +5097,16 @@ impl WorkspaceView {
         let task = cx.background_executor().spawn(async move {
             GitRepository::open(root, &auth).and_then(|repo| repo.remote(operation))
         });
-        self.command_message = Some(format!("Running {operation:?}…"));
+        self.command_message =
+            Some(tf!("ws.running_remote_op", "operation" => format!("{operation:?}")).to_string());
         cx.spawn(async move |workspace, cx| {
             let result = task.await;
             let _ = workspace.update(cx, |workspace, cx| {
                 workspace.command_message = Some(match result {
-                    Ok(output) if output.trim().is_empty() => format!("{operation:?} completed"),
+                    Ok(output) if output.trim().is_empty() => {
+                        tf!("ws.remote_op_completed", "operation" => format!("{operation:?}"))
+                            .to_string()
+                    }
                     Ok(output) => output.trim().to_owned(),
                     Err(error) => error.to_string(),
                 });
@@ -5057,7 +5245,7 @@ impl WorkspaceView {
                 if entry.is_dir {
                     self.explorer_tree.toggle_expanded(entry.path);
                 } else {
-                    self.open_editor(entry.path, cx);
+                    self.open_editor(entry.path, window, cx);
                 }
             }
             _ => return false,
@@ -5090,9 +5278,9 @@ impl WorkspaceView {
             return;
         };
         match action {
-            KeyAction::NewTerminalTab => self.create_terminal(false, window, cx),
+            KeyAction::NewTerminalTab => self.request_new_terminal(None, window, cx),
             KeyAction::NewPrivateTerminal => self.create_terminal(true, window, cx),
-            KeyAction::NewEditorTab => self.create_editor(cx),
+            KeyAction::NewEditorTab => self.create_editor(window, cx),
             KeyAction::NewPreviewTab => self.request_preview(window, cx),
             KeyAction::ClosePaneOrTab => self.close_active(window, cx),
             KeyAction::GotoTab1 => {
@@ -5223,7 +5411,7 @@ impl WorkspaceView {
                     .unwrap_or_else(|| {
                         empty_state_message(
                             Icon::Terminal,
-                            ui_text::empty::PANE_UNAVAILABLE,
+                            t!("empty.pane_unavailable"),
                             None,
                             &self.palette,
                         )
@@ -5385,7 +5573,7 @@ impl WorkspaceView {
             .child(explorer_tool_button(
                 "remote-explorer-up",
                 Icon::ChevronUp,
-                "Parent directory",
+                t!("ws.parent_directory"),
                 &self.palette,
                 cx,
                 move |this, cx| {
@@ -5398,7 +5586,7 @@ impl WorkspaceView {
             .child(explorer_tool_button(
                 "remote-explorer-new-file",
                 Icon::File,
-                ui_text::explorer::NEW_FILE,
+                t!("explorer.new_file"),
                 &self.palette,
                 cx,
                 |this, cx| this.begin_command(CommandMode::CreateFile, cx),
@@ -5406,7 +5594,7 @@ impl WorkspaceView {
             .child(explorer_tool_button(
                 "remote-explorer-new-dir",
                 Icon::Folder,
-                ui_text::explorer::NEW_DIRECTORY,
+                t!("explorer.new_directory"),
                 &self.palette,
                 cx,
                 |this, cx| this.begin_command(CommandMode::CreateDirectory, cx),
@@ -5414,7 +5602,7 @@ impl WorkspaceView {
             .child(explorer_tool_button(
                 "remote-explorer-refresh",
                 Icon::Refresh,
-                ui_text::explorer::REFRESH,
+                t!("explorer.refresh"),
                 &self.palette,
                 cx,
                 |this, cx| {
@@ -5425,7 +5613,7 @@ impl WorkspaceView {
                 toolbar.child(explorer_tool_button(
                     "remote-explorer-cancel",
                     Icon::Close,
-                    "Cancel remote request",
+                    t!("ws.cancel_remote_request"),
                     &self.palette,
                     cx,
                     move |this, cx| this.cancel_remote_explorer(tab_id, cx),
@@ -5490,11 +5678,11 @@ impl WorkspaceView {
                                     .when(detailed, |row| {
                                         row.child(div().w(px(68.)).flex_shrink_0().child(
                                             if entry.is_symlink {
-                                                "链接"
+                                                t!("ws.type_symlink")
                                             } else if is_dir {
-                                                "文件夹"
+                                                t!("ws.type_folder")
                                             } else {
-                                                "文件"
+                                                t!("ws.type_file")
                                             },
                                         ))
                                         .child(
@@ -5650,14 +5838,21 @@ impl WorkspaceView {
                         })
                         .text_xs()
                         .text_color(ui::muted(&self.palette))
-                        .child(SharedString::from(format!(
-                            "{host_label}:{root}{}",
-                            if loading {
-                                "  · loading…"
-                            } else {
-                                "  · remote"
-                            }
-                        ))),
+                        .child(SharedString::from(if loading {
+                            tf!(
+                                "ws.remote_footer_loading",
+                                "host" => host_label,
+                                "root" => root.to_owned()
+                            )
+                            .to_string()
+                        } else {
+                            tf!(
+                                "ws.remote_footer_ready",
+                                "host" => host_label,
+                                "root" => root.to_owned()
+                            )
+                            .to_string()
+                        })),
                 )
                 .child(
                     div()
@@ -5672,9 +5867,9 @@ impl WorkspaceView {
                         .text_xs()
                         .text_color(ui::muted(&self.palette))
                         .child(SharedString::from(
-                            state.map(|s| s.status.clone()).unwrap_or_else(|| {
-                                "Reconnect the SSH/SFTP tab to browse remote files.".into()
-                            }),
+                            state
+                                .map(|s| s.status.clone())
+                                .unwrap_or_else(|| t!("ws.remote_reconnect_hint").to_string()),
                         )),
                 )
                 .children(state.and_then(|state| state.error.clone()).map(|error| {
@@ -5742,9 +5937,7 @@ impl WorkspaceView {
                                 .children(
                                     (listing.is_some_and(|listing| listing.entries.is_empty())
                                         && !loading)
-                                        .then(|| {
-                                            empty_hint("Remote directory is empty", &self.palette)
-                                        }),
+                                        .then(|| empty_hint(t!("ws.remote_empty"), &self.palette)),
                                 ),
                         )
                         .child(scrollbar),
@@ -5790,7 +5983,7 @@ impl WorkspaceView {
                     div()
                         .p_2()
                         .text_xs()
-                        .child("SFTP 文件浏览已在主区域打开。左侧会话列表可切换或新建连接。")
+                        .child(t!("ws.sftp_browser_hint"))
                         .into_any_element()
                 } else if let Some(remote) = self.remote_explorer_content(cx) {
                     remote
@@ -5803,7 +5996,7 @@ impl WorkspaceView {
                         .child(explorer_tool_button(
                             "explorer-find",
                             Icon::Search,
-                            ui_text::explorer::FIND,
+                            t!("explorer.find"),
                             &self.palette,
                             cx,
                             |this, cx| this.begin_command(CommandMode::FindFile, cx),
@@ -5811,7 +6004,7 @@ impl WorkspaceView {
                         .child(explorer_tool_button(
                             "explorer-search",
                             Icon::FileText,
-                            ui_text::explorer::SEARCH,
+                            t!("explorer.search"),
                             &self.palette,
                             cx,
                             |this, cx| this.begin_command(CommandMode::SearchContent, cx),
@@ -5819,7 +6012,7 @@ impl WorkspaceView {
                         .child(explorer_tool_button(
                             "explorer-new-file",
                             Icon::File,
-                            ui_text::explorer::NEW_FILE,
+                            t!("explorer.new_file"),
                             &self.palette,
                             cx,
                             |this, cx| this.begin_command(CommandMode::CreateFile, cx),
@@ -5827,7 +6020,7 @@ impl WorkspaceView {
                         .child(explorer_tool_button(
                             "explorer-new-dir",
                             Icon::Folder,
-                            ui_text::explorer::NEW_DIRECTORY,
+                            t!("explorer.new_directory"),
                             &self.palette,
                             cx,
                             |this, cx| this.begin_command(CommandMode::CreateDirectory, cx),
@@ -5835,7 +6028,7 @@ impl WorkspaceView {
                         .child(explorer_tool_button(
                             "explorer-refresh",
                             Icon::Refresh,
-                            ui_text::explorer::REFRESH,
+                            t!("explorer.refresh"),
                             &self.palette,
                             cx,
                             |this, cx| this.refresh_workspace_data(cx),
@@ -5888,8 +6081,8 @@ impl WorkspaceView {
                                             .child(SharedString::from(hit.path))
                                             .on_mouse_down(
                                                 MouseButton::Left,
-                                                cx.listener(move |this, _, _, cx| {
-                                                    this.open_editor(path.clone(), cx)
+                                                cx.listener(move |this, _, window, cx| {
+                                                    this.open_editor(path.clone(), window, cx)
                                                 }),
                                             )
                                     })
@@ -5921,8 +6114,8 @@ impl WorkspaceView {
                                     )))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.open_editor(path.clone(), cx)
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.open_editor(path.clone(), window, cx)
                                         }),
                                     )
                             })
@@ -5978,7 +6171,7 @@ impl WorkspaceView {
                                                 this.explorer_tree.toggle_expanded(path.clone());
                                                 window.focus(&this.focus_handle, cx);
                                             } else {
-                                                this.open_editor(path.clone(), cx);
+                                                this.open_editor(path.clone(), window, cx);
                                             }
                                             cx.notify();
                                         }),
@@ -6020,19 +6213,15 @@ impl WorkspaceView {
                                 .pb_1()
                                 .text_xs()
                                 .text_color(ui::muted(&self.palette))
-                                .child(SharedString::from(format!(
-                                    "{}{}",
-                                    root_label,
-                                    if self.explorer_deep_indexing {
-                                        "  · indexing…"
-                                    } else if self.explorer_index_incomplete {
-                                        "  · index incomplete"
-                                    } else if visible_entry_count > 500 {
-                                        "  · showing first 500"
-                                    } else {
-                                        ""
-                                    }
-                                ))),
+                                .child(SharedString::from(if self.explorer_deep_indexing {
+                                    format!("{root_label}{}", t!("ws.explorer_footer_indexing"))
+                                } else if self.explorer_index_incomplete {
+                                    format!("{root_label}{}", t!("ws.explorer_footer_incomplete"))
+                                } else if visible_entry_count > 500 {
+                                    format!("{root_label}{}", t!("ws.explorer_footer_truncated"))
+                                } else {
+                                    root_label.clone()
+                                })),
                         )
                         .children(self.explorer_error.clone().map(|error| {
                             div()
@@ -6050,9 +6239,7 @@ impl WorkspaceView {
                                         .py_1()
                                         .text_xs()
                                         .text_color(ui::muted(&self.palette))
-                                        .child(SharedString::from(
-                                            ui_text::explorer::INDEX_INCOMPLETE,
-                                        ))
+                                        .child(t!("explorer.index_incomplete"))
                                 },
                             ),
                         )
@@ -6083,7 +6270,7 @@ impl WorkspaceView {
                                             .as_ref()
                                             .is_some_and(|index| index.entries().is_empty()))
                                     .then(|| {
-                                        empty_hint(ui_text::empty::NO_VISIBLE_FILES, &self.palette)
+                                        empty_hint(t!("empty.no_visible_files"), &self.palette)
                                     }),
                                 ),
                         )
@@ -6096,7 +6283,7 @@ impl WorkspaceView {
                     .vcs_branch
                     .as_ref()
                     .and_then(|state| state.name.clone())
-                    .unwrap_or_else(|| "No repository".into());
+                    .unwrap_or_else(|| t!("ws.no_repository").to_string());
                 let toolbar = div()
                     .flex()
                     .flex_row()
@@ -6104,49 +6291,49 @@ impl WorkspaceView {
                     .gap_1()
                     .mb_1()
                     .child(sidebar_button(
-                        ui_text::git::STAGE_ALL,
+                        t!("git.stage_all"),
                         "git-stage-all",
                         &self.palette,
                         cx,
                         |this, cx| this.stage_all(cx),
                     ))
                     .child(sidebar_button(
-                        ui_text::git::COMMIT,
+                        t!("git.commit"),
                         "git-commit",
                         &self.palette,
                         cx,
                         |this, cx| this.begin_command(CommandMode::GitCommit, cx),
                     ))
                     .child(sidebar_button(
-                        ui_text::git::FETCH,
+                        t!("git.fetch"),
                         "git-fetch",
                         &self.palette,
                         cx,
                         |this, cx| this.run_remote(RemoteOperation::Fetch, cx),
                     ))
                     .child(sidebar_button(
-                        ui_text::git::PULL,
+                        t!("git.pull"),
                         "git-pull",
                         &self.palette,
                         cx,
                         |this, cx| this.run_remote(RemoteOperation::PullFfOnly, cx),
                     ))
                     .child(sidebar_button(
-                        ui_text::git::PUSH,
+                        t!("git.push"),
                         "git-push",
                         &self.palette,
                         cx,
                         |this, cx| this.run_remote(RemoteOperation::Push, cx),
                     ))
                     .child(sidebar_button(
-                        ui_text::git::NEW_BRANCH,
+                        t!("git.new_branch"),
                         "git-new-branch",
                         &self.palette,
                         cx,
                         |this, cx| this.begin_command(CommandMode::GitCreateBranch, cx),
                     ))
                     .child(sidebar_button(
-                        ui_text::git::SWITCH_BRANCH,
+                        t!("git.switch_branch"),
                         "git-switch-branch",
                         &self.palette,
                         cx,
@@ -6166,8 +6353,9 @@ impl WorkspaceView {
                             .text_xs()
                             .cursor_pointer()
                             .child(SharedString::from(format!(
-                                "{:?}  {}",
-                                file.group, file.path
+                                "{}  {}",
+                                change_group_label(file.group),
+                                file.path
                             )))
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -6180,7 +6368,7 @@ impl WorkspaceView {
                 div()
                     .flex()
                     .flex_col()
-                    .child(SharedString::from(format!("Branch: {branch}")))
+                    .child(tf!("ws.branch_label", "branch" => branch))
                     .child(toolbar)
                     .children(rows)
                     .into_any_element()
@@ -6203,13 +6391,13 @@ impl WorkspaceView {
                     })
                     .collect::<Vec<_>>();
                 let empty = rows.is_empty().then(|| {
-                    empty_hint(ui_text::empty::NO_GIT_HISTORY, &self.palette).into_any_element()
+                    empty_hint(t!("empty.no_git_history"), &self.palette).into_any_element()
                 });
                 div()
                     .flex()
                     .flex_col()
                     .child(sidebar_button(
-                        ui_text::git::OPEN_FULL_HISTORY,
+                        t!("git.open_full_history"),
                         "git-open-history",
                         &self.palette,
                         cx,
@@ -6248,10 +6436,13 @@ impl WorkspaceView {
                     self.schedule_remote_explorer_scan(tab_id, remote.profile.clone(), path, cx);
                 }
             }
-            let label = format!(
-                "{:?} · {}@{} · Remote Explorer via SFTP · 本地 Agent 未连接此主机",
-                remote.kind, remote.profile.user, remote.profile.host
-            );
+            let label = tf!(
+                "ws.remote_context",
+                "kind" => format!("{:?}", remote.kind),
+                "user" => remote.profile.user.clone(),
+                "host" => remote.profile.host.clone()
+            )
+            .to_string();
             self.composer.update(cx, |composer, _| {
                 composer.update_terminal_context(String::new(), String::new(), None)
             });
@@ -6677,7 +6868,7 @@ impl gpui::Render for WorkspaceView {
                         div()
                             .id(close_id.clone())
                             .group(close_id.clone())
-                            .aria_label("Close tab")
+                            .aria_label(t!("chrome.close_tab"))
                             .flex_shrink_0()
                             .w(px(18.0))
                             .h(px(18.0))
@@ -6739,10 +6930,12 @@ impl gpui::Render for WorkspaceView {
                 div()
                     .id("new-tab")
                     .group("new-tab")
-                    .aria_label("New terminal tab")
+                    .aria_label(t!("chrome.new_terminal_tab"))
                     .tooltip({
                         let palette = p.clone();
-                        move |_window, cx| Tooltip::view("New terminal tab", &palette, cx)
+                        move |_window, cx| {
+                            Tooltip::view(t!("chrome.new_terminal_tab"), &palette, cx)
+                        }
                     })
                     .w(px(26.0))
                     .h(px(26.0))
@@ -6764,16 +6957,18 @@ impl gpui::Render for WorkspaceView {
                     )
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _event, window, cx| {
-                            cx.stop_propagation();
-                            this.handle_new_tab_action(NewTabAction::Terminal, window, cx);
-                        }),
+                        cx.listener(
+                            |this, event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.request_new_terminal(Some(event.position), window, cx);
+                            },
+                        ),
                     ),
             )
             .child(
                 div()
                     .id("new-tab-menu-toggle")
-                    .aria_label("Open new tab menu")
+                    .aria_label(t!("ws.open_new_tab_menu"))
                     .aria_expanded(self.new_tab_menu.is_some())
                     .w(px(18.0))
                     .h(px(26.0))
@@ -6813,9 +7008,9 @@ impl gpui::Render for WorkspaceView {
             div()
                 .id(button_id)
                 .group(button_id)
-                .aria_label("Toggle sidebar")
+                .aria_label(t!("ws.toggle_sidebar"))
                 .tooltip(move |_window, cx| {
-                    Tooltip::view("Toggle Sidebar  (Ctrl+B)", &tooltip_palette, cx)
+                    Tooltip::view(t!("ws.toggle_sidebar_hint"), &tooltip_palette, cx)
                 })
                 .size(px(tokens::height::REGULAR))
                 .flex_none()
@@ -6849,9 +7044,9 @@ impl gpui::Render for WorkspaceView {
             let mut buttons: Vec<AnyElement> = Vec::new();
             if markdown_source_active || markdown_preview_active {
                 let (glyph, label) = if markdown_source_active {
-                    (Icon::FileCode, "Preview")
+                    (Icon::FileCode, t!("ws.preview"))
                 } else {
-                    (Icon::FileText, "Source")
+                    (Icon::FileText, t!("ws.source"))
                 };
                 let hover_bg = ui::hover_wash(&p);
                 let id = "preview-toggle-markdown";
@@ -6859,7 +7054,7 @@ impl gpui::Render for WorkspaceView {
                     div()
                         .id(id)
                         .group(id)
-                        .aria_label(label)
+                        .aria_label(label.clone())
                         .h(px(tokens::height::REGULAR))
                         .px(px(tokens::space::SM))
                         .flex()
@@ -6873,7 +7068,7 @@ impl gpui::Render for WorkspaceView {
                             icon_size::SM,
                             gpui_color_alpha(p.foreground, 0.72),
                         ))
-                        .child(SharedString::from(label))
+                        .child(label.clone())
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _event, window, cx| {
@@ -6890,7 +7085,7 @@ impl gpui::Render for WorkspaceView {
                     div()
                         .id(id)
                         .group(id)
-                        .aria_label("Web preview")
+                        .aria_label(t!("ws.web_preview"))
                         .h(px(tokens::height::REGULAR))
                         .px(px(tokens::space::SM))
                         .flex()
@@ -6904,7 +7099,7 @@ impl gpui::Render for WorkspaceView {
                             icon_size::SM,
                             gpui_color_alpha(p.foreground, 0.72),
                         ))
-                        .child("Web preview")
+                        .child(t!("ws.web_preview"))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _event, window, cx| {
@@ -6921,7 +7116,7 @@ impl gpui::Render for WorkspaceView {
                     div()
                         .id(id)
                         .group(id)
-                        .aria_label("Open in browser")
+                        .aria_label(t!("action.open_in_browser"))
                         .h(px(tokens::height::REGULAR))
                         .px(px(tokens::space::SM))
                         .flex()
@@ -6935,7 +7130,7 @@ impl gpui::Render for WorkspaceView {
                             icon_size::SM,
                             gpui_color_alpha(p.foreground, 0.72),
                         ))
-                        .child("Open in Browser")
+                        .child(t!("ws.open_in_browser"))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |_this, _event, _window, _cx| {
@@ -6975,8 +7170,8 @@ impl gpui::Render for WorkspaceView {
                 .unwrap_or_else(|| {
                     empty_state_message(
                         Icon::Terminal,
-                        ui_text::empty::NO_TABS,
-                        Some(SharedString::from(ui_text::empty::NO_TABS_DETAIL)),
+                        t!("empty.no_tabs"),
+                        Some(t!("empty.no_tabs_detail")),
                         &p,
                     )
                     .into_any_element()
@@ -7001,21 +7196,17 @@ impl gpui::Render for WorkspaceView {
                         .border_color(ui::border(&p))
                         .children(
                             [
-                                (Icon::Terminal, SidebarPanel::Ssh, "SSH / SFTP"),
-                                (
-                                    Icon::Files,
-                                    SidebarPanel::Explorer,
-                                    ui_text::activity::EXPLORER,
-                                ),
+                                (Icon::Terminal, SidebarPanel::Ssh, t!("activity.ssh")),
+                                (Icon::Files, SidebarPanel::Explorer, t!("activity.explorer")),
                                 (
                                     Icon::GitBranch,
                                     SidebarPanel::SourceControl,
-                                    ui_text::activity::SOURCE_CONTROL,
+                                    t!("activity.source_control"),
                                 ),
                                 (
                                     Icon::GitCommit,
                                     SidebarPanel::GitHistory,
-                                    ui_text::activity::GIT_HISTORY,
+                                    t!("activity.git_history"),
                                 ),
                             ]
                             .into_iter()
@@ -7028,10 +7219,13 @@ impl gpui::Render for WorkspaceView {
                                 };
                                 div()
                                     .id(SharedString::from(format!("sidebar-{panel:?}")))
-                                    .aria_label(label)
+                                    .aria_label(label.clone())
                                     .tooltip({
                                         let palette = p.clone();
-                                        move |_window, cx| Tooltip::view(label, &palette, cx)
+                                        let tooltip_label = label.clone();
+                                        move |_window, cx| {
+                                            Tooltip::view(tooltip_label.clone(), &palette, cx)
+                                        }
                                     })
                                     .w(px(32.0))
                                     .h(px(32.0))
@@ -7133,17 +7327,17 @@ impl gpui::Render for WorkspaceView {
                 branch
                     .name
                     .clone()
-                    .or_else(|| branch.detached.then(|| "detached".into()))
+                    .or_else(|| branch.detached.then(|| t!("ws.git_detached").to_string()))
             })
-            .unwrap_or_else(|| "no branch".into());
+            .unwrap_or_else(|| t!("ws.git_no_branch").to_string());
         let status_left = self.status_context_label(&cwd, cx);
         let workspace_name = self
             .model
             .active_project_dir()
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("Workspace")
-            .to_owned();
+            .map(str::to_owned)
+            .unwrap_or_else(|| t!("ws.workspace").into());
         let bell_rows = agent_indicators
             .into_iter()
             .map(|indicator| {
@@ -7182,7 +7376,13 @@ impl gpui::Render for WorkspaceView {
                 .bg(gpui_color(p.overlay))
                 .border_b_1()
                 .border_color(ui::border(&p))
-                .child(div().px_3().py_2().text_sm().child("Agent activity"))
+                .child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_sm()
+                        .child(t!("chrome.agent_activity")),
+                )
                 .children(bell_rows)
                 .with_animation(
                     "bell-panel-fade-in",
@@ -7287,7 +7487,7 @@ impl gpui::Render for WorkspaceView {
                     .id("new-tab-menu")
                     .w(px(220.0))
                     .child(new_tab_menu_item(
-                        "Terminal",
+                        t!("ws.tab_terminal"),
                         "new-tab-terminal",
                         true,
                         NewTabAction::Terminal,
@@ -7295,7 +7495,7 @@ impl gpui::Render for WorkspaceView {
                         cx,
                     ))
                     .child(new_tab_menu_item(
-                        "Editor",
+                        t!("ws.tab_editor"),
                         "new-tab-editor",
                         true,
                         NewTabAction::Editor,
@@ -7303,7 +7503,7 @@ impl gpui::Render for WorkspaceView {
                         cx,
                     ))
                     .child(new_tab_menu_item(
-                        "SSH / SFTP 连接…",
+                        t!("ws.new_tab_ssh"),
                         "new-tab-ssh",
                         true,
                         NewTabAction::Ssh,
@@ -7312,6 +7512,48 @@ impl gpui::Render for WorkspaceView {
                     ))
                     .with_animation(
                         "new-tab-menu-fade-in",
+                        Animation::new(UI_FADE_IN).with_easing(ease_in_out),
+                        |style, delta| style.opacity(delta),
+                    ),
+            )
+        });
+        // 新建终端 shell 选择器（`shell_prompt` 开启时替代直接创建）：默认项 +
+        // 后台探测到的 shell（含 WSL 发行版）。列表异步刷新，先渲染已有缓存。
+        let shell_menu = self.shell_menu.map(|position| {
+            anchored().position(position).child(
+                menu_panel(&p)
+                    .id("shell-picker-menu")
+                    .w(px(280.0))
+                    .child(
+                        div()
+                            .id("shell-picker-title")
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(ui::muted(&p))
+                            .child(t!("ws.choose_shell")),
+                    )
+                    .child(shell_menu_item(
+                        crate::shell_select::ShellOption::Default,
+                        "shell-menu-default",
+                        &p,
+                        cx,
+                    ))
+                    .children(
+                        self.discovered_shells
+                            .iter()
+                            .enumerate()
+                            .map(|(index, shell)| {
+                                shell_menu_item(
+                                    crate::shell_select::ShellOption::from(shell),
+                                    SharedString::from(format!("shell-menu-{index}")),
+                                    &p,
+                                    cx,
+                                )
+                            }),
+                    )
+                    .with_animation(
+                        "shell-menu-fade-in",
                         Animation::new(UI_FADE_IN).with_easing(ease_in_out),
                         |style, delta| style.opacity(delta),
                     ),
@@ -7326,7 +7568,7 @@ impl gpui::Render for WorkspaceView {
                         let can_copy = terminal.read(cx).has_selection();
                         panel
                             .child(terminal_menu_item(
-                                "复制",
+                                t!("ws.copy"),
                                 "terminal-copy",
                                 can_copy,
                                 TerminalMenuAction::Copy,
@@ -7335,7 +7577,7 @@ impl gpui::Render for WorkspaceView {
                                 cx,
                             ))
                             .child(terminal_menu_item(
-                                "粘贴",
+                                t!("ws.paste"),
                                 "terminal-paste",
                                 true,
                                 TerminalMenuAction::Paste,
@@ -7344,7 +7586,7 @@ impl gpui::Render for WorkspaceView {
                                 cx,
                             ))
                             .child(terminal_menu_item(
-                                "全选",
+                                t!("ws.select_all"),
                                 "terminal-select-all",
                                 true,
                                 TerminalMenuAction::SelectAll,
@@ -7353,7 +7595,7 @@ impl gpui::Render for WorkspaceView {
                                 cx,
                             ))
                             .child(terminal_menu_item(
-                                "查找…",
+                                t!("ws.find"),
                                 "terminal-find",
                                 true,
                                 TerminalMenuAction::Find,
@@ -7364,7 +7606,7 @@ impl gpui::Render for WorkspaceView {
                             .child(menu_separator(&p))
                     })
                     .child(split_menu_item(
-                        "Split right",
+                        t!("ws.split_right"),
                         "pane-menu-split-right",
                         can_split_right,
                         SplitMenuAction::Right,
@@ -7372,7 +7614,7 @@ impl gpui::Render for WorkspaceView {
                         cx,
                     ))
                     .child(split_menu_item(
-                        "Split down",
+                        t!("ws.split_down"),
                         "pane-menu-split-down",
                         can_split_down,
                         SplitMenuAction::Down,
@@ -7381,7 +7623,7 @@ impl gpui::Render for WorkspaceView {
                     ))
                     .child(menu_separator(&p))
                     .child(split_menu_item(
-                        "Close focused pane",
+                        t!("ws.close_focused_pane"),
                         "pane-menu-close",
                         has_multiple_panes,
                         SplitMenuAction::CloseActive,
@@ -7389,7 +7631,7 @@ impl gpui::Render for WorkspaceView {
                         cx,
                     ))
                     .child(split_menu_item(
-                        "Keep only focused pane",
+                        t!("ws.keep_only_focused_pane"),
                         "pane-menu-close-others",
                         has_multiple_panes,
                         SplitMenuAction::CloseOthers,
@@ -7482,24 +7724,26 @@ impl gpui::Render for WorkspaceView {
             .on_mouse_move(cx.listener(Self::move_titlebar))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::stop_panel_resizes))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::stop_titlebar_move))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _event, _window, cx| {
-                    let closed_ssh = this.ssh_context_menu.take().is_some();
-                    let closed_group = this.ssh_group_menu.take().is_some();
-                    let closed_explorer = this.explorer_context_menu.take().is_some();
-                    let closed_new_tab = this.new_tab_menu.take().is_some();
-                    let closed_pane = this.pane_context_menu.take().is_some();
-                    if closed_ssh
-                        || closed_group
-                        || closed_explorer
-                        || closed_new_tab
-                        || closed_pane
-                    {
-                        cx.notify();
-                    }
-                }),
-            )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        let closed_ssh = this.ssh_context_menu.take().is_some();
+                        let closed_group = this.ssh_group_menu.take().is_some();
+                        let closed_explorer = this.explorer_context_menu.take().is_some();
+                        let closed_new_tab = this.new_tab_menu.take().is_some();
+                        let closed_shell = this.shell_menu.take().is_some();
+                        let closed_pane = this.pane_context_menu.take().is_some();
+                        if closed_ssh
+                            || closed_group
+                            || closed_explorer
+                            || closed_new_tab
+                            || closed_shell
+                            || closed_pane
+                        {
+                            cx.notify();
+                        }
+                    }),
+                )
             .flex()
             .flex_col()
             .size_full()
@@ -7583,7 +7827,7 @@ impl gpui::Render for WorkspaceView {
                                 ui::icon_button(
                                     "titlebar-open-workspace",
                                     Icon::FolderOpen,
-                                    "Open Workspace…  (Ctrl+O)",
+                                    t!("ws.open_workspace_hint"),
                                     &p,
                                 )
                                 .on_mouse_down(
@@ -7602,11 +7846,11 @@ impl gpui::Render for WorkspaceView {
                                 let wash = ui::hover_wash(&p);
                                 div()
                                     .id("agent-bell")
-                                    .aria_label("Agent activity")
+                                    .aria_label(t!("chrome.agent_activity"))
                                     .tooltip({
                                         let palette = p.clone();
                                         move |_window, cx| {
-                                            Tooltip::view("Agent activity", &palette, cx)
+                                            Tooltip::view(t!("chrome.agent_activity"), &palette, cx)
                                         }
                                     })
                                     .h(px(tokens::height::REGULAR))
@@ -7632,17 +7876,19 @@ impl gpui::Render for WorkspaceView {
                                     )
                             })
                             .child(
-                                ui::icon_button("settings", Icon::Settings, "Settings", &p)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(Self::open_settings),
-                                    ),
+                                ui::icon_button(
+                                    "settings",
+                                    Icon::Settings,
+                                    t!("chrome.settings"),
+                                    &p,
+                                )
+                                .on_mouse_down(MouseButton::Left, cx.listener(Self::open_settings)),
                             )
                             .when(crate::updater::ready(cx), |bar| {
                                 bar.child(
                                     ui::button(
                                         "update-ready",
-                                        "Update available",
+                                        t!("ws.update_available"),
                                         ui::ButtonKind::Subtle,
                                         &p,
                                     )
@@ -7700,7 +7946,7 @@ impl gpui::Render for WorkspaceView {
                                                 // 灰=未连接或已正常结束，红=失败/异常。
                                                 let (state, dot_color) = if running {
                                                     (
-                                                        "远程会话运行中 / 认证中",
+                                                        t!("ws.remote_state_running"),
                                                         ui::color(p.status[1]),
                                                     )
                                                 } else {
@@ -7708,15 +7954,15 @@ impl gpui::Render for WorkspaceView {
                                                         |terminal| terminal.read(cx).exit_code(),
                                                     ) {
                                                         Some(0) => (
-                                                            "已正常完成",
+                                                            t!("ws.remote_state_finished"),
                                                             ui::alpha(p.foreground, 0.35),
                                                         ),
                                                         Some(_) => (
-                                                            "连接 / 传输失败或已取消（详见输出）",
+                                                            t!("ws.remote_state_failed"),
                                                             ui::color(p.status[3]),
                                                         ),
                                                         None => (
-                                                            "远程会话未连接",
+                                                            t!("ws.remote_state_disconnected"),
                                                             ui::alpha(p.foreground, 0.35),
                                                         ),
                                                     }
@@ -7728,11 +7974,9 @@ impl gpui::Render for WorkspaceView {
                                                     .bg(dot_color)
                                                     .tooltip({
                                                         let palette = p.clone();
-                                                        let label: SharedString =
-                                                            state.to_string().into();
                                                         move |_window, cx| {
                                                             Tooltip::view(
-                                                                label.clone(),
+                                                                state.clone(),
                                                                 &palette,
                                                                 cx,
                                                             )
@@ -7750,9 +7994,9 @@ impl gpui::Render for WorkspaceView {
                                                             remote.transfer.is_some()
                                                         })
                                                     {
-                                                        "新建传输…"
+                                                        t!("ws.new_transfer")
                                                     } else {
-                                                        "重新连接"
+                                                        t!("ws.reconnect")
                                                     },
                                                     ButtonKind::Subtle,
                                                     &p,
@@ -7764,7 +8008,7 @@ impl gpui::Render for WorkspaceView {
                                             .child(
                                                 ui::button(
                                                     "remote-disconnect",
-                                                    "断开",
+                                                    t!("ws.disconnect"),
                                                     ButtonKind::Ghost,
                                                     &p,
                                                 )
@@ -7785,7 +8029,7 @@ impl gpui::Render for WorkspaceView {
                                             .child(
                                                 ui::button(
                                                     "remote-manager",
-                                                    "连接管理",
+                                                    t!("ws.connection_manager"),
                                                     ButtonKind::Ghost,
                                                     &p,
                                                 )
@@ -7841,11 +8085,15 @@ impl gpui::Render for WorkspaceView {
                                 let tint = gpui_color_alpha(p.foreground, 0.72);
                                 div()
                                     .id("status-open-workspace")
-                                    .aria_label("Open workspace")
+                                    .aria_label(t!("ws.open_workspace"))
                                     .tooltip({
                                         let palette = p.clone();
                                         move |_window, cx| {
-                                            Tooltip::view("Open Workspace…  (Ctrl+O)", &palette, cx)
+                                            Tooltip::view(
+                                                t!("ws.open_workspace_hint"),
+                                                &palette,
+                                                cx,
+                                            )
                                         }
                                     })
                                     .flex()
@@ -7879,16 +8127,18 @@ impl gpui::Render for WorkspaceView {
                             .child(
                                 div()
                                     .text_color(gpui_color(status_color(&p, ai_status)))
-                                    .child(SharedString::from(format!(
-                                        "AI {}",
-                                        status_label(ai_status)
-                                    ))),
+                                    .child(
+                                        tf!("ws.ai_status", "status" => status_label(ai_status)),
+                                    ),
                             )
                             .when(ai_tools_running > 0, |row| {
-                                row.child(SharedString::from(format!("tools: {ai_tools_running}")))
+                                row.child(tf!(
+                                    "ws.ai_tools_running",
+                                    "count" => ai_tools_running
+                                ))
                             })
                             .when_some(preview_url, |row, url| {
-                                let label = SharedString::from(format!("Open Web Preview: {url}"));
+                                let label = tf!("ws.open_web_preview", "url" => url.clone());
                                 row.child(
                                     ui::button(
                                         "open-detected-preview",
@@ -7915,9 +8165,9 @@ impl gpui::Render for WorkspaceView {
                                             "terminal-toggle",
                                             Icon::Terminal,
                                             if terminal_hidden {
-                                                "Show terminal panes"
+                                                t!("ws.show_terminal")
                                             } else {
-                                                "Hide terminal panes"
+                                                t!("ws.hide_terminal")
                                             },
                                             &p,
                                         )
@@ -7939,9 +8189,9 @@ impl gpui::Render for WorkspaceView {
                                         Icon::ChevronUp
                                     },
                                     if self.model.composer_visible {
-                                        "Hide Agent panel (Ctrl+I)"
+                                        t!("ws.hide_agent_panel")
                                     } else {
-                                        "Show Agent panel (Ctrl+I)"
+                                        t!("ws.show_agent_panel")
                                     },
                                     &p,
                                 )
@@ -7964,6 +8214,7 @@ impl gpui::Render for WorkspaceView {
             .children(ssh_group_menu)
             .children(explorer_context_menu)
             .children(new_tab_menu)
+            .children(shell_menu)
             .children(pane_context_menu);
         self.render_window_frame(root, &p, window, cx)
     }
@@ -8277,7 +8528,7 @@ fn remote_icon_kind(name: &str, is_dir: bool) -> IconKind {
 fn explorer_tool_button(
     id: &'static str,
     glyph: Icon,
-    label: &'static str,
+    label: impl Into<SharedString>,
     p: &ResolvedPalette,
     cx: &mut Context<WorkspaceView>,
     listener: impl Fn(&mut WorkspaceView, &mut Context<WorkspaceView>) + 'static,
@@ -8350,22 +8601,22 @@ fn explorer_context_actions(target: &ExplorerContextTarget) -> &'static [Explore
     }
 }
 
-fn explorer_context_action_label(action: ExplorerContextAction) -> &'static str {
+fn explorer_context_action_label(action: ExplorerContextAction) -> SharedString {
     match action {
-        ExplorerContextAction::Open => "Open",
-        ExplorerContextAction::CreateFile => "New File…",
-        ExplorerContextAction::CreateDirectory => "New Folder…",
-        ExplorerContextAction::Rename => "Rename…",
-        ExplorerContextAction::Move => "Move…",
-        ExplorerContextAction::Delete => "Delete…",
-        ExplorerContextAction::Reveal => "Show in File Manager",
-        ExplorerContextAction::AttachToAi => "Attach to AI",
-        ExplorerContextAction::FindFile => "Find File…",
-        ExplorerContextAction::SearchContent => "Search in Files…",
-        ExplorerContextAction::UploadFile => "Upload File…",
-        ExplorerContextAction::UploadDirectory => "Upload Folder…",
-        ExplorerContextAction::Download => "Download…",
-        ExplorerContextAction::Refresh => "Refresh",
+        ExplorerContextAction::Open => t!("ws.ctx_open"),
+        ExplorerContextAction::CreateFile => t!("ws.ctx_new_file"),
+        ExplorerContextAction::CreateDirectory => t!("ws.ctx_new_folder"),
+        ExplorerContextAction::Rename => t!("ws.ctx_rename"),
+        ExplorerContextAction::Move => t!("ws.ctx_move"),
+        ExplorerContextAction::Delete => t!("ws.ctx_delete"),
+        ExplorerContextAction::Reveal => t!("ws.ctx_reveal"),
+        ExplorerContextAction::AttachToAi => t!("ws.ctx_attach"),
+        ExplorerContextAction::FindFile => t!("ws.ctx_find_file"),
+        ExplorerContextAction::SearchContent => t!("ws.ctx_search_files"),
+        ExplorerContextAction::UploadFile => t!("ws.ctx_upload_file"),
+        ExplorerContextAction::UploadDirectory => t!("ws.ctx_upload_folder"),
+        ExplorerContextAction::Download => t!("ws.ctx_download"),
+        ExplorerContextAction::Refresh => t!("ws.ctx_refresh"),
     }
 }
 
@@ -8419,7 +8670,7 @@ fn utf16_to_byte(text: &str, utf16_offset: usize) -> usize {
 }
 
 fn sidebar_button(
-    label: &'static str,
+    label: impl Into<SharedString>,
     id: &'static str,
     p: &ResolvedPalette,
     cx: &mut Context<WorkspaceView>,
@@ -8478,8 +8729,36 @@ fn path_breadcrumb(path: &str) -> String {
     }
 }
 
+/// 新建终端 shell 选择器的菜单项：点击即以该 shell 创建终端（一次性选择，
+/// 不写回设置；默认项 `spawn_override` 为 None，走设置默认）。
+fn shell_menu_item(
+    option: crate::shell_select::ShellOption,
+    id: impl Into<gpui::ElementId>,
+    p: &ResolvedPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> impl IntoElement {
+    let hover_bg = ui::hover_wash(p);
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .text_xs()
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover_bg))
+        .child(option.label())
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _event, window, cx| {
+                cx.stop_propagation();
+                this.shell_menu = None;
+                this.create_terminal_with_shell(false, option.spawn_override(), window, cx);
+            }),
+        )
+}
+
 fn new_tab_menu_item(
-    label: &'static str,
+    label: impl Into<SharedString>,
     id: &'static str,
     enabled: bool,
     action: NewTabAction,
@@ -8494,7 +8773,7 @@ fn new_tab_menu_item(
         .rounded_sm()
         .text_xs()
         .opacity(if enabled { 1.0 } else { 0.45 })
-        .child(label)
+        .child(label.into())
         .when(enabled, |item| {
             item.cursor_pointer()
                 .hover(move |style| style.bg(hover_bg))
@@ -8552,7 +8831,7 @@ fn terminal_menu_shortcut(action: TerminalMenuAction) -> &'static str {
 }
 
 fn terminal_menu_item(
-    label: &'static str,
+    label: impl Into<SharedString>,
     id: &'static str,
     enabled: bool,
     action: TerminalMenuAction,
@@ -8560,6 +8839,7 @@ fn terminal_menu_item(
     p: &ResolvedPalette,
     cx: &mut Context<WorkspaceView>,
 ) -> impl IntoElement {
+    let label = label.into();
     let shortcut = terminal_menu_shortcut(action);
     let hover_bg = ui::hover_wash(p);
     let focus_ring = ui::focus_ring(p);
@@ -8588,7 +8868,7 @@ fn terminal_menu_item(
         .focusable()
         .tab_stop(enabled)
         .role(Role::Button)
-        .aria_label(label)
+        .aria_label(label.clone())
         .focus_visible(move |style| style.border_1().border_color(focus_ring))
         .child(
             div()
@@ -8617,13 +8897,14 @@ fn terminal_menu_item(
 }
 
 fn split_menu_item(
-    label: &'static str,
+    label: impl Into<SharedString>,
     id: &'static str,
     enabled: bool,
     action: SplitMenuAction,
     p: &ResolvedPalette,
     cx: &mut Context<WorkspaceView>,
 ) -> impl IntoElement {
+    let label = label.into();
     let focus_ring = ui::focus_ring(p);
     let hover_bg = ui::hover_wash(p);
     div()
@@ -8636,11 +8917,11 @@ fn split_menu_item(
         .focusable()
         .tab_stop(enabled)
         .role(Role::Button)
-        .aria_label(label)
+        .aria_label(label.clone())
         .aria_description(if enabled {
-            "Activate this split pane command"
+            t!("ws.split_aria_active")
         } else {
-            "Unavailable for the focused pane"
+            t!("ws.split_aria_unavailable")
         })
         .focus_visible(move |style| style.border_1().border_color(focus_ring))
         .child(label)
@@ -8706,25 +8987,34 @@ fn terminal_agent_status(state: AgentState) -> AgentStatus {
     }
 }
 
-fn status_label(status: AgentStatus) -> &'static str {
+fn status_label(status: AgentStatus) -> SharedString {
     match status {
-        AgentStatus::Started => "started",
-        AgentStatus::Working => "working",
-        AgentStatus::Attention => "attention",
-        AgentStatus::Finished => "finished",
-        AgentStatus::Exited => "exited",
-        AgentStatus::Error => "error",
+        AgentStatus::Started => t!("ws.agent_started"),
+        AgentStatus::Working => t!("ws.agent_working"),
+        AgentStatus::Attention => t!("ws.agent_attention"),
+        AgentStatus::Finished => t!("ws.agent_finished"),
+        AgentStatus::Exited => t!("ws.agent_exited"),
+        AgentStatus::Error => t!("ws.agent_error"),
     }
 }
 
-fn agent_status_message(status: AgentStatus) -> &'static str {
+fn agent_status_message(status: AgentStatus) -> SharedString {
     match status {
-        AgentStatus::Started => "Agent started",
-        AgentStatus::Working => "Agent is working",
-        AgentStatus::Attention => "Agent needs your attention",
-        AgentStatus::Finished => "Agent finished",
-        AgentStatus::Exited => "Agent exited",
-        AgentStatus::Error => "Agent encountered an error",
+        AgentStatus::Started => t!("ws.agent_message_started"),
+        AgentStatus::Working => t!("ws.agent_message_working"),
+        AgentStatus::Attention => t!("ws.agent_message_attention"),
+        AgentStatus::Finished => t!("ws.agent_message_finished"),
+        AgentStatus::Exited => t!("ws.agent_message_exited"),
+        AgentStatus::Error => t!("ws.agent_message_error"),
+    }
+}
+
+/// 源码控制侧栏行首的变更分组标签（原 `{:?}` Debug 输出）。
+fn change_group_label(group: ChangeGroup) -> SharedString {
+    match group {
+        ChangeGroup::Staged => t!("ws.staged"),
+        ChangeGroup::Unstaged => t!("ws.unstaged"),
+        ChangeGroup::Untracked => t!("ws.untracked"),
     }
 }
 
@@ -8755,13 +9045,13 @@ fn map_appearance(appearance: termior_store::settings::Appearance) -> Appearance
     }
 }
 
-fn load_settings() -> (Settings, Option<PathBuf>, Option<String>) {
+pub(crate) fn load_settings() -> (Settings, Option<PathBuf>, Option<String>) {
     let data_dir = app_data_dir().ok();
     let Some(dir) = data_dir.as_ref() else {
         return (
             default_settings(),
             None,
-            Some("Could not resolve application data directory".into()),
+            Some(t!("ws.data_dir_error").to_string()),
         );
     };
     let path = dir.join("Termior-settings.json");
@@ -8792,6 +9082,7 @@ fn skip_startup_workspace_scans() -> bool {
         "TERMIOR_SPLIT_PANE_SMOKE",
         "TERMIOR_NFR_MEASURE",
         "TERMIOR_IDLE_REDRAW_PROBE",
+        "TERMIOR_SHELL_PICKER_SMOKE",
     ]
     .iter()
     .any(|key| std::env::var_os(key).is_some())
@@ -8968,11 +9259,11 @@ mod tab_focus_tests {
             WorkspaceView::new(std::env::temp_dir(), false, cx)
         });
 
-        let (tab_a, tab_b) = cx.update(|_window, cx| {
+        let (tab_a, tab_b) = cx.update(|window, cx| {
             workspace.update(cx, |ws, cx| {
-                ws.create_editor(cx);
+                ws.create_editor(window, cx);
                 let tab_a = ws.model.active.unwrap();
-                ws.create_editor(cx);
+                ws.create_editor(window, cx);
                 let tab_b = ws.model.active.unwrap();
                 (tab_a, tab_b)
             })
@@ -9014,11 +9305,11 @@ mod tab_focus_tests {
             WorkspaceView::new(std::env::temp_dir(), false, cx)
         });
 
-        let (tab_a, tab_b) = cx.update(|_window, cx| {
+        let (tab_a, tab_b) = cx.update(|window, cx| {
             workspace.update(cx, |ws, cx| {
-                ws.create_editor(cx);
+                ws.create_editor(window, cx);
                 let tab_a = ws.model.active.unwrap();
-                ws.create_editor(cx);
+                ws.create_editor(window, cx);
                 let tab_b = ws.model.active.unwrap();
                 (tab_a, tab_b)
             })
@@ -9056,11 +9347,11 @@ mod tab_focus_tests {
             WorkspaceView::new(std::env::temp_dir(), false, cx)
         });
 
-        let (tab_a, tab_b) = cx.update(|_window, cx| {
+        let (tab_a, tab_b) = cx.update(|window, cx| {
             workspace.update(cx, |ws, cx| {
-                ws.create_editor(cx);
+                ws.create_editor(window, cx);
                 let tab_a = ws.model.active.unwrap();
-                ws.create_editor(cx);
+                ws.create_editor(window, cx);
                 let tab_b = ws.model.active.unwrap();
                 (tab_a, tab_b)
             })
@@ -9086,5 +9377,62 @@ mod tab_focus_tests {
             Some(handle_a),
             "closing the focused tab must hand focus to the surviving tab's pane"
         );
+    }
+
+    /// Markdown「源码」视图必须可编辑：预览切回源码后焦点落在编辑器，缓冲可改写。
+    #[gpui::test]
+    fn markdown_source_view_is_editable_after_preview_toggle(cx: &mut TestAppContext) {
+        let root =
+            std::env::temp_dir().join(format!("termior-md-source-edit-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let path = root.join("source-edit.md");
+        std::fs::write(&path, "# original\n").unwrap();
+
+        let (workspace, cx) = cx.add_window_view(|_window, cx| {
+            crate::updater::init(cx);
+            WorkspaceView::new(root.clone(), false, cx)
+        });
+        cx.run_until_parked();
+
+        // 打开 Markdown → 预览 → 切回源码。
+        cx.update(|window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.open_editor(path.clone(), window, cx);
+                ws.request_preview(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            workspace.update(cx, |ws, cx| {
+                ws.toggle_markdown_preview(window, cx);
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.draw(cx).clear();
+        });
+
+        let focused = cx.update(|window, cx| {
+            let ws = workspace.read(cx);
+            let focused = window.focused(cx);
+            let editor = ws.active_editor().cloned().expect("source editor tab");
+            let handle = editor.read(cx).focus_handle(cx);
+            assert_eq!(
+                focused,
+                Some(handle),
+                "toggling from Markdown preview to Source must focus the editable editor"
+            );
+            let before = editor.read(cx).text();
+            assert!(before.contains("# original"), "source shows markdown text");
+            editor.update(cx, |editor, _| {
+                // 源码视图持有同一 EditorView 缓冲，revision 可推进即写路径未只读封死。
+                let revision = editor.revision();
+                assert!(revision < u64::MAX);
+            });
+            focused
+        });
+        assert!(focused.is_some());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

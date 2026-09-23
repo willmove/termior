@@ -85,11 +85,11 @@ impl ComposerDock {
         }
     }
 
-    /// 停靠切换按钮的 tooltip 文案。
-    pub fn toggle_label(self) -> &'static str {
+    /// 停靠切换按钮 tooltip 的 i18n 键（由视图层 `t!` 解析）。
+    pub fn toggle_label_key(self) -> &'static str {
         match self {
-            Self::Bottom => "Dock agent panel to the right",
-            Self::Right => "Dock agent panel to the bottom",
+            Self::Bottom => "composer.dock_right",
+            Self::Right => "composer.dock_bottom",
         }
     }
 }

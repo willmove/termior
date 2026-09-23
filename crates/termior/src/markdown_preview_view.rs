@@ -59,11 +59,12 @@ impl MarkdownPreviewView {
 impl Render for MarkdownPreviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = ui::palette(cx);
+        let fallback_title = t!("markdown.fallback_title");
         let title = self
             .path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("Markdown");
+            .unwrap_or(&fallback_title);
         // 滚动块的元素 id 前缀按视图实体区分，多个预览标签并存时不冲突。
         let id_prefix = format!("preview-md-{}", cx.entity().entity_id().as_non_zero_u64());
         let blocks = markdown_render::render_blocks(
@@ -93,7 +94,7 @@ impl Render for MarkdownPreviewView {
                         div()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_sm()
-                            .child("Markdown Preview"),
+                            .child(t!("markdown.preview_title")),
                     )
                     .child(
                         div()
@@ -114,7 +115,7 @@ impl Render for MarkdownPreviewView {
                             .bg(ui::selected_wash(&p))
                             .text_xs()
                             .text_color(ui::color(p.accent))
-                            .child("Live"),
+                            .child(t!("markdown.live_badge")),
                     ),
             )
             .child(

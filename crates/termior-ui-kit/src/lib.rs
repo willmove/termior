@@ -7,7 +7,6 @@
 
 mod layout;
 mod search;
-pub mod text;
 pub mod tokens;
 
 pub use layout::{LayoutError, LayoutNode, PaneExtent, PaneId, PaneLayout, SplitDirection};

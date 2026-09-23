@@ -12,7 +12,9 @@ pub mod service;
 
 pub use bridge::{PtyData, TerminalBridge, TerminalEventProxy, WriterHandle};
 pub use pty::{
-    list_wsl_distributions, parse_wsl_list_output, PtySession, PtySessionConfig, SpawnError,
+    discover_native_shells, discover_shells, discover_wsl_shells, list_wsl_distributions,
+    parse_wsl_list_output, shell_kind_for_program, DiscoveredShell, PtySession, PtySessionConfig,
+    SpawnError,
 };
 pub use service::shared_terminal_service;
 pub use service::LocalTerminalService;

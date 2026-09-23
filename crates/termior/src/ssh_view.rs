@@ -39,11 +39,11 @@ fn save_prompt_preference(
 ) -> Result<(), String> {
     use termior_ssh::credentials;
     if secret.is_empty() || secret.len() > 1023 || secret.contains(['\0', '\r', '\n']) {
-        return Err("密码/口令不能为空、超过 1023 字节或包含换行。".into());
+        return Err(t!("ssh.error.secret_invalid").to_string());
     }
     let Some(dir) = dir else {
         return if remember {
-            Err("应用数据目录不可用；可取消记住密码，仅用于本次连接。".into())
+            Err(t!("ssh.error.no_app_data_remember").to_string())
         } else {
             Ok(())
         };
@@ -55,7 +55,7 @@ fn save_prompt_preference(
         .find(|saved| saved.name == profile.name && credentials::same_target(saved, profile))
     else {
         return if remember {
-            Err("连接配置已删除或更改；请取消记住密码，或更新连接管理后重试。".into())
+            Err(t!("ssh.error.profile_changed").to_string())
         } else {
             Ok(())
         };
@@ -141,7 +141,7 @@ impl SshView {
                     self.select_all = false;
                     self.pending_transfer = None;
                     self.confirm_delete = false;
-                    self.status = "会话配置已删除".into();
+                    self.status = t!("ssh.status.session_deleted").to_string();
                 }
             }
             Err(error) => {
@@ -174,11 +174,11 @@ impl SshView {
             self.select_all = rename;
             self.scroll.set_offset(gpui::point(px(0.), px(0.)));
             self.status = if rename {
-                "修改连接名称后点击保存"
+                t!("ssh.status.rename_hint")
             } else {
-                "编辑会话后点击保存"
+                t!("ssh.status.edit_hint")
             }
-            .into();
+            .to_string();
         }
         cx.notify();
     }
@@ -212,7 +212,7 @@ impl SshView {
             Ok(value) => (value.unwrap_or_default(), String::new(), false),
             Err(error) => (
                 Profiles::default(),
-                format!("无法读取连接配置：{error}。修复文件后重新打开，避免覆盖原配置。"),
+                tf!("ssh.error.load_failed", "error" => error).to_string(),
                 true,
             ),
         };
@@ -254,10 +254,15 @@ impl SshView {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::new(dir, Box::new(|_, _| {}), cx);
-        view.auth_prompt = Some(format!(
-            "{} · {}\n{}",
-            challenge.profile.name, challenge.profile.host, challenge.prompt
-        ));
+        view.auth_prompt = Some(
+            tf!(
+                "ssh.prompt.shared_title",
+                "name" => challenge.profile.name,
+                "host" => challenge.profile.host,
+                "prompt" => challenge.prompt
+            )
+            .to_string(),
+        );
         view.remember = challenge.remember;
         view.status = challenge.error.clone().unwrap_or_default();
         view.shared_auth = Some(challenge);
@@ -336,7 +341,7 @@ impl SshView {
                 self.values[3]
                     .trim()
                     .parse::<u16>()
-                    .map_err(|_| "端口应为 1–65535".to_owned())?,
+                    .map_err(|_| t!("ssh.error.port_range").to_string())?,
             )
         };
         let profile = Profile {
@@ -406,19 +411,22 @@ impl SshView {
     }
     fn persist(&mut self, profiles: Profiles) -> Result<(), String> {
         if self.load_failed {
-            return Err("配置读取失败，已禁止覆盖".into());
+            return Err(t!("ssh.error.write_blocked").to_string());
         }
-        let dir = self.dir.as_ref().ok_or("应用数据目录不可用")?;
+        let dir = self
+            .dir
+            .as_ref()
+            .ok_or_else(|| t!("ssh.error.no_app_data").to_string())?;
         profiles.save(dir).map_err(|e| e.to_string())?;
         self.profiles = profiles;
         Ok(())
     }
     fn save(&mut self) -> Result<(), String> {
         if self.load_failed {
-            return Err("配置读取失败，已禁止覆盖".into());
+            return Err(t!("ssh.error.write_blocked").to_string());
         }
         if self.dir.is_none() {
-            return Err("应用数据目录不可用".into());
+            return Err(t!("ssh.error.no_app_data").to_string());
         }
         let profile = self.profile()?;
         let previous = self
@@ -426,7 +434,7 @@ impl SshView {
             .and_then(|i| self.profiles.connections.get(i))
             .cloned();
         if !self.remember && (!self.values[7].is_empty() || !self.values[8].is_empty()) {
-            return Err("请勾选记住密码，或清空密码/口令后在统一认证窗口输入".into());
+            return Err(t!("ssh.error.remember_required").to_string());
         }
         let mut updated = self.profiles.clone();
         let index = self.selected.unwrap_or(updated.connections.len());
@@ -458,10 +466,8 @@ impl SshView {
                     p.use_saved_credentials && termior_ssh::credentials::same_target(p, &previous)
                 })
             {
-                termior_ssh::credentials::delete_all(&previous).map_err(|_| {
-                    "配置已保存，但旧凭据删除失败；请在系统凭据管理器中清理 Termior-ssh 条目"
-                        .to_owned()
-                })?;
+                termior_ssh::credentials::delete_all(&previous)
+                    .map_err(|_| t!("ssh.error.stale_credentials").to_string())?;
             }
         }
         Ok(())
@@ -616,21 +622,22 @@ impl SshView {
                 }),
             };
             let _ = this.update(cx, |this, cx| {
-                let t = connection.transfer.as_ref().unwrap();
-                this.status = format!(
-                    "待确认 {}（{} @ {}）：{} {} {}。{}",
-                    if upload { "上传" } else { "下载" },
-                    connection.profile.name,
-                    connection.profile.host,
-                    t.local_path,
-                    if upload { "→" } else { "←" },
-                    t.remote_path,
-                    if resume {
-                        "续传要求已有内容与源文件一致，否则文件可能损坏。"
+                let transfer = connection.transfer.as_ref().unwrap();
+                this.status = tf!(
+                    "ssh.transfer.pending",
+                    "action" => if upload { t!("ssh.transfer.upload") } else { t!("ssh.transfer.download") },
+                    "name" => connection.profile.name,
+                    "host" => connection.profile.host,
+                    "local" => transfer.local_path,
+                    "arrow" => if upload { "→" } else { "←" },
+                    "remote" => transfer.remote_path,
+                    "warning" => if resume {
+                        t!("ssh.transfer.resume_warning")
                     } else {
-                        "目标同名文件将被覆盖。"
+                        t!("ssh.transfer.overwrite_warning")
                     }
-                );
+                )
+                .to_string();
                 this.pending_transfer = Some(connection);
                 cx.notify();
             });
@@ -667,8 +674,8 @@ impl Render for SshView {
             .flex_shrink_0()
             .when(narrow, |d| d.w_full().flex_row().flex_wrap());
         list = list.child(
-            ui::button("new", "＋ 新建连接", ButtonKind::Subtle, &p).on_click(cx.listener(
-                |this, _, _, cx| {
+            ui::button("new", t!("ssh.new_connection"), ButtonKind::Subtle, &p).on_click(
+                cx.listener(|this, _, _, cx| {
                     this.selected = None;
                     this.clear_secrets();
                     this.values = Default::default();
@@ -682,8 +689,8 @@ impl Render for SshView {
                     this.marked = None;
                     cx.emit(ProfilesChanged);
                     cx.notify();
-                },
-            )),
+                }),
+            ),
         );
         // 未分组连接在前；分组名作为静态小标签行（含空分组），管理窗口不做折叠。
         let partition =
@@ -716,16 +723,16 @@ impl Render for SshView {
         // 两列紧凑排布；行的顺序与 Tab 键序（0..=8）保持一致。
         let mut cells: Vec<Option<gpui::Div>> = (0..10).map(|_| None).collect();
         for (i, label) in [
-            "连接名称",
-            "主机 / IP / SSH config 别名",
-            "用户名（空白沿用 SSH config）",
-            "端口（空白沿用 SSH config / 22）",
-            "私钥路径（可选，支持加密私钥）",
-            "跳板机（可选：user@host:port，逗号分隔多级）",
-            "SFTP 远程路径（上传目标 / 下载源）",
-            "登录密码（留空保留已保存密码）",
-            "私钥口令（留空保留已保存口令）",
-            "分组（可选，留空为未分组）",
+            t!("ssh.field.name"),
+            t!("ssh.field.host"),
+            t!("ssh.field.user"),
+            t!("ssh.field.port"),
+            t!("ssh.field.identity"),
+            t!("ssh.field.jump"),
+            t!("ssh.field.remote_path"),
+            t!("ssh.field.password"),
+            t!("ssh.field.passphrase"),
+            t!("ssh.field.group"),
         ]
         .into_iter()
         .enumerate()
@@ -763,9 +770,9 @@ impl Render for SshView {
                     .min_w_0()
                     .child(div().text_size(px(font_size::BODY)).flex_shrink_0().child(
                         if self.auth_prompt.is_some() {
-                            "认证响应"
+                            t!("ssh.field.auth_response")
                         } else {
-                            label
+                            label.clone()
                         },
                     ))
                     .child(
@@ -951,9 +958,9 @@ impl Render for SshView {
                             ui::button(
                                 "remember-auth",
                                 if self.remember {
-                                    "☑ 记住密码（保存到系统凭据库）"
+                                    t!("ssh.prompt.remember.on")
                                 } else {
-                                    "☐ 记住密码（保存到系统凭据库）"
+                                    t!("ssh.prompt.remember.off")
                                 },
                                 ButtonKind::Subtle,
                                 &p,
@@ -968,9 +975,7 @@ impl Render for SshView {
                             div()
                                 .text_size(px(font_size::MICRO))
                                 .text_color(ui::muted(&p))
-                                .child(
-                                    "未勾选：仅在此主机的当前连接中复用；关闭最后一个会话后清除。",
-                                ),
+                                .child(t!("ssh.prompt.remember_hint")),
                         )
                 })
                 .when(!self.status.is_empty(), |element| {
@@ -981,24 +986,24 @@ impl Render for SshView {
                     )
                 })
                 .child(
-                    ui::button("submit", "确认", ButtonKind::Primary, &p)
+                    ui::button("submit", t!("ssh.prompt.confirm"), ButtonKind::Primary, &p)
                         .debug_selector(|| "submit".into())
                         .on_click(
                             cx.listener(|this, _, window, cx| this.submit_prompt(window, cx)),
                         ),
                 )
                 .child(
-                    ui::button("cancel", "取消", ButtonKind::Ghost, &p)
+                    ui::button("cancel", t!("ssh.prompt.cancel"), ButtonKind::Ghost, &p)
                         .on_click(cx.listener(|this, _, window, _| this.cancel_prompt(window))),
                 )
                 .into_any_element();
         }
         let mut auth = div().flex().flex_wrap().gap(px(space::XS));
         for (i, (value, label)) in [
-            (Authentication::Auto, "自动"),
-            (Authentication::Password, "密码 / MFA"),
-            (Authentication::Key, "密钥"),
-            (Authentication::Agent, "SSH Agent"),
+            (Authentication::Auto, t!("ssh.auth.auto")),
+            (Authentication::Password, t!("ssh.auth.password")),
+            (Authentication::Key, t!("ssh.auth.key")),
+            (Authentication::Agent, t!("ssh.auth.agent")),
         ]
         .into_iter()
         .enumerate()
@@ -1021,43 +1026,83 @@ impl Render for SshView {
                 })),
             );
         }
-        form = form.child(auth).child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap(px(space::XS))
-                .child(
-                    ui::button("remember", if self.remember { "☑ 记住密码和私钥口令（系统凭据库）" } else { "☐ 记住密码和私钥口令（系统凭据库）" }, ButtonKind::Subtle, &p).whitespace_normal().justify_start()
-                        .on_click(cx.listener(|this, _, _, cx| { this.remember = !this.remember; cx.notify(); }))
-                )
-                .child(
-                    ui::button("forget", "清除该连接的已保存凭据", ButtonKind::Ghost, &p).on_click(cx.listener(|this, _, _, cx| {
-                        this.status = this.profile().and_then(|p| {
-                            termior_ssh::credentials::delete(&p, termior_ssh::credentials::Kind::Password)?;
-                            termior_ssh::credentials::delete(&p, termior_ssh::credentials::Kind::Passphrase)
-                        }).map(|_| { this.clear_secrets(); this.cursor = this.cursor.min(this.values[this.field].len()); "已清除系统凭据".into() }).unwrap_or_else(|e| e);
-                        cx.notify();
-                    }))
-                ),
-        ).child(
-            div()
-                .text_size(px(font_size::MICRO))
-                .text_color(ui::muted(&p))
-                .child("密码和私钥口令仅保存到系统凭据库；私钥继续使用原文件或 SSH Agent。首次指纹及 MFA 仍需确认。"),
-        );
+        form = form
+            .child(auth)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(space::XS))
+                    .child(
+                        ui::button(
+                            "remember",
+                            if self.remember {
+                                t!("ssh.remember.on")
+                            } else {
+                                t!("ssh.remember.off")
+                            },
+                            ButtonKind::Subtle,
+                            &p,
+                        )
+                        .whitespace_normal()
+                        .justify_start()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.remember = !this.remember;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        ui::button(
+                            "forget",
+                            t!("ssh.forget_credentials"),
+                            ButtonKind::Ghost,
+                            &p,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.status = this
+                                .profile()
+                                .and_then(|p| {
+                                    termior_ssh::credentials::delete(
+                                        &p,
+                                        termior_ssh::credentials::Kind::Password,
+                                    )?;
+                                    termior_ssh::credentials::delete(
+                                        &p,
+                                        termior_ssh::credentials::Kind::Passphrase,
+                                    )
+                                })
+                                .map(|_| {
+                                    this.clear_secrets();
+                                    this.cursor = this.cursor.min(this.values[this.field].len());
+                                    t!("ssh.status.credentials_cleared").to_string()
+                                })
+                                .unwrap_or_else(|e| e);
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(font_size::MICRO))
+                    .text_color(ui::muted(&p))
+                    .child(t!("ssh.credentials_hint")),
+            );
         let mut actions = div().flex().flex_wrap().gap(px(space::XS)).child(
-            ui::button("save", "保存", ButtonKind::Subtle, &p)
+            ui::button("save", t!("action.save"), ButtonKind::Subtle, &p)
                 .debug_selector(|| "ssh-save".into())
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.status = this.save().map(|_| "已保存".into()).unwrap_or_else(|e| e);
+                    this.status = this
+                        .save()
+                        .map(|_| t!("ssh.status.saved").to_string())
+                        .unwrap_or_else(|e| e);
                     cx.emit(ProfilesChanged);
                     cx.notify();
                 })),
         );
         for (i, (kind, label)) in [
-            (SessionKind::Shell, "连接 SSH"),
-            (SessionKind::Sftp, "打开 SFTP"),
+            (SessionKind::Shell, t!("ssh.connect_ssh")),
+            (SessionKind::Sftp, t!("ssh.open_sftp")),
         ]
         .into_iter()
         .enumerate()
@@ -1081,8 +1126,7 @@ impl Render for SshView {
                                     },
                                     cx,
                                 );
-                                this.status =
-                                    "连接已在主窗口的新标签打开；请在那里完成认证。".into();
+                                this.status = t!("ssh.status.connected").to_string();
                             }
                             Err(e) => this.status = e,
                         }
@@ -1095,9 +1139,9 @@ impl Render for SshView {
             ui::button(
                 "delete",
                 if self.confirm_delete {
-                    "确认删除"
+                    t!("ssh.delete_confirm")
                 } else {
-                    "删除"
+                    t!("ssh.delete")
                 },
                 ButtonKind::Ghost,
                 &p,
@@ -1141,7 +1185,7 @@ impl Render for SshView {
                                 this.cursor = 0;
                                 this.select_all = false;
                                 this.pending_transfer = None;
-                                this.status = "已删除配置，活动连接不受影响".into();
+                                this.status = t!("ssh.status.deleted").to_string();
                             }
                             Err(e) => this.status = e,
                         }
@@ -1161,9 +1205,9 @@ impl Render for SshView {
                 ui::button(
                     "recursive",
                     if self.recursive {
-                        "☑ 整个目录"
+                        t!("ssh.transfer.recursive.on")
                     } else {
-                        "☐ 整个目录"
+                        t!("ssh.transfer.recursive.off")
                     },
                     ButtonKind::Subtle,
                     &p,
@@ -1178,9 +1222,9 @@ impl Render for SshView {
                 ui::button(
                     "resume",
                     if self.resume {
-                        "☑ 断点续传"
+                        t!("ssh.transfer.resume.on")
                     } else {
-                        "☐ 断点续传"
+                        t!("ssh.transfer.resume.off")
                     },
                     ButtonKind::Subtle,
                     &p,
@@ -1192,24 +1236,34 @@ impl Render for SshView {
                 })),
             )
             .child(
-                ui::button("upload", "选择上传…", ButtonKind::Subtle, &p)
-                    .on_click(cx.listener(|this, _, _, cx| this.choose_transfer(true, cx))),
+                ui::button(
+                    "upload",
+                    t!("ssh.transfer.upload_button"),
+                    ButtonKind::Subtle,
+                    &p,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.choose_transfer(true, cx))),
             )
             .child(
-                ui::button("download", "下载到…", ButtonKind::Subtle, &p)
-                    .on_click(cx.listener(|this, _, _, cx| this.choose_transfer(false, cx))),
+                ui::button(
+                    "download",
+                    t!("ssh.transfer.download_button"),
+                    ButtonKind::Subtle,
+                    &p,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.choose_transfer(false, cx))),
             );
         let confirmation = self.pending_transfer.is_some().then(|| {
             ui::button(
                 "start-transfer",
-                "确认路径并开始传输",
+                t!("ssh.transfer.confirm"),
                 ButtonKind::Primary,
                 &p,
             )
             .on_click(cx.listener(|this, _, _, cx| {
                 if let Some(connection) = this.pending_transfer.take() {
                     (this.connect)(connection, cx);
-                    this.status = "传输已在主窗口打开，可查看进度、错误或断开取消。".into();
+                    this.status = t!("ssh.status.transfer_started").to_string();
                 }
                 cx.notify();
             }))
@@ -1257,18 +1311,80 @@ impl Render for SshView {
                 )
                 .size_full(),
             );
-        div().id("ssh-manager").role(Role::Group).aria_label("SSH 连接管理").track_focus(&self.focus).on_key_down(cx.listener(Self::key))
-            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| { if this.dragging_scroll && e.pressed_button == Some(MouseButton::Left) { this.scroll_pointer(e.position.y); cx.notify(); } else { this.dragging_scroll = false; } }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.dragging_scroll = false))
-            .size_full().p(px(space::LG)).bg(ui::color(p.background)).text_color(ui::color(p.foreground)).flex().flex_col().gap(px(space::MD))
-            .child(div().text_size(px(font_size::HEADING)).flex_shrink_0().child("SSH / SFTP 连接管理"))
-            .child(div().flex().flex_1().min_h_0().gap(px(space::XS))
-                .child(div().id("ssh-scroll").flex_1().min_w_0().h_full().overflow_y_scroll().track_scroll(&self.scroll)
-                    .child(div().flex().items_start().gap(px(space::LG)).when(narrow, |d| d.flex_col()).child(list.flex_shrink_0()).child(form.when(narrow, |d| d.w_full()).child(actions).child(transfers)
-                        .child(div().text_size(px(font_size::BODY)).child(SharedString::from(self.status.clone())))
-                        .children(confirmation)
-                        .child(div().text_size(px(font_size::MICRO)).text_color(ui::muted(&p)).child("SFTP：ls / cd 浏览；put / get 上传下载；Ctrl+C 取消；help 查看命令。")))))
-                .child(scrollbar)).into_any_element()
+        div()
+            .id("ssh-manager")
+            .role(Role::Group)
+            .aria_label(t!("ssh.manager.aria"))
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::key))
+            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
+                if this.dragging_scroll && e.pressed_button == Some(MouseButton::Left) {
+                    this.scroll_pointer(e.position.y);
+                    cx.notify();
+                } else {
+                    this.dragging_scroll = false;
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.dragging_scroll = false),
+            )
+            .size_full()
+            .p(px(space::LG))
+            .bg(ui::color(p.background))
+            .text_color(ui::color(p.foreground))
+            .flex()
+            .flex_col()
+            .gap(px(space::MD))
+            .child(
+                div()
+                    .text_size(px(font_size::HEADING))
+                    .flex_shrink_0()
+                    .child(t!("ssh.manager.title")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .gap(px(space::XS))
+                    .child(
+                        div()
+                            .id("ssh-scroll")
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_start()
+                                    .gap(px(space::LG))
+                                    .when(narrow, |d| d.flex_col())
+                                    .child(list.flex_shrink_0())
+                                    .child(
+                                        form.when(narrow, |d| d.w_full())
+                                            .child(actions)
+                                            .child(transfers)
+                                            .child(
+                                                div()
+                                                    .text_size(px(font_size::BODY))
+                                                    .child(SharedString::from(self.status.clone())),
+                                            )
+                                            .children(confirmation)
+                                            .child(
+                                                div()
+                                                    .text_size(px(font_size::MICRO))
+                                                    .text_color(ui::muted(&p))
+                                                    .child(t!("ssh.sftp_hint")),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .child(scrollbar),
+            )
+            .into_any_element()
     }
 }
 impl EntityInputHandler for SshView {

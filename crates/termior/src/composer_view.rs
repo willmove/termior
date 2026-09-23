@@ -131,6 +131,11 @@ pub struct ComposerView {
     awaiting_plan_confirmation: bool,
     busy: bool,
     status: String,
+    /// 当前 status 是否为「先到 Settings → Models 配置模型」引导文案；
+    /// 是则空闲时在输入行内作为占位符复用（见 `model_setup_placeholder`）。
+    /// 原先用 `status.contains("Settings → Models")` 之类的文本嗅探，i18n 化后
+    /// 文案会随语言变化，改为在写入状态时显式维护该标记。
+    needs_model_setup: bool,
     runtime: Option<AgentRuntime>,
     active_task: Option<TaskRuntime>,
     active_cancellation: Option<CancellationToken>,
@@ -203,7 +208,8 @@ impl ComposerView {
             plan_confirmed: false,
             awaiting_plan_confirmation: false,
             busy: false,
-            status: "Choose a default chat model in Settings → Models".into(),
+            status: t!("composer.status.choose_model").to_string(),
+            needs_model_setup: true,
             runtime: None,
             active_task: None,
             active_cancellation: None,
@@ -252,6 +258,19 @@ impl ComposerView {
             backend_capability_summary: None,
             external_session: None,
         }
+    }
+
+    /// 覆盖状态行文案；非「模型未配置」引导类状态统一走这里，
+    /// 确保输入行占位符判定随之失效。
+    fn set_status(&mut self, status: impl Into<SharedString>) {
+        self.status = status.into().to_string();
+        self.needs_model_setup = false;
+    }
+
+    /// 写入「模型未配置」引导类状态：会被输入行占位符复用。
+    fn set_model_setup_status(&mut self, status: impl Into<SharedString>) {
+        self.status = status.into().to_string();
+        self.needs_model_setup = true;
     }
 
     pub fn configure(
@@ -333,11 +352,11 @@ impl ComposerView {
             .cloned();
         let Some(profile) = profile else {
             self.runtime = None;
-            self.status = if self.backend_choice == AgentBackendChoice::CodexAppServer {
-                "Ready · Codex app-server · authentication and model managed by Codex".into()
+            if self.backend_choice == AgentBackendChoice::CodexAppServer {
+                self.set_status(t!("composer.status.codex_ready"));
             } else {
-                "Settings → Models: pick a provider, click \"Use for chat\", and enable it".into()
-            };
+                self.set_model_setup_status(t!("composer.status.pick_provider"));
+            }
             cx.notify();
             return;
         };
@@ -345,14 +364,14 @@ impl ComposerView {
         let api_key = KeyringSecretStore::new().get(&key_name).ok().flatten();
         if !profile.local && api_key.is_none() {
             self.runtime = None;
-            self.status = if self.backend_choice == AgentBackendChoice::CodexAppServer {
-                "Ready · Codex app-server · authentication and model managed by Codex".into()
+            if self.backend_choice == AgentBackendChoice::CodexAppServer {
+                self.set_status(t!("composer.status.codex_ready"));
             } else {
-                format!(
-                    "Add an API key for {} in Settings → Models",
-                    profile.display_name
-                )
-            };
+                self.set_model_setup_status(tf!(
+                    "composer.status.add_api_key",
+                    "provider" => profile.display_name
+                ));
+            }
             cx.notify();
             return;
         }
@@ -360,7 +379,7 @@ impl ComposerView {
             Ok(config) => config,
             Err(error) => {
                 self.runtime = None;
-                self.status = error.to_string();
+                self.set_status(error.to_string());
                 cx.notify();
                 return;
             }
@@ -377,7 +396,7 @@ impl ComposerView {
             }
             Err(error) => {
                 self.runtime = None;
-                self.status = error.to_string();
+                self.set_status(error.to_string());
                 cx.notify();
                 return;
             }
@@ -395,7 +414,7 @@ impl ComposerView {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     self.runtime = None;
-                    self.status = error;
+                    self.set_status(error);
                     cx.notify();
                     return;
                 }
@@ -408,12 +427,12 @@ impl ComposerView {
             executor,
             system_prompt,
         });
-        self.status = format!(
-            "Ready · {} / {} · {}",
-            profile.display_name,
-            profile.model,
-            self.active_agent_name()
-        );
+        self.set_status(tf!(
+            "composer.status.ready",
+            "provider" => profile.display_name,
+            "model" => profile.model,
+            "agent" => self.active_agent_name()
+        ));
         cx.notify();
     }
 
@@ -428,11 +447,13 @@ impl ComposerView {
         let definition = self
             .custom_agents
             .get(index)
-            .ok_or_else(|| "Selected custom agent no longer exists".to_owned())?;
+            .ok_or_else(|| t!("composer.status.agent_missing").to_string())?;
         let tools = full_tools
             .clone()
             .subset(definition.tools.clone())
-            .map_err(|error| format!("Custom agent tools are invalid: {error}"))?;
+            .map_err(|error| {
+                tf!("composer.status.agent_tools_invalid", "error" => error).to_string()
+            })?;
         Ok((
             tools,
             format!(
@@ -442,14 +463,14 @@ impl ComposerView {
         ))
     }
 
-    fn active_agent_name(&self) -> &str {
+    fn active_agent_name(&self) -> SharedString {
         if self.backend_choice == AgentBackendChoice::CodexAppServer {
-            return "Codex app-server";
+            return SharedString::from("Codex app-server");
         }
         self.active_custom_agent
             .and_then(|index| self.custom_agents.get(index))
-            .map(|agent| agent.name.as_str())
-            .unwrap_or("Built-in Agent")
+            .map(|agent| SharedString::from(agent.name.as_str()))
+            .unwrap_or_else(|| t!("composer.agent_builtin"))
     }
 
     fn cycle_custom_agent(&mut self, cx: &mut Context<Self>) {
@@ -485,13 +506,16 @@ impl ComposerView {
                         runtime.tools = tools;
                         runtime.system_prompt = prompt;
                     }
-                    self.status = if self.backend_choice == AgentBackendChoice::CodexAppServer {
-                        "Active agent: Codex app-server · auth/model managed by Codex".into()
+                    if self.backend_choice == AgentBackendChoice::CodexAppServer {
+                        self.set_status(t!("composer.status.active_agent_codex"));
                     } else {
-                        format!("Active agent: {}", self.active_agent_name())
-                    };
+                        self.set_status(tf!(
+                            "composer.status.active_agent",
+                            "agent" => self.active_agent_name()
+                        ));
+                    }
                 }
-                Err(error) => self.status = error,
+                Err(error) => self.set_status(error),
             }
         }
         cx.notify();
@@ -512,27 +536,28 @@ impl ComposerView {
         cx: &mut Context<Self>,
     ) {
         let Some(data_dir) = self.data_dir.as_ref() else {
-            self.status = "Recovery storage is unavailable".into();
+            self.set_status(t!("composer.recovery.storage_unavailable"));
             cx.notify();
             return;
         };
         let tasks_root = data_dir.join("agent-tasks");
         match RecoveryCenter::apply(&tasks_root, task_id, command) {
             Ok(operation) => {
-                self.status = format!(
-                    "Recovery {} is now {:?}",
-                    operation.attempt_id, operation.state
-                );
+                self.set_status(tf!(
+                    "composer.recovery.applied",
+                    "attempt" => operation.attempt_id,
+                    "state" => format!("{:?}", operation.state)
+                ));
                 self.recovery_tasks = RecoveryCenter::scan(&tasks_root).unwrap_or_default();
             }
-            Err(error) => self.status = format!("Recovery action failed: {error}"),
+            Err(error) => self.set_status(tf!("composer.recovery.action_failed", "error" => error)),
         }
         cx.notify();
     }
 
     fn restore_checkpoint(&mut self, checkpoint_id: &str, cx: &mut Context<Self>) {
         let Some(data_dir) = self.data_dir.as_ref() else {
-            self.status = "Checkpoint storage is unavailable".into();
+            self.set_status(t!("composer.checkpoint.storage_unavailable"));
             cx.notify();
             return;
         };
@@ -558,18 +583,23 @@ impl ComposerView {
             store.apply_restore(&self.workspace_root, &plan)?;
             Ok::<_, termior_store::CheckpointError>((restored, conflicts))
         })();
-        self.status = match result {
-            Ok((restored, conflicts)) => format!(
-                "Checkpoint {checkpoint_id}: restored {restored} file(s), skipped {conflicts} conflict(s)"
-            ),
-            Err(error) => format!("Checkpoint restore failed: {error}"),
-        };
+        match result {
+            Ok((restored, conflicts)) => self.set_status(tf!(
+                "composer.checkpoint.restored",
+                "id" => checkpoint_id,
+                "restored" => restored,
+                "conflicts" => conflicts
+            )),
+            Err(error) => {
+                self.set_status(tf!("composer.checkpoint.restore_failed", "error" => error))
+            }
+        }
         cx.notify();
     }
 
     fn trigger_automation(&mut self, automation_id: &str, cx: &mut Context<Self>) {
         let Some(data_dir) = self.data_dir.as_ref() else {
-            self.status = "Automation storage is unavailable".into();
+            self.set_status(t!("composer.automation.storage_unavailable"));
             cx.notify();
             return;
         };
@@ -588,13 +618,17 @@ impl ComposerView {
             self.automations = manager.store;
             Ok::<_, std::io::Error>(run)
         })();
-        self.status = match result {
-            Ok(run) => format!(
-                "Automation {} queued as {} (task {})",
-                automation_id, run.run_id, run.task_id
-            ),
-            Err(error) => format!("Automation trigger failed: {error}"),
-        };
+        match result {
+            Ok(run) => self.set_status(tf!(
+                "composer.automation.queued",
+                "id" => automation_id,
+                "run" => run.run_id,
+                "task" => run.task_id
+            )),
+            Err(error) => {
+                self.set_status(tf!("composer.automation.trigger_failed", "error" => error))
+            }
+        }
         cx.notify();
     }
 
@@ -619,18 +653,18 @@ impl ComposerView {
             }
         };
         if let Err(error) = result {
-            self.status = format!("Memory action failed: {error}");
+            self.set_status(tf!("composer.memory.action_failed", "error" => error));
             cx.notify();
             return;
         }
         if let Some(data_dir) = self.data_dir.as_ref() {
             if let Err(error) = self.memory.persist(&data_dir.join("agent-memory.json")) {
-                self.status = format!("Memory persistence failed: {error}");
+                self.set_status(tf!("composer.memory.persist_failed", "error" => error));
                 cx.notify();
                 return;
             }
         }
-        self.status = format!("Memory {id} updated");
+        self.set_status(tf!("composer.memory.updated", "id" => id));
         cx.notify();
     }
 
@@ -650,7 +684,7 @@ impl ComposerView {
             .as_ref()
             .map_or(true, |edit| edit.summary.id != proposal_id)
         {
-            return Err("This AI edit is no longer pending".into());
+            return Err(t!("composer.edit.no_longer_pending").to_string());
         }
         self.pending_edit = None;
         self.dispatch_task_command(
@@ -658,10 +692,10 @@ impl ComposerView {
                 change_set_id: ChangeSetId(proposal_id.to_owned()),
                 accepted_hunks: accepted.to_vec(),
             },
-            "Applying reviewed hunks and continuing verification…",
+            t!("composer.edit.applying"),
             cx,
         );
-        Ok("Review submitted; Agent verification is running".into())
+        Ok(t!("composer.edit.applied").to_string())
     }
 
     pub fn reject_reviewed_edit(
@@ -674,7 +708,7 @@ impl ComposerView {
             .as_ref()
             .map_or(true, |edit| edit.summary.id != proposal_id)
         {
-            return Err("This AI edit is no longer pending".into());
+            return Err(t!("composer.edit.no_longer_pending").to_string());
         }
         self.pending_edit = None;
         self.dispatch_task_command(
@@ -682,15 +716,16 @@ impl ComposerView {
                 change_set_id: ChangeSetId(proposal_id.to_owned()),
                 accepted_hunks: Vec::new(),
             },
-            "Returning the rejected change to the Agent…",
+            t!("composer.edit.returning_rejection"),
             cx,
         );
-        Ok("Change rejected; Agent is continuing with the review result".into())
+        Ok(t!("composer.edit.rejected").to_string())
     }
 
     /// 单一附件入口：一个无过滤对话框，按扩展名自动判型（图片 / 文本文件）。
     fn pick_attachment(&mut self, cx: &mut Context<Self>) {
-        let mut dialog = rfd::AsyncFileDialog::new().set_title("Attach to Composer");
+        let mut dialog =
+            rfd::AsyncFileDialog::new().set_title(t!("composer.attach_dialog_title").to_string());
         if self.workspace_root.is_dir() {
             dialog = dialog.set_directory(&self.workspace_root);
         }
@@ -712,13 +747,16 @@ impl ComposerView {
                                 .unwrap_or("image")
                                 .to_owned();
                             view.draft.attach_image(name, mime, &bytes);
-                            view.status = "Image attached".into();
+                            view.set_status(t!("composer.status.image_attached"));
                         }
-                        Err(error) => view.status = format!("Could not attach image: {error}"),
+                        Err(error) => view.set_status(tf!(
+                            "composer.status.image_failed",
+                            "error" => error
+                        )),
                     },
                     None => {
                         view.draft.attach_file(path);
-                        view.status = "File attached".into();
+                        view.set_status(t!("composer.status.file_attached"));
                     }
                 }
                 cx.notify();
@@ -819,7 +857,7 @@ impl ComposerView {
             }
         }
         if attached {
-            self.status = "Clipboard attachment added".into();
+            self.set_status(t!("composer.status.clipboard_attached"));
             cx.notify();
         }
     }
@@ -859,7 +897,7 @@ impl ComposerView {
             return;
         }
         let Some(runtime) = self.runtime.clone() else {
-            self.status = "Configure a default model in Settings → Models first".into();
+            self.set_model_setup_status(t!("composer.status.configure_first"));
             cx.notify();
             return;
         };
@@ -878,7 +916,7 @@ impl ComposerView {
         let mut payload = match self.draft.build_payload(&runtime.tools) {
             Ok(payload) => payload,
             Err(error) => {
-                self.status = format!("Attachment rejected: {error}");
+                self.set_status(tf!("composer.status.attachment_rejected", "error" => error));
                 cx.notify();
                 return;
             }
@@ -938,7 +976,7 @@ impl ComposerView {
         }) {
             Ok(rules) => rules,
             Err(error) => {
-                self.status = format!("Could not resolve scoped AGENTS.md rules: {error}");
+                self.set_status(tf!("composer.status.rules_failed", "error" => error));
                 cx.emit(AgentStatus::Error);
                 cx.notify();
                 return;
@@ -963,7 +1001,7 @@ impl ComposerView {
                 match SkillIndex::scan_sources(&self.workspace_root, user_skills_root.as_deref()) {
                     Ok(index) => index,
                     Err(error) => {
-                        self.status = format!("Could not activate Agent Skill: {error}");
+                        self.set_status(tf!("composer.status.skill_failed", "error" => error));
                         cx.emit(AgentStatus::Error);
                         cx.notify();
                         return;
@@ -979,7 +1017,11 @@ impl ComposerView {
                 let activated = match index.activate(&name, &task_tools) {
                     Ok(activated) => activated,
                     Err(error) => {
-                        self.status = format!("Could not activate Agent Skill ${name}: {error}");
+                        self.set_status(tf!(
+                            "composer.status.skill_named_failed",
+                            "name" => name,
+                            "error" => error
+                        ));
                         cx.emit(AgentStatus::Error);
                         cx.notify();
                         return;
@@ -1018,7 +1060,7 @@ impl ComposerView {
         let plan = match assembler.plan(&context_items) {
             Ok(plan) => plan,
             Err(error) => {
-                self.status = format!("Context limit: {error}");
+                self.set_status(tf!("composer.status.context_limit", "error" => error));
                 cx.emit(AgentStatus::Attention);
                 cx.notify();
                 return;
@@ -1058,7 +1100,7 @@ impl ComposerView {
             ]) {
                 Ok(tools) => tools,
                 Err(error) => {
-                    self.status = error.to_string();
+                    self.set_status(error.to_string());
                     cx.emit(AgentStatus::Error);
                     cx.notify();
                     return;
@@ -1095,7 +1137,7 @@ impl ComposerView {
             match task.try_with_journal(data_dir) {
                 Ok(task) => task,
                 Err(error) => {
-                    self.status = format!("Could not initialize task journal: {error}");
+                    self.set_status(tf!("composer.status.journal_failed", "error" => error));
                     cx.emit(AgentStatus::Error);
                     cx.notify();
                     return;
@@ -1108,7 +1150,11 @@ impl ComposerView {
         self.active_cancellation = Some(task.cancellation_token());
         self.active_task = Some(task);
         self.active_plan_request = plan_request;
-        self.dispatch_task_command(TaskCommand::Start { user_input }, "Agent is working…", cx);
+        self.dispatch_task_command(
+            TaskCommand::Start { user_input },
+            t!("composer.status.agent_working"),
+            cx,
+        );
     }
 
     fn submit_external(&mut self, cx: &mut Context<Self>) {
@@ -1120,7 +1166,7 @@ impl ComposerView {
             return;
         }
         let Some(tools) = self.full_tools.as_ref() else {
-            self.status = "Codex backend is not configured for this workspace".into();
+            self.set_status(t!("composer.status.codex_unconfigured"));
             cx.emit(AgentStatus::Error);
             cx.notify();
             return;
@@ -1128,7 +1174,7 @@ impl ComposerView {
         let mut payload = match self.draft.build_payload(tools) {
             Ok(payload) => payload,
             Err(error) => {
-                self.status = format!("Attachment rejected: {error}");
+                self.set_status(tf!("composer.status.attachment_rejected", "error" => error));
                 cx.notify();
                 return;
             }
@@ -1154,7 +1200,7 @@ impl ComposerView {
                 task_id: new_session_id(),
                 text: user_input,
             },
-            "Codex app-server is working…",
+            t!("composer.status.codex_working"),
             cx,
         );
     }
@@ -1162,7 +1208,7 @@ impl ComposerView {
     fn dispatch_external_command(
         &mut self,
         command: ExternalCommand,
-        status: &str,
+        status: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
         if self.busy {
@@ -1173,7 +1219,7 @@ impl ComposerView {
         let cancellation = CancellationToken::default();
         self.active_cancellation = Some(cancellation.clone());
         self.busy = true;
-        self.status = status.into();
+        self.set_status(status);
         cx.emit(AgentStatus::Working);
         cx.spawn(async move |view, cx| {
             let (event_tx, mut event_rx) = futures::channel::mpsc::unbounded::<BackendEvent>();
@@ -1187,7 +1233,7 @@ impl ComposerView {
                             view.append_text_delta(text)
                         }
                         BackendEvent::ItemStarted { .. } => {
-                            view.status = "Codex is running a structured item…".into()
+                            view.set_status(t!("composer.status.codex_item"))
                         }
                         _ => {}
                     }
@@ -1230,7 +1276,7 @@ impl ComposerView {
             self.external_session = Some(session);
         }
         if let Some(error) = result.error {
-            self.status = format!("Codex backend error: {error}");
+            self.set_status(tf!("composer.status.codex_error", "error" => error));
             cx.emit(AgentStatus::Error);
             return;
         }
@@ -1250,12 +1296,15 @@ impl ComposerView {
                     request_kind,
                     arguments,
                 });
-                self.status = format!("Codex approval required: {tool_call_id}");
+                self.set_status(tf!(
+                    "composer.status.codex_approval",
+                    "call" => tool_call_id
+                ));
                 cx.emit(AgentStatus::Attention);
             }
             Some(PumpOutcome::Completed { success, status }) => {
                 self.external_pending_approval = None;
-                self.status = format!("Codex turn {status}");
+                self.set_status(tf!("composer.status.codex_turn", "status" => status));
                 cx.emit(if success {
                     AgentStatus::Finished
                 } else {
@@ -1264,15 +1313,15 @@ impl ComposerView {
             }
             Some(PumpOutcome::Unknown { reason }) => {
                 self.external_pending_approval = None;
-                self.status = format!("Codex result is unknown: {reason}");
+                self.set_status(tf!("composer.status.codex_unknown", "reason" => reason));
                 cx.emit(AgentStatus::Attention);
             }
             Some(PumpOutcome::Pending) => {
-                self.status = "Codex turn is still running".into();
+                self.set_status(t!("composer.status.codex_running"));
                 cx.emit(AgentStatus::Attention);
             }
             None => {
-                self.status = "Codex backend returned no outcome".into();
+                self.set_status(t!("composer.status.codex_no_outcome"));
                 cx.emit(AgentStatus::Error);
             }
         }
@@ -1281,28 +1330,28 @@ impl ComposerView {
     fn dispatch_task_command(
         &mut self,
         command: TaskCommand,
-        status: &str,
+        status: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
         if self.busy {
             return;
         }
         let Some(task_runtime) = self.active_task.take() else {
-            self.status = "No active Agent task".into();
+            self.set_status(t!("composer.status.no_task"));
             cx.emit(AgentStatus::Error);
             cx.notify();
             return;
         };
         let Some(runtime) = self.runtime.clone() else {
             self.active_task = Some(task_runtime);
-            self.status = "No configured Agent runtime".into();
+            self.set_status(t!("composer.status.no_runtime"));
             cx.emit(AgentStatus::Error);
             cx.notify();
             return;
         };
         self.active_cancellation = Some(task_runtime.cancellation_token());
         self.busy = true;
-        self.status = status.into();
+        self.set_status(status);
         cx.emit(AgentStatus::Working);
         cx.spawn(async move |view, cx| {
             let (event_tx, mut event_rx) =
@@ -1338,7 +1387,7 @@ impl ComposerView {
         self.persist_task_summary(&result.task);
         if let Some(dir) = self.data_dir.as_deref() {
             if let Err(error) = result.task.persist_journal(dir) {
-                self.status = format!("Agent journal error: {error}");
+                self.set_status(tf!("composer.status.journal_error", "error" => error));
                 self.active_task = Some(result.task);
                 cx.emit(AgentStatus::Error);
                 return;
@@ -1346,7 +1395,7 @@ impl ComposerView {
         }
 
         if let Some(error) = result.error {
-            self.status = format!("Agent error: {error}");
+            self.set_status(tf!("composer.status.agent_error", "error" => error));
             cx.emit(AgentStatus::Error);
             return;
         }
@@ -1354,16 +1403,19 @@ impl ComposerView {
         match result.task.task().state {
             TaskState::WaitingApproval => {
                 let Some(request) = result.task.pending_approval() else {
-                    self.status = "Agent runtime lost its pending approval".into();
+                    self.set_status(t!("composer.status.lost_approval"));
                     cx.emit(AgentStatus::Error);
                     return;
                 };
                 let Some(contract) = result.task.pending_contract() else {
-                    self.status = "Agent runtime lost the pending tool contract".into();
+                    self.set_status(t!("composer.status.lost_contract"));
                     cx.emit(AgentStatus::Error);
                     return;
                 };
-                self.status = format!("Approval required: {}", request.summary);
+                self.set_status(tf!(
+                    "composer.status.approval_required",
+                    "summary" => request.summary
+                ));
                 self.pending_approval = Some(PendingApproval { request, contract });
                 self.active_task = Some(result.task);
                 cx.emit(AgentStatus::Attention);
@@ -1374,7 +1426,7 @@ impl ComposerView {
                     .pending_change_summary()
                     .and_then(|summary| serde_json::from_str::<EditProposalSummary>(summary).ok());
                 let Some(summary) = summary else {
-                    self.status = "Agent runtime returned an invalid change summary".into();
+                    self.set_status(t!("composer.status.invalid_summary"));
                     cx.emit(AgentStatus::Error);
                     return;
                 };
@@ -1383,33 +1435,39 @@ impl ComposerView {
                     summary,
                     decisions: HashMap::new(),
                 });
-                self.status = "Review every proposed hunk before verification".into();
+                self.set_status(t!("composer.status.review_hunks"));
                 self.active_task = Some(result.task);
                 cx.emit(AgentStatus::Attention);
                 cx.emit(review_request);
             }
             TaskState::WaitingUser => {
-                self.status = match result.task.task().waiting_reason.as_ref() {
+                match result.task.task().waiting_reason.as_ref() {
                     Some(WaitingReason::BudgetExhausted {
                         dimension,
                         used,
                         limit,
-                    }) => format!("Agent paused: {dimension:?} budget exhausted ({used}/{limit})"),
-                    Some(reason) => format!("Agent needs input: {reason:?}"),
-                    None => "Agent needs input".into(),
-                };
+                    }) => self.set_status(tf!(
+                        "composer.status.budget_exhausted",
+                        "dimension" => format!("{dimension:?}"),
+                        "used" => used,
+                        "limit" => limit
+                    )),
+                    Some(reason) => self.set_status(tf!(
+                        "composer.status.needs_input_reason",
+                        "reason" => format!("{reason:?}")
+                    )),
+                    None => self.set_status(t!("composer.status.needs_input")),
+                }
                 self.active_task = Some(result.task);
                 cx.emit(AgentStatus::Attention);
             }
             TaskState::CompletedVerified => {
                 if self.active_plan_request {
                     self.awaiting_plan_confirmation = true;
-                    self.status =
-                        "Plan ready · confirm or reject before write-capable tools are exposed"
-                            .into();
+                    self.set_status(t!("composer.plan.ready"));
                     cx.emit(AgentStatus::Attention);
                 } else {
-                    self.status = "Agent finished · verified".into();
+                    self.set_status(t!("composer.status.finished_verified"));
                     cx.emit(AgentStatus::Finished);
                 }
                 self.active_task = None;
@@ -1417,33 +1475,34 @@ impl ComposerView {
             TaskState::CompletedUnverified => {
                 if self.active_plan_request {
                     self.awaiting_plan_confirmation = true;
-                    self.status =
-                        "Plan ready · confirm or reject before write-capable tools are exposed"
-                            .into();
+                    self.set_status(t!("composer.plan.ready"));
                     cx.emit(AgentStatus::Attention);
                 } else {
-                    self.status = "Agent finished · unverified (no acceptance command)".into();
+                    self.set_status(t!("composer.status.finished_unverified"));
                     cx.emit(AgentStatus::Finished);
                 }
                 self.active_task = None;
             }
             TaskState::Cancelled => {
-                self.status = "Agent task cancelled".into();
+                self.set_status(t!("composer.status.cancelled"));
                 self.active_task = None;
                 cx.emit(AgentStatus::Finished);
             }
             TaskState::Unknown => {
-                self.status = "Agent stopped with an unknown side-effect result".into();
+                self.set_status(t!("composer.status.unknown_result"));
                 self.active_task = None;
                 cx.emit(AgentStatus::Attention);
             }
             TaskState::Failed => {
-                self.status = "Agent task failed; inspect the last tool result".into();
+                self.set_status(t!("composer.status.task_failed"));
                 self.active_task = None;
                 cx.emit(AgentStatus::Error);
             }
             state => {
-                self.status = format!("Agent task state: {state:?}");
+                self.set_status(tf!(
+                    "composer.status.task_state",
+                    "state" => format!("{state:?}")
+                ));
                 self.active_task = Some(result.task);
                 cx.emit(AgentStatus::Attention);
             }
@@ -1471,7 +1530,7 @@ impl ComposerView {
         if self.external_pending_approval.take().is_some() {
             self.dispatch_external_command(
                 ExternalCommand::Respond { approved: true },
-                "Returning approval to Codex…",
+                t!("composer.status.returning_approval_codex"),
                 cx,
             );
             return;
@@ -1479,13 +1538,16 @@ impl ComposerView {
         let Some(pending) = self.pending_approval.take() else {
             return;
         };
-        let label = format!("Running approved tool: {}", pending.request.tool_name);
+        let label = tf!(
+            "composer.status.running_tool",
+            "tool" => pending.request.tool_name
+        );
         self.dispatch_task_command(
             TaskCommand::ResolveApproval {
                 call_id: pending.request.call_id,
                 approved: true,
             },
-            &label,
+            label,
             cx,
         );
     }
@@ -1494,7 +1556,7 @@ impl ComposerView {
         if self.external_pending_approval.take().is_some() {
             self.dispatch_external_command(
                 ExternalCommand::Respond { approved: false },
-                "Returning rejection to Codex…",
+                t!("composer.status.returning_rejection_codex"),
                 cx,
             );
             return;
@@ -1505,7 +1567,7 @@ impl ComposerView {
                     call_id: pending.request.call_id,
                     approved: false,
                 },
-                "Returning the rejection to the Agent…",
+                t!("composer.status.returning_rejection"),
                 cx,
             );
         }
@@ -1536,7 +1598,7 @@ impl ComposerView {
             return;
         };
         if edit.decisions.len() != edit.summary.hunk_ids.len() {
-            self.status = "Accept or reject every hunk first".into();
+            self.set_status(t!("composer.status.decide_hunks"));
             cx.notify();
             return;
         }
@@ -1589,9 +1651,7 @@ impl ComposerView {
     /// 首次切到 Yolo 弹一次确认（本次应用运行内不再重复）。
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         if self.backend_choice == AgentBackendChoice::CodexAppServer {
-            self.status =
-                "Codex app-server decides per-request approvals through its capability contract"
-                    .into();
+            self.set_status(t!("composer.status.codex_owns_approvals"));
             cx.notify();
             return;
         }
@@ -1606,12 +1666,8 @@ impl ComposerView {
             let entity = cx.entity().downgrade();
             cx.spawn(async move |_, cx| {
                 let confirmed = rfd::AsyncMessageDialog::new()
-                    .set_title("Enable Yolo mode")
-                    .set_description(
-                        "Gated tools (file writes, commands, background shells) will run \
-                         without asking for approval. Security guards (workspace bounds, \
-                         secret deny-list) stay active. Enable Yolo mode?",
-                    )
+                    .set_title(t!("composer.mode.yolo_title").to_string())
+                    .set_description(t!("composer.mode.yolo_description").to_string())
                     .set_buttons(rfd::MessageButtons::YesNo)
                     .show()
                     .await;
@@ -1633,11 +1689,11 @@ impl ComposerView {
         self.mode_menu_open = false;
         self.plan_confirmed = false;
         self.awaiting_plan_confirmation = false;
-        self.status = match mode {
-            Mode::Auto => "Mode: Auto · gated tools ask for approval".into(),
-            Mode::Plan => "Mode: Plan · zero writes until the plan is confirmed".into(),
-            Mode::Yolo => "Mode: Yolo · gated tools run without asking".into(),
-        };
+        match mode {
+            Mode::Auto => self.set_status(t!("composer.mode.status_auto")),
+            Mode::Plan => self.set_status(t!("composer.mode.status_plan")),
+            Mode::Yolo => self.set_status(t!("composer.mode.status_yolo")),
+        }
         self.persist_session();
         cx.notify();
     }
@@ -1659,7 +1715,7 @@ impl ComposerView {
         self.history.push(Message::assistant(
             "The proposed plan was rejected. No write-capable tool was exposed.",
         ));
-        self.status = "Plan rejected".into();
+        self.set_status(t!("composer.plan.rejected"));
         cx.emit(AgentStatus::Finished);
         self.persist_session();
         cx.notify();
@@ -1676,13 +1732,13 @@ impl ComposerView {
     fn stop_active_task(&mut self, cx: &mut Context<Self>) {
         if let Some(cancellation) = &self.active_cancellation {
             cancellation.cancel();
-            self.status = "Cancelling Agent task…".into();
+            self.set_status(t!("composer.status.cancelling"));
             cx.emit(AgentStatus::Attention);
             cx.notify();
             return;
         }
         if self.active_task.is_some() {
-            self.dispatch_task_command(TaskCommand::Cancel, "Cancelling Agent task…", cx);
+            self.dispatch_task_command(TaskCommand::Cancel, t!("composer.status.cancelling"), cx);
         }
     }
 
@@ -1701,7 +1757,7 @@ impl ComposerView {
             .saturating_add(4 * 1024 * 1024);
         self.dispatch_task_command(
             TaskCommand::IncreaseBudgets { budgets },
-            "Continuing Agent task with an increased budget…",
+            t!("composer.budget.continuing"),
             cx,
         );
     }
@@ -1828,12 +1884,7 @@ impl ComposerView {
         if self.runtime.is_some() {
             return None;
         }
-        let status = self.status.as_str();
-        if status.contains("Settings → Models") || status.contains("API key") {
-            Some(status)
-        } else {
-            None
-        }
+        self.needs_model_setup.then_some(self.status.as_str())
     }
 }
 
@@ -1887,7 +1938,7 @@ fn run_external_command(
                     return ExternalRunResult {
                         session: None,
                         outcome: None,
-                        error: Some("Codex approval session is missing".into()),
+                        error: Some(t!("composer.status.codex_session_missing").to_string()),
                     }
                 }
             };
@@ -1922,7 +1973,7 @@ fn run_external_command(
                 return ExternalRunResult {
                     session: Some(session.clone()),
                     outcome: None,
-                    error: Some("Codex session lock is poisoned".into()),
+                    error: Some(t!("composer.status.codex_lock_poisoned").to_string()),
                 }
             }
         };
@@ -1961,7 +2012,7 @@ fn run_external_command(
         if cancellation.is_cancelled() {
             let result = session
                 .lock()
-                .map_err(|_| "Codex session lock is poisoned".to_owned())
+                .map_err(|_| t!("composer.status.codex_lock_poisoned").to_string())
                 .and_then(|mut guard| guard.cancel().map_err(|error| error.to_string()));
             return ExternalRunResult {
                 session: Some(session.clone()),
@@ -1994,7 +2045,7 @@ fn run_external_command(
                 return ExternalRunResult {
                     session: Some(session.clone()),
                     outcome: None,
-                    error: Some("Codex session lock is poisoned".into()),
+                    error: Some(t!("composer.status.codex_lock_poisoned").to_string()),
                 }
             }
         };
@@ -2016,16 +2067,17 @@ impl gpui::Render for ComposerView {
             view: cx.entity().downgrade(),
         };
         let ime_anchor = self.ime_anchor.clone();
-        let agent_name = self.active_agent_name().to_owned();
+        let agent_name = self.active_agent_name();
         let agent_tooltip = self
             .backend_capability_summary
             .clone()
-            .unwrap_or_else(|| "Agent — click to switch".into());
+            .map(SharedString::from)
+            .unwrap_or_else(|| t!("composer.agent_tooltip"));
         let external_backend = self.backend_choice == AgentBackendChoice::CodexAppServer;
         let mode_label = if external_backend {
-            "Backend approval"
+            t!("composer.backend_approval")
         } else {
-            self.mode.label()
+            SharedString::from(self.mode.label())
         };
         let environment_id = self
             .active_task
@@ -2039,23 +2091,23 @@ impl gpui::Render for ComposerView {
                 }
             });
         let environment_tooltip = if external_backend {
-            format!(
-                "host={} · root={} · file=workspace-write · network=backend-declared · credentials=Codex-managed · process=backend-declared · trust=reported/unknown",
-                std::env::consts::OS,
-                self.workspace_root.display()
+            tf!(
+                "composer.environment_external",
+                "host" => std::env::consts::OS,
+                "root" => self.workspace_root.display()
             )
         } else {
-            format!(
-                "host={} · root={} · file=workspace-confined · network=provider/tool policy · credentials=keyring references only · process=local session tree · trust=verified where probed",
-                std::env::consts::OS,
-                self.workspace_root.display()
+            tf!(
+                "composer.environment_builtin",
+                "host" => std::env::consts::OS,
+                "root" => self.workspace_root.display()
             )
         };
         let context_label = self.context_plan().map(|plan| {
-            format!(
-                "Context {}t · {} items",
-                plan.total_tokens,
-                plan.entries.len()
+            tf!(
+                "composer.context_summary",
+                "tokens" => plan.total_tokens,
+                "items" => plan.entries.len()
             )
         });
         let compact = self.is_compact();
@@ -2087,7 +2139,11 @@ impl gpui::Render for ComposerView {
             .enumerate()
             .map(|(index, message)| {
                 let is_user = message.role == Role::User;
-                let label = if is_user { "You" } else { "Termior" };
+                let label = if is_user {
+                    t!("composer.message_you")
+                } else {
+                    t!("composer.message_agent")
+                };
                 let label_color = if is_user {
                     crate::ui::muted(&p)
                 } else {
@@ -2152,10 +2208,10 @@ impl gpui::Render for ComposerView {
                     .border_color(crate::ui::border(&p))
                     .text_xs()
                     .cursor_pointer()
-                    .child(SharedString::from(format!(
-                        "{}  ×",
-                        attachment.chip_label()
-                    )))
+                    .child(tf!(
+                        "composer.attachment_chip",
+                        "label" => attachment.chip_label()
+                    ))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
@@ -2204,11 +2260,11 @@ impl gpui::Render for ComposerView {
             .as_ref()
             .map(|pending| {
                 (
-                    format!(
-                        "Approval: {} · call={} · effect={:?}",
-                        pending.request.summary,
-                        pending.request.call_id,
-                        pending.contract.side_effect
+                    tf!(
+                        "composer.approval.headline",
+                        "summary" => pending.request.summary,
+                        "call" => pending.request.call_id,
+                        "effect" => format!("{:?}", pending.contract.side_effect)
                     ),
                     pending.request.arguments.clone(),
                 )
@@ -2216,9 +2272,11 @@ impl gpui::Render for ComposerView {
             .or_else(|| {
                 self.external_pending_approval.as_ref().map(|pending| {
                     (
-                        format!(
-                            "Codex approval: {} · request={} · call={}",
-                            pending.request_kind, pending.backend_request_id, pending.tool_call_id
+                        tf!(
+                            "composer.approval.codex_headline",
+                            "kind" => pending.request_kind,
+                            "request" => pending.backend_request_id,
+                            "call" => pending.tool_call_id
                         ),
                         pending.arguments.clone(),
                     )
@@ -2235,7 +2293,7 @@ impl gpui::Render for ComposerView {
                 .border_1()
                 .border_color(crate::ui::color(p.status[2]))
                 .bg(crate::ui::alpha(p.status[2], 0.08))
-                .child(SharedString::from(headline))
+                .child(headline)
                 .child(div().text_xs().child(SharedString::from(arguments)))
                 .child(
                     div()
@@ -2250,7 +2308,7 @@ impl gpui::Render for ComposerView {
                                 .bg(crate::ui::color(p.status[1]))
                                 .text_color(crate::ui::on_color(p.status[1]))
                                 .cursor_pointer()
-                                .child("Approve")
+                                .child(t!("composer.approval.approve"))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| this.approve_tool(cx)),
@@ -2265,7 +2323,7 @@ impl gpui::Render for ComposerView {
                                 .bg(crate::ui::color(p.status[3]))
                                 .text_color(crate::ui::on_color(p.status[3]))
                                 .cursor_pointer()
-                                .child("Reject")
+                                .child(t!("composer.approval.reject"))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| this.reject_tool(cx)),
@@ -2295,7 +2353,7 @@ impl gpui::Render for ComposerView {
                             crate::ui::color(p.foreground)
                         })
                         .cursor_pointer()
-                        .child(SharedString::from(format!("Accept hunk {id}")))
+                        .child(tf!("composer.edit.accept_hunk", "id" => id))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
@@ -2318,7 +2376,7 @@ impl gpui::Render for ComposerView {
                             crate::ui::color(p.foreground)
                         })
                         .cursor_pointer()
-                        .child(SharedString::from(format!("Reject hunk {id}")))
+                        .child(tf!("composer.edit.reject_hunk", "id" => id))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, _, cx| {
@@ -2336,10 +2394,7 @@ impl gpui::Render for ComposerView {
                 .rounded_md()
                 .border_1()
                 .border_color(crate::ui::color(p.accent))
-                .child(SharedString::from(format!(
-                    "AI diff · {}",
-                    edit.summary.path
-                )))
+                .child(tf!("composer.edit.headline", "path" => edit.summary.path))
                 .child(
                     div()
                         .max_h(px(70.0))
@@ -2361,7 +2416,7 @@ impl gpui::Render for ComposerView {
                                 .bg(crate::ui::color(p.status[1]))
                                 .text_color(crate::ui::on_color(p.status[1]))
                                 .cursor_pointer()
-                                .child("Apply decisions")
+                                .child(t!("composer.edit.apply"))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| this.apply_edit(cx)),
@@ -2376,7 +2431,7 @@ impl gpui::Render for ComposerView {
                                 .bg(crate::ui::color(p.status[3]))
                                 .text_color(crate::ui::on_color(p.status[3]))
                                 .cursor_pointer()
-                                .child("Reject all")
+                                .child(t!("composer.edit.reject_all"))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| this.reject_edit(cx)),
@@ -2426,11 +2481,12 @@ impl gpui::Render for ComposerView {
                             .flex()
                             .justify_between()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Context Inspector")
-                            .child(SharedString::from(format!(
-                                "{} / {} tokens",
-                                plan.total_tokens, plan.hard_limit
-                            ))),
+                            .child(t!("composer.context_inspector"))
+                            .child(tf!(
+                                "composer.context_tokens",
+                                "used" => plan.total_tokens,
+                                "limit" => plan.hard_limit
+                            )),
                     )
                     .children(rows)
             });
@@ -2462,19 +2518,21 @@ impl gpui::Render for ComposerView {
                                 "{} · {}",
                                 task.task_id, task.attempt_id
                             )))
-                            .child(SharedString::from(format!(
-                                "{:?} · event {}",
-                                task.recovered_state, task.last_trusted_event
-                            ))),
+                            .child(tf!(
+                                "composer.recovery.attempt_state",
+                                "state" => format!("{:?}", task.recovered_state),
+                                "event" => task.last_trusted_event
+                            )),
                     )
-                    .child(div().text_xs().text_color(crate::ui::muted(&p)).child(
-                        SharedString::from(format!(
-                            "persisted={} · backend={} · actions: {}",
-                            task.persisted_state,
-                            task.backend_id.as_deref().unwrap_or("unknown"),
-                            task.available_actions.join(", ")
-                        )),
-                    ))
+                    .child(div().text_xs().text_color(crate::ui::muted(&p)).child(tf!(
+                        "composer.recovery.task_detail",
+                        "persisted" => task.persisted_state,
+                        "backend" => task
+                            .backend_id
+                            .clone()
+                            .unwrap_or_else(|| t!("composer.recovery.unknown_backend").to_string()),
+                        "actions" => task.available_actions.join(", ")
+                    )))
                     .when_some(task.diagnostic.clone(), |row, diagnostic| {
                         row.child(
                             div()
@@ -2501,7 +2559,7 @@ impl gpui::Render for ComposerView {
                                             .border_color(crate::ui::border(&p))
                                             .text_xs()
                                             .cursor_pointer()
-                                            .child("Prepare retry")
+                                            .child(t!("composer.recovery.prepare_retry"))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, _, _, cx| {
@@ -2528,7 +2586,7 @@ impl gpui::Render for ComposerView {
                                             .border_color(crate::ui::color(p.status[3]))
                                             .text_xs()
                                             .cursor_pointer()
-                                            .child("Abandon")
+                                            .child(t!("composer.recovery.abandon"))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, _, _, cx| {
@@ -2557,14 +2615,14 @@ impl gpui::Render for ComposerView {
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Recovery Center"),
+                        .child(t!("composer.recovery.title")),
                 )
                 .when(self.recovery_tasks.is_empty(), |panel| {
                     panel.child(
                         div()
                             .text_xs()
                             .text_color(crate::ui::muted(&p))
-                            .child("No unfinished tasks were found."),
+                            .child(t!("composer.recovery.empty")),
                     )
                 })
                 .children(rows)
@@ -2606,17 +2664,18 @@ impl gpui::Render for ComposerView {
                                     .justify_between()
                                     .child(SharedString::from(automation.name.clone()))
                                     .child(if automation.enabled {
-                                        "enabled"
+                                        t!("composer.automation.enabled")
                                     } else {
-                                        "disabled"
+                                        t!("composer.automation.disabled")
                                     }),
                             )
-                            .child(div().text_xs().text_color(crate::ui::muted(&p)).child(
-                                SharedString::from(format!(
-                                    "template v{} · next={} · last={} · {:?}",
-                                    automation.template.version, next, last, automation.trigger
-                                )),
-                            ))
+                            .child(div().text_xs().text_color(crate::ui::muted(&p)).child(tf!(
+                                "composer.automation.detail",
+                                "version" => automation.template.version,
+                                "next" => next,
+                                "last" => last,
+                                "trigger" => format!("{:?}", automation.trigger)
+                            )))
                             .when(automation.enabled, |row| {
                                 row.child(
                                     div()
@@ -2628,7 +2687,7 @@ impl gpui::Render for ComposerView {
                                         .border_color(crate::ui::border(&p))
                                         .text_xs()
                                         .cursor_pointer()
-                                        .child("Queue manual run")
+                                        .child(t!("composer.automation.queue_run"))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
@@ -2648,93 +2707,101 @@ impl gpui::Render for ComposerView {
                 .rounded_md()
                 .border_1()
                 .border_color(crate::ui::border(&p))
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Automations"))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(t!("composer.automation.title")),
+                )
                 .when(self.automations.automations.is_empty(), |panel| {
                     panel.child(
                         div()
                             .text_xs()
                             .text_color(crate::ui::muted(&p))
-                            .child("No local automation templates are configured."),
+                            .child(t!("composer.automation.empty")),
                     )
                 })
                 .children(rows)
         });
-        let checkpoint_center =
-            self.checkpoint_center_open.then(|| {
-                let rows = self
-                    .checkpoints
-                    .iter()
-                    .enumerate()
-                    .map(|(index, checkpoint)| {
-                        let checkpoint_id = checkpoint.id.clone();
-                        let files = checkpoint
-                            .files
-                            .iter()
-                            .map(|file| file.relative_path.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        div()
-                            .id(SharedString::from(format!("checkpoint-entry-{index}")))
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .p_2()
-                            .rounded_md()
-                            .bg(crate::ui::alpha(p.foreground, 0.04))
-                            .child(
-                                div()
-                                    .flex()
-                                    .justify_between()
-                                    .child(SharedString::from(checkpoint.id.clone()))
-                                    .child(SharedString::from(format!(
-                                        "task {} · event {}",
-                                        checkpoint.task_id, checkpoint.sequence
-                                    ))),
-                            )
-                            .child(
-                                div().text_xs().text_color(crate::ui::muted(&p)).child(
-                                    SharedString::from(format!("recoverable files: {files}")),
+        let checkpoint_center = self.checkpoint_center_open.then(|| {
+            let rows = self
+                .checkpoints
+                .iter()
+                .enumerate()
+                .map(|(index, checkpoint)| {
+                    let checkpoint_id = checkpoint.id.clone();
+                    let files = checkpoint
+                        .files
+                        .iter()
+                        .map(|file| file.relative_path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    div()
+                        .id(SharedString::from(format!("checkpoint-entry-{index}")))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .p_2()
+                        .rounded_md()
+                        .bg(crate::ui::alpha(p.foreground, 0.04))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .child(SharedString::from(checkpoint.id.clone()))
+                                .child(tf!(
+                                    "composer.checkpoint.meta",
+                                    "task" => checkpoint.task_id,
+                                    "event" => checkpoint.sequence
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(crate::ui::muted(&p))
+                                .child(tf!("composer.checkpoint.files", "files" => files)),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("restore-checkpoint-{index}")))
+                                .px_2()
+                                .py(px(2.0))
+                                .rounded_md()
+                                .border_1()
+                                .border_color(crate::ui::border(&p))
+                                .text_xs()
+                                .cursor_pointer()
+                                .child(t!("composer.checkpoint.restore"))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.restore_checkpoint(&checkpoint_id, cx);
+                                    }),
                                 ),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("restore-checkpoint-{index}")))
-                                    .px_2()
-                                    .py(px(2.0))
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(crate::ui::border(&p))
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .child("Restore unchanged outputs")
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.restore_checkpoint(&checkpoint_id, cx);
-                                        }),
-                                    ),
-                            )
-                    });
-                div()
-                    .id("checkpoint-center-panel")
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .p_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(crate::ui::border(&p))
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("File Checkpoints"),
-                    )
-                    .child(div().text_xs().text_color(crate::ui::muted(&p)).child(
-                        "Process, network, and external-service effects are not reversible.",
-                    ))
-                    .children(rows)
-            });
+                        )
+                });
+            div()
+                .id("checkpoint-center-panel")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&p))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(t!("composer.checkpoint.title")),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(crate::ui::muted(&p))
+                        .child(t!("composer.checkpoint.note")),
+                )
+                .children(rows)
+        });
         let skill_center = self.skill_center_open.then(|| {
             let rows = self.skills.iter().enumerate().map(|(index, skill)| {
                 let active = self.active_skills.iter().any(|name| name == &skill.name);
@@ -2752,28 +2819,26 @@ impl gpui::Render for ComposerView {
                             .justify_between()
                             .child(SharedString::from(format!("${}", skill.name)))
                             .child(if active {
-                                "active this turn"
+                                t!("composer.skills.active")
                             } else {
-                                "available"
+                                t!("composer.skills.available")
                             }),
                     )
-                    .child(div().text_xs().text_color(crate::ui::muted(&p)).child(
-                        SharedString::from(format!(
-                            "{} · source={} · allowed tools: {}",
-                            skill.description,
-                            skill.path.display(),
-                            if skill.allowed_tools.is_empty() {
-                                "task tool set".into()
-                            } else {
-                                skill
-                                    .allowed_tools
-                                    .iter()
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            }
-                        )),
-                    ))
+                    .child(div().text_xs().text_color(crate::ui::muted(&p)).child(tf!(
+                        "composer.skills.detail",
+                        "description" => skill.description,
+                        "source" => skill.path.display(),
+                        "tools" => if skill.allowed_tools.is_empty() {
+                            t!("composer.skills.task_tool_set").to_string()
+                        } else {
+                            skill
+                                .allowed_tools
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    )))
             });
             div()
                 .id("skill-center-panel")
@@ -2787,7 +2852,7 @@ impl gpui::Render for ComposerView {
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Agent Skills"),
+                        .child(t!("composer.skills.title")),
                 )
                 .when_some(self.skill_scan_error.clone(), |panel, error| {
                     panel.child(
@@ -2820,10 +2885,11 @@ impl gpui::Render for ComposerView {
                             .p_2()
                             .rounded_md()
                             .bg(crate::ui::alpha(p.status[2], 0.08))
-                            .child(SharedString::from(format!(
-                                "Candidate {} · confidence {}",
-                                candidate.id, candidate.confidence
-                            )))
+                            .child(tf!(
+                                "composer.memory.candidate",
+                                "id" => candidate.id,
+                                "confidence" => candidate.confidence
+                            ))
                             .child(
                                 div()
                                     .text_xs()
@@ -2845,7 +2911,7 @@ impl gpui::Render for ComposerView {
                                             .border_color(crate::ui::border(&p))
                                             .text_xs()
                                             .cursor_pointer()
-                                            .child("Accept")
+                                            .child(t!("composer.memory.accept"))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, _, _, cx| {
@@ -2870,7 +2936,7 @@ impl gpui::Render for ComposerView {
                                             .border_color(crate::ui::color(p.status[3]))
                                             .text_xs()
                                             .cursor_pointer()
-                                            .child("Reject")
+                                            .child(t!("composer.memory.reject"))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, _, _, cx| {
@@ -2925,7 +2991,11 @@ impl gpui::Render for ComposerView {
                                         .border_color(crate::ui::border(&p))
                                         .text_xs()
                                         .cursor_pointer()
-                                        .child(if entry.enabled { "Pause" } else { "Resume" })
+                                        .child(if entry.enabled {
+                                            t!("composer.memory.pause")
+                                        } else {
+                                            t!("composer.memory.resume")
+                                        })
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
@@ -2948,7 +3018,7 @@ impl gpui::Render for ComposerView {
                                         .border_color(crate::ui::color(p.status[3]))
                                         .text_xs()
                                         .cursor_pointer()
-                                        .child("Delete")
+                                        .child(t!("composer.memory.delete"))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, _, _, cx| {
@@ -2975,7 +3045,7 @@ impl gpui::Render for ComposerView {
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("Agent Memory"),
+                        .child(t!("composer.memory.title")),
                 )
                 .children(candidates)
                 .children(entries)
@@ -2991,7 +3061,7 @@ impl gpui::Render for ComposerView {
                     .rounded_md()
                     .border_1()
                     .border_color(crate::ui::color(p.status[2]))
-                    .child("The Agent reached its task budget.")
+                    .child(t!("composer.budget.reached"))
                     .child(
                         div()
                             .id("continue-agent-budget")
@@ -3002,7 +3072,7 @@ impl gpui::Render for ComposerView {
                             .bg(crate::ui::color(p.accent))
                             .text_color(crate::ui::on_color(p.accent))
                             .cursor_pointer()
-                            .child("Continue (+25 steps / +15 min)")
+                            .child(t!("composer.budget.continue"))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.continue_with_more_budget(cx)),
@@ -3018,7 +3088,7 @@ impl gpui::Render for ComposerView {
                 .rounded_md()
                 .border_1()
                 .border_color(crate::ui::color(p.accent))
-                .child("Plan awaiting confirmation")
+                .child(t!("composer.plan.awaiting"))
                 .child(
                     div()
                         .id("confirm-plan")
@@ -3028,7 +3098,7 @@ impl gpui::Render for ComposerView {
                         .bg(crate::ui::color(p.status[1]))
                         .text_color(crate::ui::on_color(p.status[1]))
                         .cursor_pointer()
-                        .child("Confirm plan")
+                        .child(t!("composer.plan.confirm"))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.confirm_plan(cx)),
@@ -3043,7 +3113,7 @@ impl gpui::Render for ComposerView {
                         .bg(crate::ui::color(p.status[3]))
                         .text_color(crate::ui::on_color(p.status[3]))
                         .cursor_pointer()
-                        .child("Reject plan")
+                        .child(t!("composer.plan.reject"))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _, _, cx| this.reject_plan(cx)),
@@ -3068,6 +3138,12 @@ impl gpui::Render for ComposerView {
                     [Mode::Auto, Mode::Plan, Mode::Yolo].map(|mode| {
                         let selected = mode == selected_mode;
                         let hover = crate::ui::hover_wash(&p);
+                        // 档位名 Auto/Plan/Yolo 是专有名词保留原文；一句话说明走 i18n。
+                        let description = match mode {
+                            Mode::Auto => t!("composer.mode.auto_desc"),
+                            Mode::Plan => t!("composer.mode.plan_desc"),
+                            Mode::Yolo => t!("composer.mode.yolo_desc"),
+                        };
                         div()
                             .id(SharedString::from(format!(
                                 "composer-mode-{}",
@@ -3084,11 +3160,7 @@ impl gpui::Render for ComposerView {
                             .cursor_pointer()
                             .hover(move |style| style.bg(hover))
                             .child(mode.label())
-                            .child(
-                                div()
-                                    .text_color(crate::ui::muted(&p))
-                                    .child(mode.description()),
-                            )
+                            .child(div().text_color(crate::ui::muted(&p)).child(description))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
@@ -3104,14 +3176,18 @@ impl gpui::Render for ComposerView {
             .flex_col()
             .relative()
             .overflow_hidden()
-            .when(self.fill_workspace || self.dock == ComposerDock::Right, |root| {
-                root.w_full().h_full()
-            })
-            .when(!self.fill_workspace && self.dock == ComposerDock::Bottom, |root| {
-                root.w_full()
-                    .when(compact, |root| root.min_h(px(COMPOSER_COMPACT_HEIGHT)))
-                    .when(!compact, |root| root.h(px(self.panel_height)))
-            })
+            .when(
+                self.fill_workspace || self.dock == ComposerDock::Right,
+                |root| root.w_full().h_full(),
+            )
+            .when(
+                !self.fill_workspace && self.dock == ComposerDock::Bottom,
+                |root| {
+                    root.w_full()
+                        .when(compact, |root| root.min_h(px(COMPOSER_COMPACT_HEIGHT)))
+                        .when(!compact, |root| root.h(px(self.panel_height)))
+                },
+            )
             // 分隔线由工作区在面板外沿绘制的拖拽手柄承担。
             .bg(crate::ui::color(p.elevated))
             .text_color(crate::ui::color(p.foreground))
@@ -3149,7 +3225,7 @@ impl gpui::Render for ComposerView {
                                     .px_1()
                                     .text_xs()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Agent"),
+                                    .child(t!("composer.header")),
                             )
                             .when(!self.recovery_tasks.is_empty(), |header| {
                                 header.child(
@@ -3161,10 +3237,10 @@ impl gpui::Render for ComposerView {
                                         .bg(crate::ui::alpha(p.status[2], 0.14))
                                         .text_xs()
                                         .cursor_pointer()
-                                        .child(SharedString::from(format!(
-                                            "Recovery {}",
-                                            self.recovery_tasks.len()
-                                        )))
+                                        .child(tf!(
+                                            "composer.recovery.badge",
+                                            "count" => self.recovery_tasks.len()
+                                        ))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
@@ -3173,7 +3249,7 @@ impl gpui::Render for ComposerView {
                                                     !this.recovery_center_open;
                                                 cx.notify();
                                             }),
-                                    ),
+                                        ),
                                 )
                             })
                             .child(
@@ -3185,10 +3261,10 @@ impl gpui::Render for ComposerView {
                                     .bg(crate::ui::alpha(p.accent, 0.10))
                                     .text_xs()
                                     .cursor_pointer()
-                                    .child(SharedString::from(format!(
-                                        "Automations {}",
-                                        self.automations.automations.len()
-                                    )))
+                                    .child(tf!(
+                                        "composer.automation.badge",
+                                        "count" => self.automations.automations.len()
+                                    ))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
@@ -3209,10 +3285,10 @@ impl gpui::Render for ComposerView {
                                         .bg(crate::ui::alpha(p.status[1], 0.12))
                                         .text_xs()
                                         .cursor_pointer()
-                                        .child(SharedString::from(format!(
-                                            "Checkpoints {}",
-                                            self.checkpoints.len()
-                                        )))
+                                        .child(tf!(
+                                            "composer.checkpoint.badge",
+                                            "count" => self.checkpoints.len()
+                                        ))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
@@ -3221,36 +3297,41 @@ impl gpui::Render for ComposerView {
                                                     !this.checkpoint_center_open;
                                                 cx.notify();
                                             }),
-                                    ),
-                                )
-                            })
-                            .when(!self.skills.is_empty() || self.skill_scan_error.is_some(), |header| {
-                                header.child(
-                                    div()
-                                        .id("composer-skill-center")
-                                        .px_2()
-                                        .py(px(2.0))
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(crate::ui::border(&p))
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .child(SharedString::from(format!(
-                                            "Skills {}",
-                                            self.skills.len()
-                                        )))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.skill_center_open = !this.skill_center_open;
-                                                cx.notify();
-                                            }),
                                         ),
                                 )
                             })
                             .when(
-                                !self.memory.candidates.is_empty() || !self.memory.entries.is_empty(),
+                                !self.skills.is_empty() || self.skill_scan_error.is_some(),
+                                |header| {
+                                    header.child(
+                                        div()
+                                            .id("composer-skill-center")
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(crate::ui::border(&p))
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .child(tf!(
+                                                "composer.skills.badge",
+                                                "count" => self.skills.len()
+                                            ))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.skill_center_open =
+                                                        !this.skill_center_open;
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
+                                },
+                            )
+                            .when(
+                                !self.memory.candidates.is_empty()
+                                    || !self.memory.entries.is_empty(),
                                 |header| {
                                     header.child(
                                         div()
@@ -3262,11 +3343,11 @@ impl gpui::Render for ComposerView {
                                             .border_color(crate::ui::border(&p))
                                             .text_xs()
                                             .cursor_pointer()
-                                            .child(SharedString::from(format!(
-                                                "Memory {}",
-                                                self.memory.candidates.len()
+                                            .child(tf!(
+                                                "composer.memory.badge",
+                                                "count" => self.memory.candidates.len()
                                                     + self.memory.entries.len()
-                                            )))
+                                            ))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, _, cx| {
@@ -3309,7 +3390,7 @@ impl gpui::Render for ComposerView {
                                 crate::ui::icon_button(
                                     "composer-dock",
                                     self.dock.toggle_icon(),
-                                    self.dock.toggle_label(),
+                                    t!(self.dock.toggle_label_key()),
                                     &p,
                                 )
                                 .on_mouse_down(
@@ -3323,7 +3404,7 @@ impl gpui::Render for ComposerView {
                                 crate::ui::icon_button(
                                     "composer-collapse",
                                     Icon::ChevronDown,
-                                    "Hide agent panel (Ctrl+I)",
+                                    t!("composer.hide_panel"),
                                     &p,
                                 )
                                 .on_mouse_down(
@@ -3416,7 +3497,7 @@ impl gpui::Render for ComposerView {
                         crate::ui::icon_button(
                             "composer-attach",
                             Icon::Paperclip,
-                            "Attach file or image",
+                            t!("composer.attach_hint"),
                             &p,
                         )
                         .on_mouse_down(
@@ -3452,9 +3533,9 @@ impl gpui::Render for ComposerView {
                             .tooltip(move |_window, cx| {
                                 Tooltip::view(
                                     if external_backend {
-                                        "Approvals are requested by the external backend"
+                                        t!("composer.mode.backend_hint")
                                     } else {
-                                        "Approval mode: Auto / Plan / Yolo"
+                                        t!("composer.mode.hint")
                                     },
                                     &mode_palette,
                                     cx,
@@ -3473,7 +3554,9 @@ impl gpui::Render for ComposerView {
                                 cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     if external_backend {
-                                        this.status = "Codex app-server owns approval policy; Termior still renders and records each request".into();
+                                        this.set_status(t!(
+                                            "composer.status.codex_owns_approvals_hint"
+                                        ));
                                     } else {
                                         this.mode_menu_open = !this.mode_menu_open;
                                     }
@@ -3500,7 +3583,7 @@ impl gpui::Render for ComposerView {
                             .tooltip(move |_window, cx| {
                                 Tooltip::view(agent_tooltip.clone(), &agent_palette, cx)
                             })
-                            .child(SharedString::from(agent_name))
+                            .child(agent_name)
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.cycle_custom_agent(cx)),
@@ -3521,18 +3604,17 @@ impl gpui::Render for ComposerView {
                                 .cursor_pointer()
                                 .tooltip(move |_window, cx| {
                                     Tooltip::view(
-                                        "Context Inspector — sent, summarized, truncated, and excluded items",
+                                        t!("composer.context_inspector_hint"),
                                         &inspector_palette,
                                         cx,
                                     )
                                 })
-                                .child(SharedString::from(label))
+                                .child(label)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.context_inspector_open =
-                                            !this.context_inspector_open;
+                                        this.context_inspector_open = !this.context_inspector_open;
                                         cx.notify();
                                     }),
                                 ),
@@ -3544,9 +3626,9 @@ impl gpui::Render for ComposerView {
                             "composer-send",
                             if self.busy { Icon::Close } else { Icon::Send },
                             if self.busy {
-                                "Stop Agent task"
+                                t!("composer.stop_task")
                             } else {
-                                "Send (Enter)"
+                                t!("composer.send_hint")
                             },
                             &p,
                         )

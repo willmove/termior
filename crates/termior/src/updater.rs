@@ -31,7 +31,7 @@ pub fn init(cx: &mut App) {
         return;
     }
     let updater = cx.new(|_| Updater {
-        status: "Updates have not been checked".into(),
+        status: t!("updater.status_not_checked").to_string(),
         busy: false,
         ready: None,
         installer_opened: false,
@@ -87,7 +87,7 @@ pub fn set_enabled(enabled: bool, cx: &mut App) {
             this.operation = None;
             this.busy = false;
             if this.ready.is_none() {
-                this.status = "Automatic updates are off".into();
+                this.status = t!("updater.status_disabled").to_string();
             }
             if enabled {
                 this.check(cx);
@@ -103,7 +103,7 @@ impl Updater {
             return;
         }
         self.busy = true;
-        self.status = "Checking for updates…".into();
+        self.status = t!("updater.status_checking").to_string();
         let generation = self.generation;
         self.operation = Some(cx.spawn(async move |this, cx| {
             let result = cx
@@ -119,8 +119,11 @@ impl Updater {
                         }
                         this.busy = false;
                         this.status = match result {
-                            Ok(_) => "You are up to date".into(),
-                            Err(error) => format!("Update check failed: {error}"),
+                            Ok(_) => t!("updater.status_up_to_date").to_string(),
+                            Err(error) => {
+                                tf!("updater.status_check_failed", "error" => error.to_string())
+                                    .to_string()
+                            }
                         };
                         cx.notify();
                     });
@@ -132,7 +135,9 @@ impl Updater {
                     if this.generation != generation {
                         return false;
                     }
-                    this.status = format!("Downloading Termior {}…", available.version);
+                    this.status =
+                        tf!("updater.status_downloading", "version" => available.version.clone())
+                            .to_string();
                     cx.notify();
                     true
                 })
@@ -151,13 +156,18 @@ impl Updater {
                 this.busy = false;
                 match result {
                     Ok(prepared) => {
-                        this.status = format!(
-                            "Termior {} is ready to install (SHA-256 verified)",
-                            prepared.version
-                        );
+                        this.status = tf!(
+                            "updater.status_ready",
+                            "version" => prepared.version.clone()
+                        )
+                        .to_string();
                         this.ready = Some(prepared);
                     }
-                    Err(error) => this.status = format!("Update download failed: {error}"),
+                    Err(error) => {
+                        this.status =
+                            tf!("updater.status_download_failed", "error" => error.to_string())
+                                .to_string()
+                    }
                 }
                 cx.notify();
             });
@@ -175,16 +185,29 @@ impl Updater {
         self.busy = true;
         // Do not let a preference change cancel an installer handoff.
         self.installer_opened = true;
-        self.status = "Opening installer…".into();
+        self.status = t!("updater.status_opening_installer").to_string();
         self.operation = Some(cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async move { prepared.launch() }).await;
+            let result = cx
+                .background_executor()
+                .spawn(async move { prepared.launch() })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
-                    Ok(path) => this.status = format!("Installer opened. Finish your terminal tasks, close Termior, and complete installation. Installer: {}", path.display()),
+                    Ok(path) => {
+                        this.status = tf!(
+                            "updater.status_installer_opened",
+                            "path" => path.display().to_string()
+                        )
+                        .to_string()
+                    }
                     Err(error) => {
                         this.installer_opened = false;
-                        this.status = format!("Could not open installer: {error}. Check again to retry or use release downloads.");
+                        this.status = tf!(
+                            "updater.status_installer_failed",
+                            "error" => error.to_string()
+                        )
+                        .to_string();
                     }
                 }
                 cx.notify();

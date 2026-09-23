@@ -1,0 +1,13 @@
+[package]
+name = "termior-i18n"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# 翻译表在编译期内嵌（include_str!），运行时零文件依赖；
+# serde_json 仅在首次访问翻译表时解析一次，之后全部走内存 HashMap。
+serde_json = { workspace = true }
+# 仅用于「跟随系统」语言检测；已是依赖树中的既有 crate（gpui 间接依赖）。
+sys-locale = "0.3"

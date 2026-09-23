@@ -107,18 +107,18 @@ impl gpui::Render for GitDiffView {
                 .rounded_md()
                 .border_1()
                 .border_color(ui::border(&p))
-                .child(SharedString::from(format!(
-                    "Hunk {} · {}",
-                    index + 1,
-                    hunk.header
-                )))
+                .child(tf!(
+                    "git.hunk_heading",
+                    "index" => index + 1,
+                    "header" => hunk.header.clone()
+                ))
                 .children(group.map(|group| {
                     ui::button(
                         SharedString::from(format!("git-hunk-{index}")),
                         if group == ChangeGroup::Staged {
-                            "Unstage hunk"
+                            t!("git.unstage_hunk")
                         } else {
-                            "Stage hunk"
+                            t!("git.stage_hunk")
                         },
                         ButtonKind::Subtle,
                         &p,
@@ -157,9 +157,9 @@ impl gpui::Render for GitDiffView {
                 .child(SharedString::from(line.to_owned()))
         });
         let file_label = match self.group {
-            Some(ChangeGroup::Staged) => "Unstage file",
-            Some(ChangeGroup::Unstaged | ChangeGroup::Untracked) => "Stage file",
-            None => "Commit snapshot",
+            Some(ChangeGroup::Staged) => t!("git.unstage_file"),
+            Some(ChangeGroup::Unstaged | ChangeGroup::Untracked) => t!("git.stage_file"),
+            None => t!("git.commit_snapshot"),
         };
         let status = self.status.as_ref().map(|result| match result {
             Ok(message) => div()
@@ -207,9 +207,9 @@ impl gpui::Render for GitDiffView {
                                 ui::button(
                                     "git-discard-file",
                                     if self.confirm_discard {
-                                        "Confirm discard"
+                                        t!("git.confirm_discard")
                                     } else {
-                                        "Discard…"
+                                        t!("git.discard")
                                     },
                                     ButtonKind::Danger,
                                     &p,
@@ -441,8 +441,8 @@ impl gpui::Render for GitHistoryView {
                         div()
                             .relative()
                             .child(SharedString::from(format!(
-                                "Search history: {}|",
-                                self.query
+                                "{}|",
+                                tf!("git.search_history_prompt", "query" => self.query.clone())
                             )))
                             // IME 候选窗锚点探针：记录输入行文本 bounds 与样式。
                             .child(crate::ime_anchor::anchor_probe(&ime_anchor)),
@@ -475,11 +475,11 @@ impl gpui::Render for GitHistoryView {
                                     .justify_between()
                                     .px_3()
                                     .py_2()
-                                    .child("Changed files")
+                                    .child(t!("git.changed_files"))
                                     .children(remote_commit.map(|commit| {
                                         ui::button(
                                             "open-remote-commit",
-                                            "Open remote",
+                                            t!("git.open_remote"),
                                             ButtonKind::Subtle,
                                             &p,
                                         )
@@ -593,7 +593,7 @@ impl InputHandler for GitHistoryInputHandler {
         // 过滤器光标恒在 query 末尾：锚点 = "Search history: {query}" 的终点。
         let view = self.view.upgrade()?;
         let view = view.read(cx);
-        let text = format!("Search history: {}", view.query);
+        let text = tf!("git.search_history_prompt", "query" => view.query.clone()).to_string();
         view.ime_anchor.caret_bounds(&text, text.len(), window)
     }
 

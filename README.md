@@ -28,7 +28,7 @@ Termior brings a real PTY terminal, a lightweight code editor, a file explorer, 
 The workspace has moved from a pure-logic prototype to a buildable GPUI desktop workbench. It currently includes:
 
 - Persistent workspaces, 8 tab kinds, splits, Explorer / Source Control / History sidebars, a status bar, and a separate settings window;
-- A real terminal built on portable-pty and alacritty_terminal: shell integration (bash/zsh/fish/PowerShell), OSC 7/133/777, IME, search, scrollback, URL and localhost detection, and Windows Job Objects; WSL distribution switching; a copy/paste/select-all context menu;
+- A real terminal built on portable-pty and alacritty_terminal: shell integration (bash/zsh/fish/PowerShell), OSC 7/133/777, IME, search, scrollback, URL and localhost detection, and Windows Job Objects; a Settings default-shell picker (system default / detected shells incl. Git Bash and WSL distros / manual path) plus an optional ask-on-new-terminal shell menu; a copy/paste/select-all context menu;
 - [SSH sessions and SFTP](docs/ssh.md): connection profiles with sidebar quick-connect, OS credential store, password/MFA/key/agent authentication, jump hosts, host key verification, and file/directory transfer with resume; a dual-pane SFTP browser plus a File Explorer that follows the active remote tab;
 - Rope edit buffers, a virtualized viewport, incremental tree-sitter highlighting, search, undo/redo, inline completion ghost text, 10 editor themes, and a Vim interaction layer;
 - File indexing with shallow indexing and debounced watching, gitignore awareness, fuzzy find, streaming background grep, keyboard tree navigation, and full context menus; per-tab project folders with `cd` injection and sidebar follow;
@@ -161,6 +161,10 @@ Windows uses Inno Setup, macOS opens a DMG to drag-replace the app, and Linux us
 - Cloud provider egress always passes URL and post-resolution IP SSRF checks;
 - File writes never land on disk directly from the model — they must pass tool approval and hunk review.
 
+### Internationalization (i18n)
+
+The interface ships in seven languages: English, Simplified Chinese, Traditional Chinese, Japanese, Korean, Spanish, and German. **Settings → General → Language** switches immediately (the main window follows the debounced save); the default **Follow system** tracks your OS locale. Translations are flat JSON tables embedded at compile time in `crates/termior-i18n/locales/` — `en.json` is the source of truth, every locale must keep an identical key set, and a CI test enforces parity plus non-empty values. See [ADR 0007](docs/adr/0007-i18n-embedded-json-tables.md) for the design.
+
 ### License
 
 The project itself is under the [MIT License](LICENSE). Third-party dependency licences are audited with `cargo deny --exclude termior check`; [LICENSE-APACHE](LICENSE-APACHE) exists only to preserve the upstream Apache-2.0 terms of the vendored `gpui_windows`, and the GPUI upstream dependency tree is verified separately.
@@ -187,7 +191,7 @@ Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、�
 当前分支已经从纯逻辑原型推进到可编译的 GPUI 桌面工作台，主要包含：
 
 - 持久化工作区、8 类 tab、分栏、Explorer/Source Control/History 侧栏、状态栏、独立设置窗口；
-- portable-pty + alacritty_terminal 真终端，shell integration（bash/zsh/fish/PowerShell）、OSC 7/133/777、IME、搜索、回滚滚动、URL/localhost 检测和 Windows Job Object；支持 WSL 发行版切换；提供复制/粘贴/全选的上下文菜单；
+- portable-pty + alacritty_terminal 真终端，shell integration（bash/zsh/fish/PowerShell）、OSC 7/133/777、IME、搜索、回滚滚动、URL/localhost 检测和 Windows Job Object；设置页可选默认 Shell（系统默认 / 探测到的 shell，含 Git Bash 与 WSL 发行版 / 手动路径），并可开启「新建终端时选择 Shell」；提供复制/粘贴/全选的上下文菜单；
 - [SSH 会话与 SFTP](docs/ssh.md)：连接配置与侧栏快捷连接、系统凭据库、密码/MFA/密钥/agent 认证、跳板机、主机指纹校验、文件/目录上传下载与续传，并提供双栏 SFTP 浏览器与跟随活动远程 tab 的 File Explorer；
 - Rope 编辑缓冲、虚拟可视区、tree-sitter 增量高亮、搜索、撤销重做、行内补全 ghost text、10 套编辑器主题和 Vim 交互层；
 - 文件索引（浅层索引与防抖监听）、gitignore、模糊查找、后台流式 grep、键盘树导航与完整上下文菜单；按 tab 记忆项目文件夹并注入 `cd`，侧栏跟随该锚点；
@@ -323,6 +327,10 @@ Windows 使用 Inno Setup，macOS 打开 DMG 后拖拽替换应用，Linux 使�
 - `.env`、`.ssh`、credentials 等敏感路径在 canonicalize 后双向拒绝
 - 云 Provider 出网统一经过 URL 和解析后 IP 的 SSRF 检查
 - 写文件不会由模型直接落盘，必须经过工具审批和 hunk 审阅
+
+### 国际化（i18n）
+
+界面内置七种语言：英语、简体中文、繁體中文、日本語、한국어、Español、Deutsch。**设置 → General → Language** 即选即切（主窗口随防抖保存同步）；默认「跟随系统」使用操作系统语言。翻译表是编译期内嵌的 flat JSON（`crates/termior-i18n/locales/`），`en.json` 为唯一事实来源，各语言键集必须完全一致，CI 测试强制校验键奇偶与非空值。设计见 [ADR 0007](docs/adr/0007-i18n-embedded-json-tables.md)。
 
 ### 许可
 

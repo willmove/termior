@@ -73,7 +73,7 @@ impl EditorView {
             focus_handle: cx.focus_handle(),
             marked_text: String::new(),
             ime_anchor: crate::ime_anchor::ImeAnchor::new(),
-            title: "Untitled".into(),
+            title: t!("editor.untitled").to_string(),
             theme: default_editor_theme(),
             search: SearchOverlay::default(),
             search_matches: Vec::new(),
@@ -107,7 +107,7 @@ impl EditorView {
             title: path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .unwrap_or("Editor")
+                .unwrap_or(&t!("editor.fallback_title"))
                 .to_owned(),
             theme: default_editor_theme(),
             search: SearchOverlay::default(),
@@ -181,7 +181,7 @@ impl EditorView {
         self.title = path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("Editor")
+            .unwrap_or(&t!("editor.fallback_title"))
             .to_owned();
         self.buffer.set_path(path);
     }
@@ -810,21 +810,24 @@ impl Render for EditorView {
                 .bg(crate::ui::color(p.overlay))
                 .text_color(crate::ui::color(p.foreground))
                 .shadow_md()
-                .child(SharedString::from(format!("Find: {}|", self.search.query)))
                 .child(SharedString::from(format!(
-                    "{}/{} · {}",
-                    if self.search.total == 0 {
+                    "{}|",
+                    tf!("editor.find_prompt", "query" => self.search.query.clone())
+                )))
+                .child(tf!(
+                    "editor.find_counter",
+                    "current" => if self.search.total == 0 {
                         0
                     } else {
                         self.search.current + 1
                     },
-                    self.search.total,
-                    if self.search.options.case_sensitive {
+                    "total" => self.search.total,
+                    "case" => if self.search.options.case_sensitive {
                         "Aa"
                     } else {
                         "aa"
                     }
-                )))
+                ))
         });
         let vim_status = self.vim_enabled.then(|| {
             let command = if self.vim.mode() == VimMode::CommandLine {
@@ -942,6 +945,13 @@ impl Render for EditorView {
             .relative()
             .track_focus(&focus)
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, window, cx| {
+                    // 点击正文即可聚焦，避免打开后看似“只读”。
+                    window.focus(&this.focus_handle, cx);
+                }),
+            )
             .on_scroll_wheel(cx.listener(|_this, _event, _window, cx| cx.notify()))
             .size_full()
             .bg(parse_hex(&self.theme.background))

@@ -17,7 +17,9 @@ async fn apply_profiles_mutation(
     mutate: impl FnOnce(&mut termior_ssh::Profiles) -> Result<(), String>,
 ) {
     let result = (|| -> Result<(), String> {
-        let dir = dir.as_ref().ok_or("应用数据目录不可用")?;
+        let dir = dir
+            .as_ref()
+            .ok_or_else(|| t!("sftp.error.data_dir_unavailable").to_string())?;
         let mut profiles = termior_ssh::Profiles::load(dir).map_err(|e| e.to_string())?;
         mutate(&mut profiles)?;
         profiles.save(dir).map_err(|e| e.to_string())?;
@@ -116,43 +118,41 @@ impl WorkspaceView {
     }
 
     pub(super) fn ssh_session_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut panel =
-            div()
-                .flex()
-                .flex_col()
-                .min_w_0()
-                .gap_1()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .px_2()
-                        .py_1()
-                        .child(div().text_sm().child("SSH 会话"))
-                        .child(
-                            ui::button("ssh-manage", "管理…", ButtonKind::Subtle, &self.palette)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_ssh_manager(window, cx)
-                                })),
+        let mut panel = div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .py_1()
+                    .child(div().text_sm().child(t!("sftp.panel_title")))
+                    .child(
+                        ui::button(
+                            "ssh-manage",
+                            t!("sftp.manage"),
+                            ButtonKind::Subtle,
+                            &self.palette,
+                        )
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.open_ssh_manager(window, cx)),
                         ),
-                )
-                .child(
-                    div()
-                        .px_2()
-                        .pb_2()
-                        .text_xs()
-                        .child("双击连接 · 右键打开 SFTP"),
-                );
+                    ),
+            )
+            .child(div().px_2().pb_2().text_xs().child(t!("sftp.session_hint")));
         if let Some(error) = &self.ssh_profiles_error {
             panel = panel.child(
                 div()
                     .px_2()
                     .text_xs()
-                    .child(format!("配置读取失败：{error}")),
+                    .child(tf!("sftp.profiles_load_failed", "error" => error)),
             );
         } else if self.ssh_profiles.connections.is_empty() && self.ssh_profiles.groups.is_empty() {
-            panel = panel.child(div().px_2().text_xs().child("暂无连接，点击管理添加。"));
+            panel = panel.child(div().px_2().text_xs().child(t!("sftp.no_connections")));
         }
         // 未分组连接在前（无表头），分组按持久化顺序随后；分组不改变存储顺序。
         let partition = termior_ssh::group_connections(
@@ -180,7 +180,7 @@ impl WorkspaceView {
         panel = panel.child(
             ui::button(
                 "ssh-new-group",
-                "＋ 新建分组",
+                t!("sftp.new_group"),
                 ButtonKind::Subtle,
                 &self.palette,
             )
@@ -196,7 +196,14 @@ impl WorkspaceView {
             .filter(|tab| tab.remote.is_some())
             .collect();
         if !sessions.is_empty() {
-            panel = panel.child(div().mt_3().px_2().py_1().text_xs().child("已打开会话"));
+            panel = panel.child(
+                div()
+                    .mt_3()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .child(t!("sftp.open_sessions")),
+            );
             for (index, tab) in sessions.into_iter().enumerate() {
                 let id = tab.id;
                 let wash = ui::hover_wash(&self.palette);
@@ -399,12 +406,12 @@ impl WorkspaceView {
         match menu.phase {
             SessionMenuPhase::Session => {
                 for (index, label) in [
-                    "连接 SSH",
-                    "以 SFTP 连接",
-                    "重命名…",
-                    "编辑会话…",
-                    "移动到分组…",
-                    "删除会话…",
+                    t!("sftp.menu.connect_ssh"),
+                    t!("sftp.menu.connect_sftp"),
+                    t!("sftp.menu.rename"),
+                    t!("sftp.menu.edit"),
+                    t!("sftp.menu.move_to_group"),
+                    t!("sftp.menu.delete"),
                 ]
                 .into_iter()
                 .enumerate()
@@ -493,9 +500,9 @@ impl WorkspaceView {
                             .items_center()
                             .justify_between()
                             .child(if target.is_empty() {
-                                "未分组".to_string()
+                                t!("sftp.ungrouped")
                             } else {
-                                target.clone()
+                                target.clone().into()
                             })
                             .when(*current, |item| {
                                 item.text_color(gpui_color(self.palette.accent)).child("✓")
@@ -523,7 +530,7 @@ impl WorkspaceView {
                         .text_sm()
                         .cursor_pointer()
                         .hover(move |style| style.bg(wash))
-                        .child("新建分组…")
+                        .child(t!("sftp.menu.new_group"))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, window, cx| {
@@ -553,7 +560,10 @@ impl WorkspaceView {
     pub(super) fn ssh_group_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.ssh_group_menu.clone()?;
         let mut panel = menu_panel(&self.palette).id("ssh-group-menu").w(px(200.));
-        for (index, label) in ["重命名分组…", "删除分组"].into_iter().enumerate() {
+        for (index, label) in [t!("sftp.group.rename"), t!("sftp.group.delete")]
+            .into_iter()
+            .enumerate()
+        {
             let name = menu.name.clone();
             let wash = ui::hover_wash(&self.palette);
             panel = panel.child(
@@ -601,9 +611,14 @@ impl WorkspaceView {
 
     fn move_session_to_group(&mut self, name: String, group: String, cx: &mut Context<Self>) {
         let message = if group.is_empty() {
-            format!("“{name}”已移出分组")
+            tf!("sftp.message.moved_out_of_group", "name" => name).to_string()
         } else {
-            format!("“{name}”已移入分组“{group}”")
+            tf!(
+                "sftp.message.moved_to_group",
+                "name" => name,
+                "group" => group
+            )
+            .to_string()
         };
         self.mutate_saved_profiles(
             message,
@@ -612,7 +627,7 @@ impl WorkspaceView {
                     .connections
                     .iter()
                     .position(|p| p.name == name)
-                    .ok_or("会话配置已变化，请重试")?;
+                    .ok_or_else(|| t!("sftp.error.profiles_changed").to_string())?;
                 profiles.upsert_group(&group);
                 profiles.connections[index].group = group;
                 Ok(())
@@ -629,11 +644,16 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let message = match &assign {
-            Some(name) => format!("“{name}”已移入分组“{group}”"),
+            Some(name) => tf!(
+                "sftp.message.moved_to_group",
+                "name" => name,
+                "group" => group
+            )
+            .to_string(),
             None if self.ssh_profiles.groups.contains(&group) => {
-                format!("分组“{group}”已存在")
+                tf!("sftp.message.group_exists", "group" => group).to_string()
             }
-            None => format!("已新建分组“{group}”"),
+            None => tf!("sftp.message.group_created", "group" => group).to_string(),
         };
         self.mutate_saved_profiles(
             message,
@@ -644,7 +664,7 @@ impl WorkspaceView {
                         .connections
                         .iter()
                         .position(|p| p.name == name)
-                        .ok_or("会话配置已变化，请重试")?;
+                        .ok_or_else(|| t!("sftp.error.profiles_changed").to_string())?;
                     profiles.connections[index].group = group;
                 }
                 Ok(())
@@ -654,7 +674,12 @@ impl WorkspaceView {
     }
 
     pub(super) fn rename_group(&mut self, old: String, new: String, cx: &mut Context<Self>) {
-        let message = format!("分组“{old}”已重命名为“{new}”");
+        let message = tf!(
+            "sftp.message.group_renamed",
+            "old" => old,
+            "new" => new
+        )
+        .to_string();
         self.mutate_saved_profiles(
             message,
             move |profiles| {
@@ -662,7 +687,7 @@ impl WorkspaceView {
                     return Ok(());
                 }
                 if !profiles.groups.contains(&old) {
-                    return Err("分组已不存在，请刷新后重试".into());
+                    return Err(t!("sftp.error.group_missing").to_string());
                 }
                 // 与现有分组重名即合并：成员全部并入既有分组，旧名移除。
                 if profiles.groups.contains(&new) {
@@ -689,15 +714,23 @@ impl WorkspaceView {
             .filter(|p| p.group == group)
             .count();
         let detail = if members == 0 {
-            format!("删除空分组“{group}”？")
+            tf!("sftp.confirm.delete_empty_group", "group" => group).to_string()
         } else {
-            format!("删除分组“{group}”？其中 {members} 个连接将归入未分组。")
+            tf!(
+                "sftp.confirm.delete_group",
+                "group" => group,
+                "members" => tn!(members, "sftp.connection_count")
+            )
+            .to_string()
         };
         let answer = window.prompt(
             PromptLevel::Warning,
-            "删除分组",
+            &t!("sftp.confirm.delete_group_title"),
             Some(&detail),
-            &[PromptButton::ok("删除"), PromptButton::cancel("取消")],
+            &[
+                PromptButton::ok(t!("sftp.delete")),
+                PromptButton::cancel(t!("sftp.cancel")),
+            ],
             cx,
         );
         let dir = self.data_dir.clone();
@@ -710,7 +743,7 @@ impl WorkspaceView {
                 workspace,
                 cx,
                 dir,
-                format!("分组“{label}”已删除"),
+                tf!("sftp.message.group_deleted", "group" => label).to_string(),
                 move |profiles| {
                     profiles.groups.retain(|name| *name != group);
                     for connection in &mut profiles.connections {
@@ -748,9 +781,12 @@ impl WorkspaceView {
     ) {
         let answer = window.prompt(
             PromptLevel::Warning,
-            "删除会话配置",
-            Some(&format!("删除“{}”？已打开的连接会继续运行。", profile.name)),
-            &[PromptButton::ok("删除"), PromptButton::cancel("取消")],
+            &t!("sftp.confirm.delete_session_title"),
+            Some(tf!("sftp.confirm.delete_session", "name" => profile.name).as_ref()),
+            &[
+                PromptButton::ok(t!("sftp.delete")),
+                PromptButton::cancel(t!("sftp.cancel")),
+            ],
             cx,
         );
         let dir = self.data_dir.clone();
@@ -759,13 +795,15 @@ impl WorkspaceView {
                 return;
             }
             let result = (|| -> Result<(), String> {
-                let dir = dir.as_ref().ok_or("应用数据目录不可用")?;
+                let dir = dir
+                    .as_ref()
+                    .ok_or_else(|| t!("sftp.error.data_dir_unavailable").to_string())?;
                 let mut profiles = termior_ssh::Profiles::load(dir).map_err(|e| e.to_string())?;
                 let index = profiles
                     .connections
                     .iter()
                     .position(|saved| saved == &profile)
-                    .ok_or("会话配置已变化，请重新选择后删除")?;
+                    .ok_or_else(|| t!("sftp.error.session_changed").to_string())?;
                 profiles.connections.remove(index);
                 profiles.save(dir).map_err(|e| e.to_string())?;
                 if profile.use_saved_credentials
@@ -774,8 +812,9 @@ impl WorkspaceView {
                             && termior_ssh::credentials::same_target(p, &profile)
                     })
                 {
-                    termior_ssh::credentials::delete_all(&profile)
-                        .map_err(|e| format!("配置已删除，但系统凭据清理失败：{e}"))?;
+                    termior_ssh::credentials::delete_all(&profile).map_err(|e| {
+                        tf!("sftp.error.credentials_cleanup_failed", "error" => e).to_string()
+                    })?;
                 }
                 Ok(())
             })();
@@ -787,7 +826,7 @@ impl WorkspaceView {
                 this.ssh_selected = None;
                 this.command_message = Some(
                     result
-                        .map(|_| "会话配置已删除".into())
+                        .map(|_| t!("sftp.message.session_deleted").to_string())
                         .unwrap_or_else(|e| e),
                 );
                 cx.notify();
@@ -931,7 +970,7 @@ impl WorkspaceView {
     fn choose_sftp_local_directory(&mut self, tab_id: TabId, cx: &mut Context<Self>) {
         cx.spawn(async move |workspace, cx| {
             if let Some(folder) = rfd::AsyncFileDialog::new()
-                .set_title("选择本地目录")
+                .set_title(t!("sftp.choose_local_dir").to_string())
                 .pick_folder()
                 .await
             {
@@ -974,11 +1013,11 @@ impl WorkspaceView {
                             let metadata =
                                 std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
                             if metadata.file_type().is_symlink() {
-                                return Err("请上传实际文件或目录，暂不拖放符号链接".into());
+                                return Err(t!("sftp.error.no_symlink_upload").to_string());
                             }
                             let local_path = path
                                 .to_str()
-                                .ok_or("本地文件名不是有效 Unicode")?
+                                .ok_or_else(|| t!("sftp.error.local_name_unicode").to_string())?
                                 .to_owned();
                             let transfer = Transfer {
                                 upload: true,
@@ -1028,7 +1067,7 @@ impl WorkspaceView {
             return;
         }
         let Some(local_path) = local_directory.to_str() else {
-            self.command_message = Some("本地路径不是有效 Unicode".into());
+            self.command_message = Some(t!("sftp.error.local_path_unicode").to_string());
             cx.notify();
             return;
         };
@@ -1067,20 +1106,36 @@ impl WorkspaceView {
             .iter()
             .map(|t| {
                 if t.upload {
-                    format!("上传 {} → {}:{}", t.local_path, profile.host, t.remote_path)
+                    tf!(
+                        "sftp.transfer.upload_line",
+                        "local" => t.local_path,
+                        "host" => profile.host,
+                        "remote" => t.remote_path
+                    )
+                    .to_string()
                 } else {
-                    format!("下载 {}:{} → {}", profile.host, t.remote_path, t.local_path)
+                    tf!(
+                        "sftp.transfer.download_line",
+                        "host" => profile.host,
+                        "remote" => t.remote_path,
+                        "local" => t.local_path
+                    )
+                    .to_string()
                 }
             })
             .collect::<Vec<_>>()
             .join("\n");
         let answer = window.prompt(
             PromptLevel::Warning,
-            "确认文件传输",
+            &t!("sftp.confirm.transfer_title"),
             Some(&format!(
-                "{description}\n\n同名文件可能被覆盖；文件夹递归传输。取消可能留下部分文件。"
+                "{description}\n\n{}",
+                t!("sftp.confirm.transfer_warning")
             )),
-            &[PromptButton::ok("开始传输"), PromptButton::cancel("取消")],
+            &[
+                PromptButton::ok(t!("sftp.start_transfer")),
+                PromptButton::cancel(t!("sftp.cancel")),
+            ],
             cx,
         );
         cx.spawn_in(window, async move |workspace, cx| {
@@ -1129,7 +1184,7 @@ impl WorkspaceView {
         let Some(state) = self.sftp_browsers.get(&tab_id) else {
             return div()
                 .p_4()
-                .child("SFTP 尚未连接。点击上方“重新连接”打开文件浏览器。")
+                .child(t!("sftp.not_connected"))
                 .into_any_element();
         };
         let local_root = state.path.clone();
@@ -1166,7 +1221,7 @@ impl WorkspaceView {
                     .flex()
                     .items_center()
                     .text_sm()
-                    .child("本地文件"),
+                    .child(t!("sftp.local_files")),
             )
             .child(
                 div()
@@ -1175,17 +1230,22 @@ impl WorkspaceView {
                     .gap_1()
                     .flex_shrink_0()
                     .child(
-                        ui::button("sftp-local-up", "上级", ButtonKind::Subtle, &self.palette)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(path) = &local_up {
-                                    this.scan_sftp_local(tab_id, path.clone(), cx);
-                                }
-                            })),
+                        ui::button(
+                            "sftp-local-up",
+                            t!("sftp.parent_dir"),
+                            ButtonKind::Subtle,
+                            &self.palette,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(path) = &local_up {
+                                this.scan_sftp_local(tab_id, path.clone(), cx);
+                            }
+                        })),
                     )
                     .child(
                         ui::button(
                             "sftp-local-choose",
-                            "选择目录…",
+                            t!("sftp.choose_dir"),
                             ButtonKind::Subtle,
                             &self.palette,
                         )
@@ -1196,7 +1256,7 @@ impl WorkspaceView {
                     .child(
                         ui::button(
                             "sftp-local-refresh",
-                            "刷新",
+                            t!("explorer.refresh"),
                             ButtonKind::Subtle,
                             &self.palette,
                         )
@@ -1207,7 +1267,7 @@ impl WorkspaceView {
                     .child(
                         ui::button(
                             "sftp-local-upload",
-                            "上传 →",
+                            t!("sftp.upload_arrow"),
                             ButtonKind::Subtle,
                             &self.palette,
                         )
@@ -1241,9 +1301,9 @@ impl WorkspaceView {
                     .flex_shrink_0()
                     .text_xs()
                     .child(if state.loading {
-                        "正在读取本地目录…"
+                        t!("sftp.loading_local")
                     } else {
-                        "双击文件夹进入 · 拖放上传"
+                        t!("sftp.local_hint")
                     }),
             )
             .child(file_columns(&self.palette));
@@ -1299,11 +1359,11 @@ impl WorkspaceView {
                             .child(name),
                     )
                     .child(div().w(px(68.)).flex_shrink_0().child(if entry.is_symlink {
-                        "链接"
+                        t!("sftp.type_symlink")
                     } else if is_dir {
-                        "文件夹"
+                        t!("sftp.type_folder")
                     } else {
-                        "文件"
+                        t!("sftp.type_file")
                     }))
                     .child(
                         div()
@@ -1345,12 +1405,10 @@ impl WorkspaceView {
                     }),
             );
         }
-        local = local.child(rows).child(
-            div()
-                .py_1()
-                .text_xs()
-                .child(format!("{} 项 · 拖到右侧上传", state.entries.len())),
-        );
+        local = local.child(rows).child(div().py_1().text_xs().child(tf!(
+            "sftp.local_footer",
+            "count" => tn!(state.entries.len(), "sftp.item_count")
+        )));
         let remote_drop = remote_path.clone();
         let remote_external = remote_path.clone();
         let remote = div()
@@ -1393,7 +1451,7 @@ impl WorkspaceView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_sm().child("远程文件 · SFTP"))
+                    .child(div().text_sm().child(t!("sftp.remote_files")))
                     .child(
                         div()
                             .flex()
@@ -1401,7 +1459,7 @@ impl WorkspaceView {
                             .child(
                                 ui::button(
                                     "sftp-remote-path",
-                                    "转到路径…",
+                                    t!("sftp.goto_path"),
                                     ButtonKind::Subtle,
                                     &self.palette,
                                 )
@@ -1421,7 +1479,7 @@ impl WorkspaceView {
                             .child(
                                 ui::button(
                                     "sftp-download",
-                                    "← 下载",
+                                    t!("sftp.download_arrow"),
                                     ButtonKind::Subtle,
                                     &self.palette,
                                 )
@@ -1453,7 +1511,7 @@ impl WorkspaceView {
                     .px_2()
                     .py_1()
                     .text_sm()
-                    .child("已断开 · 点击重新连接后继续文件操作"),
+                    .child(t!("sftp.disconnected_hint")),
             );
         }
         if self.command_mode != CommandMode::Browse {
@@ -1464,11 +1522,11 @@ impl WorkspaceView {
                     .border_1()
                     .border_color(gpui_color(self.palette.accent))
                     .text_sm()
-                    .child(format!(
-                        "{}: {}{}|  · Enter 确认 / Esc 取消",
-                        self.command_mode.label(),
-                        self.command_input,
-                        self.command_marked_text
+                    .child(tf!(
+                        "sftp.command_bar",
+                        "label" => self.command_mode.label(),
+                        "input" => self.command_input,
+                        "marked" => self.command_marked_text
                     )),
             );
         }
@@ -1518,38 +1576,38 @@ impl WorkspaceView {
                 .map(|t| {
                     let t = t.read(cx);
                     if !t.has_exited() {
-                        "传输中"
+                        t!("sftp.status.transferring")
                     } else if t.exit_code() == Some(0) {
-                        "已完成"
+                        t!("sftp.status.completed")
                     } else {
-                        "失败 / 已取消"
+                        t!("sftp.status.failed")
                     }
                 })
                 .unwrap_or(
                     if self.pending_terminals.iter().any(|(tab, _)| *tab == id) {
-                        "正在启动…"
+                        t!("sftp.status.starting")
                     } else {
-                        "启动失败 · 查看详情"
+                        t!("sftp.status.start_failed")
                     },
                 );
             let running = terminal.as_ref().is_some_and(|t| !t.read(cx).has_exited());
-            let title = format!(
-                "{} · {} · {}",
-                if job.upload {
-                    "↑ 上传"
+            let title = tf!(
+                "sftp.transfer.title",
+                "direction" => if job.upload {
+                    t!("sftp.upload_short")
                 } else {
-                    "↓ 下载"
+                    t!("sftp.download_short")
                 },
-                if job.upload {
+                "name" => if job.upload {
                     Path::new(&job.local_path)
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned()
                 } else {
-                    termior_ssh::sftp::file_name(&job.remote_path).into()
+                    termior_ssh::sftp::file_name(&job.remote_path).to_owned()
                 },
-                status
+                "status" => status
             );
             transfers = transfers.child(
                 div()
@@ -1570,7 +1628,7 @@ impl WorkspaceView {
                     .child(
                         ui::button(
                             ("sftp-job-view", id.0),
-                            "查看进度",
+                            t!("sftp.view_progress"),
                             ButtonKind::Subtle,
                             &self.palette,
                         )
@@ -1586,7 +1644,7 @@ impl WorkspaceView {
                         row.child(
                             ui::button(
                                 ("sftp-job-cancel", id.0),
-                                "取消",
+                                t!("sftp.cancel"),
                                 ButtonKind::Ghost,
                                 &self.palette,
                             )
@@ -1617,9 +1675,20 @@ pub(super) fn file_columns(palette: &ResolvedPalette) -> Div {
         .text_xs()
         .border_b_1()
         .border_color(ui::border(palette))
-        .child(div().flex_1().child("名称"))
-        .child(div().w(px(68.)).flex_shrink_0().child("类型"))
-        .child(div().w(px(90.)).flex_shrink_0().text_right().child("大小"))
+        .child(div().flex_1().child(t!("sftp.column_name")))
+        .child(
+            div()
+                .w(px(68.))
+                .flex_shrink_0()
+                .child(t!("sftp.column_type")),
+        )
+        .child(
+            div()
+                .w(px(90.))
+                .flex_shrink_0()
+                .text_right()
+                .child(t!("sftp.column_size")),
+        )
 }
 
 #[cfg(test)]
@@ -1952,8 +2021,8 @@ mod tests {
         cx.simulate_mouse_down(delete, MouseButton::Left, Modifiers::default());
         cx.run_until_parked();
         let (_, detail) = cx.pending_prompt().expect("删除分组需要确认");
-        assert!(detail.contains("1 个连接"), "{detail}");
-        cx.simulate_prompt_answer("删除");
+        assert!(detail.contains("1 connection"), "{detail}");
+        cx.simulate_prompt_answer("Delete");
         cx.run_until_parked();
         let saved = termior_ssh::Profiles::load(root.path()).unwrap();
         assert!(saved.groups.is_empty());
@@ -2065,11 +2134,11 @@ mod tests {
             .expect("drag must require transfer confirmation");
         assert!(detail.contains("/folder"));
         assert!(detail.contains(root.path().to_str().unwrap()));
-        assert!(detail.contains("递归"));
+        assert!(detail.contains("recursively"));
         cx.update(|window, cx| {
             view.update(cx, |v, cx| v.close_tab(v.model.active.unwrap(), window, cx))
         });
-        cx.simulate_prompt_answer("开始传输");
+        cx.simulate_prompt_answer("Start transfer");
         cx.run_until_parked();
         view.update(cx, |v, _| {
             assert!(
@@ -2106,13 +2175,13 @@ mod tests {
         let (_, detail) = cx
             .pending_prompt()
             .expect("dropping a local file starts upload confirmation");
-        assert!(detail.contains("上传"));
+        assert!(detail.contains("Upload"));
         assert!(detail.contains("local.txt"));
         assert!(
             detail.contains(":/folder"),
             "hovered directory, not its parent: {detail}"
         );
-        cx.simulate_prompt_answer("取消");
+        cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
         cx.update(|window, cx| {
             window.draw(cx).clear();
@@ -2131,13 +2200,13 @@ mod tests {
         let (_, detail) = cx
             .pending_prompt()
             .expect("dropping a remote file starts download confirmation");
-        assert!(detail.contains("下载"));
+        assert!(detail.contains("Download"));
         assert!(detail.contains("/file.txt"));
         assert!(
             detail.contains("destination"),
             "hovered local directory: {detail}"
         );
-        cx.simulate_prompt_answer("取消");
+        cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
         view.update(cx, |v, _| {
             assert_eq!(
@@ -2181,7 +2250,7 @@ mod tests {
                 source
             })
         });
-        cx.simulate_prompt_answer("开始传输");
+        cx.simulate_prompt_answer("Start transfer");
         cx.run_until_parked();
         view.update(cx, |v, cx| {
             assert_eq!(v.model.active, Some(source));

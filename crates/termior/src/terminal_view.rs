@@ -1099,23 +1099,23 @@ impl Render for TerminalView {
                         .text_color(crate::ui::color(self.palette.foreground))
                         .shadow_md()
                         .child(SharedString::from(format!(
-                            "Find: {}|",
-                            self.search_overlay.query
+                            "{}|",
+                            tf!("terminal.find_prompt", "query" => self.search_overlay.query.clone())
                         )))
-                        .child(SharedString::from(format!(
-                            "{}/{} · {}",
-                            if self.search_overlay.total == 0 {
+                        .child(tf!(
+                            "terminal.find_counter",
+                            "current" => if self.search_overlay.total == 0 {
                                 0
                             } else {
                                 self.search_overlay.current + 1
                             },
-                            self.search_overlay.total,
-                            if self.search_overlay.options.case_sensitive {
+                            "total" => self.search_overlay.total,
+                            "case" => if self.search_overlay.options.case_sensitive {
                                 "Aa"
                             } else {
                                 "aa"
                             }
-                        ))),
+                        )),
                 )
             })
             .when_some(hovered_link, |element, url| {

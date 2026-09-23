@@ -18,8 +18,9 @@ use termior_ai::{
 };
 use termior_store::{
     atomic_write, default_keymap, settings::Appearance, DataFiles, KeyAction, Platform, Settings,
-    UserKeyBinding,
+    ShellDetection, UserKeyBinding,
 };
+use termior_terminal::DiscoveredShell;
 use termior_theme::{
     resolve_active_palette, themes_for_native_appearance, NativeAppearance, ThemeLibrary,
 };
@@ -32,6 +33,7 @@ enum EditField {
     LineHeight,
     LetterSpacing,
     Scrollback,
+    ShellPath,
     Instructions,
     Model,
     BaseUrl,
@@ -54,6 +56,8 @@ enum SelectMenu {
     DarkTheme,
     EditorTheme,
     Appearance,
+    Language,
+    Shell,
     ProviderProfile,
     AgentProfile,
 }
@@ -107,6 +111,9 @@ pub struct SettingsView {
     save_generation: u64,
     /// `commit_edit` 改了 settings 后置位，由调用方 `schedule_save`。
     settings_dirty: bool,
+    /// 后台探测的本机 shell 列表（shell 下拉与 WSL 勾选用）；含 wsl.exe
+    /// 子进程调用，异步填充。
+    discovered_shells: Vec<DiscoveredShell>,
     _updater_subscription: gpui::Subscription,
 }
 
@@ -164,8 +171,21 @@ impl SettingsView {
             pending_tasks: Vec::new(),
             save_generation: 0,
             settings_dirty: false,
+            discovered_shells: Vec::new(),
         };
         view.refresh_credential_state();
+        // shell 探测含 wsl.exe 子进程，异步跑完再刷新下拉（FR-TERM-05）。
+        let discover_task = cx.spawn(async move |view, cx| {
+            let shells = cx
+                .background_executor()
+                .spawn(async move { termior_terminal::discover_shells() })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.discovered_shells = shells;
+                cx.notify();
+            });
+        });
+        view.track_task(discover_task);
         view
     }
 
@@ -182,14 +202,14 @@ impl SettingsView {
         self.set_page(SettingsPage::About, cx);
     }
 
-    fn page_label(page: SettingsPage) -> &'static str {
+    fn page_label(page: SettingsPage) -> SharedString {
         match page {
-            SettingsPage::General => "General",
-            SettingsPage::Models => "Models",
-            SettingsPage::Themes => "Themes",
-            SettingsPage::Shortcuts => "Shortcuts",
-            SettingsPage::Agents => "Agents",
-            SettingsPage::About => "About",
+            SettingsPage::General => t!("settings.page.general"),
+            SettingsPage::Models => t!("settings.page.models"),
+            SettingsPage::Themes => t!("settings.page.themes"),
+            SettingsPage::Shortcuts => t!("settings.page.shortcuts"),
+            SettingsPage::Agents => t!("settings.page.agents"),
+            SettingsPage::About => t!("settings.page.about"),
         }
     }
 
@@ -419,6 +439,10 @@ impl SettingsView {
             EditField::LineHeight => self.settings.terminal.line_height.to_string(),
             EditField::LetterSpacing => self.settings.terminal.letter_spacing.to_string(),
             EditField::Scrollback => self.settings.terminal.scrollback_lines.to_string(),
+            EditField::ShellPath => match &self.settings.terminal.shell_detection {
+                ShellDetection::Manual { path } => path.clone(),
+                ShellDetection::Auto => String::new(),
+            },
             EditField::Instructions => self.settings.custom_instructions.clone(),
             EditField::Model => self.profile().map(|p| p.model.clone()).unwrap_or_default(),
             EditField::BaseUrl => self
@@ -427,11 +451,11 @@ impl SettingsView {
                 .unwrap_or_default(),
             EditField::ApiKey => {
                 if self.pending_api_key.is_some() {
-                    "•••••••• (unsaved — click Save API key)".into()
+                    t!("settings.api_key.unsaved").to_string()
                 } else if self.credential_present {
-                    "•••••••• (stored in OS keychain)".into()
+                    t!("settings.api_key.stored").to_string()
                 } else {
-                    "Click to add a key".into()
+                    t!("settings.api_key.click_to_add").to_string()
                 }
             }
             EditField::BackgroundOpacity => self.settings.background.opacity.to_string(),
@@ -474,6 +498,11 @@ impl SettingsView {
                 .parse::<u32>()
                 .map(|value| self.settings.terminal.scrollback_lines = value)
                 .map_err(|error| error.to_string()),
+            EditField::ShellPath => {
+                // 空路径视同 auto（spawn 侧对空 Manual 已按 None 处理）。
+                self.settings.terminal.shell_detection = ShellDetection::Manual { path: value };
+                Ok(())
+            }
             EditField::Instructions => {
                 self.settings.custom_instructions = self.draft.clone();
                 Ok(())
@@ -496,8 +525,7 @@ impl SettingsView {
                     Ok(())
                 } else {
                     self.pending_api_key = Some(value);
-                    self.status =
-                        "API key ready — click Save API key to store it in the OS keychain".into();
+                    self.status = t!("settings.status.api_key_ready").to_string();
                     Ok(())
                 }
             }
@@ -535,7 +563,9 @@ impl SettingsView {
             }
         };
         match result {
-            Err(error) => self.status = format!("Invalid value: {error}"),
+            Err(error) => {
+                self.status = tf!("settings.status.invalid_value", "error" => error).to_string()
+            }
             Ok(()) if field != EditField::ApiKey => {
                 self.settings_dirty = true;
             }
@@ -619,18 +649,26 @@ impl SettingsView {
             });
         match result {
             Ok(()) => {
-                if self.status.starts_with("Save failed")
-                    || self.status.starts_with("Invalid")
-                    || self.status.is_empty()
-                    || self.status == "Settings saved"
-                {
+                // 保存成功后清理与保存相关的旧状态；前缀用当前语言的文案生成，
+                // 避免非英文界面下英文前缀匹配失效导致旧错误残留。
+                let stale = self.status.is_empty()
+                    || self.status == *t!("settings.status.saved")
+                    || self
+                        .status
+                        .starts_with(&*tf!("settings.status.save_failed", "error" => ""))
+                    || self
+                        .status
+                        .starts_with(&*tf!("settings.status.invalid_value", "error" => ""));
+                if stale {
                     self.status.clear();
                 }
                 if let Some(on_save) = &self.on_save {
                     on_save(&self.settings, cx);
                 }
             }
-            Err(error) => self.status = format!("Save failed: {error}"),
+            Err(error) => {
+                self.status = tf!("settings.status.save_failed", "error" => error).to_string()
+            }
         }
         cx.notify();
     }
@@ -639,9 +677,9 @@ impl SettingsView {
         self.commit_edit();
         let Some(value) = self.pending_api_key.take() else {
             self.status = if self.credential_present {
-                "API key already stored in the OS keychain".into()
+                t!("settings.status.api_key_already_stored").to_string()
             } else {
-                "Enter an API key first".into()
+                t!("settings.status.enter_api_key").to_string()
             };
             cx.notify();
             return;
@@ -650,11 +688,12 @@ impl SettingsView {
         match KeyringSecretStore::new().set(&key, &value) {
             Ok(()) => {
                 self.credential_present = true;
-                self.status = "API key saved to the OS keychain".into();
+                self.status = t!("settings.status.api_key_saved").to_string();
             }
             Err(error) => {
                 self.pending_api_key = Some(value);
-                self.status = format!("Could not save API key: {error}");
+                self.status =
+                    tf!("settings.status.api_key_save_failed", "error" => error).to_string();
             }
         }
         cx.notify();
@@ -744,7 +783,7 @@ impl SettingsView {
         self.commit_edit();
         self.schedule_save_if_dirty(cx);
         if self.pending_api_key.is_some() {
-            self.status = "Save API key before testing this connection.".into();
+            self.status = t!("settings.status.save_api_key_first").to_string();
             cx.notify();
             return;
         }
@@ -759,7 +798,7 @@ impl SettingsView {
             .and_then(|key| KeyringSecretStore::new().get(&key).ok().flatten());
         let profile_id = profile.id.clone();
         self.connection_check = Some(profile_id.clone());
-        self.status = "Checking provider…".into();
+        self.status = t!("settings.status.checking_provider").to_string();
         let task = cx.spawn(async move |view, cx| {
             let result = cx
                 .background_executor()
@@ -776,8 +815,13 @@ impl SettingsView {
                     return;
                 }
                 view.status = match result {
-                    Ok(duration) => format!("Reachable in {} ms", duration.as_millis()),
-                    Err(error) => format!("Provider check failed: {error}"),
+                    Ok(duration) => {
+                        tf!("settings.status.reachable_ms", "ms" => duration.as_millis())
+                            .to_string()
+                    }
+                    Err(error) => {
+                        tf!("settings.status.provider_check_failed", "error" => error).to_string()
+                    }
                 };
                 cx.notify();
             });
@@ -863,7 +907,7 @@ impl SettingsView {
         // async dialog is awaited before touching the view again.
         let task = cx.spawn(async move |view, cx| {
             let Some(handle) = rfd::AsyncFileDialog::new()
-                .add_filter("Theme JSON", &["json"])
+                .add_filter(&*t!("settings.themes.import_filter"), &["json"])
                 .pick_file()
                 .await
             else {
@@ -891,9 +935,11 @@ impl SettingsView {
                         }
                         view.preview_theme_preferences(cx);
                         view.schedule_save(cx);
-                        "Theme imported".into()
+                        t!("settings.status.theme_imported").to_string()
                     }
-                    Err(error) => format!("Theme import failed: {error}"),
+                    Err(error) => {
+                        tf!("settings.status.theme_import_failed", "error" => error).to_string()
+                    }
                 };
                 cx.notify();
             });
@@ -908,7 +954,7 @@ impl SettingsView {
             .into_iter()
             .find(|theme| theme.id == self.settings.theme_id)
         else {
-            self.status = "Selected theme was not found".into();
+            self.status = t!("settings.status.theme_not_found").to_string();
             cx.notify();
             return;
         };
@@ -925,8 +971,12 @@ impl SettingsView {
                 .map_err(|error| error.to_string())
                 .and_then(|json| atomic_write(&path, &json).map_err(|error| error.to_string()))
             {
-                Ok(()) => format!("Theme exported to {}", path.display()),
-                Err(error) => format!("Theme export failed: {error}"),
+                Ok(()) => {
+                    tf!("settings.status.theme_exported", "path" => path.display()).to_string()
+                }
+                Err(error) => {
+                    tf!("settings.status.theme_export_failed", "error" => error).to_string()
+                }
             };
             let _ = view.update(cx, |view, cx| {
                 view.status = status;
@@ -939,7 +989,10 @@ impl SettingsView {
     fn select_background(&mut self, cx: &mut Context<Self>) {
         let task = cx.spawn(async move |view, cx| {
             let Some(handle) = rfd::AsyncFileDialog::new()
-                .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif"])
+                .add_filter(
+                    &*t!("settings.themes.image_filter"),
+                    &["png", "jpg", "jpeg", "webp", "gif"],
+                )
                 .pick_file()
                 .await
             else {
@@ -1064,18 +1117,48 @@ impl SettingsView {
         cx.notify();
     }
 
+    /// 语言选择（`None` = 跟随系统）。i18n 是进程级全局状态：这里立即切换并
+    /// notify 重渲染设置窗口；主窗口经防抖保存的 `on_save → apply_settings`
+    /// 路径同步（与主题实时预览一致的最大 400ms 延迟）。
+    fn select_language(&mut self, language: Option<&str>, cx: &mut Context<Self>) {
+        self.settings.language = language.map(str::to_owned);
+        termior_i18n::init(self.settings.language.as_deref());
+        self.select_menu = None;
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// shell 下拉选择：写回 shell_detection / wsl_distribution（映射见
+    /// `shell_select::apply_option`），主窗口经防抖保存路径同步。
+    fn select_shell(
+        &mut self,
+        option: crate::shell_select::ShellOption,
+        cx: &mut Context<Self>,
+    ) {
+        crate::shell_select::apply_option(&option, &mut self.settings);
+        self.select_menu = None;
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     fn install_hooks(&mut self, cx: &mut Context<Self>) {
         self.status = match termior_hooks::install() {
-            Ok(result) => format!("Claude Code hooks installed ({} added)", result.added),
-            Err(error) => format!("Hook install failed: {error}"),
+            Ok(result) => {
+                tf!("settings.status.hooks_installed", "count" => result.added).to_string()
+            }
+            Err(error) => tf!("settings.status.hooks_install_failed", "error" => error).to_string(),
         };
         cx.notify();
     }
 
     fn uninstall_hooks(&mut self, cx: &mut Context<Self>) {
         self.status = match termior_hooks::uninstall() {
-            Ok(result) => format!("Claude Code hooks removed ({})", result.removed),
-            Err(error) => format!("Hook uninstall failed: {error}"),
+            Ok(result) => {
+                tf!("settings.status.hooks_removed", "count" => result.removed).to_string()
+            }
+            Err(error) => {
+                tf!("settings.status.hooks_uninstall_failed", "error" => error).to_string()
+            }
         };
         cx.notify();
     }
@@ -1090,7 +1173,7 @@ impl SettingsView {
             let key = event.keystroke.key.as_str();
             if key == "escape" {
                 self.capture_shortcut = None;
-                self.status = "Shortcut capture cancelled".into();
+                self.status = t!("settings.status.shortcut_cancelled").to_string();
                 cx.stop_propagation();
                 cx.notify();
                 return;
@@ -1105,7 +1188,7 @@ impl SettingsView {
                 modifiers.control
             };
             if !has_required_modifier {
-                self.status = "Shortcuts must include Cmd/Ctrl".into();
+                self.status = t!("settings.status.shortcut_needs_modifier").to_string();
                 cx.stop_propagation();
                 cx.notify();
                 return;
@@ -1115,7 +1198,7 @@ impl SettingsView {
                 && !modifiers.alt
                 && (modifiers.control || modifiers.platform)
             {
-                self.status = "Cmd/Ctrl+S is reserved for saving editor files".into();
+                self.status = t!("settings.status.shortcut_reserved").to_string();
                 cx.stop_propagation();
                 cx.notify();
                 return;
@@ -1134,7 +1217,11 @@ impl SettingsView {
                 Ok(()) => {
                     self.capture_shortcut = None;
                     self.schedule_save(cx);
-                    format!("Updated {action:?}")
+                    tf!(
+                        "settings.status.shortcut_updated",
+                        "action" => format!("{action:?}")
+                    )
+                    .to_string()
                 }
                 Err(error) => error.to_string(),
             };
@@ -1282,7 +1369,11 @@ impl SettingsView {
     fn capture_shortcut(&mut self, action: KeyAction, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_edit();
         self.capture_shortcut = Some(action);
-        self.status = format!("Press the new Cmd/Ctrl shortcut for {action:?}");
+        self.status = tf!(
+            "settings.status.shortcut_capture",
+            "action" => format!("{action:?}")
+        )
+        .to_string();
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -1357,11 +1448,13 @@ impl SettingsView {
 
     fn edit_row(
         &self,
-        label: &'static str,
-        description: &'static str,
+        label: impl Into<SharedString>,
+        description: impl Into<SharedString>,
         field: EditField,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let label = label.into();
+        let description = description.into();
         let p = self.palette.clone();
         div()
             .flex()
@@ -1407,8 +1500,8 @@ impl SettingsView {
 
     fn section(
         &self,
-        title: &'static str,
-        description: &'static str,
+        title: impl Into<SharedString>,
+        description: impl Into<SharedString>,
         children: impl IntoIterator<Item = AnyElement>,
     ) -> AnyElement {
         let p = &self.palette;
@@ -1421,12 +1514,12 @@ impl SettingsView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_lg().child(title))
+                    .child(div().text_lg().child(title.into()))
                     .child(
                         div()
                             .text_xs()
                             .text_color(crate::ui::muted(p))
-                            .child(description),
+                            .child(description.into()),
                     ),
             )
             .children(children)
@@ -1445,12 +1538,13 @@ impl SettingsView {
     }
 
     fn select_button(
-        label: &str,
+        label: impl Into<SharedString>,
         value: impl Into<SharedString>,
         id: impl Into<gpui::ElementId>,
         open: bool,
         p: &termior_theme::ResolvedPalette,
     ) -> gpui::Stateful<gpui::Div> {
+        let label = label.into();
         div()
             .id(id)
             .w(px(360.0))
@@ -1474,11 +1568,7 @@ impl SettingsView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .text_color(crate::ui::muted(p))
-                            .child(SharedString::from(label.to_owned())),
-                    )
+                    .child(div().text_color(crate::ui::muted(p)).child(label))
                     .child(value.into()),
             )
             .child(if open { "▴" } else { "▾" })
@@ -1549,69 +1639,297 @@ impl SettingsView {
             }))
     }
 
+    /// Terminal 区：默认 shell 下拉（选中「手动路径」时追加路径输入行）、
+    /// 字体等编辑行，以及「新建终端时选择 Shell」开关。
+    fn terminal_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::shell_select::{self, ShellOption};
+
+        let shell_menu_open = self.select_menu == Some(SelectMenu::Shell);
+        let selection = shell_select::selected_option(&self.settings, &self.discovered_shells);
+        let shell_menu = shell_menu_open.then(|| {
+            let mut items: Vec<gpui::Stateful<gpui::Div>> = vec![
+                Self::select_option(
+                    t!("settings.terminal.shell.auto"),
+                    "shell-option-default",
+                    selection == ShellOption::Default,
+                    &self.palette,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.select_shell(ShellOption::Default, cx);
+                    }),
+                ),
+            ];
+            for (index, shell) in self.discovered_shells.iter().enumerate() {
+                let option = ShellOption::from(shell);
+                let selected = option == selection;
+                items.push(
+                    Self::select_option(
+                        option.label(),
+                        SharedString::from(format!("shell-option-{index}")),
+                        selected,
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.select_shell(option.clone(), cx);
+                        }),
+                    ),
+                );
+            }
+            items.push(
+                Self::select_option(
+                    t!("settings.terminal.shell.manual"),
+                    "shell-option-manual",
+                    selection == ShellOption::Manual,
+                    &self.palette,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.select_shell(ShellOption::Manual, cx);
+                    }),
+                ),
+            );
+            div()
+                .w(px(360.0))
+                .p_1()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&self.palette))
+                .bg(crate::ui::color(self.palette.overlay))
+                .shadow_md()
+                .children(items)
+        });
+        let shell_prompt = self.settings.terminal.shell_prompt;
+
+        let mut rows: Vec<AnyElement> = vec![
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    Self::select_button(
+                        t!("settings.terminal.shell"),
+                        shell_select::selection_value(&selection, &self.settings),
+                        "shell-select",
+                        shell_menu_open,
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_select_menu(SelectMenu::Shell, cx);
+                        }),
+                    ),
+                )
+                .when_some(shell_menu, |select, menu| select.child(menu))
+                .into_any_element(),
+        ];
+        if selection == ShellOption::Manual {
+            rows.push(self.edit_row(
+                t!("settings.terminal.shell.manual_path"),
+                t!("settings.terminal.shell.manual_path_description"),
+                EditField::ShellPath,
+                cx,
+            ));
+        }
+        rows.extend([
+            self.edit_row(
+                t!("settings.terminal.font_family"),
+                t!("settings.terminal.font_family_description"),
+                EditField::FontFamily,
+                cx,
+            ),
+            self.edit_row(
+                t!("settings.terminal.font_size"),
+                t!("settings.terminal.font_size_description"),
+                EditField::FontSize,
+                cx,
+            ),
+            self.edit_row(
+                t!("settings.terminal.line_height"),
+                t!("settings.terminal.line_height_description"),
+                EditField::LineHeight,
+                cx,
+            ),
+            self.edit_row(
+                t!("settings.terminal.letter_spacing"),
+                t!("settings.terminal.letter_spacing_description"),
+                EditField::LetterSpacing,
+                cx,
+            ),
+            self.edit_row(
+                t!("settings.terminal.scrollback"),
+                t!("settings.terminal.scrollback_description"),
+                EditField::Scrollback,
+                cx,
+            ),
+        ]);
+        // 「新建终端时选择 Shell」：开启后新建终端入口先弹选择器（一次性的
+        // 本次选择，不改默认）。沿用编辑区开关按钮的形态。
+        rows.push(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_sm().child(t!("settings.terminal.shell_prompt_label")))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(crate::ui::muted(&self.palette))
+                        .child(t!("settings.terminal.shell_prompt_description")),
+                )
+                .child(
+                    Self::button(
+                        tf!(
+                            "settings.terminal.shell_prompt",
+                            "state" => on_off(shell_prompt)
+                        ),
+                        "shell-prompt-toggle",
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.settings.terminal.shell_prompt =
+                                !this.settings.terminal.shell_prompt;
+                            this.schedule_save(cx);
+                            cx.notify();
+                        }),
+                    ),
+                )
+                .into_any_element(),
+        );
+        self.section(
+            t!("settings.terminal.title"),
+            t!("settings.terminal.description"),
+            rows,
+        )
+    }
+
     fn general_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let autocomplete = self.settings.autocomplete_enabled;
         let vim = self.settings.vim_mode;
         let dotfiles = self.settings.show_dotfiles;
+        // 语言下拉：当前值显示母语名（不翻译），`None` 显示「跟随系统」。
+        let language_menu_open = self.select_menu == Some(SelectMenu::Language);
+        let current_language = self
+            .settings
+            .language
+            .as_deref()
+            .and_then(termior_i18n::canonicalize);
+        let language_label = match current_language {
+            Some(id) => SharedString::from(
+                termior_i18n::available_locales()
+                    .iter()
+                    .find(|locale| locale.id == id)
+                    .map(|locale| locale.native_name)
+                    .unwrap_or(id),
+            ),
+            None => t!("settings.language.follow_system"),
+        };
+        let language_menu = language_menu_open.then(|| {
+            div()
+                .w(px(360.0))
+                .p_1()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&self.palette))
+                .bg(crate::ui::color(self.palette.overlay))
+                .shadow_md()
+                .child(
+                    Self::select_option(
+                        t!("settings.language.follow_system"),
+                        "language-option-follow-system",
+                        current_language.is_none(),
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.select_language(None, cx);
+                        }),
+                    ),
+                )
+                .children(termior_i18n::available_locales().iter().map(|locale| {
+                    let id = locale.id;
+                    Self::select_option(
+                        locale.native_name,
+                        SharedString::from(format!("language-option-{id}")),
+                        current_language == Some(id),
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.select_language(Some(id), cx);
+                        }),
+                    )
+                }))
+        });
         div()
             .flex()
             .flex_col()
             .gap_6()
             .child(
                 self.section(
-                    "SSH / SFTP",
-                    "管理远程连接、认证凭据与文件传输。",
-                    [
-                        Self::button("管理 SSH / SFTP 连接", "ssh-settings", &self.palette)
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(OpenSshManager)))
-                            .into_any_element(),
-                    ],
+                    t!("settings.language"),
+                    t!("settings.language_description"),
+                    [div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            Self::select_button(
+                                t!("settings.language"),
+                                language_label,
+                                "language-select",
+                                language_menu_open,
+                                &self.palette,
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_select_menu(SelectMenu::Language, cx);
+                                }),
+                            ),
+                        )
+                        .when_some(language_menu, |select, menu| select.child(menu))
+                        .into_any_element()],
                 ),
             )
-            .child(self.section(
-                "Terminal",
-                "Defaults for new terminal panes. Changes apply after auto-save.",
-                [
-                    self.edit_row(
-                        "Font family",
-                        "Typeface used for terminal glyphs.",
-                        EditField::FontFamily,
-                        cx,
-                    ),
-                    self.edit_row(
-                        "Font size",
-                        "Point size between 8 and 32.",
-                        EditField::FontSize,
-                        cx,
-                    ),
-                    self.edit_row(
-                        "Line height",
-                        "Multiplier for line spacing (0.8–3.0).",
-                        EditField::LineHeight,
-                        cx,
-                    ),
-                    self.edit_row(
-                        "Letter spacing",
-                        "Extra glyph spacing in logical pixels (−2–8).",
-                        EditField::LetterSpacing,
-                        cx,
-                    ),
-                    self.edit_row(
-                        "Scrollback rows",
-                        "How many lines of history each terminal keeps (200–50,000).",
-                        EditField::Scrollback,
-                        cx,
-                    ),
-                ],
-            ))
             .child(
                 self.section(
-                    "Editor & explorer",
-                    "Cross-cutting preferences for editing and the file tree.",
+                    t!("settings.ssh.section_title"),
+                    t!("settings.ssh.description"),
+                    [Self::button(
+                        t!("settings.ssh.manage_button"),
+                        "ssh-settings",
+                        &self.palette,
+                    )
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(OpenSshManager)))
+                    .into_any_element()],
+                ),
+            )
+            .child(self.terminal_section(cx))
+            .child(
+                self.section(
+                    t!("settings.editor.title"),
+                    t!("settings.editor.description"),
                     [
                         self.edit_row(
-                            "Custom instructions",
-                            "Optional guidance appended to built-in agent prompts.",
+                            t!("settings.editor.custom_instructions"),
+                            t!("settings.editor.custom_instructions_description"),
                             EditField::Instructions,
                             cx,
                         ),
@@ -1621,7 +1939,7 @@ impl SettingsView {
                             .gap_2()
                             .child(
                                 Self::button(
-                                    format!("Autocomplete: {}", on_off(autocomplete)),
+                                    tf!("settings.editor.autocomplete", "state" => on_off(autocomplete)),
                                     "autocomplete",
                                     &self.palette,
                                 )
@@ -1636,19 +1954,23 @@ impl SettingsView {
                                 ),
                             )
                             .child(
-                                Self::button(format!("Vim: {}", on_off(vim)), "vim", &self.palette)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.settings.vim_mode = !this.settings.vim_mode;
-                                            this.schedule_save(cx);
-                                            cx.notify();
-                                        }),
-                                    ),
+                                Self::button(
+                                    tf!("settings.editor.vim", "state" => on_off(vim)),
+                                    "vim",
+                                    &self.palette,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.settings.vim_mode = !this.settings.vim_mode;
+                                        this.schedule_save(cx);
+                                        cx.notify();
+                                    }),
+                                ),
                             )
                             .child(
                                 Self::button(
-                                    format!("Dotfiles: {}", on_off(dotfiles)),
+                                    tf!("settings.editor.dotfiles", "state" => on_off(dotfiles)),
                                     "dotfiles",
                                     &self.palette,
                                 )
@@ -1670,7 +1992,9 @@ impl SettingsView {
 
     fn models_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(profile) = self.profile() else {
-            return div().child("No provider profiles").into_any_element();
+            return div()
+                .child(t!("empty.no_provider_profiles"))
+                .into_any_element();
         };
         let active_chat = self.settings.models.active_chat_profile.as_deref() == Some(&profile.id);
         let active_completion =
@@ -1694,15 +2018,15 @@ impl SettingsView {
                             if self.settings.models.active_chat_profile.as_deref()
                                 == Some(entry.id.as_str())
                             {
-                                tags.push("chat ✓");
+                                tags.push(t!("settings.models.tag_chat").to_string());
                             }
                             if self.settings.models.active_completion_profile.as_deref()
                                 == Some(entry.id.as_str())
                             {
-                                tags.push("completion ✓");
+                                tags.push(t!("settings.models.tag_completion").to_string());
                             }
                             if !entry.enabled {
-                                tags.push("disabled");
+                                tags.push(t!("settings.models.tag_disabled").to_string());
                             }
                             let label = if tags.is_empty() {
                                 format!("{} · {}", entry.display_name, entry.model)
@@ -1737,15 +2061,19 @@ impl SettingsView {
             .as_deref()
             .and_then(|id| self.settings.models.profiles.iter().find(|p| p.id == id))
             .map(|p| {
-                format!(
-                    "{} · {}{}",
-                    p.display_name,
-                    p.model,
-                    // Composer 只选启用的 profile；标注禁用态，提示为何 Agent 面板没生效。
-                    if p.enabled { "" } else { " (disabled)" }
-                )
+                // Composer 只选启用的 profile；标注禁用态，提示为何 Agent 面板没生效。
+                if p.enabled {
+                    format!("{} · {}", p.display_name, p.model)
+                } else {
+                    format!(
+                        "{} · {} ({})",
+                        p.display_name,
+                        p.model,
+                        t!("settings.models.tag_disabled")
+                    )
+                }
             })
-            .unwrap_or_else(|| "Not set — choose a provider".into());
+            .unwrap_or_else(|| t!("settings.models.not_set_choose").to_string());
         let completion_profile_label = self
             .settings
             .models
@@ -1753,28 +2081,28 @@ impl SettingsView {
             .as_deref()
             .and_then(|id| self.settings.models.profiles.iter().find(|p| p.id == id))
             .map(|p| format!("{} · {}", p.display_name, p.model))
-            .unwrap_or_else(|| "Not set".into());
+            .unwrap_or_else(|| t!("settings.models.not_set").to_string());
         div()
             .flex()
             .flex_col()
             .gap_6()
             .child(
                 self.section(
-                    "1. Choose a provider",
-                    "Connect a model service for the built-in Agent. Changes save automatically; API keys require Save API key.",
+                    t!("settings.models.step1_title"),
+                    t!("settings.models.step1_description"),
                     [div()
                         .flex()
                         .flex_col()
                         .gap_1()
                         .child(
                             Self::select_button(
-                                "Provider",
-                                SharedString::from(format!(
-                                    "{} ({}/{})",
-                                    profile.display_name,
-                                    self.profile_index + 1,
-                                    self.settings.models.profiles.len()
-                                )),
+                                t!("settings.models.provider_label"),
+                                tf!(
+                                    "settings.models.provider_value",
+                                    "name" => profile.display_name,
+                                    "index" => self.profile_index + 1,
+                                    "total" => self.settings.models.profiles.len()
+                                ),
                                 "provider-select",
                                 profile_menu_open,
                                 &self.palette,
@@ -1792,18 +2120,18 @@ impl SettingsView {
                 ),
             )
             .child(self.section(
-                "2. Configure the model",
-                "Use the model ID from your provider or local model server.",
+                t!("settings.models.step2_title"),
+                t!("settings.models.step2_description"),
                 [
                     self.edit_row(
-                        "Model",
-                        "Provider model identifier used for requests.",
+                        t!("settings.models.model_label"),
+                        t!("settings.models.model_description"),
                         EditField::Model,
                         cx,
                     ),
                     self.edit_row(
-                        "Base URL",
-                        "Keep the preset URL unless using a proxy or your own server. Local servers may use HTTP.",
+                        t!("settings.models.base_url_label"),
+                        t!("settings.models.base_url_description"),
                         EditField::BaseUrl,
                         cx,
                     ),
@@ -1811,12 +2139,16 @@ impl SettingsView {
             ))
             .child(
                 self.section(
-                    "3. Connect and test",
-                    if profile.local { "API key is optional for this local provider. Start your model server, then test the connection." } else { "Add your provider API key, save it securely, then test the connection." },
+                    t!("settings.models.step3_title"),
+                    if profile.local {
+                        t!("settings.models.step3_description_local")
+                    } else {
+                        t!("settings.models.step3_description_remote")
+                    },
                     [
                         self.edit_row(
-                            "API key",
-                            "Never written to settings files — stored only in the OS keychain.",
+                            t!("settings.models.api_key_label"),
+                            t!("settings.models.api_key_description"),
                             EditField::ApiKey,
                             cx,
                         ),
@@ -1825,18 +2157,30 @@ impl SettingsView {
                             .flex_wrap()
                             .gap_2()
                             .child(
-                                Self::button("Save API key", "save-api-key", &self.palette)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.save_api_key(cx)),
-                                    ),
+                                Self::button(
+                                    t!("settings.models.save_api_key"),
+                                    "save-api-key",
+                                    &self.palette,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.save_api_key(cx)),
+                                ),
                             )
                             .child(
-                                Self::button(if self.connection_check.is_some() { "Testing…" } else { "Test connection" }, "ping-provider", &self.palette)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.ping_provider(cx)),
-                                    ),
+                                Self::button(
+                                    if self.connection_check.is_some() {
+                                        t!("settings.models.testing")
+                                    } else {
+                                        t!("settings.models.test_connection")
+                                    },
+                                    "ping-provider",
+                                    &self.palette,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.ping_provider(cx)),
+                                ),
                             )
                             .into_any_element(),
                     ],
@@ -1844,23 +2188,21 @@ impl SettingsView {
             )
             .child(
                 self.section(
-                    "4. Choose where to use this model",
-                    "Chat powers the Composer. Completion is configured separately. Choosing a default enables this provider.",
+                    t!("settings.models.step4_title"),
+                    t!("settings.models.step4_description"),
                     [
                         div()
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(
-                                div().text_sm().child(SharedString::from(format!(
-                                    "Chat (Composer): {chat_profile_label}"
-                                ))),
-                            )
-                            .child(
-                                div().text_sm().child(SharedString::from(format!(
-                                    "Completion: {completion_profile_label}"
-                                ))),
-                            )
+                            .child(div().text_sm().child(tf!(
+                                "settings.models.chat_line",
+                                "value" => chat_profile_label
+                            )))
+                            .child(div().text_sm().child(tf!(
+                                "settings.models.completion_line",
+                                "value" => completion_profile_label
+                            )))
                             .into_any_element(),
                         div()
                             .flex()
@@ -1868,7 +2210,10 @@ impl SettingsView {
                             .gap_2()
                             .child(
                                 Self::button(
-                                    format!("Enabled: {}", on_off(profile.enabled)),
+                                    tf!(
+                                        "settings.models.enabled",
+                                        "state" => on_off(profile.enabled)
+                                    ),
                                     "provider-enabled",
                                     &self.palette,
                                 )
@@ -1880,9 +2225,9 @@ impl SettingsView {
                             .child(
                                 Self::button(
                                     if active_chat {
-                                        "✓ Use for chat"
+                                        t!("settings.models.use_for_chat_active")
                                     } else {
-                                        "Use for chat"
+                                        t!("settings.models.use_for_chat")
                                     },
                                     "active-chat",
                                     &self.palette,
@@ -1895,18 +2240,16 @@ impl SettingsView {
                             .child(
                                 Self::button(
                                     if active_completion {
-                                        "✓ Use for completion"
+                                        t!("settings.models.use_for_completion_active")
                                     } else {
-                                        "Use for completion"
+                                        t!("settings.models.use_for_completion")
                                     },
                                     "active-completion",
                                     &self.palette,
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.make_active_completion(cx)
-                                    }),
+                                    cx.listener(|this, _, _, cx| this.make_active_completion(cx)),
                                 ),
                             )
                             .into_any_element(),
@@ -1922,8 +2265,8 @@ impl SettingsView {
             .background
             .image_path
             .as_deref()
-            .unwrap_or("None")
-            .to_owned();
+            .map(SharedString::from)
+            .unwrap_or_else(|| t!("settings.themes.background_none"));
         let app_themes = self.themes.all();
         let follow_system = self.settings.appearance == Appearance::FollowSystem;
         let app_theme_name = app_themes
@@ -2017,9 +2360,9 @@ impl SettingsView {
 
         let appearance_menu_open = self.select_menu == Some(SelectMenu::Appearance);
         let appearance_label = match self.settings.appearance {
-            Appearance::Light => "Light",
-            Appearance::Dark => "Dark",
-            Appearance::FollowSystem => "Follow system",
+            Appearance::Light => t!("settings.appearance.light"),
+            Appearance::Dark => t!("settings.appearance.dark"),
+            Appearance::FollowSystem => t!("settings.appearance.follow_system"),
         };
         let appearance_menu = appearance_menu_open.then(|| {
             div()
@@ -2032,9 +2375,12 @@ impl SettingsView {
                 .shadow_md()
                 .children(
                     [
-                        (Appearance::Light, "Light"),
-                        (Appearance::Dark, "Dark"),
-                        (Appearance::FollowSystem, "Follow system"),
+                        (Appearance::Light, t!("settings.appearance.light")),
+                        (Appearance::Dark, t!("settings.appearance.dark")),
+                        (
+                            Appearance::FollowSystem,
+                            t!("settings.appearance.follow_system"),
+                        ),
                     ]
                     .into_iter()
                     .map(|(appearance, label)| {
@@ -2062,7 +2408,7 @@ impl SettingsView {
                 .gap_1()
                 .child(
                     Self::select_button(
-                        "Application theme",
+                        t!("settings.themes.application_theme"),
                         app_theme_name,
                         "app-theme-select",
                         app_menu_open,
@@ -2084,7 +2430,7 @@ impl SettingsView {
                 .gap_1()
                 .child(
                     Self::select_button(
-                        "Appearance",
+                        t!("settings.themes.appearance"),
                         appearance_label,
                         "appearance-select",
                         appearance_menu_open,
@@ -2111,13 +2457,11 @@ impl SettingsView {
                         div()
                             .text_xs()
                             .text_color(crate::ui::muted(&self.palette))
-                            .child(SharedString::from(
-                                "Light slot lists light-native themes only; dark slot lists dark-native themes only.",
-                            )),
+                            .child(t!("settings.themes.pair_hint")),
                     )
                     .child(
                         Self::select_button(
-                            "Light theme",
+                            t!("settings.themes.light_theme"),
                             light_name,
                             "light-theme-select",
                             light_menu_open,
@@ -2134,7 +2478,7 @@ impl SettingsView {
                     .when_some(light_theme_menu, |select, menu| select.child(menu))
                     .child(
                         Self::select_button(
-                            "Dark theme",
+                            t!("settings.themes.dark_theme"),
                             dark_name,
                             "dark-theme-select",
                             dark_menu_open,
@@ -2159,7 +2503,7 @@ impl SettingsView {
                 .gap_1()
                 .child(
                     Self::select_button(
-                        "Editor theme",
+                        t!("settings.themes.editor_theme"),
                         editor_theme_name,
                         "editor-theme-select",
                         editor_menu_open,
@@ -2181,16 +2525,18 @@ impl SettingsView {
                 .flex()
                 .gap_2()
                 .child(
-                    Self::button("Import theme", "import-theme", &self.palette).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.import_theme(cx)),
-                    ),
+                    Self::button(t!("settings.themes.import"), "import-theme", &self.palette)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.import_theme(cx)),
+                        ),
                 )
                 .child(
-                    Self::button("Export theme", "export-theme", &self.palette).on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.export_theme(cx)),
-                    ),
+                    Self::button(t!("settings.themes.export"), "export-theme", &self.palette)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.export_theme(cx)),
+                        ),
                 )
                 .into_any_element(),
         );
@@ -2200,50 +2546,60 @@ impl SettingsView {
             .flex_col()
             .gap_6()
             .child(self.section(
-                "Appearance",
-                "Each theme has a native light or dark look. Choosing a theme locks appearance to that native side. Follow system pairs one light theme with one dark theme.",
+                t!("settings.themes.appearance"),
+                t!("settings.themes.appearance_description"),
                 appearance_items,
             ))
-            .child(self.section(
-                "Background",
-                "Optional wallpaper behind the workspace chrome.",
-                [
-                    div()
-                        .text_sm()
-                        .child(SharedString::from(format!("Image: {background}")))
-                        .into_any_element(),
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(
-                            Self::button("Choose image", "background-image", &self.palette)
+            .child(
+                self.section(
+                    t!("settings.themes.background_title"),
+                    t!("settings.themes.background_description"),
+                    [
+                        div()
+                            .text_sm()
+                            .child(tf!("settings.themes.background_image", "value" => background))
+                            .into_any_element(),
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Self::button(
+                                    t!("settings.themes.choose_image"),
+                                    "background-image",
+                                    &self.palette,
+                                )
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| this.select_background(cx)),
                                 ),
-                        )
-                        .child(
-                            Self::button("Clear image", "background-clear", &self.palette)
+                            )
+                            .child(
+                                Self::button(
+                                    t!("settings.themes.clear_image"),
+                                    "background-clear",
+                                    &self.palette,
+                                )
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| this.clear_background(cx)),
                                 ),
-                        )
-                        .into_any_element(),
-                    self.edit_row(
-                        "Background opacity",
-                        "0 = invisible overlay, 1 = fully opaque.",
-                        EditField::BackgroundOpacity,
-                        cx,
-                    ),
-                    self.edit_row(
-                        "Background blur",
-                        "Gaussian blur radius in logical pixels (0–64).",
-                        EditField::BackgroundBlur,
-                        cx,
-                    ),
-                ],
-            ))
+                            )
+                            .into_any_element(),
+                        self.edit_row(
+                            t!("settings.themes.background_opacity"),
+                            t!("settings.themes.background_opacity_description"),
+                            EditField::BackgroundOpacity,
+                            cx,
+                        ),
+                        self.edit_row(
+                            t!("settings.themes.background_blur"),
+                            t!("settings.themes.background_blur_description"),
+                            EditField::BackgroundBlur,
+                            cx,
+                        ),
+                    ],
+                ),
+            )
             .into_any_element()
     }
 
@@ -2292,8 +2648,8 @@ impl SettingsView {
                 )
         });
         self.section(
-            "Keymap",
-            "Click a row, then press a new Cmd/Ctrl chord. Conflicting bindings are rejected.",
+            t!("settings.shortcuts.title"),
+            t!("settings.shortcuts.description"),
             [div().flex().flex_col().children(rows).into_any_element()],
         )
     }
@@ -2303,24 +2659,87 @@ impl SettingsView {
         let Some(agent) = self.agent() else {
             return div().into_any_element();
         };
-        div().flex().flex_col().gap_2()
-            .child(format!("Tools · {} selected", agent.tools.len()))
-            .child(div().text_xs().text_color(crate::ui::muted(&self.palette))
-                .child("No tools selected means conversation only. Write and command tools follow the approval mode chosen in the Composer."))
-            .child(div().flex().gap_2()
-                .child(Self::button("Read-only preset", "agent-read-only", &self.palette)
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.set_agent_tools(true, cx))))
-                .child(Self::button("Clear all", "agent-no-tools", &self.palette)
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.set_agent_tools(false, cx)))))
-            .child(div().id("agent-tools-list").max_h(px(280.0)).overflow_y_scroll().children([ToolLevel::Auto, ToolLevel::Approval].into_iter().map(|level| {
-                div().flex().flex_col().gap_1()
-                    .child(div().text_sm().child(if level == ToolLevel::Auto { "Read and inspect" } else { "Make changes and run commands" }))
-                    .children(ALL_TOOLS.iter().filter(move |tool| tool.level() == level).map(|tool| {
-                        let name = tool.name();
-                        Self::select_option(tool_label(*tool), SharedString::from(format!("agent-tool-{name}")), agent.tools.iter().any(|t| t == name), &self.palette)
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.toggle_agent_tool(name, cx)))
-                    }))
-            })))
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(tn!(agent.tools.len(), "settings.agents.tools_selected"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(crate::ui::muted(&self.palette))
+                    .child(t!("settings.agents.tools_hint")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Self::button(
+                            t!("settings.agents.read_only_preset"),
+                            "agent-read-only",
+                            &self.palette,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.set_agent_tools(true, cx)),
+                        ),
+                    )
+                    .child(
+                        Self::button(
+                            t!("settings.agents.clear_all"),
+                            "agent-no-tools",
+                            &self.palette,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.set_agent_tools(false, cx)),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("agent-tools-list")
+                    .max_h(px(280.0))
+                    .overflow_y_scroll()
+                    .children(
+                        [ToolLevel::Auto, ToolLevel::Approval]
+                            .into_iter()
+                            .map(|level| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_sm().child(if level == ToolLevel::Auto {
+                                        t!("settings.agents.tools_group_auto")
+                                    } else {
+                                        t!("settings.agents.tools_group_approval")
+                                    }))
+                                    .children(
+                                        ALL_TOOLS
+                                            .iter()
+                                            .filter(move |tool| tool.level() == level)
+                                            .map(|tool| {
+                                                let name = tool.name();
+                                                Self::select_option(
+                                                    tool_label(*tool),
+                                                    SharedString::from(format!(
+                                                        "agent-tool-{name}"
+                                                    )),
+                                                    agent.tools.iter().any(|t| t == name),
+                                                    &self.palette,
+                                                )
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.toggle_agent_tool(name, cx)
+                                                    }),
+                                                )
+                                            }),
+                                    )
+                            }),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -2328,12 +2747,12 @@ impl SettingsView {
         let hook_status = termior_hooks::status()
             .map(|status| {
                 if status.fully_installed {
-                    "installed"
+                    t!("settings.agents.hooks_installed")
                 } else {
-                    "not installed"
+                    t!("settings.agents.hooks_not_installed")
                 }
             })
-            .unwrap_or("unavailable");
+            .unwrap_or_else(|_| t!("settings.agents.hooks_unavailable"));
         let agent_controls = if let Some(agent) = self.agent() {
             let menu_open = self.select_menu == Some(SelectMenu::AgentProfile);
             div()
@@ -2342,7 +2761,7 @@ impl SettingsView {
                 .gap_4()
                 .child(
                     Self::select_button(
-                        "Agent",
+                        t!("settings.agents.agent_label"),
                         agent.name.clone(),
                         "agent-select",
                         menu_open,
@@ -2373,14 +2792,14 @@ impl SettingsView {
                     ))
                 })
                 .child(self.edit_row(
-                    "Name",
-                    "Shown in the Composer agent selector.",
+                    t!("settings.agents.name_label"),
+                    t!("settings.agents.name_description"),
                     EditField::AgentName,
                     cx,
                 ))
                 .child(self.edit_row(
-                    "Instructions",
-                    "Describe the agent's role, workflow and preferred response style.",
+                    t!("settings.agents.instructions_label"),
+                    t!("settings.agents.instructions_description"),
                     EditField::AgentPrompt,
                     cx,
                 ))
@@ -2388,9 +2807,9 @@ impl SettingsView {
                 .child(
                     Self::button(
                         if self.agent_appearance_open {
-                            "▾ Appearance"
+                            t!("settings.agents.appearance_open")
                         } else {
-                            "▸ Appearance"
+                            t!("settings.agents.appearance_closed")
                         },
                         "agent-appearance",
                         &self.palette,
@@ -2406,21 +2825,26 @@ impl SettingsView {
                 .when(self.agent_appearance_open, |container| {
                     container.children([
                         self.edit_row(
-                            "Icon",
-                            "Icon key shown next to the agent name.",
+                            t!("settings.agents.icon_label"),
+                            t!("settings.agents.icon_description"),
                             EditField::AgentIcon,
                             cx,
                         ),
                         self.edit_row(
-                            "Color",
-                            "Accent color in #RRGGBB format.",
+                            t!("settings.agents.color_label"),
+                            t!("settings.agents.color_description"),
                             EditField::AgentColor,
                             cx,
                         ),
                     ])
                 })
                 .child(
-                    Self::button("Delete agent…", "remove-agent", &self.palette).on_mouse_down(
+                    Self::button(
+                        t!("settings.agents.delete_agent_ellipsis"),
+                        "remove-agent",
+                        &self.palette,
+                    )
+                    .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             this.confirm_agent_removal = true;
@@ -2434,9 +2858,9 @@ impl SettingsView {
                             .flex()
                             .flex_col()
                             .gap_2()
-                            .child(format!(
-                                "Delete {}? This removes the saved agent profile.",
-                                agent.name
+                            .child(tf!(
+                                "settings.agents.delete_confirm",
+                                "name" => agent.name
                             ))
                             .child(
                                 div()
@@ -2444,7 +2868,7 @@ impl SettingsView {
                                     .gap_2()
                                     .child(
                                         Self::button(
-                                            "Delete agent",
+                                            t!("settings.agents.delete_agent"),
                                             "confirm-remove-agent",
                                             &self.palette,
                                         )
@@ -2455,7 +2879,7 @@ impl SettingsView {
                                     )
                                     .child(
                                         Self::button(
-                                            "Cancel",
+                                            t!("settings.agents.cancel"),
                                             "cancel-remove-agent",
                                             &self.palette,
                                         )
@@ -2472,7 +2896,10 @@ impl SettingsView {
                 })
                 .into_any_element()
         } else {
-            div().text_sm().child("Create your first agent to save a role, instructions and tool permissions. You can then choose it in the Composer.").into_any_element()
+            div()
+                .text_sm()
+                .child(t!("settings.agents.empty_hint"))
+                .into_any_element()
         };
         div()
             .flex()
@@ -2480,10 +2907,10 @@ impl SettingsView {
             .gap_6()
             .child(
                 self.section(
-                    "Custom agents",
-                    "Customize the built-in Agent. Models configures its connection; this page defines its role and tools. Changes save automatically.",
+                    t!("settings.agents.title"),
+                    t!("settings.agents.description"),
                     [
-                        Self::button("New custom agent", "new-agent", &self.palette)
+                        Self::button(t!("settings.agents.new_agent"), "new-agent", &self.palette)
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _, _, cx| this.new_agent(cx)),
@@ -2495,29 +2922,37 @@ impl SettingsView {
             )
             .child(
                 self.section(
-                    "Terminal integration · Claude Code",
-                    "Optional: report activity from Claude Code running in a terminal. Independent of custom agents above.",
+                    t!("settings.agents.hooks_title"),
+                    t!("settings.agents.hooks_description"),
                     [
                         div()
                             .text_sm()
-                            .child(SharedString::from(format!("Status: {hook_status}")))
+                            .child(tf!("settings.agents.hooks_status", "value" => hook_status))
                             .into_any_element(),
                         div()
                             .flex()
                             .gap_2()
                             .child(
-                                Self::button("Install hooks", "install-hooks", &self.palette)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.install_hooks(cx)),
-                                    ),
+                                Self::button(
+                                    t!("settings.agents.install_hooks"),
+                                    "install-hooks",
+                                    &self.palette,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.install_hooks(cx)),
+                                ),
                             )
                             .child(
-                                Self::button("Uninstall hooks", "uninstall-hooks", &self.palette)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| this.uninstall_hooks(cx)),
-                                    ),
+                                Self::button(
+                                    t!("settings.agents.uninstall_hooks"),
+                                    "uninstall-hooks",
+                                    &self.palette,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| this.uninstall_hooks(cx)),
+                                ),
                             )
                             .into_any_element(),
                     ],
@@ -2525,12 +2960,12 @@ impl SettingsView {
             )
             .child(
                 self.section(
-                    "Notifications",
-                    "Desktop toasts when an agent finishes or needs attention.",
+                    t!("settings.agents.notifications_title"),
+                    t!("settings.agents.notifications_description"),
                     [Self::button(
-                        format!(
-                            "Agent notifications: {}",
-                            on_off(self.settings.agent_notifications)
+                        tf!(
+                            "settings.agents.notifications",
+                            "state" => on_off(self.settings.agent_notifications)
                         ),
                         "agent-notifications",
                         &self.palette,
@@ -2555,38 +2990,89 @@ impl SettingsView {
         let ready = state.ready.is_some();
         let busy = state.busy;
         let opened = state.installer_opened;
-        div().flex().flex_col().gap_3()
-            .child(Self::button(
-                format!("Automatic updates: {}", on_off(self.settings.automatic_updates)),
-                "automatic-updates", &self.palette,
-            ).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.settings.automatic_updates = !this.settings.automatic_updates;
-                crate::updater::set_enabled(this.settings.automatic_updates, cx);
-                this.schedule_save(cx);
-                cx.notify();
-            })))
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                Self::button(
+                    tf!(
+                        "settings.about.automatic_updates",
+                        "state" => on_off(self.settings.automatic_updates)
+                    ),
+                    "automatic-updates",
+                    &self.palette,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.settings.automatic_updates = !this.settings.automatic_updates;
+                        crate::updater::set_enabled(this.settings.automatic_updates, cx);
+                        this.schedule_save(cx);
+                        cx.notify();
+                    }),
+                ),
+            )
             .child(div().text_sm().child(state.status.clone()))
-            .child(div().text_xs().text_color(crate::ui::muted(&self.palette))
-                .child("Checks stable GitHub releases at startup and every 6 hours, then downloads a verified installer. Installation starts only when you choose it. Portable installs may need the release downloads; Linux requires a DEB installer."))
-            .when(!busy && !opened, |view| view.child(
-                Self::button(if ready { "Install update…" } else { "Check for updates" }, "check-update", &self.palette)
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |_, _, _, cx| {
-                        crate::updater::entity(cx).update(cx, |updater, cx| {
-                            if ready { updater.install(cx); } else { updater.check(cx); }
-                        });
-                    }))
-            ))
-            .child(Self::button("Release notes and downloads", "release-downloads", &self.palette)
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                    this.pending_tasks.push(cx.spawn(async move |this, cx| {
-                        let result = cx.background_executor().spawn(async {
-                            termior_platform::open_external(termior_platform::update::RELEASES_URL)
-                        }).await;
-                        if let Err(error) = result {
-                            let _ = this.update(cx, |this, cx| { this.status = error.to_string(); cx.notify(); });
-                        }
-                    }));
-                })))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(crate::ui::muted(&self.palette))
+                    .child(t!("settings.about.updates_description")),
+            )
+            .when(!busy && !opened, |view| {
+                view.child(
+                    Self::button(
+                        if ready {
+                            t!("settings.about.install_update")
+                        } else {
+                            t!("settings.about.check_updates")
+                        },
+                        "check-update",
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, _, cx| {
+                            crate::updater::entity(cx).update(cx, |updater, cx| {
+                                if ready {
+                                    updater.install(cx);
+                                } else {
+                                    updater.check(cx);
+                                }
+                            });
+                        }),
+                    ),
+                )
+            })
+            .child(
+                Self::button(
+                    t!("settings.about.release_notes"),
+                    "release-downloads",
+                    &self.palette,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.pending_tasks.push(cx.spawn(async move |this, cx| {
+                            let result = cx
+                                .background_executor()
+                                .spawn(async {
+                                    termior_platform::open_external(
+                                        termior_platform::update::RELEASES_URL,
+                                    )
+                                })
+                                .await;
+                            if let Err(error) = result {
+                                let _ = this.update(cx, |this, cx| {
+                                    this.status = error.to_string();
+                                    cx.notify();
+                                });
+                            }
+                        }));
+                    }),
+                ),
+            )
             .into_any_element()
     }
 
@@ -2598,26 +3084,33 @@ impl SettingsView {
             SettingsPage::Shortcuts => self.shortcuts_page(cx),
             SettingsPage::Agents => self.agents_page(cx),
             SettingsPage::About => self.section(
-                "About",
-                "Build identity and settings migration status.",
+                t!("settings.page.about"),
+                t!("settings.about.description"),
                 [
                     div()
                         .text_sm()
-                        .child(format!("Termior {}", env!("CARGO_PKG_VERSION")))
+                        .child(tf!(
+                            "settings.about.version",
+                            "version" => env!("CARGO_PKG_VERSION")
+                        ))
                         .into_any_element(),
                     self.update_controls(cx),
                     div()
                         .text_sm()
                         .text_color(crate::ui::muted(&self.palette))
-                        .child("MIT · No account · No telemetry · Offline with local providers")
+                        .child(t!("settings.about.principles"))
                         .into_any_element(),
                     div()
                         .text_xs()
                         .text_color(crate::ui::muted(&self.palette))
-                        .child(SharedString::from(format!(
-                            "Migration status: {}",
-                            self.migration_error.as_deref().unwrap_or("OK")
-                        )))
+                        .child(tf!(
+                            "settings.about.migration_status",
+                            "value" => self
+                                .migration_error
+                                .as_deref()
+                                .map(SharedString::from)
+                                .unwrap_or_else(|| t!("settings.about.migration_ok"))
+                        ))
                         .into_any_element(),
                 ],
             ),
@@ -2886,36 +3379,36 @@ impl InputHandler for SettingsInputHandler {
     }
 }
 
-fn tool_label(tool: termior_security::gating::ToolId) -> &'static str {
+fn tool_label(tool: termior_security::gating::ToolId) -> SharedString {
     use termior_security::gating::ToolId::*;
     match tool {
-        ReadFile => "Read files",
-        ListDirectory => "List folders",
-        FsSearch => "Find files",
-        FsGrep => "Search file contents",
-        GetTerminalContext => "Read terminal context",
-        WriteFile => "Write files",
-        CreateDirectory => "Create folders",
-        Rename => "Rename files and folders",
-        Delete => "Delete files and folders",
-        RunCommand => "Run a command",
-        ShellSessionRun => "Run in a persistent shell",
-        ShellBgSpawn => "Start background commands",
-        CommandStatus => "Check command status",
-        CommandReadOutput => "Read command output",
-        CommandWait => "Wait for commands",
-        CommandKill => "Stop commands",
-        CommandClaim => "Take control of commands",
-        CommandWriteInput => "Send input to commands",
-        RunSubagent => "Delegate to subagents",
+        ReadFile => t!("settings.tools.read_files"),
+        ListDirectory => t!("settings.tools.list_folders"),
+        FsSearch => t!("settings.tools.find_files"),
+        FsGrep => t!("settings.tools.search_file_contents"),
+        GetTerminalContext => t!("settings.tools.read_terminal_context"),
+        WriteFile => t!("settings.tools.write_files"),
+        CreateDirectory => t!("settings.tools.create_folders"),
+        Rename => t!("settings.tools.rename_files"),
+        Delete => t!("settings.tools.delete_files"),
+        RunCommand => t!("settings.tools.run_command"),
+        ShellSessionRun => t!("settings.tools.persistent_shell"),
+        ShellBgSpawn => t!("settings.tools.start_background_commands"),
+        CommandStatus => t!("settings.tools.check_command_status"),
+        CommandReadOutput => t!("settings.tools.read_command_output"),
+        CommandWait => t!("settings.tools.wait_for_commands"),
+        CommandKill => t!("settings.tools.stop_commands"),
+        CommandClaim => t!("settings.tools.take_control"),
+        CommandWriteInput => t!("settings.tools.send_input"),
+        RunSubagent => t!("settings.tools.delegate_subagents"),
     }
 }
 
-fn on_off(value: bool) -> &'static str {
+fn on_off(value: bool) -> SharedString {
     if value {
-        "On"
+        t!("settings.common.on")
     } else {
-        "Off"
+        t!("settings.common.off")
     }
 }
 

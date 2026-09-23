@@ -4,6 +4,10 @@
 // Smoke/NFR scripts that redirect stdout still receive println! via inherited pipes.
 #![windows_subsystem = "windows"]
 
+// 本地化宏必须最先声明（`#[macro_use]` 的文本作用域），
+// 其余模块的 `t!` / `tf!` / `tn!` 调用才能不限定路径直接使用。
+#[macro_use]
+mod l10n;
 mod ai_diff_view;
 mod app_identity;
 mod background_image;
@@ -17,6 +21,7 @@ mod markdown_render;
 mod monospace_font;
 mod preview_view;
 mod settings_view;
+mod shell_select;
 mod ssh_askpass;
 mod ssh_view;
 mod terminal_view;
@@ -38,12 +43,18 @@ fn main() {
     install_panic_log();
     let _ = env_logger::try_init();
     let smoke_test = std::env::var_os("TERMIOR_SMOKE_TEST").is_some();
+    // 文件夹选择对话框可能在任何视图渲染前出现：先按持久化的语言设置
+    //（缺省则系统语言）初始化 i18n，保证对话框文案跟随界面语言。
+    // WorkspaceView::new 会用同一来源再初始化一次，幂等。
+    let (preset, _, _) = workspace_view::load_settings();
+    termior_i18n::init(preset.language.as_deref());
     let markdown_preview_smoke_test =
         std::env::var_os("TERMIOR_MARKDOWN_PREVIEW_SMOKE_TEST").is_some();
     let settings_close_smoke_test = std::env::var_os("TERMIOR_SETTINGS_CLOSE_SMOKE_TEST").is_some();
     let split_pane_smoke_test = std::env::var_os("TERMIOR_SPLIT_PANE_SMOKE").is_some();
     let open_settings = std::env::var_os("TERMIOR_OPEN_SETTINGS").is_some();
     let nfr_measure = std::env::var_os("TERMIOR_NFR_MEASURE").is_some();
+    let shell_picker_smoke = std::env::var_os("TERMIOR_SHELL_PICKER_SMOKE").is_some();
     let idle_redraw_probe_secs = std::env::var("TERMIOR_IDLE_REDRAW_PROBE")
         .ok()
         .and_then(|value| value.parse::<u64>().ok());
@@ -91,6 +102,11 @@ fn main() {
                     } else if open_settings {
                         workspace.update(cx, |workspace, cx| {
                             let _ = workspace.open_settings_for_ui_shot(cx);
+                        });
+                    }
+                    if shell_picker_smoke {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.start_shell_picker_probe(window, cx);
                         });
                     }
                     if let Some(secs) = idle_redraw_probe_secs {
@@ -230,7 +246,7 @@ fn resolve_workspace_root(smoke_test: bool) -> PathBuf {
 
     if !smoke_test {
         if let Some(path) = rfd::FileDialog::new()
-            .set_title("Open a Termior workspace")
+            .set_title(t!("chrome.open_workspace_dialog"))
             .pick_folder()
             .and_then(valid_workspace)
         {

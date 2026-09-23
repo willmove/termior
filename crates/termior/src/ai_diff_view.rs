@@ -85,11 +85,11 @@ impl gpui::Render for AiDiffView {
                 .rounded_md()
                 .border_1()
                 .border_color(ui::border(&p))
-                .child(SharedString::from(format!("Hunk {}", id + 1)))
+                .child(tf!("diff.hunk", "index" => id + 1))
                 .child(
                     ui::button(
                         SharedString::from(format!("ai-diff-accept-{id}")),
-                        "Accept",
+                        t!("diff.accept"),
                         if decision == Some(true) {
                             ButtonKind::Success
                         } else {
@@ -105,7 +105,7 @@ impl gpui::Render for AiDiffView {
                 .child(
                     ui::button(
                         SharedString::from(format!("ai-diff-reject-{id}")),
-                        "Reject",
+                        t!("diff.reject"),
                         if decision == Some(false) {
                             ButtonKind::Danger
                         } else {
@@ -169,12 +169,16 @@ impl gpui::Render for AiDiffView {
                     .border_b_1()
                     .border_color(ui::border(&p))
                     .child(
-                        div().flex().flex_col().child("AI proposed edit").child(
-                            div()
-                                .text_xs()
-                                .text_color(ui::muted(&p))
-                                .child(SharedString::from(self.summary.path.clone())),
-                        ),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(t!("diff.proposed_edit"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(ui::muted(&p))
+                                    .child(SharedString::from(self.summary.path.clone())),
+                            ),
                     )
                     .child(
                         div()
@@ -183,7 +187,7 @@ impl gpui::Render for AiDiffView {
                             .child(
                                 ui::button(
                                     "ai-diff-apply",
-                                    "Apply reviewed hunks",
+                                    t!("diff.apply_reviewed"),
                                     if complete {
                                         ButtonKind::Success
                                     } else {
@@ -200,7 +204,7 @@ impl gpui::Render for AiDiffView {
                             .child(
                                 ui::button(
                                     "ai-diff-reject-all",
-                                    "Reject all",
+                                    t!("diff.reject_all"),
                                     ButtonKind::Danger,
                                     &p,
                                 )

@@ -46,12 +46,17 @@ pub const fn handles_own_window_control_clicks() -> bool {
 /// macOS 红绿灯所占的左侧宽度，标题栏内容需要为它让位。
 pub const MACOS_TRAFFIC_LIGHT_INSET: f32 = 72.0;
 
-/// 最小化 / 最大化或还原 / 关闭三个按钮。
+/// 最小化 / 最大化或还原 / 关闭三个按钮。标签（aria 文案）走 i18n 运行时。
 pub fn window_controls(p: &ResolvedPalette, is_maximized: bool) -> Div {
     let restore_or_maximize = if is_maximized {
         Icon::WindowRestore
     } else {
         Icon::WindowMaximize
+    };
+    let restore_or_maximize_label = if is_maximized {
+        termior_i18n::text("chrome.restore")
+    } else {
+        termior_i18n::text("chrome.maximize")
     };
     div()
         .flex()
@@ -60,7 +65,7 @@ pub fn window_controls(p: &ResolvedPalette, is_maximized: bool) -> Div {
         .child(control(
             "window-minimize",
             Icon::WindowMinimize,
-            "Minimize",
+            termior_i18n::text("chrome.minimize"),
             WindowControlArea::Min,
             false,
             p,
@@ -68,7 +73,7 @@ pub fn window_controls(p: &ResolvedPalette, is_maximized: bool) -> Div {
         .child(control(
             "window-maximize",
             restore_or_maximize,
-            if is_maximized { "Restore" } else { "Maximize" },
+            restore_or_maximize_label,
             WindowControlArea::Max,
             false,
             p,
@@ -76,7 +81,7 @@ pub fn window_controls(p: &ResolvedPalette, is_maximized: bool) -> Div {
         .child(control(
             "window-close",
             Icon::Close,
-            "Close",
+            termior_i18n::text("chrome.close_window"),
             WindowControlArea::Close,
             true,
             p,
@@ -86,7 +91,7 @@ pub fn window_controls(p: &ResolvedPalette, is_maximized: bool) -> Div {
 fn control(
     id: &'static str,
     glyph: Icon,
-    label: &'static str,
+    label: std::sync::Arc<str>,
     area: WindowControlArea,
     destructive: bool,
     p: &ResolvedPalette,

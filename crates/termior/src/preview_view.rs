@@ -22,7 +22,8 @@ impl PreviewView {
             Err(error) => {
                 let mut state =
                     PreviewTab::new("http://localhost:3000").expect("static preview fallback URL");
-                state.fallback(format!("Invalid saved preview URL: {error}"));
+                state
+                    .fallback(tf!("preview.invalid_url", "error" => error.to_string()).to_string());
                 state
             }
         };
@@ -61,7 +62,7 @@ impl Render for PreviewView {
             .gap_3()
             .bg(ui::color(p.background))
             .text_color(ui::color(p.foreground))
-            .child("Open this preview in your browser")
+            .child(t!("preview.open_hint"))
             .child(
                 div()
                     .text_xs()
@@ -78,7 +79,7 @@ impl Render for PreviewView {
             .child(
                 ui::button(
                     "open-preview-browser",
-                    "Open in browser",
+                    t!("action.open_in_browser"),
                     ButtonKind::Primary,
                     &p,
                 )

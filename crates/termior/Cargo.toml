@@ -24,6 +24,7 @@ termior-explorer-core = { workspace = true }
 termior-vcs = { workspace = true }
 termior-preview = { workspace = true }
 termior-platform = { workspace = true }
+termior-i18n = { workspace = true }
 termior-store = { workspace = true }
 termior-ui = { workspace = true }
 termior-ui-kit = { workspace = true }

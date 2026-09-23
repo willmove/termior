@@ -6,6 +6,7 @@
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 #[cfg(windows)]
@@ -724,6 +725,84 @@ fn wsl_visible_path(path: &std::path::Path) -> std::ffi::OsString {
     }
 }
 
+/// 一个可供用户选择启动的 shell 条目（设置页下拉与新建终端选择器共用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscoveredShell {
+    /// 本机原生 shell：`program` 为解析后的可执行路径（spawn 直接可用）。
+    Native { program: String },
+    /// WSL 发行版（Windows）：经 `wsl.exe -d <distribution>` 启动，发行版内
+    /// 默认按 Bash 处理（见 [`PtySession::spawn`]）。
+    Wsl { distribution: String },
+}
+
+/// 探测本机可选择的 shell（设置页下拉与新建终端选择器共用）。
+///
+/// 原生部分见 [`discover_native_shells`]（即时）；WSL 部分见
+/// [`discover_wsl_shells`]（一次 wsl.exe 子进程调用，带超时）。UI 侧需要
+/// 先出列表的可分两段调用。
+pub fn discover_shells() -> Vec<DiscoveredShell> {
+    let mut shells = discover_native_shells();
+    shells.extend(discover_wsl_shells());
+    shells
+}
+
+/// 探测本机原生 shell：Windows 上 pwsh → powershell → cmd → bash（PATH 存在性
+/// 检查，`System32\bash.exe` 是 WSL 启动垫片，跳过——WSL 发行版由
+/// [`discover_wsl_shells`] 单独列出）；Unix 上 zsh → bash → fish。即时返回。
+pub fn discover_native_shells() -> Vec<DiscoveredShell> {
+    let candidates: &[&str] = if cfg!(windows) {
+        &["pwsh", "powershell", "cmd", "bash"]
+    } else {
+        &["zsh", "bash", "fish"]
+    };
+    let mut shells = Vec::new();
+    for name in candidates {
+        if let Ok(path) = which(name) {
+            if is_wsl_bash_shim(name, &path) {
+                continue;
+            }
+            shells.push(DiscoveredShell::Native {
+                program: path.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    shells
+}
+
+/// 枚举 WSL 发行版为选择器条目（Windows；非 Windows 返回空）。
+/// 失败或超时返回空列表——选择器仅少列 WSL 项，不阻塞其它 shell。
+pub fn discover_wsl_shells() -> Vec<DiscoveredShell> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let distributions = match list_wsl_distributions() {
+        Ok(distributions) => distributions,
+        Err(error) => {
+            log::warn!("WSL distro enumeration failed: {error}");
+            return Vec::new();
+        }
+    };
+    distributions
+        .into_iter()
+        .map(|distribution| DiscoveredShell::Wsl { distribution })
+        .collect()
+}
+
+/// `System32\bash.exe` 是 WSL 默认发行版启动器：在 WSL 内给 Windows 路径的
+/// rcfile 会失败，且 WSL 发行版已单独列出，这里跳过避免重复入口。
+fn is_wsl_bash_shim(name: &str, path: &std::path::Path) -> bool {
+    if !cfg!(windows) || name != "bash" {
+        return false;
+    }
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    lower.contains(r"\system32\") || lower.contains(r"/system32/")
+}
+
+/// 按可执行路径/名称推断 shell 类型（设置页与新终端选择器的展示映射用）。
+pub fn shell_kind_for_program(program: &str) -> Option<ShellKind> {
+    shell_kind_from_program(program)
+}
+
 fn shell_kind_from_program(program: &str) -> Option<ShellKind> {
     let normalized = program.replace('\\', "/");
     let file_name = normalized.rsplit('/').next()?;
@@ -758,17 +837,63 @@ fn which(name: &str) -> std::io::Result<std::path::PathBuf> {
     Err(std::io::Error::other(format!("{name} not found in PATH")))
 }
 
-/// 列出本机已安装的 WSL 发行版（Windows, FR-WS-06）。非 Windows 或 wsl.exe 不可用时
-/// 返回空列表（调用方据此隐藏 WSL 选项）。
+/// 列出本机已安装的 WSL 发行版（Windows, FR-WS-06）。非 Windows 或 wsl.exe
+/// 不可用时返回空列表（调用方据此隐藏 WSL 选项）。
+///
+/// 两个坑都得绕开：`.output()` 会继承父进程 stdin——GUI 进程的开放管道会让
+/// wsl.exe 永不返回，这里显式置 null；再外层兜底 5s 超时杀进程，避免探测
+/// 卡死整个 shell 列表。超时/失败按 Err 返回。
 pub fn list_wsl_distributions() -> std::io::Result<Vec<String>> {
     if !cfg!(windows) {
         return Ok(Vec::new());
     }
-    let output = std::process::Command::new("wsl.exe")
+    run_wsl_list_with_timeout(Duration::from_secs(5))
+}
+
+/// `wsl.exe --list --quiet` 带超时执行：轮询 `try_wait`，超时 kill。
+fn run_wsl_list_with_timeout(timeout: Duration) -> std::io::Result<Vec<String>> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+    let mut command = Command::new("wsl.exe");
+    command
         .arg("--list")
         .arg("--quiet")
-        .output()?;
-    Ok(parse_wsl_list_output(&output.stdout))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // GUI 子系统进程里控制台子进程会闪新控制台窗口（与 ssh_askpass 同策略）。
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                if !status.success() {
+                    return Err(std::io::Error::other(format!(
+                        "wsl --list exited with {status}"
+                    )));
+                }
+                let mut bytes = Vec::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    stdout.read_to_end(&mut bytes)?;
+                }
+                return Ok(parse_wsl_list_output(&bytes));
+            }
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "wsl --list timed out",
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
 }
 
 /// 解析 `wsl.exe --list --quiet` 的输出。该命令默认以 UTF-16LE 编码输出，且可能带 BOM。
@@ -1028,6 +1153,64 @@ mod tests {
     fn parse_wsl_list_empty_output_yields_empty() {
         assert!(parse_wsl_list_output(&[]).is_empty());
         assert!(parse_wsl_list_output(b"\xFF\xFE").is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_bash_shim_is_detected_by_path() {
+        assert!(is_wsl_bash_shim(
+            "bash",
+            std::path::Path::new(r"C:\Windows\System32\bash.exe")
+        ));
+        // 大小写与正斜杠都要认。
+        assert!(is_wsl_bash_shim(
+            "bash",
+            std::path::Path::new(r"c:/windows/system32/BASH.EXE")
+        ));
+        // Git Bash 不是垫片。
+        assert!(!is_wsl_bash_shim(
+            "bash",
+            std::path::Path::new(r"C:\Program Files\Git\bin\bash.exe")
+        ));
+        // 其他程序不受影响。
+        assert!(!is_wsl_bash_shim(
+            "cmd",
+            std::path::Path::new(r"C:\Windows\System32\cmd.exe")
+        ));
+    }
+
+    #[test]
+    fn shell_kind_for_program_maps_paths_and_names() {
+        assert_eq!(shell_kind_for_program("pwsh"), Some(ShellKind::Pwsh));
+        assert_eq!(
+            shell_kind_for_program(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            Some(ShellKind::Pwsh)
+        );
+        assert_eq!(shell_kind_for_program("cmd"), Some(ShellKind::Cmd));
+        assert_eq!(shell_kind_for_program("nu"), None);
+    }
+
+    #[test]
+    fn discover_shells_skips_wsl_bash_shim() {
+        // 垫片过滤依赖 which() 的真实解析结果：若列出的 bash 落在 System32，
+        // 它必须是唯一被跳过的原生条目；其余 native 条目不得为空路径。
+        let shells = discover_shells();
+        for shell in &shells {
+            match shell {
+                DiscoveredShell::Native { program } => {
+                    assert!(!program.trim().is_empty());
+                    if cfg!(windows) && program.to_ascii_lowercase().contains("system32") {
+                        assert!(
+                            !program.to_ascii_lowercase().ends_with("bash.exe"),
+                            "System32 bash.exe (WSL shim) must not be listed"
+                        );
+                    }
+                }
+                DiscoveredShell::Wsl { distribution } => {
+                    assert!(!distribution.trim().is_empty());
+                }
+            }
+        }
     }
 
     #[cfg(windows)]

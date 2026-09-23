@@ -6547,6 +6547,7 @@ dependencies = [
  "termior-explorer",
  "termior-explorer-core",
  "termior-hooks",
+ "termior-i18n",
  "termior-platform",
  "termior-preview",
  "termior-security",
@@ -6687,6 +6688,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "termior-i18n"
+version = "0.1.9"
+dependencies = [
+ "serde_json",
+ "sys-locale",
+]
+
+[[package]]
 name = "termior-platform"
 version = "0.1.9"
 dependencies = [
@@ -6804,6 +6813,7 @@ dependencies = [
  "gpui",
  "serde",
  "serde_json",
+ "termior-i18n",
  "termior-theme",
  "thiserror 1.0.69",
 ]

@@ -35,6 +35,9 @@ pub struct Settings {
     pub autocomplete_enabled: bool,
     /// 自定义指令（设置 → General，FR-SESS-03 P1）。
     pub custom_instructions: String,
+    /// 界面语言（设置 → General）。`None` = 跟随系统；`Some(id)` 为
+    /// `termior-i18n` 的规范语言 id（en/zh-CN/zh-TW/ja/ko/es/de）。
+    pub language: Option<String>,
     /// dotfiles 显隐开关（FR-EXPL-01）。
     pub show_dotfiles: bool,
     /// 代理通知开关（FR-NOTIF-05 P1）。
@@ -77,8 +80,10 @@ pub enum Appearance {
     FollowSystem,
 }
 
-/// 终端设置（FR-TERM-09）。
+/// 终端设置（FR-TERM-09）。容器级 default：手编 JSON 缺字段时按 [`Default`]
+/// 补齐（FR-DATA「关闭状态下手动编辑 JSON 合法」）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default = "TerminalSettings::default")]
 pub struct TerminalSettings {
     pub font_family: String,
     /// 字号 8–32（FR-TERM-09 预设档位）。
@@ -91,6 +96,10 @@ pub struct TerminalSettings {
     pub scrollback_lines: u32,
     /// shell 探测策略（FR-TERM-05）。
     pub shell_detection: ShellDetection,
+    /// 新建终端入口先弹 shell 选择器（true），或直接用默认 shell（false）。
+    /// 选择器中的「默认」仍走 `shell_detection` + `wsl_distribution`。
+    #[serde(default)]
+    pub shell_prompt: bool,
 }
 
 impl Default for TerminalSettings {
@@ -102,6 +111,7 @@ impl Default for TerminalSettings {
             letter_spacing: 0.0,
             scrollback_lines: 10_000,
             shell_detection: ShellDetection::Auto,
+            shell_prompt: false,
         }
     }
 }
@@ -310,6 +320,7 @@ pub fn default_settings() -> Settings {
         terminal: TerminalSettings::default(),
         autocomplete_enabled: false,
         custom_instructions: String::new(),
+        language: None,
         show_dotfiles: true,
         agent_notifications: true,
         automatic_updates: true,
@@ -453,6 +464,30 @@ mod tests {
     fn shell_detection_serializes() {
         let json = serde_json::to_string(&ShellDetection::Auto).unwrap();
         assert_eq!(json, "\"auto\"");
+    }
+
+    #[test]
+    fn shell_prompt_defaults_for_legacy_json() {
+        // 旧版本设置文件没有 shell_prompt 字段：serde default 补 false，
+        // 手动编辑 JSON 缺字段也应合法（FR-DATA）。
+        let json = r#"{
+            "font_family": "x", "font_size": 14, "line_height": 1.2,
+            "scrollback_lines": 1000, "shell_detection": "auto"
+        }"#;
+        let terminal: TerminalSettings = serde_json::from_str(json).unwrap();
+        assert!(!terminal.shell_prompt);
+    }
+
+    #[test]
+    fn sparse_terminal_object_fills_defaults() {
+        // 手编 JSON 只给关心的字段（如 shell_prompt），其余按 Default 补齐——
+        // 此前缺 font_family 等字段会让整个 Settings 解析失败、静默回退全默认。
+        let json = r#"{ "terminal": { "shell_prompt": true } }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert!(settings.terminal.shell_prompt);
+        assert_eq!(settings.terminal.font_family, default_settings().terminal.font_family);
+        assert_eq!(settings.terminal.font_size, 14);
+        assert_eq!(settings.terminal.shell_detection, ShellDetection::Auto);
     }
 
     #[test]

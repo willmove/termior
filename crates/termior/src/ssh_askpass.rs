@@ -53,6 +53,9 @@ fn resolved_destination(profile: &Profile) -> (String, String, bool) {
 }
 
 pub fn run() -> ! {
+    // 独立 askpass 进程：按持久化设置（缺省系统语言）初始化界面语言。
+    let (preset, _, _) = crate::workspace_view::load_settings();
+    termior_i18n::init(preset.language.as_deref());
     // Background Explorer cancellation also dismisses a pending native trust/
     // credential prompt, even if ssh has already exited before process cleanup.
     if let Some(dir) = std::env::var_os("TERMIOR_SSH_ASKPASS_CANCEL_DIR") {
@@ -87,7 +90,7 @@ pub fn run() -> ! {
         || prompt.contains("Are you sure you want to continue connecting")
     {
         let result = rfd::MessageDialog::new()
-            .set_title("SSH 主机指纹确认")
+            .set_title(t!("askpass.host_fingerprint_title"))
             .set_description(&prompt)
             .set_buttons(rfd::MessageButtons::YesNo)
             .set_level(rfd::MessageLevel::Warning)
@@ -99,7 +102,7 @@ pub fn run() -> ! {
     }
     if std::env::var("SSH_ASKPASS_PROMPT").as_deref() == Ok("none") {
         rfd::MessageDialog::new()
-            .set_title("SSH 认证提示")
+            .set_title(t!("askpass.auth_notice_title"))
             .set_description(&prompt)
             .show();
         std::process::exit(0);
@@ -108,8 +111,7 @@ pub fn run() -> ! {
     let kind = credentials::prompt_kind(&profile, &prompt, &user, &host);
     // A ProxyJump child's server-controlled keyboard-interactive prompt can mimic
     // the final host. OpenSSH askpass does not expose which hop invoked it.
-    let mut error =
-        (!direct).then(|| "代理/跳板连接需手动确认凭据；可使用 SSH Agent 免输入。".to_owned());
+    let mut error = (!direct).then(|| t!("askpass.proxy_credential_hint").to_string());
     if profile.use_saved_credentials && direct {
         if let Some(kind) = kind {
             // A rejected saved password must not cause repeated automatic attempts.
@@ -148,7 +150,7 @@ pub fn run() -> ! {
                 crate::app_identity::window_options(WindowBounds::Windowed(bounds)),
                 |window, cx| {
                     let view = cx.new(|cx| crate::ssh_view::SshView::new_prompt(prompt, cx));
-                    window.set_window_title("SSH 身份认证 · Termior");
+                    window.set_window_title(&t!("askpass.window_title"));
                     window.focus(&view.read(cx).focus_handle(cx), cx);
                     window.on_window_should_close(cx, |_, _| std::process::exit(1));
                     window.activate_window();

@@ -15,6 +15,7 @@ members = [
     "crates/termior-vcs",
     "crates/termior-preview",
     "crates/termior-platform",
+    "crates/termior-i18n",
     "crates/termior-ui-kit",
     "crates/termior-ui",
     "crates/termior-ai",
@@ -99,6 +100,7 @@ termior-explorer = { path = "crates/termior-explorer" }
 termior-vcs = { path = "crates/termior-vcs" }
 termior-preview = { path = "crates/termior-preview" }
 termior-platform = { path = "crates/termior-platform" }
+termior-i18n = { path = "crates/termior-i18n" }
 termior-ui-kit = { path = "crates/termior-ui-kit" }
 termior-ui = { path = "crates/termior-ui" }
 termior-ai = { path = "crates/termior-ai" }
