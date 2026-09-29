@@ -1,5 +1,6 @@
 //! User-owned graphical SFTP sessions. Remote operations reuse the workspace's
 //! persistent SFTP client; transfers retain the existing cancellable PTY jobs.
+use super::helpers::{explorer_icon, gpui_color, remote_icon_kind};
 use super::*;
 use termior_ssh::{Connection, Profile, SessionKind, Transfer};
 
@@ -1693,6 +1694,8 @@ pub(super) fn file_columns(palette: &ResolvedPalette) -> Div {
 
 #[cfg(test)]
 mod tests {
+    use super::super::helpers::single_pane;
+    use super::super::remote_explorer::RemoteExplorerRequest;
     use super::*;
     use gpui::{Modifiers, TestAppContext};
 
