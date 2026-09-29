@@ -6531,36 +6531,16 @@ dependencies = [
 name = "termior"
 version = "0.2.0"
 dependencies = [
- "alacritty_terminal",
  "env_logger",
- "futures",
  "gpui",
  "gpui_platform",
- "image",
- "log",
  "rfd",
  "serde_json",
- "tempfile",
- "termior-agent-host",
- "termior-ai",
- "termior-editor",
- "termior-explorer",
- "termior-explorer-core",
- "termior-hooks",
  "termior-i18n",
- "termior-platform",
- "termior-preview",
- "termior-security",
- "termior-ssh",
  "termior-store",
- "termior-terminal",
- "termior-terminal-core",
- "termior-theme",
  "termior-ui",
  "termior-ui-kit",
- "termior-vcs",
  "winresource",
- "zeroize",
 ]
 
 [[package]]
@@ -6799,11 +6779,35 @@ dependencies = [
 name = "termior-ui"
 version = "0.2.0"
 dependencies = [
+ "alacritty_terminal",
+ "futures",
+ "gpui",
+ "gpui_platform",
+ "image",
+ "log",
+ "rfd",
  "serde",
  "serde_json",
+ "tempfile",
+ "termior-agent-host",
+ "termior-ai",
+ "termior-editor",
+ "termior-explorer",
+ "termior-explorer-core",
+ "termior-hooks",
+ "termior-i18n",
+ "termior-platform",
+ "termior-preview",
+ "termior-security",
  "termior-ssh",
+ "termior-store",
+ "termior-terminal",
+ "termior-terminal-core",
+ "termior-theme",
  "termior-ui-kit",
+ "termior-vcs",
  "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]

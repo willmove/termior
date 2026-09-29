@@ -5,47 +5,22 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# GPUI 入口 crate（FR-WS 骨架 / FR-THEME 渲染层接入 / FR-TERM 终端 tab）。
+# GPUI 入口 crate（spec §5.2：入口、窗口、全局 keymap、装配）。
+# 视图层在 `termior-ui` crate；本 crate 只做进程装配、smoke/NFR 探针与崩溃日志。
 # gpui / gpui_platform 锁定到与已验证编译通过的同一 zed rev。
 [dependencies]
-zeroize.workspace = true
-termior-ssh.workspace = true
 gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49" }
 # gpui_platform 的 default features 为空，且它以 default-features = false 依赖 gpui_linux；
 # 不显式打开 wayland / x11 时，Linux 下 current_platform() 会走到 unreachable!() 而 panic。
 # 这两个 feature 在非 Linux 目标上是空操作（gpui_linux 仅为 Linux target 依赖），与 zed 自身一致。
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "3565c49", features = ["wayland", "x11"] }
-termior-theme = { workspace = true }
-termior-terminal = { workspace = true }
-termior-terminal-core = { workspace = true }
-termior-editor = { workspace = true }
-termior-explorer = { workspace = true }
-termior-explorer-core = { workspace = true }
-termior-vcs = { workspace = true }
-termior-preview = { workspace = true }
-termior-platform = { workspace = true }
-termior-i18n = { workspace = true }
-termior-store = { workspace = true }
 termior-ui = { workspace = true }
 termior-ui-kit = { workspace = true }
-termior-security = { workspace = true }
-termior-ai = { workspace = true, features = ["keyring-backend"] }
-termior-agent-host = { workspace = true }
-termior-hooks = { workspace = true }
-alacritty_terminal = { workspace = true }
-futures = { workspace = true }
-log = { workspace = true }
-env_logger = "0.11"
+termior-i18n = { workspace = true }
+termior-store = { workspace = true }
 serde_json = { workspace = true }
 rfd = "0.17.2"
-# 背景图 GPU 渲染（FR-THEME-05）：解码 + 一次性高斯模糊缓存纹理。
-# features 对齐 rfd 文件选择过滤项（png/jpg/jpeg/webp/gif）；跨平台直接依赖
-# （之前仅 Linux 窗口图标用到，现 Windows/macOS 也需解码）。
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
-
-[dev-dependencies]
-tempfile.workspace = true
-gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49", features = ["test-support"] }
+env_logger = "0.11"
 
 [build-dependencies]
 winresource = "0.1"

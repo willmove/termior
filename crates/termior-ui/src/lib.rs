@@ -2,6 +2,34 @@
 
 #![forbid(unsafe_code)]
 
+// 本地化宏必须最先声明（`#[macro_use]` 的文本作用域），
+// 其余模块的 `t!` / `tf!` / `tn!` 调用才能不限定路径直接使用。
+#[macro_use]
+mod l10n;
+
+// 视图层（spec §5.2：tabs/panes、sidebar、statusbar、header、settings 窗口、
+// composer 视图）。自 `termior` 入口 crate 迁入；`pub` 仅开放入口装配所需的模块。
+mod ai_diff_view;
+pub mod app_identity;
+mod background_image;
+mod composer_view;
+mod editor_view;
+mod git_views;
+mod ime_anchor;
+mod keystroke;
+mod markdown_preview_view;
+mod markdown_render;
+pub mod monospace_font;
+mod preview_view;
+mod settings_view;
+mod shell_select;
+pub mod ssh_askpass;
+mod ssh_view;
+mod terminal_view;
+mod ui;
+mod updater;
+pub mod workspace_view;
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use termior_ui_kit::{LayoutError, PaneId, PaneLayout, SplitDirection};

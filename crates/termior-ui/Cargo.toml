@@ -5,11 +5,42 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+# tabs/panes、sidebar、statusbar、header、settings 窗口、composer 视图（spec §5.2）。
+# 视图层自 `termior` 入口 crate 迁入本 crate；`termior` 只保留进程装配。
 [dependencies]
 termior-ssh.workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 termior-ui-kit = { workspace = true }
 
+gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49" }
+# ssh_askpass 辅助进程模式自建 GPUI 应用实例（见 ssh_askpass.rs）。
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "3565c49", features = ["wayland", "x11"] }
+log = { workspace = true }
+termior-theme = { workspace = true }
+termior-terminal = { workspace = true }
+termior-terminal-core = { workspace = true }
+termior-editor = { workspace = true }
+termior-explorer = { workspace = true }
+termior-explorer-core = { workspace = true }
+termior-vcs = { workspace = true }
+termior-preview = { workspace = true }
+termior-platform = { workspace = true }
+termior-i18n = { workspace = true }
+termior-store = { workspace = true }
+termior-security = { workspace = true }
+termior-ai = { workspace = true, features = ["keyring-backend"] }
+termior-agent-host = { workspace = true }
+termior-hooks = { workspace = true }
+alacritty_terminal = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+zeroize = { workspace = true }
+rfd = "0.17.2"
+# 背景图 GPU 渲染（FR-THEME-05）：解码 + 一次性高斯模糊缓存纹理。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+
 [dev-dependencies]
 serde_json = { workspace = true }
+tempfile.workspace = true
+gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49", features = ["test-support"] }

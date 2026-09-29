@@ -4,41 +4,20 @@
 // Smoke/NFR scripts that redirect stdout still receive println! via inherited pipes.
 #![windows_subsystem = "windows"]
 
-// 本地化宏必须最先声明（`#[macro_use]` 的文本作用域），
-// 其余模块的 `t!` / `tf!` / `tn!` 调用才能不限定路径直接使用。
-#[macro_use]
-mod l10n;
-mod ai_diff_view;
-mod app_identity;
-mod background_image;
-mod composer_view;
-mod editor_view;
-mod git_views;
-mod ime_anchor;
-mod keystroke;
-mod markdown_preview_view;
-mod markdown_render;
-mod monospace_font;
-mod preview_view;
-mod settings_view;
-mod shell_select;
-mod ssh_askpass;
-mod ssh_view;
-mod terminal_view;
-mod ui;
-mod updater;
-mod workspace_view;
+// 视图层已实现于 `termior-ui` crate（spec §5.2）；入口只保留进程装配、
+// smoke/NFR 探针与崩溃日志。
+use termior_ui::t;
 
 use gpui::{
     px, size, App, AppContext, Bounds, Entity, KeyBinding, Window, WindowAppearance, WindowBounds,
 };
 use gpui_platform::application;
 use std::{ffi::OsString, io::Write as _, path::PathBuf};
-use workspace_view::{OpenWorkspace, WorkspaceView};
+use termior_ui::workspace_view::{self, OpenWorkspace, WorkspaceView};
 
 fn main() {
     if std::env::var_os("TERMIOR_SSH_ASKPASS").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        ssh_askpass::run();
+        termior_ui::ssh_askpass::run();
     }
     install_panic_log();
     let _ = env_logger::try_init();
@@ -71,10 +50,10 @@ fn main() {
             // 必须在建窗前解析：GPUI 找不到 family 时会静默回退到比例字体，
             // 终端网格宽和字形 advance 就会对不上（见 monospace_font 模块注释）。
             let text_system = cx.text_system().clone();
-            monospace_font::init_default(&text_system);
+            termior_ui::monospace_font::init_default(&text_system);
             let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
             cx.open_window(
-                app_identity::main_window_options(WindowBounds::Windowed(bounds)),
+                termior_ui::app_identity::main_window_options(WindowBounds::Windowed(bounds)),
                 |window, cx| {
                     let system_is_dark = matches!(
                         window.appearance(),

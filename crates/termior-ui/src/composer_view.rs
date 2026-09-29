@@ -1,3 +1,4 @@
+use crate::{ComposerDock, MAX_COMPOSER_HEIGHT, MIN_COMPOSER_HEIGHT};
 use futures::StreamExt;
 use gpui::{
     canvas, div, prelude::*, px, relative, App, Bounds, ClipboardEntry, ClipboardItem, Context,
@@ -34,7 +35,6 @@ use termior_store::{
     CheckpointManifest, CheckpointStore, DataFiles, RecoveryCenter, RecoveryCommand,
     RecoveryTaskSummary, RestoreAction, Settings,
 };
-use termior_ui::{ComposerDock, MAX_COMPOSER_HEIGHT, MIN_COMPOSER_HEIGHT};
 use termior_ui_kit::{menu_panel, tokens::icon_size, Icon, Tooltip};
 
 #[derive(Clone)]
@@ -238,7 +238,7 @@ impl ComposerView {
             selected_path_suggestion: 0,
             dock: ComposerDock::Bottom,
             fill_workspace: false,
-            panel_height: termior_ui::DEFAULT_COMPOSER_HEIGHT,
+            panel_height: crate::DEFAULT_COMPOSER_HEIGHT,
             scroll_handle: ScrollHandle::new(),
             last_context_plan: None,
             context_inspector_open: false,

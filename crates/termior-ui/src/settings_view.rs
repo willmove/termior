@@ -12,6 +12,7 @@ use std::{ops::Range, path::PathBuf, time::Duration};
 const SETTINGS_NAV_WIDTH: f32 = 180.0;
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 640.0;
 const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
+use crate::SettingsPage;
 use termior_ai::{
     AgentDefinition, AgentDefinitionStore, HttpProvider, KeyringSecretStore, ProviderConfig,
     SecretStore,
@@ -24,7 +25,6 @@ use termior_terminal::DiscoveredShell;
 use termior_theme::{
     resolve_active_palette, themes_for_native_appearance, NativeAppearance, ThemeLibrary,
 };
-use termior_ui::SettingsPage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditField {

@@ -17,7 +17,7 @@ pub(crate) fn window_options(bounds: WindowBounds) -> WindowOptions {
 /// The main window draws its own titlebar so tabs and the window controls can share
 /// one row. Secondary windows (settings) keep the system titlebar — they have no tab
 /// strip to merge into it, so a custom one would only cost a row of chrome.
-pub(crate) fn main_window_options(bounds: WindowBounds) -> WindowOptions {
+pub fn main_window_options(bounds: WindowBounds) -> WindowOptions {
     WindowOptions {
         titlebar: Some(TitlebarOptions {
             title: Some("Termior".into()),

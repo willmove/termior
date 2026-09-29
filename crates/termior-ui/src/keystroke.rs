@@ -319,10 +319,7 @@ mod tests {
             b"\x1b[200~ab\x1b[201~"
         );
         assert_eq!(
-            encode_paste(
-                "a\r\nb\nc",
-                TermMode::default() | TermMode::BRACKETED_PASTE
-            ),
+            encode_paste("a\r\nb\nc", TermMode::default() | TermMode::BRACKETED_PASTE),
             b"\x1b[200~a\rb\rc\x1b[201~"
         );
     }

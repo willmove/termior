@@ -13,6 +13,11 @@ use crate::{
     terminal_view::{TerminalView, TerminalViewEvent},
     ui::{self, ButtonKind},
 };
+use crate::{
+    ComposerDock, SidebarPanel, TabId, TabKind, WorkspaceState, DEFAULT_COMPOSER_DOCK_WIDTH,
+    DEFAULT_COMPOSER_HEIGHT, MAX_COMPOSER_DOCK_WIDTH, MAX_COMPOSER_HEIGHT, MIN_COMPOSER_DOCK_WIDTH,
+    MIN_COMPOSER_HEIGHT,
+};
 use futures::{
     future::{self, Either},
     StreamExt,
@@ -55,11 +60,6 @@ use termior_terminal_core::osc::AgentState;
 use termior_theme::{
     active_theme_id, resolve_active_palette, Appearance, ResolvedPalette, Theme, ThemeLibrary,
 };
-use termior_ui::{
-    ComposerDock, SidebarPanel, TabId, TabKind, WorkspaceState, DEFAULT_COMPOSER_DOCK_WIDTH,
-    DEFAULT_COMPOSER_HEIGHT, MAX_COMPOSER_DOCK_WIDTH, MAX_COMPOSER_HEIGHT, MIN_COMPOSER_DOCK_WIDTH,
-    MIN_COMPOSER_HEIGHT,
-};
 use termior_ui_kit::{
     empty_hint, empty_state_message, icon, menu_panel, menu_separator,
     titlebar::{draws_own_window_controls, handles_own_window_control_clicks, window_controls},
@@ -69,7 +69,7 @@ use termior_ui_kit::{
 
 // 该代码库第一个 GPUI Action：`Cmd/Ctrl+O` 快捷键（在 `main.rs` 绑定）与
 // 状态栏按钮共用内核 `open_workspace`。
-actions!(termior, [OpenWorkspace]);
+actions!(termior_ui, [OpenWorkspace]);
 
 /// Short oneshot fade for sidebar / toast / menus. Never `.repeat()` — that would break idle zero-redraw.
 const UI_FADE_IN: Duration = Duration::from_millis(160);
@@ -867,7 +867,7 @@ impl WorkspaceView {
     /// Opens the settings window then closes it via the same `remove_window` path as the
     /// title-bar close button, so CI / local smoke can assert no `window not found` log.
     /// Used by `scripts/settings-close-smoke.ps1`; normal launches never call this method.
-    pub(crate) fn start_settings_close_smoke(&self, cx: &mut Context<Self>) {
+    pub fn start_settings_close_smoke(&self, cx: &mut Context<Self>) {
         let handle = self.open_settings_window(cx);
         // Exercise the shared updater subscription and About controls before closing.
         let _ = handle.update(cx, |settings, _, cx| settings.show_about(cx));
@@ -897,7 +897,7 @@ impl WorkspaceView {
 
     /// Splits the active tab to the right, then quits. Used by CI to prove a
     /// multi-pane layout can be created on Windows without crashing.
-    pub(crate) fn start_split_pane_smoke(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn start_split_pane_smoke(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |workspace, cx| {
             for _ in 0..20 {
                 cx.background_executor()
@@ -934,11 +934,7 @@ impl WorkspaceView {
 
     /// Exercises the same request path as the header Preview button with an active Markdown file.
     /// Used by `scripts/markdown-preview-smoke.ps1`; normal launches never call this method.
-    pub(crate) fn start_markdown_preview_smoke(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn start_markdown_preview_smoke(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let path = self.model.root.join("preview-smoke.md");
         self.open_editor(path.clone(), window, cx);
         self.request_preview(window, cx);
@@ -2179,7 +2175,7 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    pub(crate) fn open_ssh_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_ssh_manager(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(handle) = self.ssh_manager_window {
             if handle
                 .update(cx, |_, window, _| window.activate_window())
@@ -4435,7 +4431,7 @@ impl WorkspaceView {
     }
 
     /// UI screenshot helper (`TERMIOR_OPEN_SETTINGS`): open settings without SendKeys.
-    pub(crate) fn open_settings_for_ui_shot(
+    pub fn open_settings_for_ui_shot(
         &self,
         cx: &mut Context<Self>,
     ) -> gpui::WindowHandle<SettingsView> {
@@ -4447,7 +4443,7 @@ impl WorkspaceView {
     /// Settles for a few seconds (explorer indexing / first paint), then arms a
     /// render counter for the probe window and prints `TERMIOR_IDLE_REDRAW_FRAMES=N`.
     /// NFR-03 expects N == 0 when nothing schedules `cx.notify()` / repeating animations.
-    pub(crate) fn start_idle_redraw_probe(&self, probe_secs: u64, cx: &mut Context<Self>) {
+    pub fn start_idle_redraw_probe(&self, probe_secs: u64, cx: &mut Context<Self>) {
         let settle = Duration::from_secs(3);
         let probe = Duration::from_secs(probe_secs.max(1));
         cx.spawn(async move |_, cx| {
@@ -4469,7 +4465,7 @@ impl WorkspaceView {
     /// `TERMIOR_SHELL_SETTINGS …`（解析出的 shell 设置），触发新建终端
     /// 选择器；5 秒后打印 `TERMIOR_SHELL_MENU open=… items=…` 与逐条
     /// `TERMIOR_SHELL_ITEM[i]`（后台探测结果），随后退出。判定不依赖截图目测。
-    pub(crate) fn start_shell_picker_probe(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn start_shell_picker_probe(&self, window: &mut Window, cx: &mut Context<Self>) {
         let main_window = window.window_handle();
         let entity = cx.entity();
         cx.spawn(async move |_, cx| {
@@ -9040,7 +9036,7 @@ fn map_appearance(appearance: termior_store::settings::Appearance) -> Appearance
     }
 }
 
-pub(crate) fn load_settings() -> (Settings, Option<PathBuf>, Option<String>) {
+pub fn load_settings() -> (Settings, Option<PathBuf>, Option<String>) {
     let data_dir = app_data_dir().ok();
     let Some(dir) = data_dir.as_ref() else {
         return (
