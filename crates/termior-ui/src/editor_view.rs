@@ -703,7 +703,10 @@ impl EditorView {
             }
             VimCommand::Execute(command) => match command.trim() {
                 "w" | "write" | "wq" | "x" => {
-                    let _ = self.buffer.save();
+                    if let Err(error) = self.buffer.save() {
+                        // 保存失败必须可见（与 Cmd+S 路径一致）：记日志。
+                        log::warn!("vim :w save failed: {error}");
+                    }
                 }
                 _ => {}
             },

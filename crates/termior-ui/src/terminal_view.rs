@@ -143,8 +143,19 @@ impl TerminalView {
     ) -> Self {
         let cols = PtySessionConfig::default().cols as usize;
         let rows = PtySessionConfig::default().rows as usize;
-        let output_rx = bridge.take_output().expect("output channel");
-        let exit_rx = bridge.take_exit().expect("exit channel");
+        let output_rx = bridge.take_output().unwrap_or_else(|| {
+            // 不变量破坏时不 panic：已关闭的 channel 会让 UI 按 PTY EOF 处理。
+            log::warn!("terminal bridge output channel already taken");
+            let (tx, rx) = futures::channel::mpsc::channel(1);
+            drop(tx);
+            rx
+        });
+        let exit_rx = bridge.take_exit().unwrap_or_else(|| {
+            log::warn!("terminal bridge exit channel already taken");
+            let (tx, rx) = futures::channel::oneshot::channel();
+            drop(tx);
+            rx
+        });
         let (event_proxy, mut event_rx) = TerminalEventProxy::new(bridge.writer());
         let command_service = shared_terminal_service();
         let pane_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));

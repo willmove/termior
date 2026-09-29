@@ -6571,6 +6571,7 @@ dependencies = [
  "futures",
  "ignore",
  "keyring",
+ "log",
  "reqwest",
  "serde",
  "serde_json",

@@ -321,7 +321,12 @@ impl SshView {
                     remember: self.remember,
                 },
             };
-            let challenge = self.shared_auth.take().unwrap();
+            let Some(challenge) = self.shared_auth.take() else {
+                log::warn!("ssh auth submit without pending challenge");
+                self.clear_secrets();
+                window.remove_window();
+                return;
+            };
             let _ = challenge.reply.send(answer);
             self.clear_secrets();
             window.remove_window();

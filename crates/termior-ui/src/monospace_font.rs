@@ -75,9 +75,10 @@ pub fn default_family() -> SharedString {
 ///
 /// 结果按 `configured` 缓存，因此可以在每帧 render 里直接调用。
 pub fn resolve(text_system: &TextSystem, configured: &str) -> SharedString {
+    // 锁中毒不 panic：into_inner 取回缓存（字体缓存无不一致风险）。
     if let Some(hit) = cache()
         .lock()
-        .expect("monospace font cache poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(configured)
     {
         return hit.clone();
@@ -85,7 +86,7 @@ pub fn resolve(text_system: &TextSystem, configured: &str) -> SharedString {
     let resolved = resolve_uncached(text_system, configured);
     cache()
         .lock()
-        .expect("monospace font cache poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(configured.to_owned(), resolved.clone());
     resolved
 }

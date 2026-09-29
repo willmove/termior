@@ -241,7 +241,10 @@ fn net_worker_loop(rx: Arc<Mutex<std_mpsc::Receiver<NetJob>>>) {
                 Err(_) => return,
             }
         };
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+            // worker panic 必须可见：否则流静默关闭，上层会误当作空回复（见 runtime）。
+            log::error!("provider network worker panicked; request dropped");
+        }
     }
 }
 

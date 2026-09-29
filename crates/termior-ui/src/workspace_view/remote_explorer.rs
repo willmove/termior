@@ -216,7 +216,13 @@ impl WorkspaceView {
             return;
         }
         self.remote_explorer_paths.insert(tab_id, path.clone());
-        let state = self.remote_explorers.get_mut(&tab_id).unwrap();
+        let Some(state) = self.remote_explorers.get_mut(&tab_id) else {
+            log::warn!(
+                "remote explorer state missing for tab {} after ensure",
+                tab_id.0
+            );
+            return;
+        };
         if let Some(request) = &state.request {
             coalesce_remote_scan(request.path.as_deref(), &mut state.pending, path, force);
             cx.notify();
@@ -432,7 +438,13 @@ impl WorkspaceView {
             cx.notify();
             return false;
         }
-        let state = self.remote_explorers.get_mut(&tab_id).unwrap();
+        let Some(state) = self.remote_explorers.get_mut(&tab_id) else {
+            log::warn!(
+                "remote explorer state missing for tab {} after ensure",
+                tab_id.0
+            );
+            return false;
+        };
         if state.request.is_some() {
             self.command_message = Some(t!("ws.wait_remote_request").to_string());
             cx.notify();

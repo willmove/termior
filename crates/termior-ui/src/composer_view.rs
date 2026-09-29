@@ -109,7 +109,11 @@ struct LiveTerminalContext {
 
 impl TerminalContextProvider for LiveTerminalContext {
     fn snapshot(&self) -> TerminalContext {
-        self.snapshot.lock().unwrap().clone()
+        // 锁中毒不 panic：into_inner 取回数据（快照克隆无一致性风险）。
+        self.snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -872,7 +876,11 @@ impl ComposerView {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        *self.terminal_context.snapshot.lock().unwrap() = TerminalContext {
+        *self
+            .terminal_context
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = TerminalContext {
             cwd,
             recent_output,
             captured_at_unix_ms,
@@ -1520,7 +1528,9 @@ impl ComposerView {
         let mut store = TaskSummaryStore::load(dir).unwrap_or_default();
         let sequence = runtime.events().last().map(|event| event.sequence);
         store.upsert(TaskSummary::from_task(runtime.task(), sequence));
-        let _ = store.persist(dir);
+        if let Err(error) = store.persist(dir) {
+            log::warn!("failed to persist task summary: {error}");
+        }
     }
 
     fn approve_tool(&mut self, cx: &mut Context<Self>) {

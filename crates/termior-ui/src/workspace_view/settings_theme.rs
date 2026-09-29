@@ -140,7 +140,7 @@ impl WorkspaceView {
     pub(super) fn open_settings_window(
         &self,
         cx: &mut Context<Self>,
-    ) -> gpui::WindowHandle<SettingsView> {
+    ) -> Option<gpui::WindowHandle<SettingsView>> {
         let settings = self.settings.clone();
         let migration_error = self.migration_error.clone();
         let data_dir = self.data_dir.clone();
@@ -164,7 +164,7 @@ impl WorkspaceView {
             }
         });
         let bounds = Bounds::centered(None, size(px(880.0), px(560.0)), cx);
-        cx.open_window(
+        match cx.open_window(
             app_identity::window_options(WindowBounds::Windowed(bounds)),
             |window, cx| {
                 // 接管设置窗口的关闭流程。默认情况下点击标题栏关闭按钮会走
@@ -218,8 +218,14 @@ impl WorkspaceView {
                 });
                 view
             },
-        )
-        .expect("open settings window")
+        ) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                // 设置窗口打开失败不致命：记日志并保持工作区可用。
+                log::error!("failed to open settings window: {error}");
+                None
+            }
+        }
     }
     fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         crate::updater::set_enabled(settings.automatic_updates, cx);

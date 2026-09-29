@@ -249,7 +249,11 @@ pub struct WriterHandle {
 impl WriterHandle {
     /// 写入字节（如键盘编码后的 ANSI 序列、CPR 回复）并 flush。
     pub fn write_all(&self, bytes: &[u8]) -> std::io::Result<()> {
-        let mut w = self.inner.lock().unwrap();
+        // 锁中毒不 panic（键盘热路径）：映射为 I/O 错误交调用方处理。
+        let mut w = self
+            .inner
+            .lock()
+            .map_err(|_| std::io::Error::other("PTY writer lock poisoned"))?;
         w.write_all(bytes)?;
         w.flush()?;
         Ok(())

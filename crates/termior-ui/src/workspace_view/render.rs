@@ -1967,10 +1967,11 @@ impl gpui::Render for WorkspaceView {
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
-                                            let handle = this.open_settings_window(cx);
-                                            let _ = handle.update(cx, |settings, _, cx| {
-                                                settings.show_about(cx)
-                                            });
+                                            if let Some(handle) = this.open_settings_window(cx) {
+                                                let _ = handle.update(cx, |settings, _, cx| {
+                                                    settings.show_about(cx)
+                                                });
+                                            }
                                         }),
                                     ),
                                 )

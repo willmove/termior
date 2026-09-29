@@ -376,8 +376,13 @@ impl WorkspaceView {
     }
     pub(super) fn persist_workspace(&self) {
         if let Some(dir) = &self.data_dir {
-            if let Ok(raw) = serde_json::to_string_pretty(&self.model) {
-                let _ = atomic_write(&dir.join("Termior-workspaces.json"), &raw);
+            match serde_json::to_string_pretty(&self.model) {
+                Ok(raw) => {
+                    if let Err(error) = atomic_write(&dir.join("Termior-workspaces.json"), &raw) {
+                        log::warn!("failed to persist workspace layout: {error}");
+                    }
+                }
+                Err(error) => log::warn!("failed to serialize workspace layout: {error}"),
             }
         }
     }
@@ -386,11 +391,21 @@ impl WorkspaceView {
 impl Drop for WorkspaceView {
     fn drop(&mut self) {
         if let Some(dir) = &self.data_dir {
-            if let Ok(raw) = serde_json::to_string_pretty(&self.model) {
-                let _ = atomic_write(&dir.join("Termior-workspaces.json"), &raw);
+            match serde_json::to_string_pretty(&self.model) {
+                Ok(raw) => {
+                    if let Err(error) = atomic_write(&dir.join("Termior-workspaces.json"), &raw) {
+                        log::warn!("failed to persist workspace layout on drop: {error}");
+                    }
+                }
+                Err(error) => log::warn!("failed to serialize workspace layout on drop: {error}"),
             }
-            if let Ok(raw) = serde_json::to_string_pretty(&self.settings) {
-                let _ = atomic_write(&dir.join("Termior-settings.json"), &raw);
+            match serde_json::to_string_pretty(&self.settings) {
+                Ok(raw) => {
+                    if let Err(error) = atomic_write(&dir.join("Termior-settings.json"), &raw) {
+                        log::warn!("failed to persist settings on drop: {error}");
+                    }
+                }
+                Err(error) => log::warn!("failed to serialize settings on drop: {error}"),
             }
         }
     }

@@ -39,17 +39,25 @@ impl InMemorySecretStore {
 
 impl SecretStore for InMemorySecretStore {
     fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
-        Ok(self.inner.lock().unwrap().get(key).cloned())
+        // 锁中毒映射为显式错误而非 panic / 静默 None（后者会被误当作"未设置"）。
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| SecretStoreError::Backend("lock poisoned".to_owned()))?;
+        Ok(guard.get(key).cloned())
     }
     fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
         self.inner
             .lock()
-            .unwrap()
+            .map_err(|_| SecretStoreError::Backend("lock poisoned".to_owned()))?
             .insert(key.to_string(), value.to_string());
         Ok(())
     }
     fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
-        self.inner.lock().unwrap().remove(key);
+        self.inner
+            .lock()
+            .map_err(|_| SecretStoreError::Backend("lock poisoned".to_owned()))?
+            .remove(key);
         Ok(())
     }
 }

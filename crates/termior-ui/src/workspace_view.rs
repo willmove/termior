@@ -346,8 +346,23 @@ impl WorkspaceView {
         cx.set_global(ui::ActiveTheme(palette.clone()));
         let mut model = data_dir
             .as_ref()
-            .and_then(|dir| std::fs::read_to_string(dir.join("Termior-workspaces.json")).ok())
-            .and_then(|raw| serde_json::from_str::<WorkspaceState>(&raw).ok())
+            .and_then(
+                |dir| match std::fs::read_to_string(dir.join("Termior-workspaces.json")) {
+                    Ok(raw) => Some(raw),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        log::warn!("failed to read workspace state: {error}");
+                        None
+                    }
+                },
+            )
+            .and_then(|raw| match serde_json::from_str::<WorkspaceState>(&raw) {
+                Ok(state) => Some(state),
+                Err(error) => {
+                    log::warn!("workspace state file is corrupt, starting fresh: {error}");
+                    None
+                }
+            })
             .unwrap_or_else(|| WorkspaceState::new(root.clone()));
         // 旧格式文件（Tab 无 project_dir）回填为全局 root，语义与旧版等价。
         model.backfill_project_dirs();
@@ -737,7 +752,9 @@ impl WorkspaceView {
     /// title-bar close button, so CI / local smoke can assert no `window not found` log.
     /// Used by `scripts/settings-close-smoke.ps1`; normal launches never call this method.
     pub fn start_settings_close_smoke(&self, cx: &mut Context<Self>) {
-        let handle = self.open_settings_window(cx);
+        let Some(handle) = self.open_settings_window(cx) else {
+            return;
+        };
         // Exercise the shared updater subscription and About controls before closing.
         let _ = handle.update(cx, |settings, _, cx| settings.show_about(cx));
         cx.spawn(async move |_, cx| {
@@ -857,7 +874,7 @@ impl WorkspaceView {
     pub fn open_settings_for_ui_shot(
         &self,
         cx: &mut Context<Self>,
-    ) -> gpui::WindowHandle<SettingsView> {
+    ) -> Option<gpui::WindowHandle<SettingsView>> {
         self.open_settings_window(cx)
     }
 

@@ -52,7 +52,7 @@ fn main() {
             let text_system = cx.text_system().clone();
             termior_ui::monospace_font::init_default(&text_system);
             let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
-            cx.open_window(
+            let open_result = cx.open_window(
                 termior_ui::app_identity::main_window_options(WindowBounds::Windowed(bounds)),
                 |window, cx| {
                     let system_is_dark = matches!(
@@ -105,8 +105,12 @@ fn main() {
                     }
                     workspace
                 },
-            )
-            .expect("open Termior window");
+            );
+            if let Err(error) = open_result {
+                // 主窗口创建失败无法降级为可用应用：显式报错退出，不 panic。
+                eprintln!("failed to open Termior window: {error}");
+                std::process::exit(1);
+            }
             // 跨平台：macOS 用 `cmd-o`，Windows/Linux 用 `ctrl-o`。两条显式绑定
             // 与 Zed 自身 keymap 风格一致；action 挂在 `workspace-root` 上，
             // 窗口焦点在 app 内任意位置都触发。

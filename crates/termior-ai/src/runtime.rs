@@ -744,6 +744,23 @@ impl TaskRuntime {
                     ChatEvent::Error(message) => error = Some(message),
                 }
             }
+            if error.is_none() && !saw_progress {
+                // 流未产生任何事件就结束（如网络 worker panic 后 channel 静默关闭）：
+                // 不得伪装成空助手回复，按可重试的 provider 故障处理。
+                if attempt < 3 {
+                    self.emit(TaskEventKind::Diagnostic {
+                        message: format!(
+                            "provider attempt {attempt} ended without any events; retrying"
+                        ),
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(10 * u64::from(attempt)));
+                    continue;
+                }
+                self.set_state(TaskState::Failed, None);
+                return Err(RuntimeError::Provider(
+                    "provider stream ended without producing any events".to_owned(),
+                ));
+            }
             if let Some(error) = error {
                 if !saw_progress && attempt < 3 {
                     self.emit(TaskEventKind::Diagnostic {

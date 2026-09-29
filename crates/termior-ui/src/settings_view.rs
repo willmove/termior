@@ -3131,7 +3131,9 @@ impl SettingsView {
 impl Drop for SettingsView {
     fn drop(&mut self) {
         self.commit_edit();
-        let _ = self.persist_to_disk();
+        if let Err(error) = self.persist_to_disk() {
+            log::warn!("failed to persist settings on close: {error}");
+        }
     }
 }
 

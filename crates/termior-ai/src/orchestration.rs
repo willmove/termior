@@ -464,14 +464,24 @@ impl<L: TaskLauncher> OrchestrationRuntime<L> {
                 .insert(task.id.clone(), cancellation.clone());
             let launcher = self.launcher.clone();
             let completion = self.completion_tx.clone();
-            std::thread::Builder::new()
-                .name(format!("termior-child-{}", task.id))
+            let task_id = task.id.clone();
+            let spawn_result = std::thread::Builder::new()
+                .name(format!("termior-child-{task_id}"))
                 .spawn(move || {
-                    let task_id = spec.task_id.clone();
-                    let result = launcher.launch(spec, cancellation);
-                    let _ = completion.send((task_id, result));
-                })
-                .expect("child task worker spawn failed");
+                    let worker_task_id = spec.task_id.clone();
+                    // worker panic 不得静默挂起任务：映射为显式失败结果。
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        launcher.launch(spec, cancellation)
+                    }))
+                    .unwrap_or_else(|_| Err("child task worker panicked".to_owned()));
+                    let _ = completion.send((worker_task_id, result));
+                });
+            if let Err(error) = spawn_result {
+                // 线程 spawn 失败（句柄/内存耗尽）：显式失败而非永久 Running。
+                let _ = self
+                    .completion_tx
+                    .send((task_id, Err(format!("worker spawn failed: {error}"))));
+            }
         }
     }
 
