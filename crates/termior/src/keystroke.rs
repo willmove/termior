@@ -55,11 +55,14 @@ pub fn keystroke_to_pty_bytes(ks: &Keystroke, mode: TermMode) -> Vec<u8> {
 }
 
 pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
+    // ConPTY 把 CR 和 LF 都当作一次回车：粘贴内容必须统一成单个 CR 换行，
+    // 否则来自剪贴板的 \r\n 会变成两次回车，行间多出一个空行。
+    let text = text.replace("\r\n", "\r").replace('\n', "\r");
     if mode.contains(TermMode::BRACKETED_PASTE) {
         let text = text.replace('\x1b', "");
         format!("\x1b[200~{text}\x1b[201~").into_bytes()
     } else {
-        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
+        text.into_bytes()
     }
 }
 
@@ -314,6 +317,13 @@ mod tests {
         assert_eq!(
             encode_paste("a\x1bb", TermMode::default() | TermMode::BRACKETED_PASTE),
             b"\x1b[200~ab\x1b[201~"
+        );
+        assert_eq!(
+            encode_paste(
+                "a\r\nb\nc",
+                TermMode::default() | TermMode::BRACKETED_PASTE
+            ),
+            b"\x1b[200~a\rb\rc\x1b[201~"
         );
     }
 }
