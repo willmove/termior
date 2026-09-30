@@ -257,7 +257,7 @@ impl Frame {
                 start,
                 items: self.children,
             },
-            FrameKind::Item => MarkdownNode::Item(self.children),
+            FrameKind::Item => MarkdownNode::Item(group_item_inline_runs(self.children)),
             FrameKind::FootnoteDefinition(label) => MarkdownNode::FootnoteDefinition {
                 label,
                 children: self.children,
@@ -318,6 +318,47 @@ fn finish_frame(_end: TagEnd, frames: &mut Vec<Frame>, roots: &mut Vec<MarkdownN
     if let Some(frame) = frames.pop() {
         push_node(frame.into_node(), frames, roots);
     }
+}
+
+/// 紧凑列表项（如 `- HEAD 停在 \`main\``）不经过 Paragraph 帧，内联节点直接挂在
+/// Item 下。块级渲染器按块处理每个子节点，裸内联序列会被拆成一行一个片段；把
+/// 连续的内联子节点聚合为 Paragraph（与松散列表项的表示一致），嵌套块保持原位。
+fn group_item_inline_runs(children: Vec<MarkdownNode>) -> Vec<MarkdownNode> {
+    fn is_inline(node: &MarkdownNode) -> bool {
+        matches!(
+            node,
+            MarkdownNode::Text(_)
+                | MarkdownNode::InlineCode(_)
+                | MarkdownNode::InlineMath(_)
+                | MarkdownNode::DisplayMath(_)
+                | MarkdownNode::RawHtml(_)
+                | MarkdownNode::Emphasis(_)
+                | MarkdownNode::Strong(_)
+                | MarkdownNode::Strikethrough(_)
+                | MarkdownNode::Superscript(_)
+                | MarkdownNode::Subscript(_)
+                | MarkdownNode::Link { .. }
+                | MarkdownNode::Image { .. }
+                | MarkdownNode::TaskMarker(_)
+        )
+    }
+
+    let mut grouped = Vec::new();
+    let mut inline_run = Vec::new();
+    for child in children {
+        if is_inline(&child) {
+            inline_run.push(child);
+        } else {
+            if !inline_run.is_empty() {
+                grouped.push(MarkdownNode::Paragraph(std::mem::take(&mut inline_run)));
+            }
+            grouped.push(child);
+        }
+    }
+    if !inline_run.is_empty() {
+        grouped.push(MarkdownNode::Paragraph(inline_run));
+    }
+    grouped
 }
 
 fn push_node(node: MarkdownNode, frames: &mut [Frame], roots: &mut Vec<MarkdownNode>) {
@@ -417,5 +458,48 @@ mod tests {
             .blocks
             .iter()
             .any(|node| matches!(node, MarkdownNode::RawHtml(html) if html.contains("script"))));
+    }
+
+    #[test]
+    fn tight_list_items_group_inline_runs_into_paragraphs() {
+        // 紧凑列表项不带 Paragraph 帧。若内联节点直接挂在 Item 下，块级渲染器会
+        // 一行一个片段地排版（Agent 消息碎行缺陷），解析层必须聚合为段落。
+        let document = MarkdownDocument::parse(
+            "- HEAD 停在 `main`，而 `feature/workspace` 落后于 `main`（早 9 个提交）。\n- 推进 **Composer / Agent 功能**（`FR-AGENT-*`）以及 `termior-ui` 拆分。\n",
+        );
+        let Some(MarkdownNode::List { items, .. }) = document.blocks.first() else {
+            panic!("expected a list, got {:?}", document.blocks.first());
+        };
+        assert_eq!(items.len(), 2);
+        for item in items {
+            let MarkdownNode::Item(children) = item else {
+                panic!("expected an item, got {item:?}");
+            };
+            assert_eq!(
+                children.len(),
+                1,
+                "tight item must render as a single paragraph, got {children:?}"
+            );
+            assert!(matches!(children[0], MarkdownNode::Paragraph(_)));
+        }
+    }
+
+    #[test]
+    fn tight_item_keeps_nested_blocks_beside_the_paragraph() {
+        // 内联内容与嵌套块（子列表/代码块）混排时，段落聚合不得吞掉块节点。
+        let document = MarkdownDocument::parse("- run `make`\n  - nested\n");
+        let Some(MarkdownNode::List { items, .. }) = document.blocks.first() else {
+            panic!("expected a list, got {:?}", document.blocks.first());
+        };
+        let MarkdownNode::Item(children) = &items[0] else {
+            panic!("expected an item");
+        };
+        assert_eq!(
+            children.len(),
+            2,
+            "paragraph + nested list, got {children:?}"
+        );
+        assert!(matches!(children[0], MarkdownNode::Paragraph(_)));
+        assert!(matches!(children[1], MarkdownNode::List { .. }));
     }
 }

@@ -42,6 +42,9 @@ mod linux {
     }
 }
 
+// 这两个探测辅助只被上方 cfg(linux|freebsd) 的 `linux::prepare` 调用；其余平台
+// 编译期就是死代码，仅由单元测试覆盖，故只在那些平台豁免 dead_code 检查。
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
 pub(crate) fn should_force_software_gl(
     prefer_software: bool,
     libgl_already_set: bool,
@@ -53,6 +56,7 @@ pub(crate) fn should_force_software_gl(
     prefer_software || !has_accessible_render_node
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
 pub(crate) fn has_accessible_render_node_in(dri: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dri) else {
         return false;
