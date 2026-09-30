@@ -4,7 +4,7 @@ Guidance for AI coding agents (Claude Code, ZCode, and others) operating in this
 
 ## Project shape
 
-Termior is a Rust + GPUI desktop app, organised as a Cargo workspace under `crates/` (~17 crates). Top-level docs live in `docs/`. The authoritative product spec is `docs/termior-spec.md` (SDD, v0.1). Read it before touching product behaviour.
+Termior is a Rust + GPUI desktop app, organised as a Cargo workspace under `crates/` (the authoritative member list is in `Cargo.toml`, not reproduced here). Top-level docs live in `docs/`. The authoritative product spec is `docs/termior-spec.md` (SDD, v0.2 draft). Read it before touching product behaviour.
 
 ## Agent skills
 
