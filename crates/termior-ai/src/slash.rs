@@ -26,6 +26,8 @@ pub enum ComposerCommand {
     /// `/snippet <handle> <text>`：保存 `#handle` 片段（FR-AGENT-04）。
     SaveSnippet,
     Snippets,
+    /// 应用内 TODO 面板（FR-SESS-04）。
+    Todos,
 }
 
 /// 一条命令被选中后要执行的动作。
@@ -108,6 +110,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     composer_with_args("snippet", ComposerCommand::SaveSnippet, "slash.snippet"),
     composer("snippets", ComposerCommand::Snippets, "slash.snippets"),
+    composer("todos", ComposerCommand::Todos, "slash.todos"),
     app("terminal", KeyAction::NewTerminalTab, "slash.terminal"),
     app(
         "private-terminal",

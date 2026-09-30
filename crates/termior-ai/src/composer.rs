@@ -283,6 +283,32 @@ pub struct TodoStore {
     pub items: Vec<TodoItem>,
 }
 
+/// 单次 `todo_write` 允许的最大条目数（FR-SESS-04）。
+pub const MAX_TODO_ITEMS: usize = 100;
+const MAX_TODO_TEXT_CHARS: usize = 2_000;
+
+/// `todo_write` 的一条输入；缺省 `id` 时由存储分配。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TodoDraft {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub text: String,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TodoError {
+    #[error("at most {MAX_TODO_ITEMS} todo items are allowed")]
+    TooMany,
+    #[error("todo text must be 1..={MAX_TODO_TEXT_CHARS} characters")]
+    InvalidText,
+    #[error("duplicate todo id: {0}")]
+    DuplicateId(String),
+    #[error("todo text looks like a secret and was not stored")]
+    SecretLike,
+}
+
 impl TodoStore {
     pub fn add(&mut self, id: impl Into<String>, text: impl Into<String>) {
         self.items.push(TodoItem {
@@ -298,6 +324,57 @@ impl TodoStore {
         };
         item.done = done;
         true
+    }
+
+    pub fn remove(&mut self, id: &str) -> bool {
+        let before = self.items.len();
+        self.items.retain(|item| item.id != id);
+        self.items.len() < before
+    }
+
+    /// 以整表替换语义应用 `todo_write`：全部校验通过才生效，重放同一输入结果相同。
+    pub fn replace_all(&mut self, drafts: Vec<TodoDraft>) -> Result<(), TodoError> {
+        if drafts.len() > MAX_TODO_ITEMS {
+            return Err(TodoError::TooMany);
+        }
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for draft in &drafts {
+            let length = draft.text.trim().chars().count();
+            if length == 0 || length > MAX_TODO_TEXT_CHARS {
+                return Err(TodoError::InvalidText);
+            }
+            if termior_security::assert_no_secret_fields(&draft.text).is_err() {
+                return Err(TodoError::SecretLike);
+            }
+            if let Some(id) = &draft.id {
+                if !used.insert(id.clone()) {
+                    return Err(TodoError::DuplicateId(id.clone()));
+                }
+            }
+        }
+        let mut next = 1usize;
+        self.items = drafts
+            .into_iter()
+            .map(|draft| {
+                let id = draft.id.unwrap_or_else(|| loop {
+                    let candidate = format!("todo-{next}");
+                    next += 1;
+                    if used.insert(candidate.clone()) {
+                        break candidate;
+                    }
+                });
+                TodoItem {
+                    id,
+                    text: draft.text.trim().to_owned(),
+                    done: draft.done,
+                }
+            })
+            .collect();
+        Ok(())
+    }
+
+    pub fn open_count(&self) -> usize {
+        self.items.iter().filter(|item| !item.done).count()
     }
 }
 
@@ -405,5 +482,53 @@ mod tests {
         assert_eq!(snippet_query("please #rev now", 15), None);
         assert_eq!(snippet_query("issue#12", 8), None);
         assert_eq!(snippet_query("中文 #片段", 5), Some("片"));
+    }
+
+    #[test]
+    fn todo_replace_all_validates_before_mutating() {
+        let mut todos = TodoStore::default();
+        todos.add("keep", "existing");
+        let draft = |id: Option<&str>, text: &str| TodoDraft {
+            id: id.map(str::to_owned),
+            text: text.into(),
+            done: false,
+        };
+        assert_eq!(
+            todos.replace_all(vec![draft(Some("a"), "x"), draft(Some("a"), "y")]),
+            Err(TodoError::DuplicateId("a".into()))
+        );
+        assert_eq!(
+            todos.replace_all(vec![draft(None, "  ")]),
+            Err(TodoError::InvalidText)
+        );
+        assert_eq!(
+            todos.replace_all(vec![draft(
+                None,
+                "use sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123"
+            )]),
+            Err(TodoError::SecretLike)
+        );
+        assert_eq!(
+            todos.replace_all(vec![draft(None, "x"); MAX_TODO_ITEMS + 1]),
+            Err(TodoError::TooMany)
+        );
+        assert_eq!(todos.items[0].id, "keep", "failed writes must not mutate");
+
+        todos
+            .replace_all(vec![
+                draft(Some("todo-1"), " write tests "),
+                draft(None, "fix bug"),
+                TodoDraft {
+                    done: true,
+                    ..draft(None, "ship")
+                },
+            ])
+            .unwrap();
+        let ids: Vec<_> = todos.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["todo-1", "todo-2", "todo-3"]);
+        assert_eq!(todos.items[0].text, "write tests");
+        assert_eq!(todos.open_count(), 2);
+        assert!(todos.remove("todo-2"));
+        assert!(!todos.remove("todo-2"));
     }
 }

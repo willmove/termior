@@ -70,6 +70,13 @@ pub struct ToolExecutor {
     checkpoints: Option<Arc<termior_store::CheckpointStore>>,
     checkpoint_sequence: AtomicU64,
     external_handlers: HashMap<String, Arc<dyn ExternalToolHandler>>,
+    todos: Option<TodoBinding>,
+}
+
+/// 与 Composer 共享的应用内 TODO（FR-SESS-04）；`data_dir` 为空时只保存在内存。
+struct TodoBinding {
+    store: Arc<Mutex<crate::TodoStore>>,
+    data_dir: Option<PathBuf>,
 }
 
 impl ToolExecutor {
@@ -113,7 +120,17 @@ impl ToolExecutor {
             checkpoints: None,
             checkpoint_sequence: AtomicU64::new(1),
             external_handlers: HashMap::new(),
+            todos: None,
         })
+    }
+
+    pub fn with_todo_store(
+        mut self,
+        store: Arc<Mutex<crate::TodoStore>>,
+        data_dir: Option<PathBuf>,
+    ) -> Self {
+        self.todos = Some(TodoBinding { store, data_dir });
+        self
     }
 
     pub fn with_terminal_context(mut self, context: Arc<dyn TerminalContextProvider>) -> Self {
@@ -269,6 +286,8 @@ impl ToolExecutor {
             "fs_search" => self.fs_search(&args),
             "fs_grep" => self.fs_grep(&args),
             "get_terminal_context" => self.terminal_context(),
+            "todo_read" => self.todo_read(),
+            "todo_write" => self.todo_write(&args),
             "write_file" => self.propose_write(&args),
             "create_directory" => self.create_directory(&args),
             "rename" => self.rename(&args),
@@ -374,6 +393,45 @@ impl ToolExecutor {
             .ok_or_else(|| ToolError::Io("no active terminal context".into()))?
             .snapshot();
         serde_json::to_string(&context).map_err(|error| ToolError::Io(error.to_string()))
+    }
+
+    fn todo_binding(&self) -> Result<&TodoBinding, ToolError> {
+        self.todos
+            .as_ref()
+            .ok_or_else(|| ToolError::Io("todo store is not available".into()))
+    }
+
+    fn todo_read(&self) -> Result<String, ToolError> {
+        let store = self
+            .todo_binding()?
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        serde_json::to_string(&*store).map_err(|error| ToolError::Io(error.to_string()))
+    }
+
+    /// 整表替换：先在副本上校验并落盘，成功后才更新共享状态，失败不留半写结果。
+    fn todo_write(&self, args: &Value) -> Result<String, ToolError> {
+        let binding = self.todo_binding()?;
+        let drafts: Vec<crate::TodoDraft> = serde_json::from_value(
+            args.get("items").cloned().unwrap_or(Value::Null),
+        )
+        .map_err(|error| ToolError::InvalidArguments(format!("todo_write items: {error}")))?;
+        let mut store = binding
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut next = store.clone();
+        next.replace_all(drafts)
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        if let Some(dir) = &binding.data_dir {
+            termior_store::DataFiles::new(dir.clone())
+                .todos::<crate::TodoStore>()
+                .save(&next)
+                .map_err(|error| ToolError::Io(format!("todo store: {error}")))?;
+        }
+        *store = next;
+        serde_json::to_string(&*store).map_err(|error| ToolError::Io(error.to_string()))
     }
 
     fn propose_write(&self, args: &Value) -> Result<String, ToolError> {
@@ -965,6 +1023,55 @@ mod tests {
             .execute_auto("fs_grep", r#"{"query":"needle"}"#)
             .unwrap()
             .contains("hello.txt:1:needle"));
+    }
+
+    #[test]
+    fn todo_tools_round_trip_through_shared_store_and_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(crate::TodoStore::default()));
+        let executor =
+            executor(dir.path()).with_todo_store(store.clone(), Some(data.path().to_path_buf()));
+
+        let written = executor
+            .execute_auto(
+                "todo_write",
+                r#"{"items":[{"text":"write tests","done":false},{"id":"ship","text":"ship","done":true}]}"#,
+            )
+            .unwrap();
+        assert!(written.contains("todo-1"));
+        assert_eq!(store.lock().unwrap().open_count(), 1);
+        let on_disk: crate::TodoStore = termior_store::DataFiles::new(data.path().to_path_buf())
+            .todos()
+            .load()
+            .unwrap();
+        assert_eq!(on_disk, *store.lock().unwrap());
+        assert_eq!(executor.execute_auto("todo_read", "{}").unwrap(), written);
+
+        // 非法写入整体拒绝，共享状态与磁盘均不变。
+        assert!(matches!(
+            executor.execute_auto(
+                "todo_write",
+                r#"{"items":[{"id":"a","text":"x","done":false},{"id":"a","text":"y","done":false}]}"#
+            ),
+            Err(ToolError::InvalidArguments(_))
+        ));
+        assert!(matches!(
+            executor.execute_auto("todo_write", r#"{"items":[{"text":"x"}]}"#),
+            Err(ToolError::InvalidArguments(_))
+        ));
+        assert_eq!(store.lock().unwrap().items.len(), 2);
+        // 不写工作区。
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn todo_tools_report_missing_store() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            executor(dir.path()).execute_auto("todo_read", "{}"),
+            Err(ToolError::Io(_))
+        ));
     }
 
     #[test]

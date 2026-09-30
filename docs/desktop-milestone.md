@@ -19,6 +19,7 @@
 - 会话、项目记忆、设置、布局、自定义代理/snippets/TODO 使用原子 JSON 存储；
 - Composer `/` 命令面板（FR-AGENT-05）：输入开头的 `/` 弹出可模糊筛选的命令列表，Composer 动作（会话、模式、代理、面板）就地执行，应用动作复用快捷键 `KeyAction` 路径；
 - `#handle` 片段（FR-AGENT-04）：`/snippet <handle> <内容>` 保存、`#` 前缀补全、`/snippets` 面板查看与删除；提交时展开且保留原文换行与缩进；
+- 应用内 TODO（FR-SESS-04）：Agent 通过自动执行的 `todo_read` / `todo_write`（整表替换、校验后原子落盘，不触达工作区）读写，用户在 `/todos` 面板勾选或删除，两者共享同一份 `Termior-ai-todos.json`；
 - 内置 Agent 与终端代理 OSC 状态进入统一通知路由：目标可见时抑制、隐藏时显示主题 toast、窗口失焦时发送系统通知；header 铃铛列出状态并可跳转目标，Claude Code hooks 可安全安装/卸载；
 
 ## 本阶段验证门槛
@@ -40,7 +41,6 @@ GitHub Actions 另在 Windows/macOS/Linux 构建 release 桌面二进制、记�
 > 2026-09-30 按代码核对刷新。WSL 发行版切换、背景图渲染、行内补全停顿调度与 ghost text、
 > 自动更新（`termior-platform::update`）和 NFR 基准 harness（`docs/nfr-baselines.md`）已落地，不再列入。
 
-- FR-SESS-04 应用内 TODO 的 Agent 工具与界面（`TodoStore` 仅有存储层）；
 - FR-ATERM-05 从终端选区/失败命令附加时携带命令 ID、cwd、退出码；
 - FR-AGENT-06 语音输入（P2）；
 - 多窗口工作区切换与跨窗口 tab 管理；

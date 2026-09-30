@@ -3448,6 +3448,8 @@ fn tool_label(tool: termior_security::gating::ToolId) -> SharedString {
         CommandClaim => t!("settings.tools.take_control"),
         CommandWriteInput => t!("settings.tools.send_input"),
         RunSubagent => t!("settings.tools.delegate_subagents"),
+        TodoRead => t!("settings.tools.read_todos"),
+        TodoWrite => t!("settings.tools.write_todos"),
     }
 }
 

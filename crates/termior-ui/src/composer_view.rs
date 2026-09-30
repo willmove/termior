@@ -26,7 +26,7 @@ use termior_ai::{
     HttpProvider, KeyringSecretStore, Message, Mode, ProviderConfig, Role, RuntimeBudgets,
     SecretStore, SessionStore, Snippet, SnippetError, SnippetStore, TaskCommand, TaskConfig,
     TaskRuntime, TaskState, TaskSummary, TaskSummaryStore, TerminalContext,
-    TerminalContextProvider, ToolContract, ToolExecutor, ToolRegistry, WaitingReason,
+    TerminalContextProvider, TodoStore, ToolContract, ToolExecutor, ToolRegistry, WaitingReason,
 };
 use termior_explorer_core::fuzzy::fuzzy_match;
 use termior_platform::AgentStatus;
@@ -171,6 +171,9 @@ pub struct ComposerView {
     snippet_suggestions: Vec<Snippet>,
     selected_snippet_suggestion: usize,
     snippet_center_open: bool,
+    /// 与 ToolExecutor 共享的应用内 TODO（FR-SESS-04），Agent 与用户读写同一份。
+    todos: Arc<Mutex<TodoStore>>,
+    todo_center_open: bool,
     /// 停靠位置与底部停靠高度，由 WorkspaceView 在恢复/拖拽/切换后同步。
     dock: ComposerDock,
     fill_workspace: bool,
@@ -257,6 +260,8 @@ impl ComposerView {
             snippet_suggestions: Vec::new(),
             selected_snippet_suggestion: 0,
             snippet_center_open: false,
+            todos: Arc::new(Mutex::new(TodoStore::default())),
+            todo_center_open: false,
             dock: ComposerDock::Bottom,
             fill_workspace: false,
             panel_height: crate::DEFAULT_COMPOSER_HEIGHT,
@@ -308,6 +313,9 @@ impl ComposerView {
             let files = DataFiles::new(dir.clone());
             self.sessions = files.sessions::<SessionStore>().load().unwrap_or_default();
             self.snippets = files.snippets::<SnippetStore>().load().unwrap_or_default();
+            self.todos = Arc::new(Mutex::new(
+                files.todos::<TodoStore>().load().unwrap_or_default(),
+            ));
             self.custom_agents = files
                 .agents::<AgentDefinitionStore>()
                 .load()
@@ -407,7 +415,9 @@ impl ComposerView {
         };
         let executor = match ToolExecutor::new(root, full_tools.clone()) {
             Ok(executor) => {
-                let executor = executor.with_terminal_context(self.terminal_context.clone());
+                let executor = executor
+                    .with_terminal_context(self.terminal_context.clone())
+                    .with_todo_store(self.todos.clone(), self.data_dir.clone());
                 let executor = if let Some(data_dir) = self.data_dir.as_ref() {
                     executor.with_checkpoint_store(data_dir.join("agent-checkpoints"))
                 } else {
@@ -837,6 +847,31 @@ impl ComposerView {
         }
     }
 
+    /// 用户在面板里勾选/删除 TODO：先落盘再更新共享状态，与 `todo_write` 的失败语义一致。
+    fn update_todos(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut TodoStore) -> bool,
+    ) {
+        let todos = self.todos.clone();
+        let mut store = todos
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut next = store.clone();
+        if !change(&mut next) {
+            return;
+        }
+        if let Some(dir) = &self.data_dir {
+            if let Err(error) = DataFiles::new(dir.clone()).todos::<TodoStore>().save(&next) {
+                self.set_status(tf!("composer.todo.save_failed", "error" => error));
+                cx.notify();
+                return;
+            }
+        }
+        *store = next;
+        cx.notify();
+    }
+
     fn delete_snippet(&mut self, handle: &str, cx: &mut Context<Self>) {
         if self.snippets.remove(handle) {
             self.set_status(tf!("composer.snippet.deleted", "handle" => handle));
@@ -920,6 +955,7 @@ impl ComposerView {
                     }
                 },
                 ComposerCommand::Snippets => self.snippet_center_open = !self.snippet_center_open,
+                ComposerCommand::Todos => self.todo_center_open = !self.todo_center_open,
             },
         }
         cx.notify();
@@ -1291,6 +1327,7 @@ impl ComposerView {
                 "fs_search",
                 "fs_grep",
                 "get_terminal_context",
+                "todo_read",
             ]) {
                 Ok(tools) => tools,
                 Err(error) => {
@@ -2132,6 +2169,7 @@ impl ComposerView {
             || self.skill_center_open
             || self.memory_center_open
             || self.snippet_center_open
+            || self.todo_center_open
     }
 
     /// 工作区在恢复、拖拽或停靠切换后同步布局参数。
@@ -2622,6 +2660,95 @@ impl gpui::Render for ComposerView {
                         },
                     ))
             });
+        let todo_center = self.todo_center_open.then(|| {
+            let todos = self
+                .todos
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let open = todos.open_count();
+            let rows = todos.items.into_iter().enumerate().map(|(index, item)| {
+                let toggle_id = item.id.clone();
+                let delete_id = item.id.clone();
+                let done = item.done;
+                div()
+                    .id(SharedString::from(format!("todo-entry-{index}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(crate::ui::alpha(p.foreground, 0.04))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("toggle-todo-{index}")))
+                            .cursor_pointer()
+                            .child(SharedString::from(if done { "☑" } else { "☐" }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    let id = toggle_id.clone();
+                                    this.update_todos(cx, |store| store.set_done(&id, !done));
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .when(done, |text| {
+                                text.line_through().text_color(crate::ui::muted(&p))
+                            })
+                            .child(SharedString::from(item.text)),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("delete-todo-{index}")))
+                            .px_2()
+                            .py(px(2.0))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(crate::ui::color(p.status[3]))
+                            .text_xs()
+                            .cursor_pointer()
+                            .child(t!("composer.todo.delete"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    let id = delete_id.clone();
+                                    this.update_todos(cx, |store| store.remove(&id));
+                                }),
+                            ),
+                    )
+            });
+            div()
+                .id("todo-center-panel")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&p))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(tf!("composer.todo.title", "open" => open)),
+                )
+                .when(rows.len() == 0, |panel| {
+                    panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(crate::ui::muted(&p))
+                            .child(t!("composer.todo.empty")),
+                    )
+                })
+                .children(rows)
+        });
         let snippet_center = self.snippet_center_open.then(|| {
             let rows = self
                 .snippets
@@ -3883,6 +4010,7 @@ impl gpui::Render for ComposerView {
                         .pb_1()
                         .gap_2()
                         .children(messages)
+                        .children(todo_center)
                         .children(snippet_center)
                         .children(memory_center)
                         .children(skill_center)
@@ -4470,6 +4598,27 @@ mod layout_tests {
         vcx.update(|window, cx| {
             window.refresh();
             let _ = window.draw(cx);
+        });
+    }
+
+    #[test]
+    fn todo_panel_shows_agent_items_and_user_edits_update_the_shared_store() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        composer.update(vcx, |view, cx| {
+            view.todos.lock().unwrap().add("todo-1", "write tests");
+            view.invoke_slash_command(slash::find_command("todos").unwrap(), "", cx);
+            assert!(view.todo_center_open);
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        composer.update(vcx, |view, cx| {
+            view.update_todos(cx, |store| store.set_done("todo-1", true));
+            assert_eq!(view.todos.lock().unwrap().open_count(), 0);
+            view.update_todos(cx, |store| store.remove("todo-1"));
+            assert!(view.todos.lock().unwrap().items.is_empty());
         });
     }
 

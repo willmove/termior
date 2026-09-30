@@ -1,7 +1,8 @@
 //! 工具两级门控模型（FR-SEC-01 / FR-AGENT-09）。
 //!
 //! 工具分两级：
-//! - [`ToolLevel::Auto`]：只读工具，自动执行（`read_file`、`list_directory`、`fs_search`、`fs_grep`）。
+//! - [`ToolLevel::Auto`]：只读工具，自动执行（`read_file`、`list_directory`、`fs_search`、`fs_grep`）；
+//!   以及只写应用数据的 `todo_read` / `todo_write`（FR-SESS-04）。
 //! - [`ToolLevel::Approval`]：审批门控（`write_file`、`create_directory`、`rename`、`delete`、
 //!   `run_command`、`shell_session_run`、`shell_bg_spawn`）。
 
@@ -31,6 +32,9 @@ pub enum ToolId {
     RunSubagent,
     /// 实时上下文桥（FR-AGENT-07）——只读快照，自动执行。
     GetTerminalContext,
+    /// 应用内 TODO（FR-SESS-04）：只读写应用数据目录，不触达工作区或进程，自动执行。
+    TodoRead,
+    TodoWrite,
 }
 
 impl ToolId {
@@ -55,6 +59,8 @@ impl ToolId {
             ToolId::CommandWriteInput => "command_write_input",
             ToolId::RunSubagent => "run_subagent",
             ToolId::GetTerminalContext => "get_terminal_context",
+            ToolId::TodoRead => "todo_read",
+            ToolId::TodoWrite => "todo_write",
         }
     }
 
@@ -68,7 +74,9 @@ impl ToolId {
             | ToolId::CommandStatus
             | ToolId::CommandReadOutput
             | ToolId::CommandWait
-            | ToolId::GetTerminalContext => ToolLevel::Auto,
+            | ToolId::GetTerminalContext
+            | ToolId::TodoRead
+            | ToolId::TodoWrite => ToolLevel::Auto,
             ToolId::WriteFile
             | ToolId::CreateDirectory
             | ToolId::Rename
@@ -118,6 +126,8 @@ pub const ALL_TOOLS: &[ToolId] = &[
     ToolId::CommandWriteInput,
     ToolId::RunSubagent,
     ToolId::GetTerminalContext,
+    ToolId::TodoRead,
+    ToolId::TodoWrite,
 ];
 
 #[cfg(test)]
@@ -135,6 +145,8 @@ mod tests {
             ToolId::CommandReadOutput,
             ToolId::CommandWait,
             ToolId::GetTerminalContext,
+            ToolId::TodoRead,
+            ToolId::TodoWrite,
         ] {
             assert_eq!(t.level(), ToolLevel::Auto, "{} should be Auto", t.name());
         }

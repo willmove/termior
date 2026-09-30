@@ -2,6 +2,7 @@
 //!
 //! 工具分两级（对齐 [`termior_security::gating`]）：
 //! - 自动执行（只读）：`read_file`、`list_directory`、`fs_search`、`fs_grep`、`get_terminal_context`
+//!   （另有只写应用数据的 `todo_read` / `todo_write`，FR-SESS-04）
 //! - 审批门控（写/执行）：`write_file`、`create_directory`、`rename`、`delete`、
 //!   `run_command`、`shell_session_run`、`shell_bg_spawn`
 //!
@@ -332,6 +333,11 @@ fn description_for(t: termior_security::gating::ToolId) -> &'static str {
         ToolId::RunSubagent => {
             "Delegate a bounded task to a restricted child agent (approval-gated)."
         }
+        ToolId::TodoRead => "Read the app-local TODO list shared with the user (auto-executed).",
+        ToolId::TodoWrite => {
+            "Replace the app-local TODO list with the given items; include every item to keep, \
+             omit id for new items (auto-executed, never touches the workspace)."
+        }
     }
 }
 
@@ -364,7 +370,24 @@ fn parameters_for(tool: termior_security::gating::ToolId) -> Value {
         ToolId::FsSearch | ToolId::FsGrep => {
             object_schema(&["query"], [("query", string_schema(4_096))])
         }
-        ToolId::GetTerminalContext => object_schema(&[], []),
+        ToolId::GetTerminalContext | ToolId::TodoRead => object_schema(&[], []),
+        ToolId::TodoWrite => object_schema(
+            &["items"],
+            [(
+                "items",
+                json!({
+                    "type": "array",
+                    "items": object_schema(
+                        &["text", "done"],
+                        [
+                            ("id", string_schema(64)),
+                            ("text", string_schema(2_000)),
+                            ("done", json!({"type": "boolean"})),
+                        ],
+                    )
+                }),
+            )],
+        ),
         ToolId::WriteFile => object_schema(
             &["path", "content"],
             [
@@ -447,10 +470,13 @@ fn side_effect_for(tool: termior_security::gating::ToolId) -> SideEffectClass {
         | ToolId::CommandStatus
         | ToolId::CommandReadOutput
         | ToolId::CommandWait
-        | ToolId::GetTerminalContext => SideEffectClass::Read,
-        ToolId::WriteFile | ToolId::CreateDirectory | ToolId::Rename | ToolId::Delete => {
-            SideEffectClass::LocalWrite
-        }
+        | ToolId::GetTerminalContext
+        | ToolId::TodoRead => SideEffectClass::Read,
+        ToolId::WriteFile
+        | ToolId::CreateDirectory
+        | ToolId::Rename
+        | ToolId::Delete
+        | ToolId::TodoWrite => SideEffectClass::LocalWrite,
         ToolId::RunCommand
         | ToolId::ShellSessionRun
         | ToolId::ShellBgSpawn
@@ -495,7 +521,9 @@ fn idempotency_for(tool: termior_security::gating::ToolId) -> Idempotency {
         | ToolId::CommandWait
         | ToolId::GetTerminalContext
         | ToolId::WriteFile
-        | ToolId::CreateDirectory => Idempotency::Idempotent,
+        | ToolId::CreateDirectory
+        | ToolId::TodoRead
+        | ToolId::TodoWrite => Idempotency::Idempotent,
         ToolId::Rename
         | ToolId::Delete
         | ToolId::RunCommand
@@ -652,6 +680,8 @@ mod tests {
             "run_command",
             "get_terminal_context",
             "fs_grep",
+            "todo_read",
+            "todo_write",
         ] {
             assert!(names.contains(&expected), "missing {expected}");
         }

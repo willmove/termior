@@ -47,7 +47,7 @@ pub use agent::{Agent, AgentError, AgentOutcome, AgentState, MAX_AGENT_STEPS};
 pub use approval::{ApprovalDecision, ApprovalRequest};
 pub use composer::{
     snippet_query, Attachment, AttachmentSource, ComposerDraft, ComposerError, ComposerPayload,
-    Snippet, SnippetError, SnippetStore, TodoItem, TodoStore,
+    Snippet, SnippetError, SnippetStore, TodoDraft, TodoError, TodoItem, TodoStore, MAX_TODO_ITEMS,
 };
 pub use context::{TerminalContext, TerminalContextProvider};
 pub use evaluation::{
