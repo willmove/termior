@@ -18,10 +18,17 @@ use termior_ui::workspace_view::{self, OpenWorkspace, WorkspaceView};
 fn main() {
     let process_start = std::time::Instant::now();
     if std::env::var_os("TERMIOR_SSH_ASKPASS").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let prefer_software = workspace_view::load_settings().0.prefer_software_rendering;
+        termior_ui::gpu::prepare(prefer_software);
         termior_ui::ssh_askpass::run();
     }
     install_panic_log();
     let _ = env_logger::try_init();
+    // wgpu 会同时探测 Vulkan 和 GLES。无 DRM render node 的 Linux（虚拟机、
+    // 未加入 video/render 组）上，GLES/EGL 探测会打出 Mesa DRI2/ZINK 错误，
+    // 尽管 lavapipe Vulkan 仍能出窗。必须在创建 GPUI 实例之前设置。
+    let (preset, _, _) = workspace_view::load_settings();
+    termior_ui::gpu::prepare(preset.prefer_software_rendering);
     let smoke_test = std::env::var_os("TERMIOR_SMOKE_TEST").is_some();
     let nfr_measure = std::env::var_os("TERMIOR_NFR_MEASURE").is_some();
     // NFR-01 分阶段计时：从 main 入口起算（不含进程加载/动态链接，那部分由
@@ -37,7 +44,6 @@ fn main() {
     // 文件夹选择对话框可能在任何视图渲染前出现：先按持久化的语言设置
     //（缺省则系统语言）初始化 i18n，保证对话框文案跟随界面语言。
     // WorkspaceView::new 会用同一来源再初始化一次，幂等。
-    let (preset, _, _) = workspace_view::load_settings();
     termior_i18n::init(preset.language.as_deref());
     phase("settings");
     let markdown_preview_smoke_test =

@@ -15,6 +15,7 @@ mod background_image;
 mod composer_view;
 mod editor_view;
 mod git_views;
+pub mod gpu;
 mod ime_anchor;
 mod keystroke;
 mod markdown_preview_view;
