@@ -103,7 +103,8 @@ pub struct TerminalView {
     hovered_link: Option<String>,
     /// 左键按下位置，用于区分"点击打开链接"与"拖拽框选"。
     mouse_down_position: Option<Point<Pixels>>,
-    buffer_text: String,
+    /// NFR-02 键入回显探针状态（仅 nfr-run 驱动的测量模式使用）。
+    nfr_echo: NfrEchoProbe,
     text_style: TerminalTextStyle,
     cell_width: f32,
     line_height_px: f32,
@@ -240,6 +241,7 @@ impl TerminalView {
                     }
                     view.vte_processor.advance(&mut view.term, &bytes);
                     view.output_sequence = view.output_sequence.saturating_add(1);
+                    view.nfr_echo.observe_output();
                     let output_cursor = OutputCursor {
                         sequence: view.output_sequence,
                     };
@@ -325,7 +327,7 @@ impl TerminalView {
             link_spans: Vec::new(),
             hovered_link: None,
             mouse_down_position: None,
-            buffer_text: String::new(),
+            nfr_echo: NfrEchoProbe::default(),
             cell_width: text_style.font_size * 0.6 + text_style.letter_spacing,
             line_height_px,
             viewport_origin: Point::default(),
@@ -366,7 +368,30 @@ impl TerminalView {
     }
 
     pub fn recent_text(&self) -> String {
-        termior_ai::context::tail_lines(&self.buffer_text, 300)
+        // 按需从网格取尾部，而不是每帧 render 都预先拼好 300 行（NFR-03 热路径）。
+        terminal_buffer_tail_to_text(&self.term, 300)
+    }
+
+    /// 已收到过 PTY 输出（shell 已起来）。
+    pub fn has_output(&self) -> bool {
+        self.output_sequence > 0
+    }
+
+    /// NFR-02 探针：像用户键入一样写入 `bytes`，并开始计时到回显上屏。
+    pub fn nfr_echo_send(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_input(bytes)?;
+        self.nfr_echo.start();
+        Ok(())
+    }
+
+    /// 上一次探针键入是否还在等待回显上屏。
+    pub fn nfr_echo_pending(&self) -> bool {
+        self.nfr_echo.sent_at.is_some()
+    }
+
+    /// 已采集的回显延迟（ms）。
+    pub fn nfr_echo_samples(&self) -> &[f64] {
+        &self.nfr_echo.samples
     }
 
     pub fn recent_commands(&self) -> &[TerminalCommandRecord] {
@@ -940,12 +965,13 @@ impl Render for TerminalView {
         };
 
         // 提前把 renderable content 收集成 owned 数据，避免 'static paint 闭包借用 &self.term。
+        // render 在本帧 draw 内执行：回显输出已进网格、正在上屏，记为一次回显延迟。
+        self.nfr_echo.observe_render();
         let content = self.term.renderable_content();
         let snapshot: RenderSnapshot = collect_snapshot(content);
         let (snapshot_text, snapshot_rows) = snapshot_to_text(&snapshot);
         self.snapshot_text = snapshot_text;
         self.snapshot_rows = snapshot_rows;
-        self.buffer_text = terminal_buffer_tail_to_text(&self.term, 300);
         self.update_search();
         let search = self.search.clone();
         // 链接区间缓存到状态里，鼠标悬停/点击时按行列换算字节偏移命中。
@@ -1308,13 +1334,58 @@ struct RenderSnapshot {
 }
 
 /// Cell 的 owned 快照；保留组合字符和样式标志，避免把 VTE 网格降级为纯字符矩阵。
+///
+/// 基字符用 `char` 存，组合字符放 `zerowidth`（绝大多数 cell 为空，空 Vec 不分配），
+/// 这样逐帧收集可视区时不再为每个 cell 分配一个 `String`（NFR-03 热路径）。
 struct CellSnapshot {
-    text: String,
+    c: char,
+    zerowidth: Vec<char>,
     fg: VteColor,
     bg: VteColor,
     underline_color: Option<VteColor>,
     flags: Flags,
     selected: bool,
+}
+
+impl CellSnapshot {
+    /// 把 cell 的文本（基字符 + 组合字符）追加到 `out`。
+    fn push_text(&self, out: &mut String) {
+        out.push(self.c);
+        out.extend(self.zerowidth.iter());
+    }
+}
+
+/// NFR-02 键入回显延迟探针：键入写入 PTY → shell 回显输出进入网格 → 包含它的那一帧
+/// render。终点取在 render（本帧 draw 内）而非 present 之后，因此不含本帧剩余的
+/// paint/present 耗时；那部分由帧耗时 p99 指标覆盖。
+#[derive(Default)]
+struct NfrEchoProbe {
+    sent_at: Option<std::time::Instant>,
+    echoed: bool,
+    samples: Vec<f64>,
+}
+
+impl NfrEchoProbe {
+    fn start(&mut self) {
+        self.sent_at = Some(std::time::Instant::now());
+        self.echoed = false;
+    }
+
+    fn observe_output(&mut self) {
+        if self.sent_at.is_some() {
+            self.echoed = true;
+        }
+    }
+
+    fn observe_render(&mut self) {
+        if !self.echoed {
+            return;
+        }
+        self.echoed = false;
+        if let Some(sent_at) = self.sent_at.take() {
+            self.samples.push(sent_at.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
 }
 
 /// 光标快照。
@@ -1342,10 +1413,10 @@ fn collect_snapshot(content: RenderableContent<'_>) -> RenderSnapshot {
     let cells = display_iter
         .map(|indexed| {
             let cell = indexed.cell;
-            let mut text = String::from(cell.c);
-            if let Some(zerowidth) = cell.zerowidth() {
-                text.extend(zerowidth);
-            }
+            let zerowidth = cell
+                .zerowidth()
+                .map(|chars| chars.to_vec())
+                .unwrap_or_default();
             let selected = selection.as_ref().is_some_and(|selection| {
                 selection.contains_cell(&indexed, cursor_point, cursor_shape)
             });
@@ -1353,7 +1424,8 @@ fn collect_snapshot(content: RenderableContent<'_>) -> RenderSnapshot {
                 indexed.point.line.0 + display_offset.min(i32::MAX as usize) as i32,
                 indexed.point.column.0,
                 CellSnapshot {
-                    text,
+                    c: cell.c,
+                    zerowidth,
                     fg: cell.fg,
                     bg: cell.bg,
                     underline_color: cell.underline_color(),
@@ -1391,25 +1463,28 @@ struct SnapshotRow {
 fn snapshot_to_text(
     snapshot: &RenderSnapshot,
 ) -> (String, std::collections::BTreeMap<i32, SnapshotRow>) {
-    let mut rows = std::collections::BTreeMap::<i32, Vec<String>>::new();
+    // display_iter 按行、列升序产出 cell，故逐行直接拼接即可：列空洞补空格，
+    // 宽字符 spacer 不占文本。每行一个 String，而不是每个 cell 一个。
+    // 值为 (行文本, 下一个待写列)。
+    let mut rows = std::collections::BTreeMap::<i32, (String, usize)>::new();
     for (row, column, cell) in &snapshot.cells {
-        let line = rows.entry(*row).or_default();
-        if line.len() <= *column {
-            line.resize(*column + 1, " ".to_owned());
+        let (line, next_column) = rows.entry(*row).or_default();
+        if *column < *next_column {
+            continue;
         }
-        if cell
+        line.extend(std::iter::repeat(' ').take(*column - *next_column));
+        *next_column = *column + 1;
+        if !cell
             .flags
             .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
         {
-            line[*column].clear();
-        } else {
-            line[*column].clone_from(&cell.text);
+            cell.push_text(line);
         }
     }
     let mut text = String::new();
     let mut row_map = std::collections::BTreeMap::new();
-    for (row, line) in rows {
-        let line_text = line.concat().trim_end().to_owned();
+    for (row, (mut line_text, _)) in rows {
+        line_text.truncate(line_text.trim_end().len());
         if !text.is_empty() {
             text.push('\n');
         }
@@ -1533,40 +1608,31 @@ fn paint_terminal(
     };
     window.paint_quad(fill(total_bounds, default_bg));
 
-    // 2) 逐 cell：背景单独绘制；文本按连续同样式 run 合并。宽字符占两格，但它的
-    // spacer 不进入文本 run，组合字符则跟随主字符一起交给 shaping。
-    let mut cur_row: i32 = if let Some(first) = snapshot.cells.first() {
-        first.0
-    } else {
-        paint_cursor(&snapshot.cursor, palette, origin, lh, cw, window);
-        return;
-    };
+    // 2) 背景层：同一行里连续同色的非默认背景合并成一个 quad；文本 run 先收集，
+    //    等所有背景（含搜索高亮）画完再画。
+    //
+    // 绘制顺序必须是「全部背景 → 全部文字」：GPUI 按绘制先后与包围盒重叠决定层级，
+    // 背景若与文字交错绘制，后一个 cell 的背景会盖住前一个 cell 溢出的字形。宽字符
+    // （CJK）占两格但在自己那格就 flush，其右半边正好被 spacer cell 的背景盖住——
+    // 这就是带背景色的行（选区、Claude Code 输入框）里中文只剩左半边的原因。
+    let mut background = BackgroundRun::default();
+    let mut text_runs: Vec<PendingTextRun> = Vec::new();
     let mut run_text = String::new();
     let mut run_style: Option<CellTextStyle> = None;
     let mut run_start_col: usize = 0;
     let mut run_next_col: usize = 0;
+    let mut cur_row: i32 = snapshot.cells.first().map_or(0, |first| first.0);
 
     for (row, col, cell) in &snapshot.cells {
-        // 换行：flush 上一段
+        // 换行：结束上一行的背景段与文本段
         if *row != cur_row {
-            if let Some(style) = run_style.as_ref() {
-                flush_run(
-                    &mut run_text,
-                    style,
-                    run_start_col,
-                    cur_row,
-                    origin,
-                    lh,
-                    cw,
-                    text_style,
-                    window,
-                    cx,
-                );
+            background.flush(origin, lh, cw, window);
+            if let Some(style) = run_style.take() {
+                push_text_run(&mut text_runs, &mut run_text, style, run_start_col, cur_row);
             }
             cur_row = *row;
             run_start_col = *col;
             run_next_col = *col;
-            run_style = None;
         }
 
         let mut cell_bg = resolve_color(cell.bg, palette, &snapshot.colors);
@@ -1581,32 +1647,10 @@ fn paint_terminal(
             cell_fg = cell_fg.opacity(0.7);
         }
 
-        // 非默认背景：画 cell 背景块
         if cell_bg != default_bg {
-            let cb = Bounds {
-                origin: point(origin.x + px(*col as f32 * cw), origin.y + lh * *row as f32),
-                size: gpui::size(px(cw), lh),
-            };
-            window.paint_quad(fill(cb, cell_bg));
-        }
-
-        let search_line = (*row).max(0) as usize;
-        if let Some((hit_index, _)) = search
-            .hits
-            .iter()
-            .enumerate()
-            .find(|(_, hit)| hit.line == search_line && hit.char_range.contains(col))
-        {
-            let bounds = Bounds {
-                origin: point(origin.x + px(*col as f32 * cw), origin.y + lh * *row as f32),
-                size: gpui::size(px(cw), lh),
-            };
-            let color = if hit_index == search.current {
-                gpui::hsla(0.10, 0.85, 0.55, 0.75)
-            } else {
-                gpui::hsla(0.12, 0.70, 0.45, 0.45)
-            };
-            window.paint_quad(fill(bounds, color));
+            background.extend(*row, *col, cell_bg, origin, lh, cw, window);
+        } else {
+            background.flush(origin, lh, cw, window);
         }
 
         if cell
@@ -1658,87 +1702,120 @@ fn paint_terminal(
         };
         let append = !hidden && run_style.as_ref() == Some(&style) && *col == run_next_col;
         if !append {
-            if let Some(previous_style) = run_style.as_ref() {
-                flush_run(
+            if let Some(previous_style) = run_style.take() {
+                push_text_run(
+                    &mut text_runs,
                     &mut run_text,
                     previous_style,
                     run_start_col,
                     cur_row,
-                    origin,
-                    lh,
-                    cw,
-                    text_style,
-                    window,
-                    cx,
                 );
             }
             run_start_col = *col;
             run_style = (!hidden).then_some(style);
         }
         if !hidden {
-            run_text.push_str(&cell.text);
+            cell.push_text(&mut run_text);
         }
         run_next_col = col.saturating_add(cell_width);
         // 宽字符占两列，而 force_width 只会把下一个基字形吸附到 +1 个 cell 宽，
-        // 表达不了这个跨度；就地 flush，让后面的字符从自己的真实列重新锚定。
+        // 表达不了这个跨度；就地结束该 run，让后面的字符从自己的真实列重新锚定。
         if cell_width == 2 {
             if let Some(wide_style) = run_style.take() {
-                flush_run(
-                    &mut run_text,
-                    &wide_style,
-                    run_start_col,
-                    cur_row,
-                    origin,
-                    lh,
-                    cw,
-                    text_style,
-                    window,
-                    cx,
-                );
+                push_text_run(&mut text_runs, &mut run_text, wide_style, run_start_col, cur_row);
             }
         }
     }
-    if let Some(style) = run_style.as_ref() {
-        flush_run(
-            &mut run_text,
-            style,
-            run_start_col,
-            cur_row,
-            origin,
-            lh,
-            cw,
-            text_style,
-            window,
-            cx,
-        );
+    background.flush(origin, lh, cw, window);
+    if let Some(style) = run_style.take() {
+        push_text_run(&mut text_runs, &mut run_text, style, run_start_col, cur_row);
     }
 
-    // 3) 光标块
+    // 3) 搜索高亮：每个命中一个 quad（此前是逐 cell 线性扫描全部命中）。
+    //    仍在文字之下，保证高亮不遮字。
+    for (hit_index, hit) in search.hits.iter().enumerate() {
+        if hit.char_range.is_empty() {
+            continue;
+        }
+        let bounds = Bounds {
+            origin: point(
+                origin.x + px(hit.char_range.start as f32 * cw),
+                origin.y + lh * hit.line as f32,
+            ),
+            size: gpui::size(px(hit.char_range.len() as f32 * cw), lh),
+        };
+        let color = if hit_index == search.current {
+            gpui::hsla(0.10, 0.85, 0.55, 0.75)
+        } else {
+            gpui::hsla(0.12, 0.70, 0.45, 0.45)
+        };
+        window.paint_quad(fill(bounds, color));
+    }
+
+    // 4) 文字层
+    for run in text_runs {
+        paint_text_run(run, origin, lh, cw, text_style, window, cx);
+    }
+
+    // 5) 光标块
     paint_cursor(&snapshot.cursor, palette, origin, lh, cw, window);
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CellTextStyle {
-    fg: Hsla,
-    weight: FontWeight,
-    font_style: FontStyle,
-    underline: Option<UnderlineStyle>,
-    strikethrough: Option<StrikethroughStyle>,
+/// 同一行内连续、同色的非默认背景 cell 段；颜色或行变化、遇到默认背景时 flush。
+#[derive(Default)]
+struct BackgroundRun {
+    /// (行, 起始列, 下一列, 颜色)
+    current: Option<(i32, usize, usize, Hsla)>,
 }
 
-/// flush 一段同色文本：shape 成 ShapedLine 后 paint。
-#[allow(clippy::too_many_arguments)]
-fn flush_run(
-    text: &mut String,
-    style: &CellTextStyle,
+impl BackgroundRun {
+    #[allow(clippy::too_many_arguments)]
+    fn extend(
+        &mut self,
+        row: i32,
+        col: usize,
+        color: Hsla,
+        origin: Point<Pixels>,
+        lh: Pixels,
+        cw: f32,
+        window: &mut Window,
+    ) {
+        if let Some((run_row, _, next_col, run_color)) = self.current.as_mut() {
+            if *run_row == row && *next_col == col && *run_color == color {
+                *next_col = col + 1;
+                return;
+            }
+        }
+        self.flush(origin, lh, cw, window);
+        self.current = Some((row, col, col + 1, color));
+    }
+
+    fn flush(&mut self, origin: Point<Pixels>, lh: Pixels, cw: f32, window: &mut Window) {
+        if let Some((row, start, end, color)) = self.current.take() {
+            let bounds = Bounds {
+                origin: point(origin.x + px(start as f32 * cw), origin.y + lh * row as f32),
+                size: gpui::size(px((end - start) as f32 * cw), lh),
+            };
+            window.paint_quad(fill(bounds, color));
+        }
+    }
+}
+
+/// 已合并、待绘制的一段同样式文本。
+struct PendingTextRun {
+    text: String,
+    style: CellTextStyle,
     start_col: usize,
     row: i32,
-    origin: Point<Pixels>,
-    lh: Pixels,
-    cw: f32,
-    text_style: &TerminalTextStyle,
-    window: &mut Window,
-    cx: &mut App,
+}
+
+/// 结束当前文本 run：纯空白且无下划线/删除线的段不画（背景已由背景层负责）。
+fn push_text_run(
+    runs: &mut Vec<PendingTextRun>,
+    text: &mut String,
+    style: CellTextStyle,
+    start_col: usize,
+    row: i32,
 ) {
     if text.is_empty() {
         return;
@@ -1750,8 +1827,41 @@ fn flush_run(
         text.clear();
         return;
     }
+    runs.push(PendingTextRun {
+        text: std::mem::take(text),
+        style,
+        start_col,
+        row,
+    });
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CellTextStyle {
+    fg: Hsla,
+    weight: FontWeight,
+    font_style: FontStyle,
+    underline: Option<UnderlineStyle>,
+    strikethrough: Option<StrikethroughStyle>,
+}
+
+/// 画一段同样式文本：shape 成 ShapedLine 后 paint。
+fn paint_text_run(
+    run: PendingTextRun,
+    origin: Point<Pixels>,
+    lh: Pixels,
+    cw: f32,
+    text_style: &TerminalTextStyle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let PendingTextRun {
+        text,
+        style,
+        start_col,
+        row,
+    } = run;
     let len = text.len();
-    let shared = SharedString::from(std::mem::take(text));
+    let shared = SharedString::from(text);
     let run = TextRun {
         len,
         font: Font {
@@ -2399,7 +2509,9 @@ mod protocol_tests {
             .find(|(_, column, _)| *column == 2)
             .expect("combining cell")
             .2;
-        assert_eq!(combining.text, "e\u{301}");
+        let mut combining_text = String::new();
+        combining.push_text(&mut combining_text);
+        assert_eq!(combining_text, "e\u{301}");
         assert!(snapshot
             .cells
             .iter()

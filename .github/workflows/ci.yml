@@ -154,17 +154,36 @@ jobs:
             BIN=./target/release/termior.exe
           fi
           cargo build -p termior-bench --features run-harness --release --bins
-          ./target/release/nfr-run --binary "$BIN" --dwell-secs 6 > nfr-run-payload.json
+          # The app exits on its own after FPS + key-echo sampling; dwell is only the upper bound.
+          ./target/release/nfr-run --binary "$BIN" --dwell-secs 20 --echo-samples 40 > nfr-run-payload.json
           cat nfr-run-payload.json
           ./target/release/nfr-gate --platform ${{ matrix.platform }} \
             --payload nfr-run-payload.json \
             --baselines docs/baselines/nfr-baselines.json
+      - name: NFR process-level measurement on Linux (xvfb, record-only)
+        # GPUI needs a display: run under xvfb with Mesa's software Vulkan (lavapipe).
+        # No linux baseline is pinned yet, so nfr-gate only records these samples.
+        # Software rendering makes FPS/frame-time pessimistic; cold start and RSS are
+        # the useful numbers here. Kept non-blocking until the numbers are stable.
+        if: matrix.platform == 'linux'
+        continue-on-error: true
+        shell: bash
+        run: |
+          sudo apt-get install -y xvfb mesa-vulkan-drivers
+          cargo build -p termior-bench --features run-harness --release --bins
+          xvfb-run -a -s "-screen 0 1920x1080x24" \
+            ./target/release/nfr-run --binary ./target/release/termior --dwell-secs 20 --echo-samples 40 > nfr-run-payload.json
+          cat nfr-run-payload.json
+          ./target/release/nfr-gate --platform linux \
+            --payload nfr-run-payload.json \
+            --baselines docs/baselines/nfr-baselines.json
       - name: Upload NFR payload
-        if: matrix.platform == 'windows' || matrix.platform == 'macos'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: nfr-run-payload-${{ matrix.platform }}
           path: nfr-run-payload.json
+          if-no-files-found: ignore
 
   coverage:
     name: Core coverage ≥ 80%

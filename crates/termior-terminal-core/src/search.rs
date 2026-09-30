@@ -69,8 +69,10 @@ impl TerminalSearch {
 }
 
 pub fn find_hyperlinks(text: &str) -> Vec<Range<usize>> {
-    let regex = Regex::new(r#"https?://[^\s<>\"'`]+"#).expect("static hyperlink regex");
-    regex
+    // 终端每帧 render 都会调用：正则只编译一次。
+    static REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    REGEX
+        .get_or_init(|| Regex::new(r#"https?://[^\s<>\"'`]+"#).expect("static hyperlink regex"))
         .find_iter(text)
         .map(|matched| {
             let trimmed = matched

@@ -16,23 +16,39 @@ use std::{ffi::OsString, io::Write as _, path::PathBuf};
 use termior_ui::workspace_view::{self, OpenWorkspace, WorkspaceView};
 
 fn main() {
+    let process_start = std::time::Instant::now();
     if std::env::var_os("TERMIOR_SSH_ASKPASS").as_deref() == Some(std::ffi::OsStr::new("1")) {
         termior_ui::ssh_askpass::run();
     }
     install_panic_log();
     let _ = env_logger::try_init();
     let smoke_test = std::env::var_os("TERMIOR_SMOKE_TEST").is_some();
+    let nfr_measure = std::env::var_os("TERMIOR_NFR_MEASURE").is_some();
+    // NFR-01 分阶段计时：从 main 入口起算（不含进程加载/动态链接，那部分由
+    // harness 的「spawn → 首帧」总时长覆盖），用于定位冷启动耗时花在哪一段。
+    let phase = move |name: &str| {
+        if nfr_measure {
+            termior_ui::nfr::emit(&format!(
+                "TERMIOR_NFR_PHASE {name}={:.1}",
+                process_start.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
+    };
     // 文件夹选择对话框可能在任何视图渲染前出现：先按持久化的语言设置
     //（缺省则系统语言）初始化 i18n，保证对话框文案跟随界面语言。
     // WorkspaceView::new 会用同一来源再初始化一次，幂等。
     let (preset, _, _) = workspace_view::load_settings();
     termior_i18n::init(preset.language.as_deref());
+    phase("settings");
     let markdown_preview_smoke_test =
         std::env::var_os("TERMIOR_MARKDOWN_PREVIEW_SMOKE_TEST").is_some();
     let settings_close_smoke_test = std::env::var_os("TERMIOR_SETTINGS_CLOSE_SMOKE_TEST").is_some();
     let split_pane_smoke_test = std::env::var_os("TERMIOR_SPLIT_PANE_SMOKE").is_some();
     let open_settings = std::env::var_os("TERMIOR_OPEN_SETTINGS").is_some();
-    let nfr_measure = std::env::var_os("TERMIOR_NFR_MEASURE").is_some();
+    let nfr_echo_samples = std::env::var("TERMIOR_NFR_ECHO_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|samples| *samples > 0);
     let shell_picker_smoke = std::env::var_os("TERMIOR_SHELL_PICKER_SMOKE").is_some();
     let idle_redraw_probe_secs = std::env::var("TERMIOR_IDLE_REDRAW_PROBE")
         .ok()
@@ -44,13 +60,16 @@ fn main() {
         || nfr_measure
         || idle_redraw_probe_secs.is_some();
     let root = resolve_workspace_root(headless);
+    phase("workspace_root");
     application()
         .with_assets(termior_ui_kit::IconAssets)
         .run(move |cx: &mut App| {
+            phase("app_init");
             // 必须在建窗前解析：GPUI 找不到 family 时会静默回退到比例字体，
             // 终端网格宽和字形 advance 就会对不上（见 monospace_font 模块注释）。
             let text_system = cx.text_system().clone();
             termior_ui::monospace_font::init_default(&text_system);
+            phase("fonts");
             let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);
             let open_result = cx.open_window(
                 termior_ui::app_identity::main_window_options(WindowBounds::Windowed(bounds)),
@@ -59,8 +78,10 @@ fn main() {
                         window.appearance(),
                         WindowAppearance::Dark | WindowAppearance::VibrantDark
                     );
+                    phase("window_created");
                     let workspace: Entity<WorkspaceView> =
                         cx.new(|cx| WorkspaceView::new(root.clone(), system_is_dark, cx));
+                    phase("workspace_view");
                     workspace.update(cx, |workspace, cx| {
                         workspace.restore_or_create_runtime(window, cx);
                         workspace.start_background_services(cx);
@@ -68,6 +89,7 @@ fn main() {
                             workspace.start_markdown_preview_smoke(window, cx);
                         }
                     });
+                    phase("runtime_restored");
                     if settings_close_smoke_test {
                         workspace.update(cx, |workspace, cx| {
                             workspace.start_settings_close_smoke(cx);
@@ -101,7 +123,7 @@ fn main() {
                         });
                     }
                     if nfr_measure {
-                        schedule_nfr_measurement(window);
+                        schedule_nfr_measurement(window, workspace.clone(), nfr_echo_samples);
                     }
                     workspace
                 },
@@ -125,69 +147,130 @@ fn main() {
 /// NFR 测量模式（`TERMIOR_NFR_MEASURE=1`，由 `termior-bench` 的 `nfr-run` 驱动）。
 ///
 /// 协议（stdout 行，供 harness 采集）：
-/// - 第一帧渲染时打印 `TERMIOR_NFR_FIRST_FRAME` → 冷启动终点（NFR-01）。
-/// - 之后采样 `NFR_FPS_SAMPLE_SECS` 秒帧数，打印 `TERMIOR_NFR_FPS=NN` → 稳态帧率
-///   （NFR-03），随后 `cx.quit()` 退出。RSS 由 harness 用 sysinfo 旁路采集（NFR-04）。
+/// - `TERMIOR_NFR_PHASE name=ms`：冷启动各阶段相对 main 入口的时间戳（NFR-01 定位用）。
+/// - `TERMIOR_NFR_FIRST_FRAME`：首帧**上屏之后**打印 → 冷启动终点（NFR-01）。
+///   GPUI 的 next-frame 回调在同一 tick 的 draw 之前执行，所以在第二次回调里打印，
+///   才能保证第一帧已经 draw + present（最多多计一个刷新间隔，偏保守）。
+/// - `TERMIOR_NFR_FPS=NN` / `TERMIOR_NFR_FRAME_P99_MS=NN.N`：采样期间**每个 tick 都强制
+///   整窗重绘**（`window.refresh()` 绕过视图缓存），统计真实 draw 的帧率与帧间隔 p99
+///   （NFR-03）。只数 next-frame 回调而不重绘，量到的是显示器刷新节拍而非渲染开销——
+///   空闲零重绘下根本没有帧被画出来。
+/// - `TERMIOR_NFR_WINDOW_ACTIVE=0|1`：GPUI 对非前台窗口把帧间隔限到 ~33ms，
+///   CI 上窗口拿不到前台时帧率上限约 30fps，据此判读。
+/// - 可选 `TERMIOR_NFR_ECHO_P99_MS`：`TERMIOR_NFR_ECHO_SAMPLES=N` 时帧率采样后接着跑
+///   键入回显探针（NFR-02），由 workspace 打印结果并退出；否则直接 `cx.quit()`。
 ///
-/// 这是冒烟测试（`schedule_smoke_exit`）的性能采样对偶：smoke 验「能启动」，
-/// NFR 量「有多快/多重」。绝对值依赖硬件，门禁只看相对基线回归（见 docs/nfr-baselines.md）。
+/// RSS 由 harness 用 sysinfo 旁路采集（NFR-04）。绝对值依赖硬件，门禁只看相对基线
+/// 回归（见 docs/nfr-baselines.md）。
 ///
 /// `on_next_frame` 只在注册的下一帧触发一次；要持续采样就用共享状态自重注册。
-fn schedule_nfr_measurement(window: &mut Window) {
+fn schedule_nfr_measurement(
+    window: &mut Window,
+    workspace: Entity<WorkspaceView>,
+    echo_samples: Option<usize>,
+) {
     let state = std::rc::Rc::new(std::cell::RefCell::new(NfrFrameState::start()));
-    nfr_next_frame(window, state);
+    nfr_next_frame(window, state, workspace, echo_samples);
 }
 
-fn nfr_next_frame(window: &mut Window, state: std::rc::Rc<std::cell::RefCell<NfrFrameState>>) {
+fn nfr_next_frame(
+    window: &mut Window,
+    state: std::rc::Rc<std::cell::RefCell<NfrFrameState>>,
+    workspace: Entity<WorkspaceView>,
+    echo_samples: Option<usize>,
+) {
     window.on_next_frame(move |window, cx| {
-        let action = state.borrow_mut().on_frame();
+        let action = state
+            .borrow_mut()
+            .on_frame(std::time::Instant::now(), window.is_window_active());
         match action {
-            NfrAction::Continue => nfr_next_frame(window, state),
-            NfrAction::Quit => cx.quit(),
+            NfrAction::Continue { redraw } => {
+                if redraw {
+                    window.refresh();
+                }
+                nfr_next_frame(window, state, workspace, echo_samples);
+            }
+            NfrAction::Done => match echo_samples {
+                Some(samples) => workspace.update(cx, |workspace, cx| {
+                    workspace.start_nfr_echo_probe(samples, cx);
+                }),
+                None => cx.quit(),
+            },
         }
     });
 }
 
 const NFR_FPS_SAMPLE_SECS: f64 = 1.5;
 
-struct NfrFrameState {
-    first_frame_done: bool,
-    sample_start: Option<std::time::Instant>,
-    frame_count: u32,
+enum NfrPhase {
+    /// 等待第一次回调（其后本 tick 画出首帧）。
+    AwaitFirstDraw,
+    /// 首帧已 draw；下一次回调时它已上屏。
+    AwaitFirstPresent,
+    /// 强制重绘采样中。
+    Sampling {
+        start: std::time::Instant,
+        last: std::time::Instant,
+    },
 }
 
+struct NfrFrameState {
+    phase: NfrPhase,
+    intervals_ms: Vec<f64>,
+    window_active: bool,
+}
+
+#[derive(Debug, PartialEq)]
 enum NfrAction {
-    Continue,
-    Quit,
+    Continue { redraw: bool },
+    Done,
 }
 
 impl NfrFrameState {
     fn start() -> Self {
         Self {
-            first_frame_done: false,
-            sample_start: None,
-            frame_count: 0,
+            phase: NfrPhase::AwaitFirstDraw,
+            intervals_ms: Vec::new(),
+            window_active: true,
         }
     }
 
-    fn on_frame(&mut self) -> NfrAction {
-        if !self.first_frame_done {
-            self.first_frame_done = true;
-            println!("TERMIOR_NFR_FIRST_FRAME");
-            // 从下一帧开始计 FPS 采样窗口，避免把首帧的冷路径计入稳态。
-            self.sample_start = Some(std::time::Instant::now());
-            return NfrAction::Continue;
-        }
-        self.frame_count += 1;
-        if let Some(start) = self.sample_start {
-            let elapsed = start.elapsed().as_secs_f64();
-            if elapsed >= NFR_FPS_SAMPLE_SECS {
-                let fps = (self.frame_count as f64 / elapsed).round();
-                println!("TERMIOR_NFR_FPS={fps:.0}");
-                return NfrAction::Quit;
+    fn on_frame(&mut self, now: std::time::Instant, window_active: bool) -> NfrAction {
+        match self.phase {
+            NfrPhase::AwaitFirstDraw => {
+                self.phase = NfrPhase::AwaitFirstPresent;
+                NfrAction::Continue { redraw: false }
+            }
+            NfrPhase::AwaitFirstPresent => {
+                termior_ui::nfr::emit("TERMIOR_NFR_FIRST_FRAME");
+                // 从这里开始计采样窗口，避免把首帧冷路径计入稳态。
+                self.phase = NfrPhase::Sampling {
+                    start: now,
+                    last: now,
+                };
+                NfrAction::Continue { redraw: true }
+            }
+            NfrPhase::Sampling { start, last } => {
+                self.intervals_ms
+                    .push(now.duration_since(last).as_secs_f64() * 1000.0);
+                self.window_active &= window_active;
+                self.phase = NfrPhase::Sampling { start, last: now };
+                let elapsed = now.duration_since(start).as_secs_f64();
+                if elapsed < NFR_FPS_SAMPLE_SECS {
+                    return NfrAction::Continue { redraw: true };
+                }
+                let fps = (self.intervals_ms.len() as f64 / elapsed).round();
+                termior_ui::nfr::emit(&format!("TERMIOR_NFR_FPS={fps:.0}"));
+                if let Some(p99) = termior_ui::nfr::percentile(&self.intervals_ms, 0.99) {
+                    termior_ui::nfr::emit(&format!("TERMIOR_NFR_FRAME_P99_MS={p99:.1}"));
+                }
+                termior_ui::nfr::emit(&format!(
+                    "TERMIOR_NFR_WINDOW_ACTIVE={}",
+                    u8::from(self.window_active)
+                ));
+                NfrAction::Done
             }
         }
-        NfrAction::Continue
     }
 }
 
@@ -325,6 +408,34 @@ mod tests {
             workspace_from_args([OsString::from("demo")]),
             Some(PathBuf::from("demo"))
         );
+    }
+
+    #[test]
+    fn nfr_first_frame_waits_for_present_and_sampling_forces_redraw() {
+        use std::time::{Duration, Instant};
+        let mut state = NfrFrameState::start();
+        let t0 = Instant::now();
+        // 第一次回调：首帧还没 draw，不打点也不强制重绘。
+        assert_eq!(
+            state.on_frame(t0, true),
+            NfrAction::Continue { redraw: false }
+        );
+        // 第二次回调：首帧已上屏，开始强制重绘采样。
+        assert_eq!(
+            state.on_frame(t0 + Duration::from_millis(16), true),
+            NfrAction::Continue { redraw: true }
+        );
+        let mut now = t0 + Duration::from_millis(16);
+        let mut action = NfrAction::Continue { redraw: true };
+        while action != NfrAction::Done {
+            now += Duration::from_millis(20);
+            action = state.on_frame(now, false);
+        }
+        assert!(!state.window_active);
+        assert!(state
+            .intervals_ms
+            .iter()
+            .all(|interval| (*interval - 20.0).abs() < 0.5));
     }
 
     #[test]

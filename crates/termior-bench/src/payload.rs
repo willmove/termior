@@ -30,8 +30,8 @@ impl PtyThroughputPayload {
     }
 }
 
-/// 一次进程级 harness 运行的载荷（冷启动 / RSS / 帧率）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// 一次进程级 harness 运行的载荷（冷启动 / RSS / 帧率 / 帧耗时 / 键入回显）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RunPayload {
     /// 冷启动耗时（ms）。首帧可交互到进程启动。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -39,9 +39,22 @@ pub struct RunPayload {
     /// 常驻 RSS（MiB）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rss_mib: Option<f64>,
-    /// 稳态帧率（fps）。
+    /// 稳态帧率（fps），采样期间每帧强制整窗重绘。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fps: Option<f64>,
+    /// 强制重绘下的帧间隔 p99（ms）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_p99_ms: Option<f64>,
+    /// 键入回显延迟 p99（ms）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub echo_p99_ms: Option<f64>,
+    /// 采样期间窗口是否一直处于前台。`false` 时 GPUI 把帧间隔限到 ~33ms，
+    /// 帧率上限约 30fps——判读帧率前先看这一项。仅供判读，不进门禁。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_active: Option<bool>,
+    /// 冷启动分阶段时间戳（相对 main 入口，ms）。仅供定位，不进门禁。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub phases_ms: std::collections::BTreeMap<String, f64>,
 }
 
 impl RunPayload {
@@ -56,6 +69,12 @@ impl RunPayload {
         }
         if let Some(v) = self.fps {
             out.push(Sample::new(MetricKind::Fps, platform, scenario, v));
+        }
+        if let Some(v) = self.frame_p99_ms {
+            out.push(Sample::new(MetricKind::FrameP99Ms, platform, scenario, v));
+        }
+        if let Some(v) = self.echo_p99_ms {
+            out.push(Sample::new(MetricKind::EchoP99Ms, platform, scenario, v));
         }
         out
     }

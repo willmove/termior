@@ -174,9 +174,15 @@ fn payload_run_expands_to_samples() {
         cold_start_ms: Some(800.0),
         rss_mib: Some(140.0),
         fps: Some(59.0),
+        frame_p99_ms: Some(18.0),
+        echo_p99_ms: Some(12.0),
+        window_active: Some(true),
+        phases_ms: [("fonts".to_owned(), 40.0)].into_iter().collect(),
     };
     let samples = run.to_samples("windows", "typical");
-    assert_eq!(samples.len(), 3);
+    assert_eq!(samples.len(), 5);
+    assert!(samples.iter().any(|s| s.kind == MetricKind::FrameP99Ms));
+    assert!(samples.iter().any(|s| s.kind == MetricKind::EchoP99Ms));
     assert!(samples.iter().any(|s| s.kind == MetricKind::ColdStartMs));
     assert!(samples.iter().any(|s| s.kind == MetricKind::RssMiB));
     assert!(samples.iter().any(|s| s.kind == MetricKind::Fps));
@@ -210,6 +216,7 @@ fn harness_report_parse_and_expand() {
                 cold_start_ms: Some(700.0),
                 rss_mib: None,
                 fps: Some(60.0),
+                ..Default::default()
             }),
         ],
     };

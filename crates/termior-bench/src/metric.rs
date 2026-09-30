@@ -24,13 +24,22 @@ pub enum MetricKind {
     /// PTY/VTE 吞吐（NFR-02）：单位 MiB/s（渲染跟上速率）。
     #[serde(rename = "pty_throughput_mibps")]
     PtyThroughputMiBps,
+    /// 强制重绘下的帧间隔 p99（NFR-03）：单位毫秒。60fps 对应 ≈16.7ms。
+    #[serde(rename = "frame_p99_ms")]
+    FrameP99Ms,
+    /// 键入回显延迟 p99（NFR-02）：键入写入 PTY → 回显进入的那一帧 render，单位毫秒。
+    #[serde(rename = "echo_p99_ms")]
+    EchoP99Ms,
 }
 
 impl MetricKind {
     /// 该指标「越小越好」还是「越大越好」，决定回归方向（[`crate::compare`]）。
     pub fn lower_is_better(self) -> bool {
         match self {
-            MetricKind::ColdStartMs | MetricKind::RssMiB => true,
+            MetricKind::ColdStartMs
+            | MetricKind::RssMiB
+            | MetricKind::FrameP99Ms
+            | MetricKind::EchoP99Ms => true,
             MetricKind::Fps | MetricKind::PtyThroughputMiBps => false,
         }
     }
@@ -38,7 +47,7 @@ impl MetricKind {
     /// 展示用的单位标签。
     pub fn unit(self) -> &'static str {
         match self {
-            MetricKind::ColdStartMs => "ms",
+            MetricKind::ColdStartMs | MetricKind::FrameP99Ms | MetricKind::EchoP99Ms => "ms",
             MetricKind::RssMiB => "MiB",
             MetricKind::Fps => "fps",
             MetricKind::PtyThroughputMiBps => "MiB/s",

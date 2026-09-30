@@ -748,6 +748,80 @@ impl WorkspaceView {
         }));
     }
 
+    /// NFR-02 键入回显 p99 探针（`TERMIOR_NFR_MEASURE` 模式，由 `nfr-run` 驱动）。
+    ///
+    /// 等活动终端的 shell 起来后，交替键入 `x` / Backspace（行内容不增长），每次等回显
+    /// 上屏再发下一次；结束后打印 `TERMIOR_NFR_ECHO_P99_MS=NN.N` 并退出应用。
+    /// 普通启动永远不会调用。
+    pub fn start_nfr_echo_probe(&self, samples: usize, cx: &mut Context<Self>) {
+        cx.spawn(async move |workspace, cx| {
+            let mut terminal = None;
+            // shell 冷启动（尤其 Windows PowerShell 加载 profile）可能要数秒，最多等 8s。
+            for _ in 0..80 {
+                terminal = workspace
+                    .update(cx, |workspace, cx| {
+                        workspace
+                            .active_terminal()
+                            .filter(|terminal| terminal.read(cx).has_output())
+                            .map(|terminal| terminal.downgrade())
+                    })
+                    .ok()
+                    .flatten();
+                if terminal.is_some() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+            }
+            let Some(terminal) = terminal else {
+                crate::nfr::emit("TERMIOR_NFR_ECHO_UNAVAILABLE");
+                cx.update(|cx| cx.quit());
+                return;
+            };
+            // 等提示符输出落定，避免把 shell 启动期的输出误记为回显。
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            for index in 0..samples {
+                let key: &[u8] = if index % 2 == 0 { b"x" } else { b"\x7f" };
+                let sent = terminal
+                    .update(cx, |terminal, _| terminal.nfr_echo_send(key).is_ok())
+                    .unwrap_or(false);
+                if !sent {
+                    break;
+                }
+                // 单次最多等 500ms；超时的样本不计入（shell 没回显不是渲染延迟）。
+                for _ in 0..100 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(5))
+                        .await;
+                    let pending = terminal
+                        .read_with(cx, |terminal, _| terminal.nfr_echo_pending())
+                        .unwrap_or(false);
+                    if !pending {
+                        break;
+                    }
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(30))
+                    .await;
+            }
+            let samples = terminal
+                .read_with(cx, |terminal, _| terminal.nfr_echo_samples().to_vec())
+                .unwrap_or_default();
+            match crate::nfr::percentile(&samples, 0.99) {
+                Some(p99) => crate::nfr::emit(&format!(
+                    "TERMIOR_NFR_ECHO_P99_MS={p99:.1} samples={}",
+                    samples.len()
+                )),
+                None => crate::nfr::emit("TERMIOR_NFR_ECHO_UNAVAILABLE"),
+            }
+            cx.update(|cx| cx.quit());
+        })
+        .detach();
+    }
+
     /// Opens the settings window then closes it via the same `remove_window` path as the
     /// title-bar close button, so CI / local smoke can assert no `window not found` log.
     /// Used by `scripts/settings-close-smoke.ps1`; normal launches never call this method.
