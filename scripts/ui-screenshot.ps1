@@ -14,6 +14,7 @@
     ./scripts/ui-screenshot.ps1 -ShellPicker
     ./scripts/ui-screenshot.ps1 -Settings -SettingsSize 780x420
     ./scripts/ui-screenshot.ps1 -SshManager
+    ./scripts/ui-screenshot.ps1 -Shell scripts/fixtures/terminal-cjk-background.cmd -Label cjk
 #>
 param(
     # Prefix for the output file names, e.g. "before" -> before-main.png.
@@ -34,6 +35,11 @@ param(
     # Seed terminal.shell_prompt and capture an extra shot with the new-terminal
     # shell picker open (Ctrl+T): <Label>-shell-picker.png.
     [switch]$ShellPicker,
+    # Seed terminal.shell_detection = manual with this program, so the first terminal runs
+    # a fixture (e.g. a .cmd that prints styled text) instead of the user's shell.
+    [string]$Shell = "",
+    # Termior executable to launch; defaults to target\debug\termior.exe.
+    [string]$Binary = "",
     [int]$TimeoutSeconds = 30
 )
 
@@ -148,7 +154,8 @@ function Save-WindowShot([IntPtr]$handle, [string]$path) {
 
 & cargo build -p termior --quiet
 if ($LASTEXITCODE -ne 0) { throw "Could not build the Termior desktop binary" }
-$binary = (Resolve-Path (Join-Path $repoRoot "target\debug\termior.exe")).Path
+if (-not $Binary) { $Binary = Join-Path $repoRoot "target\debug\termior.exe" }
+$binary = (Resolve-Path $Binary).Path
 
 $shotDir = Join-Path $repoRoot "target\ui-shots"
 [void](New-Item -ItemType Directory -Force -Path $shotDir)
@@ -170,8 +177,13 @@ $seed = @{
     dark_theme_id    = $darkTheme
     editor_theme_id  = 'default'
 }
-if ($ShellPicker) { $seed.terminal = @{ shell_prompt = $true } }
-$settingsJson = $seed | ConvertTo-Json
+$terminalSeed = @{}
+if ($ShellPicker) { $terminalSeed.shell_prompt = $true }
+if ($Shell) {
+    $terminalSeed.shell_detection = @{ manual = @{ path = (Resolve-Path $Shell).Path } }
+}
+if ($terminalSeed.Count -gt 0) { $seed.terminal = $terminalSeed }
+$settingsJson = $seed | ConvertTo-Json -Depth 5
 [System.IO.File]::WriteAllText((Join-Path $dataDir "Termior-settings.json"), $settingsJson)
 
 if ($SshManager) {

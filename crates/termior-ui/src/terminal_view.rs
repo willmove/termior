@@ -1608,14 +1608,78 @@ fn paint_terminal(
     };
     window.paint_quad(fill(total_bounds, default_bg));
 
-    // 2) 背景层：同一行里连续同色的非默认背景合并成一个 quad；文本 run 先收集，
-    //    等所有背景（含搜索高亮）画完再画。
-    //
-    // 绘制顺序必须是「全部背景 → 全部文字」：GPUI 按绘制先后与包围盒重叠决定层级，
-    // 背景若与文字交错绘制，后一个 cell 的背景会盖住前一个 cell 溢出的字形。宽字符
-    // （CJK）占两格但在自己那格就 flush，其右半边正好被 spacer cell 的背景盖住——
-    // 这就是带背景色的行（选区、Claude Code 输入框）里中文只剩左半边的原因。
-    let mut background = BackgroundRun::default();
+    // 绘制顺序必须是「全部背景 → 搜索高亮 → 全部文字 → 光标」：GPUI 按绘制先后与
+    // 包围盒重叠决定层级，背景若与文字交错绘制，后一个 cell 的背景会盖住前一个 cell
+    // 溢出的字形。宽字符（CJK）占两格却在自己那格就结束 run，其右半边正好被随后
+    // spacer cell 的背景盖住——带背景色的行（选区、Claude Code 输入框）里中文因此只剩
+    // 左半边。plan 把背景与文字分成两张表，顺序由结构保证，而不是靠循环里的时机。
+    let plan = plan_terminal_paint(snapshot, palette, default_bg);
+
+    // 2) 背景层（同行连续同色已合并）
+    for quad in &plan.backgrounds {
+        let bounds = Bounds {
+            origin: point(
+                origin.x + px(quad.start_col as f32 * cw),
+                origin.y + lh * quad.row as f32,
+            ),
+            size: gpui::size(px((quad.end_col - quad.start_col) as f32 * cw), lh),
+        };
+        window.paint_quad(fill(bounds, quad.color));
+    }
+
+    // 3) 搜索高亮：每个命中一个 quad（此前是逐 cell 线性扫描全部命中）。
+    //    仍在文字之下，保证高亮不遮字。
+    for (hit_index, hit) in search.hits.iter().enumerate() {
+        if hit.char_range.is_empty() {
+            continue;
+        }
+        let bounds = Bounds {
+            origin: point(
+                origin.x + px(hit.char_range.start as f32 * cw),
+                origin.y + lh * hit.line as f32,
+            ),
+            size: gpui::size(px(hit.char_range.len() as f32 * cw), lh),
+        };
+        let color = if hit_index == search.current {
+            gpui::hsla(0.10, 0.85, 0.55, 0.75)
+        } else {
+            gpui::hsla(0.12, 0.70, 0.45, 0.45)
+        };
+        window.paint_quad(fill(bounds, color));
+    }
+
+    // 4) 文字层
+    for run in plan.text_runs {
+        paint_text_run(run, origin, lh, cw, text_style, window, cx);
+    }
+
+    // 5) 光标块
+    paint_cursor(&snapshot.cursor, palette, origin, lh, cw, window);
+}
+
+/// 一帧终端内容的绘制计划：背景与文字分表，由 [`paint_terminal`] 先画完全部背景再画文字。
+struct TerminalPaintPlan {
+    backgrounds: Vec<BackgroundQuad>,
+    text_runs: Vec<PendingTextRun>,
+}
+
+/// 同一行内连续、同色的非默认背景段，列区间左闭右开。
+#[derive(Debug, Clone, PartialEq)]
+struct BackgroundQuad {
+    row: i32,
+    start_col: usize,
+    end_col: usize,
+    color: Hsla,
+}
+
+/// 纯函数：把快照拆成合并后的背景段与同样式文本 run（不依赖窗口，可单测）。
+fn plan_terminal_paint(
+    snapshot: &RenderSnapshot,
+    palette: &ResolvedPalette,
+    default_bg: Hsla,
+) -> TerminalPaintPlan {
+    let mut backgrounds: Vec<BackgroundQuad> = Vec::new();
+    let mut background: Option<BackgroundQuad> = None;
     let mut text_runs: Vec<PendingTextRun> = Vec::new();
     let mut run_text = String::new();
     let mut run_style: Option<CellTextStyle> = None;
@@ -1626,7 +1690,7 @@ fn paint_terminal(
     for (row, col, cell) in &snapshot.cells {
         // 换行：结束上一行的背景段与文本段
         if *row != cur_row {
-            background.flush(origin, lh, cw, window);
+            backgrounds.extend(background.take());
             if let Some(style) = run_style.take() {
                 push_text_run(&mut text_runs, &mut run_text, style, run_start_col, cur_row);
             }
@@ -1647,10 +1711,23 @@ fn paint_terminal(
             cell_fg = cell_fg.opacity(0.7);
         }
 
-        if cell_bg != default_bg {
-            background.extend(*row, *col, cell_bg, origin, lh, cw, window);
+        if cell_bg == default_bg {
+            backgrounds.extend(background.take());
         } else {
-            background.flush(origin, lh, cw, window);
+            match background.as_mut() {
+                Some(quad) if quad.end_col == *col && quad.color == cell_bg => {
+                    quad.end_col = col + 1;
+                }
+                _ => {
+                    backgrounds.extend(background.take());
+                    background = Some(BackgroundQuad {
+                        row: *row,
+                        start_col: *col,
+                        end_col: col + 1,
+                        color: cell_bg,
+                    });
+                }
+            }
         }
 
         if cell
@@ -1726,81 +1803,15 @@ fn paint_terminal(
             }
         }
     }
-    background.flush(origin, lh, cw, window);
+    backgrounds.extend(background.take());
     if let Some(style) = run_style.take() {
         push_text_run(&mut text_runs, &mut run_text, style, run_start_col, cur_row);
     }
-
-    // 3) 搜索高亮：每个命中一个 quad（此前是逐 cell 线性扫描全部命中）。
-    //    仍在文字之下，保证高亮不遮字。
-    for (hit_index, hit) in search.hits.iter().enumerate() {
-        if hit.char_range.is_empty() {
-            continue;
-        }
-        let bounds = Bounds {
-            origin: point(
-                origin.x + px(hit.char_range.start as f32 * cw),
-                origin.y + lh * hit.line as f32,
-            ),
-            size: gpui::size(px(hit.char_range.len() as f32 * cw), lh),
-        };
-        let color = if hit_index == search.current {
-            gpui::hsla(0.10, 0.85, 0.55, 0.75)
-        } else {
-            gpui::hsla(0.12, 0.70, 0.45, 0.45)
-        };
-        window.paint_quad(fill(bounds, color));
-    }
-
-    // 4) 文字层
-    for run in text_runs {
-        paint_text_run(run, origin, lh, cw, text_style, window, cx);
-    }
-
-    // 5) 光标块
-    paint_cursor(&snapshot.cursor, palette, origin, lh, cw, window);
-}
-
-/// 同一行内连续、同色的非默认背景 cell 段；颜色或行变化、遇到默认背景时 flush。
-#[derive(Default)]
-struct BackgroundRun {
-    /// (行, 起始列, 下一列, 颜色)
-    current: Option<(i32, usize, usize, Hsla)>,
-}
-
-impl BackgroundRun {
-    #[allow(clippy::too_many_arguments)]
-    fn extend(
-        &mut self,
-        row: i32,
-        col: usize,
-        color: Hsla,
-        origin: Point<Pixels>,
-        lh: Pixels,
-        cw: f32,
-        window: &mut Window,
-    ) {
-        if let Some((run_row, _, next_col, run_color)) = self.current.as_mut() {
-            if *run_row == row && *next_col == col && *run_color == color {
-                *next_col = col + 1;
-                return;
-            }
-        }
-        self.flush(origin, lh, cw, window);
-        self.current = Some((row, col, col + 1, color));
-    }
-
-    fn flush(&mut self, origin: Point<Pixels>, lh: Pixels, cw: f32, window: &mut Window) {
-        if let Some((row, start, end, color)) = self.current.take() {
-            let bounds = Bounds {
-                origin: point(origin.x + px(start as f32 * cw), origin.y + lh * row as f32),
-                size: gpui::size(px((end - start) as f32 * cw), lh),
-            };
-            window.paint_quad(fill(bounds, color));
-        }
+    TerminalPaintPlan {
+        backgrounds,
+        text_runs,
     }
 }
-
 /// 已合并、待绘制的一段同样式文本。
 struct PendingTextRun {
     text: String,
@@ -2526,6 +2537,57 @@ mod protocol_tests {
             .any(|(_, _, cell)| cell.flags.contains(Flags::INVERSE)));
         let text = snapshot_to_text(&snapshot).0;
         assert!(text.starts_with("中e\u{301}IUR"), "snapshot text: {text:?}");
+    }
+
+    fn plan_for(input: &str, columns: usize) -> TerminalPaintPlan {
+        let term = parsed_term(input, columns, 2);
+        let snapshot = collect_snapshot(term.renderable_content());
+        let palette = termior_theme::builtin_themes()[0].palette().clone();
+        let default_bg = theme_color_to_hsla(palette.background);
+        plan_terminal_paint(&snapshot, &palette, default_bg)
+    }
+
+    /// 回归：带背景色的行里 CJK 只剩左半边（Claude Code 输入框、选区）。宽字符和
+    /// 它的 spacer 必须落在同一个背景段里，且背景与文字分表绘制（先背景后文字），
+    /// 否则 spacer 的背景会在宽字形画完之后盖住它的右半边。
+    #[test]
+    fn wide_chars_on_colored_background_share_one_background_quad() {
+        let plan = plan_for("\x1b[44m中文ab\x1b[0m", 10);
+
+        let row0: Vec<_> = plan.backgrounds.iter().filter(|q| q.row == 0).collect();
+        assert_eq!(row0.len(), 1, "backgrounds: {:?}", plan.backgrounds);
+        assert_eq!((row0[0].start_col, row0[0].end_col), (0, 6));
+
+        let texts: Vec<_> = plan
+            .text_runs
+            .iter()
+            .filter(|run| run.row == 0)
+            .map(|run| (run.text.trim_end(), run.start_col))
+            .collect();
+        assert_eq!(texts, [("中", 0), ("文", 2), ("ab", 4)]);
+    }
+
+    #[test]
+    fn inverse_wide_chars_get_a_background_covering_both_cells() {
+        // 选区与 INVERSE 走同一条前景/背景互换路径。
+        let plan = plan_for("x\x1b[7m请分\x1b[0my", 10);
+
+        let row0: Vec<_> = plan.backgrounds.iter().filter(|q| q.row == 0).collect();
+        assert_eq!(row0.len(), 1, "backgrounds: {:?}", plan.backgrounds);
+        assert_eq!((row0[0].start_col, row0[0].end_col), (1, 5));
+    }
+
+    #[test]
+    fn background_runs_split_on_color_change_and_default_gaps() {
+        let plan = plan_for("\x1b[41mab\x1b[42mcd\x1b[0m e\x1b[41mf\x1b[0m", 10);
+
+        let spans: Vec<_> = plan
+            .backgrounds
+            .iter()
+            .filter(|q| q.row == 0)
+            .map(|q| (q.start_col, q.end_col))
+            .collect();
+        assert_eq!(spans, [(0, 2), (2, 4), (6, 7)]);
     }
 
     #[test]
