@@ -19,6 +19,7 @@ use termior_ai::context_engine::{
     ContextAssembler, ContextCategory, ContextItem, ContextPlan, ContextSource, MemoryStatus,
     MemoryStore, RuleResolver, SkillIndex, SkillMetadata,
 };
+use termior_ai::slash::{self, ComposerCommand, SlashAction, SlashCommand};
 use termior_ai::{
     AgentDefinition, AgentDefinitionStore, ApprovalPolicy, ApprovalRequest, Attachment,
     AttachmentSource, CancellationToken, ChangeSetId, ComposerDraft, EditProposalSummary,
@@ -32,7 +33,7 @@ use termior_platform::AgentStatus;
 use termior_preview::MarkdownDocument;
 use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_store::{
-    CheckpointManifest, CheckpointStore, DataFiles, RecoveryCenter, RecoveryCommand,
+    CheckpointManifest, CheckpointStore, DataFiles, KeyAction, RecoveryCenter, RecoveryCommand,
     RecoveryTaskSummary, RestoreAction, Settings,
 };
 use termior_ui_kit::{menu_panel, tokens::icon_size, Icon, Tooltip};
@@ -103,6 +104,10 @@ pub struct ComposerDockToggle;
 #[derive(Debug, Clone)]
 pub struct ComposerCollapse;
 
+/// `/` 命令面板选中了应用级动作（FR-AGENT-05），由 WorkspaceView 按快捷键同一路径执行。
+#[derive(Debug, Clone, Copy)]
+pub struct ComposerAppAction(pub KeyAction);
+
 struct LiveTerminalContext {
     snapshot: Mutex<TerminalContext>,
 }
@@ -159,6 +164,9 @@ pub struct ComposerView {
     workspace_paths: Vec<String>,
     path_suggestions: Vec<String>,
     selected_path_suggestion: usize,
+    /// `/` 命令面板的候选（FR-AGENT-05），输入以 `/` 开头时实时刷新。
+    slash_suggestions: Vec<&'static SlashCommand>,
+    selected_slash_suggestion: usize,
     /// 停靠位置与底部停靠高度，由 WorkspaceView 在恢复/拖拽/切换后同步。
     dock: ComposerDock,
     fill_workspace: bool,
@@ -240,6 +248,8 @@ impl ComposerView {
             workspace_paths: Vec::new(),
             path_suggestions: Vec::new(),
             selected_path_suggestion: 0,
+            slash_suggestions: Vec::new(),
+            selected_slash_suggestion: 0,
             dock: ComposerDock::Bottom,
             fill_workspace: false,
             panel_height: crate::DEFAULT_COMPOSER_HEIGHT,
@@ -674,7 +684,7 @@ impl ComposerView {
 
     pub fn set_workspace_paths(&mut self, paths: Vec<String>) {
         self.workspace_paths = paths;
-        self.update_path_suggestions();
+        self.update_suggestions();
     }
 
     pub fn apply_reviewed_edit(
@@ -767,6 +777,79 @@ impl ComposerView {
             });
         })
         .detach();
+    }
+
+    fn update_suggestions(&mut self) {
+        self.update_path_suggestions();
+        self.update_slash_suggestions();
+    }
+
+    fn update_slash_suggestions(&mut self) {
+        self.slash_suggestions = slash::slash_query(&self.draft.input, self.cursor)
+            .map(slash::match_commands)
+            .unwrap_or_default();
+        self.selected_slash_suggestion = self
+            .selected_slash_suggestion
+            .min(self.slash_suggestions.len().saturating_sub(1));
+    }
+
+    /// 执行命令面板选中的命令：先清空 `/xxx` 输入，再分派动作。
+    fn run_slash_command(&mut self, command: &'static SlashCommand, cx: &mut Context<Self>) {
+        self.draft.input.clear();
+        self.cursor = 0;
+        self.slash_suggestions.clear();
+        self.selected_slash_suggestion = 0;
+        match command.action {
+            SlashAction::App(action) => cx.emit(ComposerAppAction(action)),
+            SlashAction::Composer(command) => match command {
+                ComposerCommand::NewSession => self.new_session(cx),
+                ComposerCommand::ModeAuto => self.set_mode(Mode::Auto, cx),
+                ComposerCommand::ModePlan => self.set_mode(Mode::Plan, cx),
+                ComposerCommand::ModeYolo => self.set_mode(Mode::Yolo, cx),
+                ComposerCommand::CycleAgent => self.cycle_custom_agent(cx),
+                ComposerCommand::Stop => self.stop_active_task(cx),
+                ComposerCommand::AttachFile => self.pick_attachment(cx),
+                ComposerCommand::ToggleDock => cx.emit(ComposerDockToggle),
+                ComposerCommand::ContextInspector => {
+                    self.context_inspector_open = !self.context_inspector_open
+                }
+                ComposerCommand::Skills => self.skill_center_open = !self.skill_center_open,
+                ComposerCommand::Memory => self.memory_center_open = !self.memory_center_open,
+                ComposerCommand::Recovery => self.recovery_center_open = !self.recovery_center_open,
+                ComposerCommand::Checkpoints => {
+                    self.checkpoint_center_open = !self.checkpoint_center_open
+                }
+                ComposerCommand::Automations => {
+                    self.automation_center_open = !self.automation_center_open
+                }
+            },
+        }
+        cx.notify();
+    }
+
+    /// 开始一个新的命名会话；当前会话已镜像落盘，忙碌或有挂起审批时拒绝。
+    fn new_session(&mut self, cx: &mut Context<Self>) {
+        if self.busy
+            || self.pending_approval.is_some()
+            || self.external_pending_approval.is_some()
+            || self.pending_edit.is_some()
+        {
+            self.set_status(t!("composer.status.session_busy"));
+            return;
+        }
+        self.persist_session();
+        self.sessions.create(new_session_id());
+        self.history.clear();
+        self.active_task = None;
+        self.last_context_plan = None;
+        self.awaiting_plan_confirmation = false;
+        self.plan_confirmed = false;
+        self.external_session = None;
+        self.draft = ComposerDraft::default();
+        self.mode = Mode::Auto;
+        self.persist_session();
+        self.set_status(t!("composer.status.session_new"));
+        cx.notify();
     }
 
     fn update_path_suggestions(&mut self) {
@@ -1788,6 +1871,38 @@ impl ComposerView {
             self.schedule_attach_clipboard(cx);
             return;
         }
+        if !self.slash_suggestions.is_empty() {
+            match event.keystroke.key.as_str() {
+                "up" => {
+                    self.selected_slash_suggestion =
+                        self.selected_slash_suggestion.saturating_sub(1);
+                    cx.notify();
+                    return;
+                }
+                "down" => {
+                    self.selected_slash_suggestion = (self.selected_slash_suggestion + 1)
+                        .min(self.slash_suggestions.len().saturating_sub(1));
+                    cx.notify();
+                    return;
+                }
+                "enter" | "return" | "tab" if !event.keystroke.modifiers.shift => {
+                    if let Some(command) = self
+                        .slash_suggestions
+                        .get(self.selected_slash_suggestion)
+                        .copied()
+                    {
+                        self.run_slash_command(command, cx);
+                    }
+                    return;
+                }
+                "escape" => {
+                    self.slash_suggestions.clear();
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if !self.path_suggestions.is_empty() {
             match event.keystroke.key.as_str() {
                 "up" => {
@@ -1832,7 +1947,7 @@ impl ComposerView {
             "right" => self.cursor = (self.cursor + 1).min(self.draft.input.chars().count()),
             _ => return,
         }
-        self.update_path_suggestions();
+        self.update_suggestions();
         cx.notify();
     }
 
@@ -1868,6 +1983,7 @@ impl ComposerView {
             && !self.awaiting_plan_confirmation
             && self.draft.attachments.is_empty()
             && self.path_suggestions.is_empty()
+            && self.slash_suggestions.is_empty()
     }
 
     /// 工作区在恢复、拖拽或停靠切换后同步布局参数。
@@ -1902,6 +2018,7 @@ impl EventEmitter<AgentStatus> for ComposerView {}
 impl EventEmitter<EditReviewRequested> for ComposerView {}
 impl EventEmitter<ComposerDockToggle> for ComposerView {}
 impl EventEmitter<ComposerCollapse> for ComposerView {}
+impl EventEmitter<ComposerAppAction> for ComposerView {}
 
 async fn run_task_command(
     runtime: AgentRuntime,
@@ -2264,6 +2381,53 @@ impl gpui::Render for ComposerView {
                                 )
                         }),
                 )
+        });
+        let slash_suggestions = (!self.slash_suggestions.is_empty()).then(|| {
+            div()
+                .id("composer-slash-palette")
+                .flex()
+                .flex_col()
+                .mx_3()
+                .mt_1()
+                .max_h(px(240.0))
+                .overflow_y_scroll()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::color(p.accent))
+                .bg(crate::ui::color(p.elevated))
+                .shadow_md()
+                .children(self.slash_suggestions.iter().copied().enumerate().map(
+                    |(index, command)| {
+                        let selected = index == self.selected_slash_suggestion;
+                        div()
+                            .id(SharedString::from(format!("composer-slash-{index}")))
+                            .flex()
+                            .flex_row()
+                            .gap_3()
+                            .px_3()
+                            .py_1()
+                            .text_xs()
+                            .cursor_pointer()
+                            .when(selected, |row| row.bg(crate::ui::selected_wash(&p)))
+                            .child(
+                                div()
+                                    .min_w(px(120.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(SharedString::from(format!("/{}", command.name))),
+                            )
+                            .child(
+                                div()
+                                    .text_color(crate::ui::muted(&p))
+                                    .child(t!(command.description_key)),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.run_slash_command(command, cx)
+                                }),
+                            )
+                    },
+                ))
         });
         let approval_display = self
             .pending_approval
@@ -3466,6 +3630,7 @@ impl gpui::Render for ComposerView {
                 )
             })
             .child(div().flex().flex_row().px_3().gap_1().children(chips))
+            .children(slash_suggestions)
             .children(path_suggestions)
             .child(
                 // 第 1 行：输入文本独占整行宽度，右侧停靠窄面板下长提示词仍完整可见。
@@ -3716,7 +3881,7 @@ impl InputHandler for ComposerInputHandler {
                 view.draft.input.insert_str(byte, text);
                 view.cursor += text.chars().count();
                 view.marked_text.clear();
-                view.update_path_suggestions();
+                view.update_suggestions();
                 cx.notify();
             });
         }
@@ -3887,6 +4052,88 @@ mod layout_tests {
                 "CJK prefix must shift anchor right: {bounds:?} vs {text:?}"
             );
             assert!(bounds.size.height > px(0.0));
+        });
+    }
+
+    fn type_text(
+        composer: &gpui::Entity<ComposerView>,
+        vcx: &mut gpui::VisualTestContext,
+        text: &str,
+    ) {
+        vcx.update(|window, cx| {
+            let mut handler = ComposerInputHandler {
+                view: composer.downgrade(),
+            };
+            handler.replace_text_in_range(None, text, window, cx);
+        });
+    }
+
+    #[test]
+    fn slash_palette_runs_composer_commands_and_clears_input() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        type_text(&composer, vcx, "/pl");
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        composer.update(vcx, |view, cx| {
+            assert_eq!(view.slash_suggestions[0].name, "plan");
+            assert!(!view.is_compact(), "palette must expand the composer");
+            view.run_slash_command(view.slash_suggestions[0], cx);
+            assert_eq!(view.mode, Mode::Plan);
+            assert!(view.draft.input.is_empty());
+            assert!(view.slash_suggestions.is_empty());
+        });
+    }
+
+    #[test]
+    fn slash_palette_ignores_paths_inside_messages() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        type_text(&composer, vcx, "look at /usr/bin");
+        composer.update(vcx, |view, _| assert!(view.slash_suggestions.is_empty()));
+    }
+
+    #[test]
+    fn slash_palette_forwards_app_actions_to_the_workspace() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let sink = received.clone();
+        vcx.update(|_, cx| {
+            cx.subscribe(&composer, move |_, action: &ComposerAppAction, _| {
+                sink.lock().unwrap().push(action.0);
+            })
+            .detach();
+        });
+        composer.update(vcx, |view, cx| {
+            let command = slash::find_command("split-right").expect("catalogued");
+            view.run_slash_command(command, cx);
+        });
+        assert_eq!(*received.lock().unwrap(), vec![KeyAction::SplitRight]);
+    }
+
+    #[test]
+    fn new_session_command_starts_an_empty_active_session() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        composer.update(vcx, |view, cx| {
+            view.sessions.create("old");
+            view.history.push(Message::user("hello"));
+            view.new_session(cx);
+            assert!(view.history.is_empty());
+            assert_eq!(view.sessions.sessions.len(), 2);
+            assert_ne!(view.sessions.active_id.as_deref(), Some("old"));
+            assert_eq!(view.sessions.get("old").unwrap().messages.len(), 1);
+
+            view.busy = true;
+            view.new_session(cx);
+            assert_eq!(
+                view.sessions.sessions.len(),
+                2,
+                "busy composer keeps its session"
+            );
         });
     }
 

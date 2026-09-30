@@ -39,6 +39,7 @@ pub mod provider;
 pub mod runtime;
 pub mod secret_store;
 pub mod session;
+pub mod slash;
 pub mod task;
 pub mod tools;
 

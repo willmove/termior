@@ -281,6 +281,17 @@ impl WorkspaceView {
         let Some(action) = self.configured_action(event) else {
             return;
         };
+        self.perform_key_action(action, window, cx);
+        cx.stop_propagation();
+    }
+
+    /// 执行一个应用级动作；快捷键与 Composer `/` 命令面板（FR-AGENT-05）共用。
+    pub(super) fn perform_key_action(
+        &mut self,
+        action: KeyAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match action {
             KeyAction::NewTerminalTab => self.request_new_terminal(None, window, cx),
             KeyAction::NewPrivateTerminal => self.create_terminal(true, window, cx),
@@ -358,7 +369,6 @@ impl WorkspaceView {
                 }
             }
         }
-        cx.stop_propagation();
         cx.notify();
     }
     fn configured_action(&self, event: &KeyDownEvent) -> Option<KeyAction> {

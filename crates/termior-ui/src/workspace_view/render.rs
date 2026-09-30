@@ -843,6 +843,11 @@ impl gpui::Render for WorkspaceView {
             }
         }
         self.process_agent_updates(window, cx);
+        for action in std::mem::take(&mut self.pending_composer_actions) {
+            cx.defer_in(window, move |this, window, cx| {
+                this.perform_key_action(action, window, cx)
+            });
+        }
         let (cwd, preview_url) = self.sync_terminal_context(cx);
         let p = self.palette.clone();
         let active = self.model.active;

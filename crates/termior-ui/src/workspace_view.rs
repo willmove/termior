@@ -4,7 +4,9 @@ use sftp_browser::{GroupMenu, LocalBrowserState, SessionMenu};
 use crate::{
     ai_diff_view::{AiDiffAction, AiDiffView},
     app_identity,
-    composer_view::{ComposerCollapse, ComposerDockToggle, ComposerView, EditReviewRequested},
+    composer_view::{
+        ComposerAppAction, ComposerCollapse, ComposerDockToggle, ComposerView, EditReviewRequested,
+    },
     editor_view::EditorView,
     git_views::{GitDiffAction, GitDiffView, GitHistoryAction, GitHistoryView},
     markdown_preview_view::MarkdownPreviewView,
@@ -297,6 +299,8 @@ pub struct WorkspaceView {
     workspace_auth: WorkspaceAuthRegistry,
     notification_router: NotificationRouter,
     pending_agent_updates: BTreeMap<String, PendingAgentUpdate>,
+    /// Composer `/` 命令面板选中的应用级动作；订阅回调拿不到 window，留到下一帧执行。
+    pending_composer_actions: Vec<KeyAction>,
     toasts: Vec<InAppToast>,
     next_toast_id: u64,
     bell_open: bool,
@@ -526,6 +530,14 @@ impl WorkspaceView {
         .detach();
         cx.subscribe(
             &composer,
+            |workspace, _composer, action: &ComposerAppAction, cx| {
+                workspace.pending_composer_actions.push(action.0);
+                cx.notify();
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &composer,
             |workspace, _composer, _: &ComposerDockToggle, cx| {
                 workspace.toggle_composer_dock(cx);
             },
@@ -623,6 +635,7 @@ impl WorkspaceView {
             workspace_auth,
             notification_router,
             pending_agent_updates: BTreeMap::new(),
+            pending_composer_actions: Vec::new(),
             toasts: Vec::new(),
             next_toast_id: 1,
             bell_open: false,
