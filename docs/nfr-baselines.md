@@ -46,8 +46,11 @@
 
 GPUI 的 next-frame 回调在每个显示刷新 tick 都会执行，**与这一 tick 是否真的 draw 无关**；
 Termior 又要求空闲零重绘。旧口径只数回调次数，量到的是显示器刷新节拍，而不是渲染开销
-（CI 上 macOS 的 40fps、Windows 的 58fps 即如此）。此外 GPUI 对**非前台窗口**把帧间隔
-限到 ~33ms：CI 窗口拿不到前台时帧率上限约 30fps，`window_active=false` 时判读帧率要打折扣。
+（旧口径在 CI 上 macOS 40fps、Windows 58fps 即如此，58 也因此残留成了 Windows 的
+过时锚点）。新口径按强制整窗重绘的实测重锚：macOS 40（实测 50-56）、Windows 27
+（GitHub-hosted runner 走 WARP 软件光栅化，实测 20-27；真机 GPU 下远高于此）。
+此外 GPUI 对**非前台窗口**把帧间隔限到 ~33ms：CI 窗口拿不到前台时帧率上限约 30fps，
+`window_active=false` 时判读帧率要打折扣。
 
 ### 为什么 PTY 吞吐是 headless 主干项
 

@@ -1,5 +1,5 @@
 {
-  "notes": "NFR 回归基线（spec §8 NFR-01~04）。绝对值依赖 CI runner 硬件；门禁只看相对回归。macOS FPS 按 GitHub-hosted runner 实测约 40fps 固化；PTY 吞吐阈值放宽以吸收 ubuntu runner 噪声。v0.1.8 将 macOS 冷启动基线 1200→1700：SSH/SFTP 功能使两平台冷启动一致增加约 16-20%（Windows 149→178ms，macOS 1450→1685-1761ms，RSS/FPS 不变），且旧基线 1200 低于 v0.1.7 实测 1450，属过紧锚点；重锚到当前已知良好值以继续检测未来回归。 v0.2.0：Windows 冷启动基线 1500→800（=spec NFR-01 目标）。旧锚 1500 远高于实测（旧口径 149-178ms），退化 10 倍门禁都不报；同时首帧标记改为首帧 present 之后打印（本地开发机实测 627-683ms），故不锚到旧口径的 ~180ms。FPS 改为强制重绘口径并新增 frame_p99_ms / echo_p99_ms（首次采集只记录，稳定后再固化）；nfr-run 改用隔离的 TERMIOR_DATA_DIR，保证是 spec 的「空载 1 终端 tab」场景。",
+  "notes": "NFR 回归基线（spec §8 NFR-01~04）。绝对值依赖 CI runner 硬件；门禁只看相对回归。macOS FPS 按 GitHub-hosted runner 实测约 40fps 固化；PTY 吞吐阈值放宽以吸收 ubuntu runner 噪声。v0.1.8 将 macOS 冷启动基线 1200→1700：SSH/SFTP 功能使两平台冷启动一致增加约 16-20%（Windows 149→178ms，macOS 1450→1685-1761ms，RSS/FPS 不变），且旧基线 1200 低于 v0.1.7 实测 1450，属过紧锚点；重锚到当前已知良好值以继续检测未来回归。 v0.2.0：Windows 冷启动基线 1500→800（=spec NFR-01 目标）。旧锚 1500 远高于实测（旧口径 149-178ms），退化 10 倍门禁都不报；同时首帧标记改为首帧 present 之后打印（本地开发机实测 627-683ms），故不锚到旧口径的 ~180ms。FPS 改为强制重绘口径并新增 frame_p99_ms / echo_p99_ms（首次采集只记录，稳定后再固化）；nfr-run 改用隔离的 TERMIOR_DATA_DIR，保证是 spec 的「空载 1 终端 tab」场景。v0.2.1：Windows FPS 基线 58→27。58 是旧口径（数刷新节拍）的值，换强制重绘口径后未重锚；GitHub-hosted Windows runner 走 WARP 软件光栅化，新口径实测 20-27fps（2026-09-30 三次：20/22/27，同版本 macOS 实测 50-56 正常，冷启动/RSS 优于基线），v0.2.0 tag 时旧口径实测 54。按 macOS「按 runner 实测固化」先例重锚到 27，继续以 40% 阈值检测未来回归。",
   "baselines": [
     {
       "kind": "pty_throughput_mibps",
@@ -40,7 +40,7 @@
       "kind": "fps",
       "platform": "windows",
       "scenario": "typical",
-      "value": 58.0,
+      "value": 27.0,
       "threshold_percent": 40.0
     },
     {
