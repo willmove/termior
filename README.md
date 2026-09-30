@@ -4,7 +4,7 @@
 
 # Termior
 
-[English](#english) · [简体中文](#简体中文)
+[English](#english) · [简体中文](#简体中文) · [繁體中文](README.zh-TW.md) · [日本語](README.ja.md) · [한국어](README.ko.md) · [Español](README.es.md) · [Deutsch](README.de.md)
 
 ---
 
@@ -48,7 +48,7 @@ The workspace has moved from a pure-logic prototype to a buildable GPUI desktop 
 
 This is still a staged milestone, not final acceptance of the whole spec. The baseline desktop scope is documented in [docs/desktop-milestone.md](docs/desktop-milestone.md); implementation evidence for Agent stages A–E, along with platform sandboxing, remote MCP OAuth, a real ACP client, and background automation execution boundaries, is documented in [docs/ai-agent-implementation-status.md](docs/ai-agent-implementation-status.md).
 
-The latest tagged release is `v0.2.0`; the workspace version lives in [Cargo.toml](Cargo.toml).
+The latest tagged release is `v0.2.1`; the workspace version lives in [Cargo.toml](Cargo.toml).
 
 ### Workspace
 
@@ -214,7 +214,7 @@ Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、�
 
 这仍是阶段性里程碑，不等于整份 spec 已最终验收。基础桌面范围见 [docs/desktop-milestone.md](docs/desktop-milestone.md)；Agent A–E 的实现证据与平台 sandbox、远端 MCP OAuth、真实 ACP 客户端和自动化后台执行等边界见 [docs/ai-agent-implementation-status.md](docs/ai-agent-implementation-status.md)。
 
-最新发布 tag 为 `v0.2.0`，工作区版本号定义在 [Cargo.toml](Cargo.toml)。
+最新发布 tag 为 `v0.2.1`，工作区版本号定义在 [Cargo.toml](Cargo.toml)。
 
 ### Workspace
 
