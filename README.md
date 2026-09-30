@@ -37,6 +37,8 @@ The workspace has moved from a pure-logic prototype to a buildable GPUI desktop 
 - 12 application themes with a custom theme model, plus a GPU-rendered blurred window background;
 - Real HTTP/SSE adapters for OpenAI, Anthropic, Gemini, Groq, xAI, Cerebras, OpenRouter, DeepSeek, Mistral, OpenAI-compatible, LM Studio, MLX, and Ollama;
 - OS keychain, session/project memory, file, image, clipboard, and `@path` attachments, snippets/TODO, and Auto / Plan / Yolo submit modes;
+- A Composer command surface: a `/` slash command palette (new session, Auto/Plan/Yolo, agent cycling, stop, attach, dock and inspector panels) that reuses the keymap instead of forking behaviour; `#handle` snippet completion backed by `/snippet` and `/snippets`; and a `/todos` panel over an app-local TODO list shared with the agent through `todo_read` / `todo_write`;
+- Terminal selections attach to the Composer with command provenance: OSC 133 C/D boundaries are aligned with the exact bytes of each command, so an attachment carries the command id, cwd, command line and exit code, and a context menu item attaches the last failed command's output;
 - Serializable Task/Turn, budgets and cancellation, real tool execution, approval cards, command timeouts, persistent shells, background processes, and the `write_file → AI diff → per-hunk decision → atomic write` safety loop;
 - A built-in agent and the Codex app-server, switchable inside the Composer; the standalone `termior-agent-host` provides the structured backend contract, Codex/ACP adapters, capability negotiation, and execution-environment description;
 - Layered `AGENTS.md` rules, a Context Inspector, Agent Skills, MCP over stdio and Streamable HTTP, bounded Hooks, reviewable Memory, custom agents, and sub-task orchestration;
@@ -46,15 +48,16 @@ The workspace has moved from a pure-logic prototype to a buildable GPUI desktop 
 
 This is still a staged milestone, not final acceptance of the whole spec. The baseline desktop scope is documented in [docs/desktop-milestone.md](docs/desktop-milestone.md); implementation evidence for Agent stages A–E, along with platform sandboxing, remote MCP OAuth, a real ACP client, and background automation execution boundaries, is documented in [docs/ai-agent-implementation-status.md](docs/ai-agent-implementation-status.md).
 
-The latest tagged release is `v0.1.8`; the workspace version lives in [Cargo.toml](Cargo.toml).
+The latest tagged release is `v0.2.0`; the workspace version lives in [Cargo.toml](Cargo.toml).
 
 ### Workspace
 
 ```text
 crates/
-  termior                  GPUI desktop application and view wiring
-  termior-ui               persisted tab / sidebar / workspace state
+  termior                  GPUI entry point, application bootstrap, and desktop wiring
+  termior-ui               GPUI view layer, persisted tab / sidebar / workspace state
   termior-ui-kit           shared controls, pane layout, and search models
+  termior-i18n             compile-time embedded translation tables and locale fallback
   termior-terminal         PTY sessions, process lifecycle, and the byte bridge
   termior-ssh              OpenSSH connection profiles, auth options, SFTP transfer commands
   termior-terminal-core    OSC, shell integration, search
@@ -200,6 +203,8 @@ Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、�
 - 12 套应用主题、自定义主题模型和 GPU 渲染的窗口背景虚化；
 - OpenAI、Anthropic、Gemini、Groq、xAI、Cerebras、OpenRouter、DeepSeek、Mistral、OpenAI-compatible、LM Studio、MLX、Ollama 的真实 HTTP/SSE 适配；
 - OS 钥匙串、会话/项目记忆、文件/图片/剪贴板/`@path` 附件、snippets/TODO，以及 Auto/Plan/Yolo 三档提交模式；
+- Composer 命令面：`/` 斜杠命令面板（新建会话、Auto/Plan/Yolo、切换 Agent、停止、附加、停靠与 inspector 面板）复用键位表执行、不另开一套行为；`#handle` 片段补全配合 `/snippet`、`/snippets`；`/todos` 面板与 Agent 通过 `todo_read` / `todo_write` 共享同一份应用内 TODO 列表；
+- 终端选区携带命令溯源附加到 Composer：OSC 133 C/D 边界与每条命令的确切字节对齐，附加上下文因此带有命令 id、cwd、命令行与退出码，另有上下文菜单项可直接附加最近一条失败命令的输出；
 - 可序列化 Task/Turn、预算与取消、真实工具执行、审批卡片、命令超时、持久 shell、后台进程，以及 `write_file → AI diff → 逐 hunk 决策 → 原子写` 安全闭环；
 - 内置 Agent 与 Codex app-server 可在 Composer 中切换；独立 `termior-agent-host` 提供结构化后端契约、Codex/ACP 适配、能力协商和执行环境描述；
 - `AGENTS.md` 分层规则、Context Inspector、Agent Skills、MCP stdio/Streamable HTTP、受限 Hooks、可审阅 Memory、自定义 Agent 与子任务编排；
@@ -209,15 +214,16 @@ Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、�
 
 这仍是阶段性里程碑，不等于整份 spec 已最终验收。基础桌面范围见 [docs/desktop-milestone.md](docs/desktop-milestone.md)；Agent A–E 的实现证据与平台 sandbox、远端 MCP OAuth、真实 ACP 客户端和自动化后台执行等边界见 [docs/ai-agent-implementation-status.md](docs/ai-agent-implementation-status.md)。
 
-最新发布 tag 为 `v0.1.8`，工作区版本号定义在 [Cargo.toml](Cargo.toml)。
+最新发布 tag 为 `v0.2.0`，工作区版本号定义在 [Cargo.toml](Cargo.toml)。
 
 ### Workspace
 
 ```text
 crates/
-  termior                  GPUI 桌面应用与视图接线
-  termior-ui               tab/sidebar/workspace 持久状态
+  termior                  GPUI 入口、应用启动与桌面接线
+  termior-ui               GPUI 视图层与 tab/sidebar/workspace 持久状态
   termior-ui-kit           通用控件、pane 布局与共享搜索模型
+  termior-i18n             编译期内嵌翻译表与语言回退
   termior-terminal         PTY 会话、进程生命周期和字节桥
   termior-ssh              OpenSSH 连接配置、认证选项与 SFTP 传输命令
   termior-terminal-core    OSC、shell integration、搜索
