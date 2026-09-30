@@ -55,6 +55,28 @@ fn terminal_canvas<T: 'static>(
     canvas(prepaint, paint).size_full()
 }
 
+/// 附加到 Composer 的终端片段及其所属命令（FR-ATERM-05）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalAttachment {
+    pub label: String,
+    pub text: String,
+    pub command: Option<termior_ai::CommandProvenance>,
+}
+
+/// 附件 chip 标签：`$ <命令>`（过长截断）加退出码。
+fn command_label(record: &TerminalCommandRecord) -> String {
+    const MAX_CHARS: usize = 40;
+    let command = record.command.as_deref().unwrap_or("?");
+    let mut label: String = command.chars().take(MAX_CHARS).collect();
+    if command.chars().count() > MAX_CHARS {
+        label.push('…');
+    }
+    match record.exit_code {
+        Some(code) => format!("$ {label} · exit {code}"),
+        None => format!("$ {label}"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalViewEvent {
     TitleChanged(Option<String>),
@@ -220,13 +242,17 @@ impl TerminalView {
                     let Ok(next) = rx.try_recv() else {
                         break;
                     };
+                    let shift = data.bytes.len();
                     data.bytes.extend(next.bytes);
                     data.events.extend(next.events);
+                    data.event_offsets
+                        .extend(next.event_offsets.into_iter().map(|offset| offset + shift));
                     data.localhost_urls.extend(next.localhost_urls);
                 }
                 let backlog_likely = data.bytes.len() >= MAX_PTY_BATCH_BYTES;
                 let bytes = data.bytes;
                 let events = data.events;
+                let event_offsets = data.event_offsets;
                 let localhost_urls = data.localhost_urls;
                 if let Some(id) = observed_session.as_ref() {
                     let _ = observed_service.observe_pane_output(id, bytes.clone());
@@ -248,7 +274,13 @@ impl TerminalView {
                     while let Ok(event) = event_rx.try_recv() {
                         view.handle_terminal_event(event, cx);
                     }
-                    for ev in events {
+                    // 按事件在字节流中的位置交错喂入，命令输出捕获才能精确对齐 OSC 133 边界。
+                    let mut consumed = 0;
+                    for (ev, offset) in events.into_iter().zip(event_offsets) {
+                        let offset = offset.clamp(consumed, bytes.len());
+                        view.command_tracker
+                            .observe_output(&bytes[consumed..offset]);
+                        consumed = offset;
                         log::info!("OSC event: {ev:?}");
                         view.command_tracker.observe(&ev, output_cursor);
                         match ev {
@@ -264,6 +296,7 @@ impl TerminalView {
                             _ => {}
                         }
                     }
+                    view.command_tracker.observe_output(&bytes[consumed..]);
                     for url in localhost_urls {
                         if !view.localhost_urls.contains(&url) {
                             view.localhost_urls.push(url);
@@ -396,6 +429,54 @@ impl TerminalView {
 
     pub fn recent_commands(&self) -> &[TerminalCommandRecord] {
         self.command_tracker.records()
+    }
+
+    /// 当前选区作为 Composer 附件（FR-EXPL-06 / FR-ATERM-05）：按选中文本定位其所属命令，
+    /// 定位不到时命令字段保持 unknown，不做猜测。
+    pub fn selection_attachment(&self) -> Option<TerminalAttachment> {
+        let text = self.term.selection_to_string()?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        let record = self.command_tracker.find_by_output(&text);
+        Some(TerminalAttachment {
+            label: record.map_or_else(
+                || t!("ws.attach.terminal_selection").to_string(),
+                command_label,
+            ),
+            command: record.map(|record| self.provenance(record)),
+            text,
+        })
+    }
+
+    /// 最近一条失败命令及其精确输出（去除控制序列后的尾部）。
+    pub fn last_failed_attachment(&self) -> Option<TerminalAttachment> {
+        let record = self.command_tracker.last_failed()?;
+        Some(TerminalAttachment {
+            label: command_label(record),
+            text: self
+                .command_tracker
+                .output_of(&record.id)
+                .unwrap_or_default(),
+            command: Some(self.provenance(record)),
+        })
+    }
+
+    pub fn has_failed_command(&self) -> bool {
+        self.command_tracker.last_failed().is_some()
+    }
+
+    fn provenance(&self, record: &TerminalCommandRecord) -> termior_ai::CommandProvenance {
+        termior_ai::CommandProvenance {
+            id: record.id.clone(),
+            cwd: if record.cwd.is_empty() {
+                self.latest_cwd.clone().unwrap_or_default()
+            } else {
+                record.cwd.clone()
+            },
+            command: record.command.clone(),
+            exit_code: record.exit_code,
+        }
     }
 
     pub fn write_input(&self, bytes: &[u8]) -> std::io::Result<()> {
@@ -2413,6 +2494,58 @@ mod protocol_tests {
                 .expect("shifted bounds");
             assert_eq!(shifted.origin.x, anchor.origin.x + px(cell_width * 2.0));
             assert_eq!(shifted.origin.y, anchor.origin.y);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn terminal_attachments_carry_the_owning_command() {
+        let mut cx = TestAppContext::single();
+        let bridge = TerminalBridge::spawn(&PtySessionConfig::default()).expect("PTY spawn");
+        let window = cx.open_window(size(px(640.0), px(480.0)), move |_, cx| {
+            TerminalView::from_bridge(
+                bridge,
+                default_theme().palette().clone(),
+                TerminalSettings::default(),
+                UserKeymap::default(),
+                cx,
+            )
+        });
+        cx.update_window(window.into(), |terminal, _window, cx| {
+            let terminal = terminal.downcast::<TerminalView>().expect("terminal root");
+            terminal.update(cx, |view, _| {
+                let output = b"\x1b[2J\x1b[Herror: \x1b[31mboom\x1b[0m\r\n";
+                view.vte_processor.advance(&mut view.term, output);
+                let cursor = OutputCursor { sequence: 1 };
+                view.command_tracker
+                    .observe(&OscEvent::CommandStart { cmd: "make".into() }, cursor);
+                view.command_tracker.observe_output(output);
+                view.command_tracker
+                    .observe(&OscEvent::CommandExit { code: Some(2) }, cursor);
+
+                assert!(view.selection_attachment().is_none(), "no selection yet");
+                let mut selection = Selection::new(
+                    SelectionType::Simple,
+                    TerminalPoint::new(Line(0), Column(0)),
+                    Side::Left,
+                );
+                selection.update(
+                    TerminalPoint::new(Line(0), view.term.last_column()),
+                    Side::Right,
+                );
+                view.term.selection = Some(selection);
+
+                let attachment = view.selection_attachment().expect("selection");
+                assert_eq!(attachment.text.trim(), "error: boom");
+                assert_eq!(attachment.label, "$ make · exit 2");
+                let command = attachment.command.expect("owning command resolved");
+                assert_eq!(command.command.as_deref(), Some("make"));
+                assert_eq!(command.exit_code, Some(2));
+
+                let failed = view.last_failed_attachment().expect("failed command");
+                assert_eq!(failed.text, "error: boom\n");
+                assert!(view.has_failed_command());
+            });
         })
         .unwrap();
     }

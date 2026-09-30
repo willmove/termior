@@ -1643,6 +1643,7 @@ impl gpui::Render for WorkspaceView {
                     .w(px(240.0))
                     .when_some(menu.terminal, |panel, terminal| {
                         let can_copy = terminal.read(cx).has_selection();
+                        let has_failed = terminal.read(cx).has_failed_command();
                         panel
                             .child(terminal_menu_item(
                                 t!("ws.copy"),
@@ -1676,6 +1677,25 @@ impl gpui::Render for WorkspaceView {
                                 "terminal-find",
                                 true,
                                 TerminalMenuAction::Find,
+                                terminal.clone(),
+                                &p,
+                                cx,
+                            ))
+                            .child(menu_separator(&p))
+                            .child(terminal_menu_item(
+                                t!("ws.ask_ai_selection"),
+                                "terminal-ask-ai",
+                                can_copy,
+                                TerminalMenuAction::AskAi,
+                                terminal.clone(),
+                                &p,
+                                cx,
+                            ))
+                            .child(terminal_menu_item(
+                                t!("ws.ask_ai_last_failed"),
+                                "terminal-ask-ai-failed",
+                                has_failed,
+                                TerminalMenuAction::AskAiLastFailed,
                                 terminal,
                                 &p,
                                 cx,

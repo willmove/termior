@@ -382,6 +382,16 @@ impl WorkspaceView {
             window.focus(&focus, cx);
         }
     }
+    /// 焦点 pane 恰好是终端时返回它（不回退到同 tab 的其他终端）。
+    pub(super) fn focused_terminal(&self) -> Option<&Entity<TerminalView>> {
+        let active = self.model.active?;
+        let tab = self.tabs.iter().find(|tab| tab.id == active)?;
+        let focused = self.model.tab(active)?.layout.focused;
+        match tab.panes.get(&focused)? {
+            PaneContent::Terminal(entity) => Some(entity),
+            _ => None,
+        }
+    }
     pub(super) fn active_terminal(&self) -> Option<&Entity<TerminalView>> {
         let active = self.model.active?;
         let tab = self.tabs.iter().find(|tab| tab.id == active)?;

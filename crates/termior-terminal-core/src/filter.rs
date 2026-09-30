@@ -7,6 +7,9 @@ use crate::osc::{OscEvent, OscParser};
 pub struct FilteredOutput {
     pub visible: Vec<u8>,
     pub events: Vec<OscEvent>,
+    /// `events[i]` 发生在 `visible[..event_offsets[i]]` 之后；用于把命令边界精确
+    /// 对齐到输出字节，而不是整批次（FR-ATERM-05）。
+    pub event_offsets: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +91,9 @@ impl OscStreamFilter {
         if events.is_empty() {
             output.visible.append(&mut self.sequence);
         } else {
+            output
+                .event_offsets
+                .extend(std::iter::repeat(output.visible.len()).take(events.len()));
             output.events.extend(events);
             self.sequence.clear();
         }
@@ -122,6 +128,15 @@ mod tests {
         let out = filter.feed(b"A\x1b\\y");
         assert_eq!(out.visible, b"y");
         assert_eq!(out.events, vec![OscEvent::Prompt(PromptMark::PromptStart)]);
+    }
+
+    #[test]
+    fn event_offsets_point_into_visible_bytes() {
+        let mut filter = OscStreamFilter::new();
+        let out = filter.feed(b"$ \x1b]133;C;make\x07building\n\x1b]133;D;2\x07$ ");
+        assert_eq!(out.visible, b"$ building\n$ ");
+        assert_eq!(out.event_offsets, vec![2, 11]);
+        assert_eq!(out.events.len(), out.event_offsets.len());
     }
 
     #[test]

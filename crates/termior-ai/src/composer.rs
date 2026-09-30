@@ -29,7 +29,21 @@ pub enum Attachment {
         source: AttachmentSource,
         label: String,
         text: String,
+        /// 终端选区所属命令（FR-ATERM-05）；无 shell integration 或无法定位时为 `None`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<CommandProvenance>,
     },
+}
+
+/// 附件来源命令的结构化元数据：命令 ID、cwd、命令行与退出码。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandProvenance {
+    pub id: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
 }
 
 impl Attachment {
@@ -101,6 +115,22 @@ impl ComposerDraft {
             source,
             label: label.into(),
             text: text.into(),
+            command: None,
+        });
+    }
+
+    /// 附加终端选区或命令输出，并携带其所属命令的元数据（FR-ATERM-05）。
+    pub fn attach_terminal_output(
+        &mut self,
+        label: impl Into<String>,
+        text: impl Into<String>,
+        command: Option<CommandProvenance>,
+    ) {
+        self.attachments.push(Attachment::Selection {
+            source: AttachmentSource::Terminal,
+            label: label.into(),
+            text: text.into(),
+            command,
         });
     }
 
@@ -131,9 +161,25 @@ impl ComposerDraft {
                     source,
                     label,
                     text: selection,
+                    command,
                 } => {
+                    let provenance = command.as_ref().map_or_else(String::new, |command| {
+                        let mut attributes = format!(
+                            " command_id=\"{}\" cwd=\"{}\"",
+                            escape_attribute(&command.id),
+                            escape_attribute(&command.cwd)
+                        );
+                        if let Some(line) = &command.command {
+                            attributes
+                                .push_str(&format!(" command=\"{}\"", escape_attribute(line)));
+                        }
+                        if let Some(code) = command.exit_code {
+                            attributes.push_str(&format!(" exit_code=\"{code}\""));
+                        }
+                        attributes
+                    });
                     text.push_str(&format!(
-                        "\n\n<selection source=\"{}\" label=\"{}\">\n{}\n</selection>",
+                        "\n\n<selection source=\"{}\" label=\"{}\"{provenance}>\n{}\n</selection>",
                         match source {
                             AttachmentSource::Terminal => "terminal",
                             AttachmentSource::Editor => "editor",
@@ -530,5 +576,42 @@ mod tests {
         assert_eq!(todos.open_count(), 2);
         assert!(todos.remove("todo-2"));
         assert!(!todos.remove("todo-2"));
+    }
+
+    #[test]
+    fn terminal_attachments_carry_command_provenance() {
+        let mut draft = ComposerDraft {
+            input: "why?".into(),
+            ..Default::default()
+        };
+        draft.attach_terminal_output(
+            "make (exit 2)",
+            "error: boom",
+            Some(CommandProvenance {
+                id: "t-command-3".into(),
+                cwd: "/project".into(),
+                command: Some("make \"all\"".into()),
+                exit_code: Some(2),
+            }),
+        );
+        draft.attach_terminal_output("selection", "plain", None);
+        let payload = draft.build_payload(&ToolRegistry::default()).unwrap();
+        assert!(payload.text.contains(
+            "<selection source=\"terminal\" label=\"make (exit 2)\" command_id=\"t-command-3\" \
+             cwd=\"/project\" command=\"make &quot;all&quot;\" exit_code=\"2\">\nerror: boom\n</selection>"
+        ));
+        assert!(payload
+            .text
+            .contains("<selection source=\"terminal\" label=\"selection\">\nplain\n</selection>"));
+
+        // 旧版草稿（无 command 字段）仍可反序列化。
+        let legacy: Attachment = serde_json::from_str(
+            r#"{"kind":"selection","source":"editor","label":"a","text":"b"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Attachment::Selection { command: None, .. }
+        ));
     }
 }

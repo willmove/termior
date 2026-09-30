@@ -556,6 +556,15 @@ impl ComposerView {
         self.draft.attach_selection(source, label, text);
     }
 
+    pub fn attach_terminal_output(
+        &mut self,
+        label: String,
+        text: String,
+        command: Option<termior_ai::CommandProvenance>,
+    ) {
+        self.draft.attach_terminal_output(label, text, command);
+    }
+
     pub fn attach_file(&mut self, path: PathBuf) {
         self.draft.attach_file(path);
     }

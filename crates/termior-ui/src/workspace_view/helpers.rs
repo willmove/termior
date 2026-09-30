@@ -439,6 +439,10 @@ pub(super) enum TerminalMenuAction {
     Paste,
     SelectAll,
     Find,
+    /// 选区附加到 Composer（FR-EXPL-06 / FR-ATERM-05）。
+    AskAi,
+    /// 最近失败命令的输出附加到 Composer（FR-ATERM-05）。
+    AskAiLastFailed,
 }
 
 /// 菜单项右侧的快捷键提示，须与 terminal_view 的按键处理及键位表保持一致
@@ -473,6 +477,14 @@ pub(super) fn terminal_menu_shortcut(action: TerminalMenuAction) -> &'static str
                 "Ctrl+F"
             }
         }
+        TerminalMenuAction::AskAi => {
+            if cfg!(target_os = "macos") {
+                "⌘L"
+            } else {
+                "Ctrl+L"
+            }
+        }
+        TerminalMenuAction::AskAiLastFailed => "",
     }
 }
 
@@ -493,6 +505,15 @@ pub(super) fn terminal_menu_item(
         move |this: &mut WorkspaceView, window: &mut Window, cx: &mut Context<WorkspaceView>| {
             cx.stop_propagation();
             this.pane_context_menu = None;
+            let attachment = match action {
+                TerminalMenuAction::AskAi => terminal.read(cx).selection_attachment(),
+                TerminalMenuAction::AskAiLastFailed => terminal.read(cx).last_failed_attachment(),
+                _ => None,
+            };
+            if let Some(attachment) = attachment {
+                this.attach_terminal_output(attachment, cx);
+                return;
+            }
             terminal.update(cx, |view, cx| {
                 window.focus(&view.focus_handle(cx), cx);
                 match action {
@@ -500,6 +521,7 @@ pub(super) fn terminal_menu_item(
                     TerminalMenuAction::Paste => view.paste_clipboard(cx),
                     TerminalMenuAction::SelectAll => view.select_all(cx),
                     TerminalMenuAction::Find => view.open_search(cx),
+                    TerminalMenuAction::AskAi | TerminalMenuAction::AskAiLastFailed => {}
                 }
             });
             cx.notify();

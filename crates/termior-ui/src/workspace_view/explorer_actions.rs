@@ -78,6 +78,20 @@ pub(super) enum ExplorerContextAction {
 
 impl WorkspaceView {
     pub(super) fn attach_active_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(terminal) = self.focused_terminal().cloned() {
+            let attachment = terminal.read(cx).selection_attachment();
+            match attachment {
+                Some(attachment) => self.attach_terminal_output(attachment, cx),
+                // 无选区时把 Ctrl+L 还给 shell（清屏）；macOS 的 ⌘L 不与之冲突。
+                None if !cfg!(target_os = "macos") => {
+                    if let Err(error) = terminal.read(cx).write_input(b"\x0c") {
+                        log::warn!("PTY write error: {error}");
+                    }
+                }
+                None => {}
+            }
+            return;
+        }
         let selection = self.active_editor().and_then(|editor| {
             let editor = editor.read(cx);
             editor
@@ -92,6 +106,19 @@ impl WorkspaceView {
             self.model.composer_visible = true;
             cx.notify();
         }
+    }
+    /// 把终端片段连同命令元数据附加到 Composer（FR-ATERM-05）。
+    pub(super) fn attach_terminal_output(
+        &mut self,
+        attachment: crate::terminal_view::TerminalAttachment,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |composer, cx| {
+            composer.attach_terminal_output(attachment.label, attachment.text, attachment.command);
+            cx.notify();
+        });
+        self.model.composer_visible = true;
+        cx.notify();
     }
     fn attach_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.composer.update(cx, |composer, cx| {

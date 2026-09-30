@@ -22,6 +22,8 @@ pub struct PtyData {
     /// PTY output with Termior OSC 7/133/777 removed, ready for the VTE parser.
     pub bytes: Vec<u8>,
     pub events: Vec<OscEvent>,
+    /// 与 `events` 等长：每个事件发生在 `bytes[..offset]` 之后。
+    pub event_offsets: Vec<usize>,
     pub localhost_urls: Vec<String>,
 }
 
@@ -211,18 +213,20 @@ fn run_reader_filtered(reader: &mut Box<dyn Read + Send>, mut tx: Sender<PtyData
                 // sole exception is OSC 7 cwd, retained as remote-session metadata so
                 // the File Explorer can follow that SSH tab without changing the local
                 // workspace root (FR-SSH-07).
-                let events = if remote {
+                let (events, event_offsets) = if remote {
                     filtered
                         .events
                         .into_iter()
-                        .filter(|event| matches!(event, OscEvent::Cwd { .. }))
-                        .collect()
+                        .zip(filtered.event_offsets)
+                        .filter(|(event, _)| matches!(event, OscEvent::Cwd { .. }))
+                        .unzip()
                 } else {
-                    filtered.events
+                    (filtered.events, filtered.event_offsets)
                 };
                 if futures::executor::block_on(tx.send(PtyData {
                     bytes: filtered.visible,
                     events,
+                    event_offsets,
                     localhost_urls,
                 }))
                 .is_err()
