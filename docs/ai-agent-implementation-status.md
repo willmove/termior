@@ -57,6 +57,8 @@
 
 ## 明确边界
 
+- “已实现”指领域模型、协议适配与自动化测试已落地；各阶段仍有未完成的 UI、平台验收与收尾项，逐项清单见 `openspec/changes/agent-stage-{b,c,d,e}-*/tasks.md` 末尾的“实施核对（2026-09-30）”。B–E 尚未归档。
+
 - 当前验证主机是 Windows。Linux `bwrap` 与 macOS `sandbox-exec` 代码通过条件编译和契约测试，但没有在本次 Windows 运行中得到对应平台的黑盒验证；UI 必须按 capability probe 结果显示，required capability 不满足时拒绝运行。
 - Windows 当前仅验证进程树控制，不宣称完整的文件、网络或凭据 sandbox；这些能力报告为 unsupported，sandboxed 任务 fail closed。
 - MCP HTTP 已实现 HTTPS 限制、Bearer/session 保持和 OAuth callback 的 state/resource 校验。完整授权服务器发现、浏览器 PKCE 登录、refresh token 周期和系统 keyring UI 尚未接入，因此不能宣称远端 OAuth 生命周期已端到端验证。

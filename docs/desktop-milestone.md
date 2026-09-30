@@ -35,10 +35,16 @@ GitHub Actions 另在 Windows/macOS/Linux 构建 release 桌面二进制、记�
 
 ## 后续仍需完成的 spec 项
 
+> 2026-09-30 按代码核对刷新。WSL 发行版切换、背景图渲染、行内补全停顿调度与 ghost text、
+> 自动更新（`termior-platform::update`）和 NFR 基准 harness（`docs/nfr-baselines.md`）已落地，不再列入。
+
+- FR-AGENT-05 Composer `/` 命令面板；
+- FR-AGENT-04 `#handle` 片段的输入补全与片段管理入口（提交时展开已实现）；
+- FR-SESS-04 应用内 TODO 的 Agent 工具与界面（`TodoStore` 仅有存储层）；
+- FR-ATERM-05 从终端选区/失败命令附加时携带命令 ID、cwd、退出码；
+- FR-AGENT-06 语音输入（P2）；
 - 多窗口工作区切换与跨窗口 tab 管理；
-- WSL 发行版切换、背景图片实际 GPU 渲染、语音输入；
-- 行内补全 Provider 的停顿调度与 ghost text 网络接线；
-- Linux 代码签名与原生安装器/自动更新（ADR 0002 已移除内嵌 WebView，发行不再受 WebView 运行时依赖阻塞）；
-- NFR 冷启动、RSS、帧率与 PTY 吞吐的正式基准与达标证据（5 MiB 编辑器基准和二进制/压缩包体积门禁已进入 CI）。
+- 三平台安装包签名（Windows/macOS 当前未签名）；
+- Agent Stage B–E 的剩余 UI 与验收项，见各 `openspec/changes/agent-stage-*/tasks.md` 末尾的“实施核对”。
 
 因此，本里程碑的含义是“主要架构与安全链路已可构建、可测试、可继续迭代”，并不把尚未验收的条目宣称为完成。
