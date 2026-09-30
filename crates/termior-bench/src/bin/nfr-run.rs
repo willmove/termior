@@ -212,9 +212,7 @@ fn parse_protocol_line(line: &str, report: &mut RunPayload) {
     } else if let Some(rest) = line.strip_prefix("TERMIOR_NFR_WINDOW_ACTIVE=") {
         report.window_active = Some(rest.trim() == "1");
         if rest.trim() != "1" {
-            eprintln!(
-                "nfr-run: window was not foreground during sampling; GPUI caps it to ~30fps"
-            );
+            eprintln!("nfr-run: window was not foreground during sampling; GPUI caps it to ~30fps");
         }
     } else if let Some(rest) = line.strip_prefix("TERMIOR_NFR_PHASE ") {
         eprintln!("nfr-run: phase {rest}");

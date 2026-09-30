@@ -1799,7 +1799,13 @@ fn plan_terminal_paint(
         // 表达不了这个跨度；就地结束该 run，让后面的字符从自己的真实列重新锚定。
         if cell_width == 2 {
             if let Some(wide_style) = run_style.take() {
-                push_text_run(&mut text_runs, &mut run_text, wide_style, run_start_col, cur_row);
+                push_text_run(
+                    &mut text_runs,
+                    &mut run_text,
+                    wide_style,
+                    run_start_col,
+                    cur_row,
+                );
             }
         }
     }
