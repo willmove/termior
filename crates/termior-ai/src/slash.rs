@@ -23,6 +23,9 @@ pub enum ComposerCommand {
     Recovery,
     Checkpoints,
     Automations,
+    /// `/snippet <handle> <text>`：保存 `#handle` 片段（FR-AGENT-04）。
+    SaveSnippet,
+    Snippets,
 }
 
 /// 一条命令被选中后要执行的动作。
@@ -38,6 +41,8 @@ pub struct SlashCommand {
     pub name: &'static str,
     pub action: SlashAction,
     pub description_key: &'static str,
+    /// 需要参数的命令：面板选中后只补全为 `/name `，由用户继续输入参数再提交。
+    pub takes_args: bool,
 }
 
 const fn composer(
@@ -49,6 +54,18 @@ const fn composer(
         name,
         action: SlashAction::Composer(command),
         description_key,
+        takes_args: false,
+    }
+}
+
+const fn composer_with_args(
+    name: &'static str,
+    command: ComposerCommand,
+    description_key: &'static str,
+) -> SlashCommand {
+    SlashCommand {
+        takes_args: true,
+        ..composer(name, command, description_key)
     }
 }
 
@@ -57,6 +74,7 @@ const fn app(name: &'static str, action: KeyAction, description_key: &'static st
         name,
         action: SlashAction::App(action),
         description_key,
+        takes_args: false,
     }
 }
 
@@ -88,6 +106,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         ComposerCommand::Automations,
         "slash.automations",
     ),
+    composer_with_args("snippet", ComposerCommand::SaveSnippet, "slash.snippet"),
+    composer("snippets", ComposerCommand::Snippets, "slash.snippets"),
     app("terminal", KeyAction::NewTerminalTab, "slash.terminal"),
     app(
         "private-terminal",
@@ -131,6 +151,19 @@ pub fn match_commands(query: &str) -> Vec<&'static SlashCommand> {
         .collect();
     hits.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
     hits.into_iter().map(|(_, command)| command).collect()
+}
+
+/// 解析提交时的整条输入 `/name args`。
+///
+/// 无参命令只在没有参数时命中：`/new` 执行命令，而 `/new approach please`
+/// 仍作为普通消息发送。
+pub fn parse_invocation(input: &str) -> Option<(&'static SlashCommand, &str)> {
+    let rest = input.trim().strip_prefix('/')?;
+    let (name, args) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(name, args)| (name, args.trim()));
+    let command = find_command(name)?;
+    (command.takes_args || args.is_empty()).then_some((command, args))
 }
 
 /// 精确按名称查找（不区分大小写）。
@@ -212,5 +245,19 @@ mod tests {
                 .all(|c| c.is_ascii_lowercase() || c == '-'));
             assert!(command.description_key.starts_with("slash."));
         }
+    }
+
+    #[test]
+    fn invocation_parsing_respects_argument_arity() {
+        let (command, args) = parse_invocation("/snippet fix  please fix it").unwrap();
+        assert_eq!(command.name, "snippet");
+        assert_eq!(args, "fix  please fix it");
+        assert_eq!(
+            parse_invocation(" /new ").map(|(c, a)| (c.name, a)),
+            Some(("new", ""))
+        );
+        assert!(parse_invocation("/new approach please").is_none());
+        assert!(parse_invocation("/unknown").is_none());
+        assert!(parse_invocation("plain text").is_none());
     }
 }

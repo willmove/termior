@@ -173,6 +173,15 @@ pub struct SnippetStore {
     pub snippets: Vec<Snippet>,
 }
 
+/// 片段 handle 非法（FR-AGENT-04）。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SnippetError {
+    #[error("usage: /snippet <handle> <text>")]
+    MissingBody,
+    #[error("snippet handles use letters, digits, '-' or '_': {0}")]
+    InvalidHandle(String),
+}
+
 impl SnippetStore {
     pub fn upsert(&mut self, handle: impl Into<String>, body: impl Into<String>) {
         let handle = handle.into().trim_start_matches('#').to_owned();
@@ -184,18 +193,81 @@ impl SnippetStore {
         }
     }
 
-    pub fn expand(&self, input: &str) -> String {
-        input
-            .split_whitespace()
-            .map(|word| {
-                word.strip_prefix('#')
-                    .and_then(|handle| self.snippets.iter().find(|item| item.handle == handle))
-                    .map(|snippet| snippet.body.as_str())
-                    .unwrap_or(word)
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
+    /// 解析 `/snippet <handle> <text>` 的参数并保存；返回规范化后的 handle。
+    pub fn define(&mut self, args: &str) -> Result<String, SnippetError> {
+        let args = args.trim();
+        let (handle, body) = args
+            .split_once(char::is_whitespace)
+            .ok_or(SnippetError::MissingBody)?;
+        let handle = handle.trim_start_matches('#');
+        if !is_valid_handle(handle) {
+            return Err(SnippetError::InvalidHandle(handle.to_owned()));
+        }
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(SnippetError::MissingBody);
+        }
+        self.upsert(handle, body);
+        Ok(handle.to_owned())
     }
+
+    pub fn remove(&mut self, handle: &str) -> bool {
+        let before = self.snippets.len();
+        self.snippets.retain(|item| item.handle != handle);
+        self.snippets.len() < before
+    }
+
+    /// `#` 补全候选：handle 前缀匹配优先，其次子串匹配；同档保持保存顺序。
+    pub fn suggest(&self, query: &str) -> Vec<&Snippet> {
+        let query = query.to_lowercase();
+        let (mut prefix, substring): (Vec<_>, Vec<_>) = self
+            .snippets
+            .iter()
+            .filter(|item| item.handle.to_lowercase().contains(&query))
+            .partition(|item| item.handle.to_lowercase().starts_with(&query));
+        prefix.extend(substring);
+        prefix
+    }
+
+    /// 把 `#handle` 词元替换为片段正文，其余文本（含换行与缩进）原样保留。
+    pub fn expand(&self, input: &str) -> String {
+        let mut output = String::with_capacity(input.len());
+        let mut rest = input;
+        while !rest.is_empty() {
+            let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let (word, tail) = rest.split_at(word_end);
+            let body = word
+                .strip_prefix('#')
+                .and_then(|handle| self.snippets.iter().find(|item| item.handle == handle))
+                .map(|snippet| snippet.body.as_str());
+            output.push_str(body.unwrap_or(word));
+            let space_end = tail
+                .find(|character: char| !character.is_whitespace())
+                .unwrap_or(tail.len());
+            output.push_str(&tail[..space_end]);
+            rest = &tail[space_end..];
+        }
+        output
+    }
+}
+
+fn is_valid_handle(handle: &str) -> bool {
+    !handle.is_empty()
+        && handle
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+/// 光标前的最后一个词元若以 `#` 开头，返回其后的查询串（可为空）。
+pub fn snippet_query(input: &str, cursor: usize) -> Option<&str> {
+    let end = input
+        .char_indices()
+        .nth(cursor)
+        .map_or(input.len(), |(byte, _)| byte);
+    input[..end]
+        .rsplit(char::is_whitespace)
+        .next()?
+        .strip_prefix('#')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,9 +352,58 @@ mod tests {
         let mut snippets = SnippetStore::default();
         snippets.upsert("review", "review this diff");
         assert_eq!(snippets.expand("please #review"), "please review this diff");
+        assert_eq!(
+            snippets.expand("line one\n  #review\tthen #unknown"),
+            "line one\n  review this diff\tthen #unknown",
+            "expansion must keep the user's newlines and indentation"
+        );
         let mut todos = TodoStore::default();
         todos.add("1", "ship");
         assert!(todos.set_done("1", true));
         assert!(todos.items[0].done);
+    }
+
+    #[test]
+    fn snippet_definitions_are_validated() {
+        let mut snippets = SnippetStore::default();
+        assert_eq!(
+            snippets.define("#fix-it  please fix\nthis"),
+            Ok("fix-it".into())
+        );
+        assert_eq!(snippets.snippets[0].body, "please fix\nthis");
+        assert_eq!(snippets.define("fix-it"), Err(SnippetError::MissingBody));
+        assert_eq!(snippets.define(""), Err(SnippetError::MissingBody));
+        assert!(matches!(
+            snippets.define("bad/handle text"),
+            Err(SnippetError::InvalidHandle(_))
+        ));
+        assert_eq!(snippets.define("fix-it replaced"), Ok("fix-it".into()));
+        assert_eq!(snippets.snippets.len(), 1);
+        assert!(snippets.remove("fix-it"));
+        assert!(!snippets.remove("fix-it"));
+    }
+
+    #[test]
+    fn snippet_suggestions_rank_prefix_first() {
+        let mut snippets = SnippetStore::default();
+        snippets.upsert("prereview", "a");
+        snippets.upsert("review", "b");
+        snippets.upsert("other", "c");
+        let handles: Vec<_> = snippets
+            .suggest("rev")
+            .iter()
+            .map(|s| s.handle.as_str())
+            .collect();
+        assert_eq!(handles, ["review", "prereview"]);
+        assert_eq!(snippets.suggest("").len(), 3);
+    }
+
+    #[test]
+    fn snippet_query_tracks_the_token_before_the_cursor() {
+        assert_eq!(snippet_query("please #rev", 11), Some("rev"));
+        assert_eq!(snippet_query("#", 1), Some(""));
+        assert_eq!(snippet_query("please #rev now", 15), None);
+        assert_eq!(snippet_query("issue#12", 8), None);
+        assert_eq!(snippet_query("中文 #片段", 5), Some("片"));
     }
 }

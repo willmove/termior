@@ -46,8 +46,8 @@ pub mod tools;
 pub use agent::{Agent, AgentError, AgentOutcome, AgentState, MAX_AGENT_STEPS};
 pub use approval::{ApprovalDecision, ApprovalRequest};
 pub use composer::{
-    Attachment, AttachmentSource, ComposerDraft, ComposerError, ComposerPayload, Snippet,
-    SnippetStore, TodoItem, TodoStore,
+    snippet_query, Attachment, AttachmentSource, ComposerDraft, ComposerError, ComposerPayload,
+    Snippet, SnippetError, SnippetStore, TodoItem, TodoStore,
 };
 pub use context::{TerminalContext, TerminalContextProvider};
 pub use evaluation::{

@@ -24,9 +24,9 @@ use termior_ai::{
     AgentDefinition, AgentDefinitionStore, ApprovalPolicy, ApprovalRequest, Attachment,
     AttachmentSource, CancellationToken, ChangeSetId, ComposerDraft, EditProposalSummary,
     HttpProvider, KeyringSecretStore, Message, Mode, ProviderConfig, Role, RuntimeBudgets,
-    SecretStore, SessionStore, SnippetStore, TaskCommand, TaskConfig, TaskRuntime, TaskState,
-    TaskSummary, TaskSummaryStore, TerminalContext, TerminalContextProvider, ToolContract,
-    ToolExecutor, ToolRegistry, WaitingReason,
+    SecretStore, SessionStore, Snippet, SnippetError, SnippetStore, TaskCommand, TaskConfig,
+    TaskRuntime, TaskState, TaskSummary, TaskSummaryStore, TerminalContext,
+    TerminalContextProvider, ToolContract, ToolExecutor, ToolRegistry, WaitingReason,
 };
 use termior_explorer_core::fuzzy::fuzzy_match;
 use termior_platform::AgentStatus;
@@ -167,6 +167,10 @@ pub struct ComposerView {
     /// `/` 命令面板的候选（FR-AGENT-05），输入以 `/` 开头时实时刷新。
     slash_suggestions: Vec<&'static SlashCommand>,
     selected_slash_suggestion: usize,
+    /// `#handle` 片段补全候选（FR-AGENT-04）。
+    snippet_suggestions: Vec<Snippet>,
+    selected_snippet_suggestion: usize,
+    snippet_center_open: bool,
     /// 停靠位置与底部停靠高度，由 WorkspaceView 在恢复/拖拽/切换后同步。
     dock: ComposerDock,
     fill_workspace: bool,
@@ -250,6 +254,9 @@ impl ComposerView {
             selected_path_suggestion: 0,
             slash_suggestions: Vec::new(),
             selected_slash_suggestion: 0,
+            snippet_suggestions: Vec::new(),
+            selected_snippet_suggestion: 0,
+            snippet_center_open: false,
             dock: ComposerDock::Bottom,
             fill_workspace: false,
             panel_height: crate::DEFAULT_COMPOSER_HEIGHT,
@@ -782,6 +789,60 @@ impl ComposerView {
     fn update_suggestions(&mut self) {
         self.update_path_suggestions();
         self.update_slash_suggestions();
+        self.update_snippet_suggestions();
+    }
+
+    fn update_snippet_suggestions(&mut self) {
+        self.snippet_suggestions = termior_ai::snippet_query(&self.draft.input, self.cursor)
+            .map(|query| {
+                self.snippets
+                    .suggest(query)
+                    .into_iter()
+                    .take(8)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.selected_snippet_suggestion = self
+            .selected_snippet_suggestion
+            .min(self.snippet_suggestions.len().saturating_sub(1));
+    }
+
+    /// 把光标前的 `#query` 词元替换为 `#handle `；正文在提交时才展开，输入框保持可读。
+    fn accept_snippet_suggestion(&mut self, handle: String, cx: &mut Context<Self>) {
+        let query_chars = termior_ai::snippet_query(&self.draft.input, self.cursor)
+            .map_or(0, |query| query.chars().count() + 1);
+        let start_char = self.cursor.saturating_sub(query_chars);
+        let start_byte = char_to_byte(&self.draft.input, start_char);
+        let end_byte = char_to_byte(&self.draft.input, self.cursor);
+        let replacement = format!("#{handle} ");
+        self.draft
+            .input
+            .replace_range(start_byte..end_byte, &replacement);
+        self.cursor = start_char + replacement.chars().count();
+        self.snippet_suggestions.clear();
+        self.selected_snippet_suggestion = 0;
+        cx.notify();
+    }
+
+    fn persist_snippets(&mut self) {
+        let Some(dir) = &self.data_dir else {
+            return;
+        };
+        if let Err(error) = DataFiles::new(dir.clone())
+            .snippets::<SnippetStore>()
+            .save(&self.snippets)
+        {
+            self.set_status(tf!("composer.snippet.save_failed", "error" => error));
+        }
+    }
+
+    fn delete_snippet(&mut self, handle: &str, cx: &mut Context<Self>) {
+        if self.snippets.remove(handle) {
+            self.set_status(tf!("composer.snippet.deleted", "handle" => handle));
+            self.persist_snippets();
+        }
+        cx.notify();
     }
 
     fn update_slash_suggestions(&mut self) {
@@ -795,6 +856,25 @@ impl ComposerView {
 
     /// 执行命令面板选中的命令：先清空 `/xxx` 输入，再分派动作。
     fn run_slash_command(&mut self, command: &'static SlashCommand, cx: &mut Context<Self>) {
+        self.slash_suggestions.clear();
+        self.selected_slash_suggestion = 0;
+        if command.takes_args {
+            // 需要参数：补全命令名，等用户输入参数后按 Enter 提交。
+            self.draft.input = format!("/{} ", command.name);
+            self.cursor = self.draft.input.chars().count();
+            self.set_status(t!(command.description_key));
+            cx.notify();
+            return;
+        }
+        self.invoke_slash_command(command, "", cx);
+    }
+
+    fn invoke_slash_command(
+        &mut self,
+        command: &'static SlashCommand,
+        args: &str,
+        cx: &mut Context<Self>,
+    ) {
         self.draft.input.clear();
         self.cursor = 0;
         self.slash_suggestions.clear();
@@ -822,6 +902,24 @@ impl ComposerView {
                 ComposerCommand::Automations => {
                     self.automation_center_open = !self.automation_center_open
                 }
+                ComposerCommand::SaveSnippet => match self.snippets.define(args) {
+                    Ok(handle) => {
+                        self.set_status(tf!("composer.snippet.saved", "handle" => handle));
+                        self.persist_snippets();
+                    }
+                    Err(error) => {
+                        // 保留输入，便于用户修正参数后重新提交。
+                        self.draft.input = format!("/snippet {args}");
+                        self.cursor = self.draft.input.chars().count();
+                        self.set_status(match error {
+                            SnippetError::MissingBody => t!("composer.snippet.usage"),
+                            SnippetError::InvalidHandle(handle) => {
+                                tf!("composer.snippet.invalid_handle", "handle" => handle)
+                            }
+                        });
+                    }
+                },
+                ComposerCommand::Snippets => self.snippet_center_open = !self.snippet_center_open,
             },
         }
         cx.notify();
@@ -976,6 +1074,11 @@ impl ComposerView {
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
+        if let Some((command, args)) = slash::parse_invocation(&self.draft.input) {
+            let args = args.to_owned();
+            self.invoke_slash_command(command, &args, cx);
+            return;
+        }
         if self.backend_choice == AgentBackendChoice::CodexAppServer {
             self.submit_external(cx);
             return;
@@ -1903,6 +2006,38 @@ impl ComposerView {
                 _ => {}
             }
         }
+        if !self.snippet_suggestions.is_empty() {
+            match event.keystroke.key.as_str() {
+                "up" => {
+                    self.selected_snippet_suggestion =
+                        self.selected_snippet_suggestion.saturating_sub(1);
+                    cx.notify();
+                    return;
+                }
+                "down" => {
+                    self.selected_snippet_suggestion = (self.selected_snippet_suggestion + 1)
+                        .min(self.snippet_suggestions.len().saturating_sub(1));
+                    cx.notify();
+                    return;
+                }
+                "enter" | "return" | "tab" if !event.keystroke.modifiers.shift => {
+                    if let Some(snippet) = self
+                        .snippet_suggestions
+                        .get(self.selected_snippet_suggestion)
+                    {
+                        let handle = snippet.handle.clone();
+                        self.accept_snippet_suggestion(handle, cx);
+                    }
+                    return;
+                }
+                "escape" => {
+                    self.snippet_suggestions.clear();
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if !self.path_suggestions.is_empty() {
             match event.keystroke.key.as_str() {
                 "up" => {
@@ -1984,6 +2119,19 @@ impl ComposerView {
             && self.draft.attachments.is_empty()
             && self.path_suggestions.is_empty()
             && self.slash_suggestions.is_empty()
+            && self.snippet_suggestions.is_empty()
+            && !self.any_center_open()
+    }
+
+    /// 任一检查面板展开时都不能收缩成 compact，否则面板被裁掉（`/skills` 等在空会话中也要可见）。
+    fn any_center_open(&self) -> bool {
+        self.context_inspector_open
+            || self.recovery_center_open
+            || self.automation_center_open
+            || self.checkpoint_center_open
+            || self.skill_center_open
+            || self.memory_center_open
+            || self.snippet_center_open
     }
 
     /// 工作区在恢复、拖拽或停靠切换后同步布局参数。
@@ -2428,6 +2576,124 @@ impl gpui::Render for ComposerView {
                             )
                     },
                 ))
+        });
+        let snippet_suggestions =
+            (!self.snippet_suggestions.is_empty()).then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .mx_3()
+                    .mt_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(crate::ui::color(p.accent))
+                    .bg(crate::ui::color(p.elevated))
+                    .shadow_md()
+                    .children(self.snippet_suggestions.iter().enumerate().map(
+                        |(index, snippet)| {
+                            let selected = index == self.selected_snippet_suggestion;
+                            let handle = snippet.handle.clone();
+                            div()
+                                .id(SharedString::from(format!("composer-snippet-{index}")))
+                                .flex()
+                                .flex_row()
+                                .gap_3()
+                                .px_3()
+                                .py_1()
+                                .text_xs()
+                                .cursor_pointer()
+                                .when(selected, |row| row.bg(crate::ui::selected_wash(&p)))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(SharedString::from(format!("#{}", snippet.handle))),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(crate::ui::muted(&p))
+                                        .child(SharedString::from(snippet_preview(&snippet.body))),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.accept_snippet_suggestion(handle.clone(), cx)
+                                    }),
+                                )
+                        },
+                    ))
+            });
+        let snippet_center = self.snippet_center_open.then(|| {
+            let rows = self
+                .snippets
+                .snippets
+                .iter()
+                .enumerate()
+                .map(|(index, snippet)| {
+                    let handle = snippet.handle.clone();
+                    div()
+                        .id(SharedString::from(format!("snippet-entry-{index}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .p_2()
+                        .rounded_md()
+                        .bg(crate::ui::alpha(p.foreground, 0.04))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(SharedString::from(format!("#{}", snippet.handle))),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(crate::ui::muted(&p))
+                                .child(SharedString::from(snippet_preview(&snippet.body))),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("delete-snippet-{index}")))
+                                .px_2()
+                                .py(px(2.0))
+                                .rounded_md()
+                                .border_1()
+                                .border_color(crate::ui::color(p.status[3]))
+                                .text_xs()
+                                .cursor_pointer()
+                                .child(t!("composer.snippet.delete"))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.delete_snippet(&handle, cx);
+                                    }),
+                                ),
+                        )
+                });
+            div()
+                .id("snippet-center-panel")
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .border_1()
+                .border_color(crate::ui::border(&p))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(t!("composer.snippet.title")),
+                )
+                .when(self.snippets.snippets.is_empty(), |panel| {
+                    panel.child(
+                        div()
+                            .text_xs()
+                            .text_color(crate::ui::muted(&p))
+                            .child(t!("composer.snippet.empty")),
+                    )
+                })
+                .children(rows)
         });
         let approval_display = self
             .pending_approval
@@ -3617,6 +3883,7 @@ impl gpui::Render for ComposerView {
                         .pb_1()
                         .gap_2()
                         .children(messages)
+                        .children(snippet_center)
                         .children(memory_center)
                         .children(skill_center)
                         .children(checkpoint_center)
@@ -3631,6 +3898,7 @@ impl gpui::Render for ComposerView {
             })
             .child(div().flex().flex_row().px_3().gap_1().children(chips))
             .children(slash_suggestions)
+            .children(snippet_suggestions)
             .children(path_suggestions)
             .child(
                 // 第 1 行：输入文本独占整行宽度，右侧停靠窄面板下长提示词仍完整可见。
@@ -3934,6 +4202,17 @@ impl InputHandler for ComposerInputHandler {
     }
 }
 
+/// 片段正文的单行预览，用于补全弹层与片段面板。
+fn snippet_preview(body: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let line = body.lines().next().unwrap_or_default();
+    let mut preview: String = line.chars().take(MAX_CHARS).collect();
+    if line.chars().count() > MAX_CHARS || body.lines().nth(1).is_some() {
+        preview.push('…');
+    }
+    preview
+}
+
 fn new_session_id() -> String {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4112,6 +4391,86 @@ mod layout_tests {
             view.run_slash_command(command, cx);
         });
         assert_eq!(*received.lock().unwrap(), vec![KeyAction::SplitRight]);
+    }
+
+    fn press(composer: &gpui::Entity<ComposerView>, vcx: &mut gpui::VisualTestContext, key: &str) {
+        composer.update_in(vcx, |view, window, cx| {
+            let event = KeyDownEvent {
+                keystroke: gpui::Keystroke::parse(key).unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            };
+            view.handle_key_down(&event, window, cx);
+        });
+    }
+
+    #[test]
+    fn snippet_command_saves_and_hash_completion_inserts_handle() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        type_text(&composer, vcx, "/snippet review Please review\n  carefully");
+        press(&composer, vcx, "enter");
+        composer.update(vcx, |view, _| {
+            assert!(view.draft.input.is_empty(), "command must not be sent");
+            assert!(view.history.is_empty());
+            assert_eq!(view.snippets.snippets[0].handle, "review");
+        });
+
+        type_text(&composer, vcx, "do #rev");
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        composer.update(vcx, |view, _| {
+            assert_eq!(view.snippet_suggestions[0].handle, "review");
+            assert!(!view.is_compact());
+        });
+        press(&composer, vcx, "tab");
+        composer.update(vcx, |view, _| {
+            assert_eq!(view.draft.input, "do #review ");
+            assert_eq!(view.cursor, view.draft.input.chars().count());
+            assert!(view.snippet_suggestions.is_empty());
+        });
+    }
+
+    #[test]
+    fn invalid_snippet_command_keeps_input_for_correction() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        type_text(&composer, vcx, "/snippet onlyhandle");
+        press(&composer, vcx, "enter");
+        composer.update(vcx, |view, _| {
+            assert_eq!(view.draft.input, "/snippet onlyhandle");
+            assert!(view.snippets.snippets.is_empty());
+        });
+    }
+
+    #[test]
+    fn selecting_an_argument_command_only_completes_its_name() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        type_text(&composer, vcx, "/snippet");
+        press(&composer, vcx, "enter");
+        composer.update(vcx, |view, _| {
+            assert_eq!(view.draft.input, "/snippet ");
+            assert!(view.slash_suggestions.is_empty());
+        });
+    }
+
+    #[test]
+    fn open_panels_keep_an_empty_composer_expanded() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        composer.update(vcx, |view, cx| {
+            assert!(view.is_compact());
+            view.invoke_slash_command(slash::find_command("snippets").unwrap(), "", cx);
+            assert!(view.snippet_center_open);
+            assert!(!view.is_compact());
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
     }
 
     #[test]
