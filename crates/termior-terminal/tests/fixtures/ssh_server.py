@@ -21,6 +21,21 @@ user_key.write_private_key_file(str(root / "identity"))
 user_key.write_private_key_file(str(root / "encrypted_identity"), password="fixture-password")
 
 class Server(paramiko.ServerInterface):
+    def __init__(self):
+        # direct-tcpip channel ids opened by `ssh -L` on this transport.
+        self.forwarded = set()
+
+    def check_channel_direct_tcpip_request(self, chanid, origin, destination):
+        self.forwarded.add(chanid)
+        return paramiko.OPEN_SUCCEEDED
+
+    def check_port_forward_request(self, address, port):
+        # Port 1 stands in for a remote listener the server refuses (`ssh -R`).
+        return False if port == 1 else port
+
+    def cancel_port_forward_request(self, address, port):
+        pass
+
     def check_auth_password(self, username, password):
         return paramiko.AUTH_SUCCESSFUL if username == "test" and password == "fixture-password" else paramiko.AUTH_FAILED
 
@@ -141,14 +156,31 @@ port = listener.getsockname()[1]
 (root / "wrong_hosts").write_text(f"[127.0.0.1]:{port} {user_key.get_name()} {user_key.get_base64()}\n", encoding="utf-8")
 print(json.dumps({"port": port}), flush=True)
 
+def tunnel_echo(channel):
+    # Stands in for the forward target: replies so the test can see the round trip.
+    while True:
+        data = channel.recv(4096)
+        if not data:
+            break
+        channel.sendall(b"tunnel:" + data)
+    channel.close()
+
 def serve(client):
     transport = paramiko.Transport(client)
     try:
         transport.add_server_key(host_key)
         transport.set_subsystem_handler("sftp", paramiko.SFTPServer, Sftp)
-        transport.start_server(server=Server())
+        server = Server()
+        transport.start_server(server=server)
+        # Channels are weakly held by the transport; keep accepted ones alive.
+        accepted = []
         while transport.is_active():
-            time.sleep(0.02)
+            channel = transport.accept(0.02)
+            if channel is None:
+                continue
+            accepted.append(channel)
+            if channel.get_id() in server.forwarded:
+                threading.Thread(target=tunnel_echo, args=(channel,), daemon=True).start()
     except (EOFError, OSError, paramiko.SSHException):
         pass
     finally:

@@ -1410,6 +1410,8 @@ impl gpui::Render for WorkspaceView {
             })
             .unwrap_or_else(|| t!("ws.git_no_branch").to_string());
         let status_left = self.status_context_label(&cwd, cx);
+        let tunnel_chip = self.render_tunnel_chip(&p, cx);
+        let tunnel_popover = self.render_tunnel_popover(&p, cx);
         let workspace_name = self
             .model
             .active_project_dir()
@@ -1830,7 +1832,9 @@ impl gpui::Render for WorkspaceView {
                     let closed_new_tab = this.new_tab_menu.take().is_some();
                     let closed_shell = this.shell_menu.take().is_some();
                     let closed_pane = this.pane_context_menu.take().is_some();
-                    if closed_ssh
+                    let closed_tunnels = this.tunnel_popover.take().is_some();
+                    if closed_tunnels
+                        || closed_ssh
                         || closed_group
                         || closed_explorer
                         || closed_new_tab
@@ -2178,6 +2182,7 @@ impl gpui::Render for WorkspaceView {
                             .items_center()
                             .gap_3()
                             .flex_shrink_0()
+                            .children(tunnel_chip)
                             .child({
                                 let wash = ui::hover_wash(&p);
                                 let tint = gpui_color_alpha(p.foreground, 0.72);
@@ -2308,6 +2313,7 @@ impl gpui::Render for WorkspaceView {
                             ),
                     ),
             )
+            .children(tunnel_popover)
             .children(ssh_context_menu)
             .children(ssh_group_menu)
             .children(explorer_context_menu)

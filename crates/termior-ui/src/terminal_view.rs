@@ -109,6 +109,8 @@ pub struct TerminalView {
     /// 最近一次已 emit 的展示标题，用于去重（OSC 7 每个 prompt 都会上报）。
     emitted_title: Option<String>,
     localhost_urls: Vec<String>,
+    /// OpenSSH forwarding failures reported in this (remote) session, in order.
+    forward_notices: Vec<termior_ssh::forward::Notice>,
     agent_state: Option<AgentState>,
     command_tracker: OscCommandTracker,
     output_sequence: u64,
@@ -248,12 +250,14 @@ impl TerminalView {
                     data.event_offsets
                         .extend(next.event_offsets.into_iter().map(|offset| offset + shift));
                     data.localhost_urls.extend(next.localhost_urls);
+                    data.forward_notices.extend(next.forward_notices);
                 }
                 let backlog_likely = data.bytes.len() >= MAX_PTY_BATCH_BYTES;
                 let bytes = data.bytes;
                 let events = data.events;
                 let event_offsets = data.event_offsets;
                 let localhost_urls = data.localhost_urls;
+                let forward_notices = data.forward_notices;
                 if let Some(id) = observed_session.as_ref() {
                     let _ = observed_service.observe_pane_output(id, bytes.clone());
                 }
@@ -300,6 +304,11 @@ impl TerminalView {
                     for url in localhost_urls {
                         if !view.localhost_urls.contains(&url) {
                             view.localhost_urls.push(url);
+                        }
+                    }
+                    for notice in forward_notices {
+                        if !view.forward_notices.contains(&notice) {
+                            view.forward_notices.push(notice);
                         }
                     }
                     cx.notify();
@@ -349,6 +358,7 @@ impl TerminalView {
             shell_title: None,
             emitted_title: None,
             localhost_urls: Vec::new(),
+            forward_notices: Vec::new(),
             agent_state: None,
             command_tracker: OscCommandTracker::new(terminal_id, ""),
             output_sequence: 0,
@@ -398,6 +408,10 @@ impl TerminalView {
 
     pub fn localhost_urls(&self) -> &[String] {
         &self.localhost_urls
+    }
+
+    pub fn forward_notices(&self) -> &[termior_ssh::forward::Notice] {
+        &self.forward_notices
     }
 
     pub fn recent_text(&self) -> String {

@@ -89,3 +89,13 @@ _Avoid_: 正常模式、标准模式
 **Yolo**:
 门控工具自动批准、不弹卡片的档位;含 `run_command`/`shell_bg_spawn` 等 shell 执行。安全护栏(路径约束、workspace 授权、secret deny-list、SSRF guard)不变——跳过的是人工审批,不是安全层。首次切换需确认一次。
 _Avoid_: 危险模式、无审批模式、bypass
+
+### SSH 与远程
+
+**端口转发 (Port Forward)**:
+SSH 连接配置中显式声明的一条隧道映射,分本地(`-L`)、远端(`-R`)与 SOCKS(`-D`)三类;只由交互 SSH 终端会话建立,状态在状态栏展示。
+_Avoid_: 端口映射规则、代理设置、隧道配置文件
+
+**承载会话 (Carrying Session)**:
+同一连接配置下实际请求并持有端口转发的那个存活 SSH 终端会话;分栏与重复标签不重复请求,只展示承载方的隧道状态。
+_Avoid_: 主会话、隧道进程

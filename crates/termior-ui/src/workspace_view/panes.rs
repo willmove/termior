@@ -253,6 +253,8 @@ impl WorkspaceView {
         self.model.tabs.remove(index);
         self.sftp_browsers.remove(&id);
         self.tabs.retain(|tab| tab.id != id);
+        // 关闭承载隧道的标签即终止其转发。
+        let _ = self.refresh_tunnels(cx);
         if self.model.active == Some(id) {
             self.model.active = if self.model.tabs.is_empty() {
                 None
@@ -295,6 +297,7 @@ impl WorkspaceView {
             if !self.remote_runtime_connected(id, cx) {
                 self.close_remote_explorer(id);
             }
+            let _ = self.refresh_tunnels(cx);
             if let Some(active) = self.model.active {
                 self.activate_runtime(active, cx);
                 // 整个 tab 被关掉时，焦点随被关 pane 消亡；交给幸存的活动 pane。

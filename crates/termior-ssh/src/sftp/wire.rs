@@ -23,7 +23,13 @@ pub(super) struct Transport {
 }
 
 fn command(profile: &Profile, askpass: &std::path::Path) -> Result<Command, Error> {
-    let mut invocation = profile.invocation(SessionKind::Shell)?;
+    // Port forwards belong to the interactive terminal session only; the
+    // background transport must neither request nor compete for them.
+    let transport = Profile {
+        forwards: Vec::new(),
+        ..profile.clone()
+    };
+    let mut invocation = transport.invocation(SessionKind::Shell)?;
     // Shell invocation ends with [-tt, --, host]. Remove only that flag,
     // not an identity-file argument which happens to have the same spelling.
     invocation.args.remove(invocation.args.len() - 3);
@@ -582,6 +588,18 @@ mod tests {
         assert!(args.contains(&"-T"));
         assert!(!args.contains(&"-tt"));
         assert!(args.contains(&"StrictHostKeyChecking=ask"));
+        assert_eq!(&args[args.len() - 3..], &["--", "::1", "sftp"]);
+        let forwarding = Profile {
+            forwards: crate::forward::parse_list("L 8080, R 9000:localhost:3000, D 1080").unwrap(),
+            ..profile
+        };
+        let cmd = command(&forwarding, std::path::Path::new("test-state")).unwrap();
+        let args = cmd
+            .get_args()
+            .map(|s| s.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|a| matches!(*a, "-L" | "-R" | "-D")));
+        assert!(args.contains(&"ClearAllForwardings=yes"));
         assert_eq!(&args[args.len() - 3..], &["--", "::1", "sftp"]);
     }
 }

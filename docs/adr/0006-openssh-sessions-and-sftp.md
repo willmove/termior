@@ -1,6 +1,7 @@
 # ADR 0006: User-owned OpenSSH sessions and SFTP
 
 Status: accepted, amended for active-tab Remote Explorer and shared authentication (2026-09-17)
+and explicit per-profile port forwarding (2026-10-01)
 
 ## Context
 
@@ -19,7 +20,8 @@ through one coordinator per credential target shared by PTY, Explorer and transf
 The connection manager saves only non-secret metadata using the store's atomic JSON
 writer. OpenSSH owns password/keyboard-interactive prompts, encrypted keys, agent
 communication, config aliases, ProxyJump and known_hosts. Force host checking to `ask`,
-disable agent/X11/port forwarding and LocalCommand for these ordinary sessions.
+disable agent/X11/port forwarding and LocalCommand for these ordinary sessions; port
+forwarding is only enabled by explicit per-profile forwards (see below).
 Respect config and system trust stores; never offer an insecure ignore-host-key mode.
 
 SFTP sessions open a graphical local/remote file browser, reusing the persistent subsystem
@@ -36,6 +38,20 @@ When a user-owned SSH/SFTP tab is active, the File Explorer uses a separate, per
 SFTP subsystem connection for remote listing and mutations; switching tabs restores the appropriate local or
 remote source. The Agent and Git remain local. Closing a tab terminates its transport.
 Connection failure retains output; app restart never reconnects or replays a job.
+
+### Amendment: explicit port forwarding (FR-SSH-10)
+
+Profiles may carry validated `-L`/`-R`/`-D` forwards (schema v4). Only interactive shell
+sessions request them, as separate argv values; SFTP tabs, transfers and the Explorer's
+background transport keep `ClearAllForwardings=yes`. Because that option also clears
+command-line forwards, forwarding sessions omit it and pass `ExitOnForwardFailure=no`, so
+the host's own `ssh_config` forwards apply as well and one failed listener never ends the
+login. One live session per profile carries the forwards; splits and duplicate tabs do not
+re-request them. State is observed without touching the tunnel: local listeners are probed
+with a bind attempt (connecting would open a channel to the remote target), busy local ports
+are skipped before spawn, and OpenSSH's forwarding diagnostics are recognised in the first
+256 KiB of session output — remote text can at worst mark a tunnel failed, never active.
+No forwarding runtime, ControlMaster or SOCKS implementation is added.
 
 ## Consequences
 
@@ -54,8 +70,8 @@ Connection failure retains output; app restart never reconnects or replays a job
   interactive window. Host trust remains explicit, OTP is never retained. ProxyJump and
   ProxyCommand use interactive responses/agent because askpass cannot authenticate which
   hop generated a server-controlled keyboard-interactive prompt.
-- Connection settings remain schema v1 with a default-false `use_saved_credentials`
-  flag. Private key files remain managed by OpenSSH; no raw key import or plaintext copy.
+- Connection settings carry a default-false `use_saved_credentials` flag (schema now v4 with
+  groups, tags/notes and forwards; older files migrate in place). Private key files remain managed by OpenSSH; no raw key import or plaintext copy.
 - Preferences and the sidebar share the same manager. Profile change events refresh
   the saved connection list; sidebar actions use the normal remote tab lifecycle.
 - The Explorer uses a small, bounded SFTP v3 protocol client over system `ssh -T -s … sftp`,

@@ -74,6 +74,7 @@ icon_set! {
     Paperclip => "paperclip",
     Send => "send",
     Loader => "loader-circle",
+    ArrowLeftRight => "arrow-left-right",
 }
 
 /// 内嵌图标的 GPUI 资源源。在 `Application::with_assets` 上安装一次即可。

@@ -125,6 +125,7 @@ mod render;
 mod settings_theme;
 mod tab_views;
 mod terminal_mgmt;
+mod tunnels;
 mod workspace_data;
 pub use workspace_data::load_settings;
 
@@ -232,6 +233,14 @@ pub struct WorkspaceView {
     explorer_watcher: Option<WorkspaceWatcher>,
     remote_explorers: HashMap<TabId, RemoteExplorerState>,
     remote_auth_sessions: HashMap<TabId, termior_ssh::auth::Session>,
+    /// SSH 端口转发运行时状态，按承载会话所在标签索引（FR-SSH-10）。
+    tunnels: HashMap<TabId, tunnels::TunnelSession>,
+    /// 隧道状态轮询任务是否在跑（只在有隧道待确认时运行）。
+    tunnel_polling: bool,
+    /// 状态栏隧道弹层：所属会话标签与锚点；`None` 表示关闭。
+    tunnel_popover: Option<(TabId, Point<Pixels>)>,
+    /// 弹层中刚复制过地址的条目，用于"已复制"反馈。
+    tunnel_copied: Option<(TabId, usize)>,
     explorer_view_tab: Option<TabId>,
     remote_explorer_paths: HashMap<TabId, String>,
     remote_terminal_cwds: HashMap<TabId, String>,
@@ -586,6 +595,10 @@ impl WorkspaceView {
             explorer_watcher: None,
             remote_explorers: HashMap::new(),
             remote_auth_sessions: HashMap::new(),
+            tunnels: HashMap::new(),
+            tunnel_polling: false,
+            tunnel_popover: None,
+            tunnel_copied: None,
             explorer_view_tab: None,
             remote_explorer_paths: HashMap::new(),
             remote_terminal_cwds: HashMap::new(),

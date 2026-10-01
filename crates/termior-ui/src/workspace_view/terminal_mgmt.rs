@@ -147,12 +147,13 @@ impl WorkspaceView {
                 self.settings.wsl_distribution.clone(),
             ),
         };
-        let remote = self
+        let mut remote = self
             .model
             .tabs
             .iter()
             .find(|tab| tab.id == tab_id)
             .and_then(|tab| tab.remote.clone());
+        let tunnel_plan = self.plan_tunnels(tab_id, pane_id, remote.as_mut(), cx);
         let auth_session = match remote
             .as_ref()
             .map(|remote| self.ensure_remote_auth(tab_id, &remote.profile, cx))
@@ -178,12 +179,21 @@ impl WorkspaceView {
             wsl_distribution,
             ..Default::default()
         };
-        let spawn_task = cx
-            .background_executor()
-            .spawn(async move { termior_terminal::TerminalBridge::spawn(&config) });
+        let spawn_task = cx.background_executor().spawn(async move {
+            let mut config = config;
+            // 预检本地端口：已占用的转发不交给 OpenSSH，直接在状态栏标为失败。
+            let tunnels = tunnel_plan.map(|forwards| {
+                let (requested, entries) = super::tunnels::preflight(&forwards);
+                if let Some(remote) = config.remote.as_mut() {
+                    remote.profile.forwards = requested;
+                }
+                entries
+            });
+            termior_terminal::TerminalBridge::spawn(&config).map(|bridge| (bridge, tunnels))
+        });
         cx.spawn(async move |workspace, cx| {
-            let bridge = match spawn_task.await {
-                Ok(bridge) => bridge,
+            let (bridge, tunnels) = match spawn_task.await {
+                Ok(spawned) => spawned,
                 Err(error) => {
                     let _ = workspace.update(cx, |workspace, cx| {
                         workspace.pending_terminals.remove(&(tab_id, pane_id));
@@ -216,6 +226,7 @@ impl WorkspaceView {
                 let entity = cx.new(|cx| {
                     TerminalView::from_bridge(bridge, palette, terminal_settings, keymap, cx)
                 });
+                let register_tunnels = tunnels;
                 let terminal_focus = entity.read(cx).focus_handle(cx);
                 let agent_id = format!("terminal-agent-{}-{}", tab_id.0, pane_id.0);
                 let agent_title = workspace
@@ -290,6 +301,9 @@ impl WorkspaceView {
                     if let Some(pane) = tab.panes.get_mut(&pane_id) {
                         *pane = PaneContent::Terminal(entity);
                     }
+                }
+                if let Some(entries) = register_tunnels {
+                    workspace.register_tunnels(tab_id, pane_id, entries, cx);
                 }
                 if workspace.model.active == Some(tab_id) {
                     workspace.follow_active_tab_project(cx);
@@ -533,6 +547,8 @@ impl WorkspaceView {
             if !self.remote_runtime_connected(tab_id, cx) {
                 self.close_remote_explorer(tab_id);
             }
+            // 承载隧道的会话结束：状态栏立即改为"已断开"。
+            let _ = self.refresh_tunnels(cx);
             cx.notify();
             return;
         }

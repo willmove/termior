@@ -25,6 +25,8 @@ pub struct PtyData {
     /// 与 `events` 等长：每个事件发生在 `bytes[..offset]` 之后。
     pub event_offsets: Vec<usize>,
     pub localhost_urls: Vec<String>,
+    /// OpenSSH port-forwarding failures seen in a remote session's output.
+    pub forward_notices: Vec<termior_ssh::forward::Notice>,
 }
 
 /// Bridges terminal-emulator events back to the PTY and application UI.
@@ -194,6 +196,7 @@ fn run_reader_filtered(reader: &mut Box<dyn Read + Send>, mut tx: Sender<PtyData
     let mut buf = [0u8; 8192];
     let mut osc_filter = OscStreamFilter::new();
     let mut url_detector = LocalhostDetector::default();
+    let mut forward_scanner = termior_ssh::forward::NoticeScanner::default();
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break, // EOF：子进程关闭了输出
@@ -207,6 +210,11 @@ fn run_reader_filtered(reader: &mut Box<dyn Read + Send>, mut tx: Sender<PtyData
                         .into_iter()
                         .map(|url| url.to_string())
                         .collect()
+                };
+                let forward_notices = if remote && !forward_scanner.finished() {
+                    forward_scanner.feed(&filtered.visible)
+                } else {
+                    Vec::new()
                 };
                 // channel 关闭（消费方 drop）时退出循环。
                 // Remote OSC must never enter the local terminal/Agent context. The
@@ -228,6 +236,7 @@ fn run_reader_filtered(reader: &mut Box<dyn Read + Send>, mut tx: Sender<PtyData
                     events,
                     event_offsets,
                     localhost_urls,
+                    forward_notices,
                 }))
                 .is_err()
                 {

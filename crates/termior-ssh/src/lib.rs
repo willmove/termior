@@ -3,7 +3,10 @@
 
 pub mod auth;
 pub mod credentials;
+pub mod forward;
 pub mod sftp;
+
+pub use forward::{Forward, ForwardKind};
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -58,6 +61,10 @@ pub struct Profile {
     /// Remembered default directory for SFTP sessions and transfers (v3).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sftp_remote_path: String,
+    /// Explicit port forwards (v4). Requested only by interactive shell sessions;
+    /// SFTP transports and the Explorer never forward.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<Forward>,
 }
 
 impl Default for Profile {
@@ -78,6 +85,7 @@ impl Default for Profile {
             tags: Vec::new(),
             notes: String::new(),
             sftp_remote_path: String::new(),
+            forwards: Vec::new(),
         }
     }
 }
@@ -265,6 +273,7 @@ impl Profile {
                 "SFTP remote path cannot contain control characters",
             ));
         }
+        forward::validate_all(&self.forwards)?;
         Ok(())
     }
 
@@ -286,7 +295,14 @@ impl Profile {
         option("ForwardAgent=no".into());
         option("ForwardX11=no".into());
         option("PermitLocalCommand=no".into());
-        option("ClearAllForwardings=yes".into());
+        let forwards = kind == SessionKind::Shell && !self.forwards.is_empty();
+        if forwards {
+            // ClearAllForwardings would also drop command-line forwards. A failed
+            // listener must not end the shell; its state is reported instead.
+            option("ExitOnForwardFailure=no".into());
+        } else {
+            option("ClearAllForwardings=yes".into());
+        }
         option(format!("ConnectTimeout={}", self.connect_timeout_secs));
         option(format!("ServerAliveInterval={}", self.keepalive_secs));
         option("ServerAliveCountMax=3".into());
@@ -338,6 +354,11 @@ impl Profile {
         if !self.jump_host.is_empty() {
             args.extend(["-J".into(), self.jump_host.clone()]);
         }
+        if forwards {
+            for forward in &self.forwards {
+                args.extend([forward.kind.flag().into(), forward.ssh_spec()]);
+            }
+        }
         if kind == SessionKind::Shell {
             args.push("-tt".into());
         }
@@ -360,8 +381,9 @@ impl Profile {
 }
 
 /// Schema version of `Termior-ssh.json`. v1 predated connection groups;
-/// v3 added per-connection tags, notes and the remembered SFTP remote path.
-pub const PROFILES_VERSION: u32 = 3;
+/// v3 added per-connection tags, notes and the remembered SFTP remote path;
+/// v4 added per-connection port forwards.
+pub const PROFILES_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -452,8 +474,8 @@ impl Profiles {
     }
     pub fn load(dir: &Path) -> Result<Self, Error> {
         let mut value: Self = termior_store::JsonStore::new(dir, "Termior-ssh.json").load()?;
-        // v1 predated groups; v3 fields (tags/notes/sftp_remote_path) all have
-        // serde defaults, so every older file upgrades in place.
+        // v1 predated groups; v3 fields (tags/notes/sftp_remote_path) and v4
+        // forwards all have serde defaults, so every older file upgrades in place.
         if value.version < PROFILES_VERSION {
             value.version = PROFILES_VERSION;
         }
@@ -571,7 +593,7 @@ mod tests {
         assert_eq!(Profiles::load(dir.path()).unwrap().connections.len(), 1);
     }
     #[test]
-    fn v1_and_v2_files_migrate_to_v3_on_load() {
+    fn older_files_migrate_to_current_version_on_load() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Termior-ssh.json"),
@@ -593,7 +615,7 @@ mod tests {
         let migrated = Profiles::load(dir.path()).unwrap();
         assert_eq!(migrated.version, PROFILES_VERSION);
         assert_eq!(migrated.connections[0].group, "prod");
-        let future = r#"{"version":4,"connections":[]}"#;
+        let future = r#"{"version":5,"connections":[]}"#;
         std::fs::write(dir.path().join("Termior-ssh.json"), future).unwrap();
         assert!(Profiles::load(dir.path()).is_err());
     }
@@ -635,6 +657,47 @@ mod tests {
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");
         }
+    }
+    #[test]
+    fn forwards_are_shell_only_argv_and_roundtrip() {
+        let mut p = profile();
+        p.forwards =
+            forward::parse_list("L 8080:127.0.0.1:8080, R 9000:localhost:3000, D 1080").unwrap();
+        let shell = p.invocation(SessionKind::Shell).unwrap().args;
+        assert!(!shell.contains(&"ClearAllForwardings=yes".to_owned()));
+        assert!(shell.contains(&"ExitOnForwardFailure=no".to_owned()));
+        for pair in [
+            ["-L", "8080:127.0.0.1:8080"],
+            ["-R", "9000:localhost:3000"],
+            ["-D", "1080"],
+        ] {
+            assert!(
+                shell.windows(2).any(|w| w == pair),
+                "{pair:?} missing from {shell:?}"
+            );
+        }
+        assert_eq!(&shell[shell.len() - 2..], &["--", "server"]);
+        let sftp = p.invocation(SessionKind::Sftp).unwrap().args;
+        assert!(sftp.contains(&"ClearAllForwardings=yes".to_owned()));
+        assert!(!sftp
+            .iter()
+            .any(|a| matches!(a.as_str(), "-L" | "-R" | "-D")));
+        let plain = profile().invocation(SessionKind::Shell).unwrap().args;
+        assert!(plain.contains(&"ClearAllForwardings=yes".to_owned()));
+        let dir = tempfile::tempdir().unwrap();
+        Profiles {
+            connections: vec![p.clone()],
+            ..Profiles::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        assert_eq!(Profiles::load(dir.path()).unwrap().connections[0], p);
+        assert!(!serde_json::to_string(&profile())
+            .unwrap()
+            .contains("forwards"));
+        let mut bad = profile();
+        bad.forwards = vec![Forward::local(8080, "$(id)", 80)];
+        assert!(bad.validate().is_err());
     }
     #[test]
     fn groups_persist_without_members_and_upsert_preserves_order() {

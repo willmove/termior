@@ -24,8 +24,12 @@ const INPUT_LINE_HEIGHT: f32 = 20.0;
 const INPUT_CARET_HEIGHT: f32 = 16.0;
 
 /// Tab 键序 = 表单视觉顺序：名称 → 分组/标签 → 主机/端口 → 用户/私钥 →
-/// 密码/口令 →（高级：跳板机、远程路径）→ 备注。高级折叠时跳过其中两项。
-const FIELD_TAB_ORDER: [usize; 12] = [0, 9, 10, 1, 3, 2, 4, 7, 8, 5, 6, 11];
+/// 密码/口令 →（高级：跳板机、远程路径、端口转发）→ 备注。高级折叠时跳过这三项。
+const FIELD_TAB_ORDER: [usize; 13] = [0, 9, 10, 1, 3, 2, 4, 7, 8, 5, 6, 12, 11];
+/// 表单字段数（`SshView::values` 的长度）。
+const FIELD_COUNT: usize = 13;
+/// 端口转发字段下标。
+const FORWARDS_FIELD: usize = 12;
 
 pub struct ProfilesChanged;
 impl gpui::EventEmitter<ProfilesChanged> for SshView {}
@@ -92,15 +96,19 @@ pub struct SshView {
     /// 表单缓冲区，下标即字段：
     /// `[0 name, 1 host, 2 user, 3 port, 4 identity, 5 jump_host,
     ///   6 sftp_remote_path, 7 password, 8 passphrase, 9 group,
-    ///   10 tags, 11 notes]`（7、8 是密钥，输入后 zeroize）。
-    values: [String; 12],
+    ///   10 tags, 11 notes, 12 forwards]`（7、8 是密钥，输入后 zeroize）。
+    values: [String; FIELD_COUNT],
     remember: bool,
     auth_prompt: Option<String>,
     shared_auth: Option<termior_ssh::auth::Challenge>,
     scroll: gpui::ScrollHandle,
     input_layouts: Rc<RefCell<Vec<Option<InputLayout>>>>,
     dragging_scroll: bool,
-    /// “高级选项”（跳板机 / SFTP 远程路径 / 传输选项）默认折叠。
+    /// 待滚入可视区的字段与剩余帧预算：先用新滚动位置画一帧，再按该帧布局滚动；
+    /// 预算耗尽（字段始终没有布局）即放弃，不会无限请求重绘。
+    reveal_field: Option<(usize, u8)>,
+    /// “高级选项”（跳板机 / SFTP 远程路径 / 端口转发 / 传输选项）默认折叠；
+    /// 选中已配置转发的连接时自动展开，避免已有隧道被藏起来。
     advanced_open: bool,
     recursive: bool,
     resume: bool,
@@ -192,6 +200,39 @@ impl SshView {
         }
         cx.notify();
     }
+    /// 从状态栏隧道弹层跳转：打开该配置并把光标放进端口转发字段。
+    pub fn edit_saved_forwards(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.edit_saved(name, false, cx);
+        if self.selected.is_some() {
+            self.advanced_open = true;
+            self.field = FORWARDS_FIELD;
+            self.cursor = self.values[FORWARDS_FIELD].len();
+            self.select_all = false;
+            self.marked = None;
+            self.status = t!("ssh.status.forwards_hint").to_string();
+            self.reveal_field = Some((FORWARDS_FIELD, 4));
+        }
+        cx.notify();
+    }
+    /// 追加一条转发模板并定位到末尾，便于直接改端口。
+    fn append_forward_template(&mut self, template: &str) {
+        let value = &mut self.values[FORWARDS_FIELD];
+        let trimmed = value
+            .trim_end()
+            .trim_end_matches([',', '，', ';', '；'])
+            .trim_end()
+            .len();
+        value.truncate(trimmed);
+        if !value.is_empty() {
+            value.push_str(", ");
+        }
+        value.push_str(template);
+        self.field = FORWARDS_FIELD;
+        self.cursor = value.len();
+        self.select_all = false;
+        self.marked = None;
+        self.pending_transfer = None;
+    }
     pub fn refresh_credential_preferences(&mut self, cx: &mut Context<Self>) {
         let Some(dir) = &self.dir else {
             return;
@@ -235,8 +276,9 @@ impl SshView {
             auth_prompt: None,
             shared_auth: None,
             scroll: gpui::ScrollHandle::new(),
-            input_layouts: Rc::new(RefCell::new(vec![None; 12])),
+            input_layouts: Rc::new(RefCell::new(vec![None; FIELD_COUNT])),
             dragging_scroll: false,
+            reveal_field: None,
             advanced_open: false,
             auth: Authentication::Auto,
             field: 0,
@@ -346,7 +388,7 @@ impl SshView {
         let reachable: Vec<usize> = FIELD_TAB_ORDER
             .iter()
             .copied()
-            .filter(|i| self.advanced_open || !matches!(i, 5 | 6))
+            .filter(|i| self.advanced_open || !matches!(*i, 5 | 6 | FORWARDS_FIELD))
             .collect();
         let n = reachable.len();
         let at = reachable.iter().position(|i| *i == self.field).unwrap_or(0);
@@ -375,6 +417,8 @@ impl SshView {
             tags: parse_tags(&self.values[10]),
             notes: self.values[11].trim().into(),
             sftp_remote_path: self.values[6].trim().into(),
+            forwards: termior_ssh::forward::parse_list(&self.values[FORWARDS_FIELD])
+                .map_err(|error| tf!("ssh.error.forwards", "error" => error).to_string())?,
             authentication: self.auth,
             ..self
                 .selected
@@ -423,10 +467,14 @@ impl SshView {
             p.group.clone(),
             p.tags.join(", "),
             p.notes.clone(),
+            termior_ssh::forward::format_list(&p.forwards),
         ];
         self.pending_transfer = None;
         self.auth = p.authentication;
         self.remember = p.use_saved_credentials;
+        if !p.forwards.is_empty() {
+            self.advanced_open = true;
+        }
         self.selected = Some(index);
         self.marked = None;
         self.select_all = false;
@@ -559,21 +607,31 @@ impl SshView {
             return;
         }
         if key.key == "tab" {
-            if let Some(layout) = &self.input_layouts.borrow()[self.field] {
-                let viewport = self.scroll.bounds();
-                let adjustment = if layout.bounds.bottom() > viewport.bottom() {
-                    viewport.bottom() - layout.bounds.bottom() - px(8.)
-                } else if layout.bounds.top() < viewport.top() {
-                    viewport.top() - layout.bounds.top() + px(8.)
-                } else {
-                    px(0.)
-                };
-                self.scroll
-                    .set_offset(self.scroll.offset() + gpui::point(px(0.), adjustment));
-            }
+            self.scroll_field_into_view(self.field, px(8.));
         }
         cx.stop_propagation();
         cx.notify();
+    }
+    /// 按上一帧布局把字段滚入可视区；`below` 为字段下方需要一并露出的余量。
+    /// 返回该字段是否已有布局。
+    fn scroll_field_into_view(&mut self, field: usize, below: Pixels) -> bool {
+        let Some(bounds) = self.input_layouts.borrow()[field]
+            .as_ref()
+            .map(|layout| layout.bounds)
+        else {
+            return false;
+        };
+        let viewport = self.scroll.bounds();
+        let adjustment = if bounds.bottom() + below > viewport.bottom() {
+            viewport.bottom() - bounds.bottom() - below
+        } else if bounds.top() < viewport.top() {
+            viewport.top() - bounds.top() + px(8.)
+        } else {
+            px(0.)
+        };
+        self.scroll
+            .set_offset(self.scroll.offset() + gpui::point(px(0.), adjustment));
+        true
     }
     fn replace(&mut self, range: Option<Range<usize>>, text: &str) {
         self.pending_transfer = None;
@@ -710,6 +768,14 @@ impl Focusable for SshView {
 }
 impl Render for SshView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some((field, budget)) = self.reveal_field.take() {
+            // 首帧只用新的滚动位置布局；之后按该帧布局滚动，并露出字段下方的预览与模板。
+            let first_frame = budget == 4;
+            if (first_frame || !self.scroll_field_into_view(field, px(96.))) && budget > 1 {
+                self.reveal_field = Some((field, budget - 1));
+                window.request_animation_frame();
+            }
+        }
         let p = ui::palette(cx);
         let narrow = window.viewport_size().width < px(650.);
         let focus = self.focus.clone();
@@ -769,7 +835,7 @@ impl Render for SshView {
             .flex_shrink_0()
             .when(self.auth_prompt.is_some(), |form| form.flex_none());
         // 单元格先按字段下标构建，行布局由 field_rows 按 visual order 组装。
-        let mut cells: Vec<Option<gpui::Div>> = (0..12).map(|_| None).collect();
+        let mut cells: Vec<Option<gpui::Div>> = (0..FIELD_COUNT).map(|_| None).collect();
         for (i, label) in [
             t!("ssh.field.name"),
             t!("ssh.field.host"),
@@ -783,6 +849,7 @@ impl Render for SshView {
             t!("ssh.field.group"),
             t!("ssh.field.tags"),
             t!("ssh.field.notes"),
+            t!("ssh.field.forwards"),
         ]
         .into_iter()
         .enumerate()
@@ -1197,7 +1264,124 @@ impl Render for SshView {
                 cx.notify();
             }))
         });
-        // 高级选项：跳板机、SFTP 远程路径与传输工具默认折叠，保持基本表单紧凑。
+        // 端口转发：OpenSSH -L/-R/-D 语法单行输入，下方实时解析预览，可一键追加模板。
+        let forwards_section = {
+            let mut preview = div().flex().flex_col().gap(px(space::XS));
+            match termior_ssh::forward::parse_list(&self.values[FORWARDS_FIELD]) {
+                Ok(forwards) if forwards.is_empty() => {
+                    preview = preview.child(
+                        div()
+                            .text_size(px(font_size::MICRO))
+                            .text_color(ui::muted(&p))
+                            .child(t!("ssh.forwards.empty_hint")),
+                    );
+                }
+                Ok(forwards) => {
+                    for (index, forward) in forwards.iter().enumerate() {
+                        let kind = match forward.kind {
+                            termior_ssh::ForwardKind::Local => t!("tunnel.kind.local"),
+                            termior_ssh::ForwardKind::Remote => t!("tunnel.kind.remote"),
+                            termior_ssh::ForwardKind::Dynamic => t!("tunnel.kind.socks"),
+                        };
+                        let mapping = match (forward.kind, forward.target_endpoint()) {
+                            (termior_ssh::ForwardKind::Remote, Some(target)) => tf!(
+                                "ssh.forwards.preview_remote",
+                                "listen" => forward.listen_endpoint(),
+                                "target" => target
+                            ),
+                            (_, Some(target)) => tf!(
+                                "ssh.forwards.preview_local",
+                                "listen" => forward.listen_endpoint(),
+                                "target" => target
+                            ),
+                            (_, None) => tf!(
+                                "ssh.forwards.preview_socks",
+                                "listen" => forward.listen_endpoint()
+                            ),
+                        };
+                        preview = preview.child(
+                            div()
+                                .id(("forward-preview", index))
+                                .flex()
+                                .items_center()
+                                .gap(px(space::SM))
+                                .text_size(px(font_size::MICRO))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .w(px(48.))
+                                        .py(px(1.))
+                                        .rounded(px(termior_ui_kit::tokens::radius::SM))
+                                        .bg(ui::alpha(p.accent, 0.14))
+                                        .text_color(ui::color(p.accent))
+                                        .flex()
+                                        .justify_center()
+                                        .child(kind),
+                                )
+                                .child(div().min_w_0().child(mapping))
+                                .when(forward.exposed_beyond_loopback(), |row| {
+                                    row.child(
+                                        div()
+                                            .flex_none()
+                                            .text_color(ui::color(p.status[2]))
+                                            .child(t!("tunnel.exposed")),
+                                    )
+                                }),
+                        );
+                    }
+                }
+                Err(error) => {
+                    preview = preview.child(
+                        div()
+                            .text_size(px(font_size::MICRO))
+                            .text_color(ui::color(p.status[3]))
+                            .child(SharedString::from(error.to_string())),
+                    );
+                }
+            }
+            let mut templates = div().flex().flex_wrap().gap(px(space::XS));
+            for (i, (label, template)) in [
+                (t!("ssh.forwards.add_local"), "L 8080:127.0.0.1:8080"),
+                (t!("ssh.forwards.add_remote"), "R 9000:127.0.0.1:3000"),
+                (t!("ssh.forwards.add_socks"), "D 1080"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                templates = templates.child(
+                    ui::button(("forward-template", i), label, ButtonKind::Ghost, &p).on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.append_forward_template(template);
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(space::SM))
+                .child(field_rows(&[&[FORWARDS_FIELD]], &mut cells))
+                .child(preview)
+                .child(templates)
+                // 详细说明只在编辑该字段时出现，避免把高级选项挤出首屏。
+                .when(self.field == FORWARDS_FIELD, |section| {
+                    section.child(
+                        div()
+                            .text_size(px(font_size::MICRO))
+                            .text_color(ui::muted(&p))
+                            .child(t!("ssh.forwards.hint")),
+                    )
+                })
+        };
+        // 高级选项：跳板机、SFTP 远程路径、端口转发与传输工具默认折叠，保持基本表单紧凑；
+        // 折叠时在开关上提示已填写的端口转发，不展开也能看到。
+        let collapsed_label = match termior_ssh::forward::parse_list(&self.values[FORWARDS_FIELD]) {
+            Ok(forwards) if forwards.is_empty() => t!("ssh.advanced.collapsed"),
+            Ok(forwards) => tf!("ssh.advanced.collapsed_forwards", "count" => forwards.len()),
+            Err(_) => t!("ssh.advanced.collapsed_forwards_invalid"),
+        };
         let advanced = div()
             .flex()
             .flex_col()
@@ -1208,7 +1392,7 @@ impl Render for SshView {
                     if self.advanced_open {
                         t!("ssh.advanced.expanded")
                     } else {
-                        t!("ssh.advanced.collapsed")
+                        collapsed_label
                     },
                     ButtonKind::Subtle,
                     &p,
@@ -1222,6 +1406,7 @@ impl Render for SshView {
             .when(self.advanced_open, |section| {
                 section
                     .child(field_rows(&[&[5], &[6]], &mut cells))
+                    .child(forwards_section)
                     .child(transfers)
                     .children(confirmation)
                     .child(
@@ -1895,6 +2080,57 @@ mod tests {
         });
     }
     #[test]
+    fn forwards_field_parses_templates_and_rejects_invalid_specs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cx = TestAppContext::single();
+        let view =
+            cx.new(|cx| SshView::new(Some(dir.path().to_path_buf()), Box::new(|_, _| {}), cx));
+        view.update(&mut cx, |view, cx| {
+            view.values[0] = "dev".into();
+            view.values[1] = "example.test".into();
+            view.values[FORWARDS_FIELD] = "8080，".into();
+            view.append_forward_template("D 1080");
+            assert_eq!(view.values[FORWARDS_FIELD], "8080, D 1080");
+            assert_eq!(view.field, FORWARDS_FIELD);
+            assert_eq!(view.cursor, view.values[FORWARDS_FIELD].len());
+            view.save().unwrap();
+            let saved = Profiles::load(dir.path()).unwrap();
+            assert_eq!(
+                termior_ssh::forward::format_list(&saved.connections[0].forwards),
+                "L 8080:127.0.0.1:8080, D 1080"
+            );
+            view.values[FORWARDS_FIELD] = "L 8080:$(id):80".into();
+            let error = view.save().unwrap_err();
+            assert!(error.contains("8080"), "{error}");
+            assert_eq!(
+                Profiles::load(dir.path()).unwrap().connections[0]
+                    .forwards
+                    .len(),
+                2,
+                "invalid forwards never overwrite the saved profile"
+            );
+            view.advanced_open = false;
+            view.field = 8;
+            assert_ne!(
+                view.next_field(false),
+                FORWARDS_FIELD,
+                "collapsed: Tab skips forwards"
+            );
+            view.advanced_open = true;
+            view.field = 6;
+            assert_eq!(view.next_field(false), FORWARDS_FIELD);
+            view.advanced_open = false;
+            view.select(0);
+            assert!(view.advanced_open, "a profile with forwards opens Advanced");
+            view.advanced_open = false;
+            view.edit_saved_forwards("dev", cx);
+            assert!(view.advanced_open);
+            assert_eq!(view.field, FORWARDS_FIELD);
+            assert_eq!(view.values[FORWARDS_FIELD], "L 8080:127.0.0.1:8080, D 1080");
+            assert!(view.reveal_field.is_some());
+        });
+    }
+    #[test]
     fn advanced_section_hides_jump_host_and_remote_path_until_opened() {
         let mut cx = TestAppContext::single();
         let (view, vcx) = cx.add_window_view(|_, cx| SshView::new(None, Box::new(|_, _| {}), cx));
@@ -1910,6 +2146,10 @@ mod tests {
                 v.input_layouts.borrow()[6].is_none(),
                 "SFTP 远程路径默认折叠"
             );
+            assert!(
+                v.input_layouts.borrow()[FORWARDS_FIELD].is_none(),
+                "端口转发默认折叠"
+            );
         });
         let toggle = vcx
             .debug_bounds("ssh-advanced-toggle")
@@ -1923,6 +2163,7 @@ mod tests {
             assert!(v.advanced_open);
             assert!(v.input_layouts.borrow()[5].is_some());
             assert!(v.input_layouts.borrow()[6].is_some());
+            assert!(v.input_layouts.borrow()[FORWARDS_FIELD].is_some());
         });
     }
 }

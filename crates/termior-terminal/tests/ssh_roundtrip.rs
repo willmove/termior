@@ -613,3 +613,117 @@ fn ssh_and_sftp_real_roundtrip() {
     assert!(code.is_some_and(|code| code != 0), "{output}");
     assert!(!output.contains("fixture-shell-ready"));
 }
+
+/// Start the loopback fixture; returns the server guard and its port.
+fn start_fixture(dir: &std::path::Path) -> (Server, u16) {
+    let python = std::env::var("TERMIOR_SSH_TEST_PYTHON")
+        .expect("set TERMIOR_SSH_TEST_PYTHON to a paramiko environment");
+    let mut server = Server(
+        Command::new(python)
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/ssh_server.py"
+            ))
+            .arg(dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut line = String::new();
+    BufReader::new(server.0.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let port = line
+        .trim()
+        .trim_start_matches("{\"port\": ")
+        .trim_end_matches('}')
+        .parse()
+        .expect("fixture port");
+    (server, port)
+}
+
+#[test]
+#[ignore = "requires Python paramiko and system OpenSSH; all server keys/files are temporary"]
+fn ssh_port_forwards_real_roundtrip() {
+    use std::io::{Read, Write};
+    use termior_ssh::forward::{self, Notice, Probe};
+    let dir = tempfile::tempdir().unwrap();
+    let (_server, port) = start_fixture(dir.path());
+    let local_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let profile = Profile {
+        name: "fixture".into(),
+        host: "127.0.0.1".into(),
+        user: "test".into(),
+        port: Some(port),
+        authentication: Authentication::Key,
+        identity_file: dir.path().join("identity").display().to_string(),
+        known_hosts_file: dir.path().join("known_hosts").display().to_string(),
+        // The fixture refuses remote port 1, standing in for a busy remote listener.
+        forwards: forward::parse_list(&format!("L {local_port}:127.0.0.1:7, R 1:localhost:9"))
+            .unwrap(),
+        ..Profile::default()
+    };
+    let local = profile.forwards[0].clone();
+    assert_eq!(forward::probe_local(&local), Probe::Free);
+    let mut bridge = TerminalBridge::spawn(&PtySessionConfig {
+        remote: Some(Connection {
+            profile,
+            kind: SessionKind::Shell,
+            transfer: None,
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut rx = bridge.take_output().unwrap();
+    let writer = bridge.writer();
+    // A real emulator answers ConPTY's cursor-position query, as the app does.
+    let (proxy, _events) = TerminalEventProxy::new(writer.clone());
+    let mut term = Term::new(Config::default(), &TermSize::new(80, 24), proxy);
+    let mut processor = Processor::<StdSyncHandler>::default();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut output = String::new();
+    let mut notices = Vec::new();
+    let mut reply = None;
+    while reply.is_none() || !notices.contains(&Notice::RemoteListenFailed(1)) {
+        while let Ok(data) = rx.try_recv() {
+            processor.advance(&mut term, &data.bytes);
+            output.push_str(&String::from_utf8_lossy(&data.bytes));
+            notices.extend(data.forward_notices);
+        }
+        if reply.is_none()
+            && output.contains("fixture-shell-ready")
+            && forward::probe_local(&local) == Probe::InUse
+        {
+            // The listener belongs to OpenSSH; data crosses the tunnel to the fixture.
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", local_port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream.write_all(b"ping").unwrap();
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).unwrap();
+            reply = Some(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tunnel fixture timeout: {output} {notices:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(reply.as_deref(), Some("tunnel:ping"));
+    writer.write_all(b"exit\r").unwrap();
+    drop(bridge);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while forward::probe_local(&local) != Probe::Free {
+        assert!(
+            Instant::now() < deadline,
+            "closing the session releases the listener"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
