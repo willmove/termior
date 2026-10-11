@@ -1610,7 +1610,11 @@ impl ComposerView {
         };
         let task = TaskRuntime::new(
             TaskConfig::new(user_input.clone(), project_dir, "native", "direct"),
-            RuntimeBudgets::default(),
+            if policy == ApprovalPolicy::Yolo {
+                RuntimeBudgets::autonomous()
+            } else {
+                RuntimeBudgets::default()
+            },
             policy,
         )
         .with_tools(tools)
@@ -2403,11 +2407,11 @@ impl ComposerView {
             return;
         }
         let mut budgets = runtime.task().budgets.clone();
-        budgets.max_model_steps = budgets.max_model_steps.saturating_add(25);
-        budgets.max_wall_clock_ms = budgets.max_wall_clock_ms.saturating_add(15 * 60 * 1_000);
+        budgets.max_model_steps = budgets.max_model_steps.saturating_add(100);
+        budgets.max_wall_clock_ms = budgets.max_wall_clock_ms.saturating_add(30 * 60 * 1_000);
         budgets.max_tool_output_bytes = budgets
             .max_tool_output_bytes
-            .saturating_add(4 * 1024 * 1024);
+            .saturating_add(16 * 1024 * 1024);
         self.dispatch_task_command(
             TaskCommand::IncreaseBudgets { budgets },
             t!("composer.budget.continuing"),

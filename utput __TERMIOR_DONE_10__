@@ -1,0 +1,25 @@
+=== e84e912 Modify agent icon
+
+=== f642838 Run Agent commands without console windows and show them in the Agent panel
+Termior is a GUI-subsystem process, so every console child spawned without
+CREATE_NO_WINDOW got its own cmd window. Set the flag on Agent commands and
+on the other console helpers (taskkill, git, hooks, agent-host transports,
+fsutil, notification PowerShell).
+
+TaskRuntime gains an optional MessageObserver so the Composer receives
+assistant tool calls and tool results while a task is still running. The
+conversation now renders each tool call as a collapsible block: the command
+and its status stay visible, and clicking expands the selectable output
+tail (ANSI stripped, capped at 200 lines).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+=== c3440f3 Show download progress, speed and ETA for app updates
+The About page only said "Downloading Termior x.y.z…" with no sign of how
+far along the installer download was. The platform updater now reports
+written bytes through an atomic counter, and the UI polls it every 500 ms
+to render a progress bar plus downloaded/total, percent, speed over a
+trailing 5 s window, and remaining time.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+

@@ -349,9 +349,23 @@ pub struct RuntimeBudgets {
 impl Default for RuntimeBudgets {
     fn default() -> Self {
         Self {
-            max_model_steps: 50,
-            max_wall_clock_ms: 30 * 60 * 1_000,
-            max_tool_output_bytes: 8 * 1024 * 1024,
+            max_model_steps: 200,
+            max_wall_clock_ms: 2 * 60 * 60 * 1_000,
+            max_tool_output_bytes: 32 * 1024 * 1024,
+            max_input_tokens: None,
+            max_output_tokens: None,
+        }
+    }
+}
+
+impl RuntimeBudgets {
+    /// Yolo 模式（完全自主，[`ApprovalPolicy::Yolo`]）使用的放宽预算：
+    /// 审批门全部自动通过，任务通常要跑完整个多步工作流，默认预算容易提前耗尽。
+    pub fn autonomous() -> Self {
+        Self {
+            max_model_steps: 500,
+            max_wall_clock_ms: 4 * 60 * 60 * 1_000,
+            max_tool_output_bytes: 64 * 1024 * 1024,
             max_input_tokens: None,
             max_output_tokens: None,
         }
