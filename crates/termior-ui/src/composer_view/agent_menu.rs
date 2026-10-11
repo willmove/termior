@@ -29,6 +29,7 @@ impl ComposerView {
                 .map(|agent| agent.locate().is_some())
                 .collect();
             self.mode_menu_open = false;
+            self.model_menu_open = false;
         }
         cx.notify();
     }

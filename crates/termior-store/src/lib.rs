@@ -41,8 +41,8 @@ pub use recovery::{
 pub use redaction::{RedactionReport, StreamingRedactor};
 pub use retention::{CleanupCandidate, CleanupReport, RetentionManager, RetentionPolicy};
 pub use settings::{
-    default_settings, BackgroundSettings, ModelProviderSettings, ModelSettings, Settings,
-    ShellDetection, TerminalSettings,
+    default_settings, recommended_models, BackgroundSettings, ModelProviderSettings, ModelSettings,
+    Settings, ShellDetection, TerminalSettings,
 };
 pub use task_journal::{JournalError, JournalEvent, JournalRecovery, TaskJournal, TaskSnapshot};
 

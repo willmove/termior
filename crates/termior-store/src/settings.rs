@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// 当前 schema 版本（由 [`crate::migrate`] 消费）。
-pub const SETTINGS_VERSION: u32 = 2;
+pub const SETTINGS_VERSION: u32 = 3;
 
 /// 应用偏好根结构（`Termior-settings.json`，FR-DATA）。
 ///
@@ -137,9 +137,127 @@ pub struct ModelProviderSettings {
     pub provider: String,
     pub display_name: String,
     pub base_url: String,
+    /// 该服务商的默认模型；作为 Agent 默认 profile 时即 Agent 默认模型。
     pub model: String,
+    /// 该服务商下可选的模型（Agent 面板逐会话切换）。旧配置缺省为空，
+    /// 读取一律走 [`Self::model_choices`]，保证默认模型始终在列。
+    #[serde(default)]
+    pub models: Vec<String>,
     pub local: bool,
     pub enabled: bool,
+}
+
+impl ModelProviderSettings {
+    /// 可选模型：按配置顺序去重并跳过空串；默认模型不在列表中时补在最前。
+    pub fn model_choices(&self) -> Vec<String> {
+        let mut choices: Vec<String> = Vec::with_capacity(self.models.len() + 1);
+        for model in &self.models {
+            let model = model.trim();
+            if !model.is_empty() && !choices.iter().any(|existing| existing == model) {
+                choices.push(model.to_owned());
+            }
+        }
+        let default = self.model.trim();
+        if !default.is_empty() && !choices.iter().any(|existing| existing == default) {
+            choices.insert(0, default.to_owned());
+        }
+        choices
+    }
+
+    /// 追加模型；已存在或为空时返回 false。
+    pub fn add_model(&mut self, model: &str) -> bool {
+        let model = model.trim();
+        if model.is_empty() || self.model_choices().iter().any(|m| m == model) {
+            return false;
+        }
+        self.models = self.model_choices();
+        self.models.push(model.to_owned());
+        true
+    }
+
+    /// 移除模型；至少保留一个。移除的是默认模型时由列表首个顶上。
+    pub fn remove_model(&mut self, model: &str) -> bool {
+        let mut choices = self.model_choices();
+        if choices.len() <= 1 || !choices.iter().any(|m| m == model) {
+            return false;
+        }
+        choices.retain(|m| m != model);
+        if self.model == model {
+            self.model = choices[0].clone();
+        }
+        self.models = choices;
+        true
+    }
+
+    /// 把内置推荐模型并入列表（保留用户自加的模型与当前默认）。
+    pub fn merge_recommended_models(&mut self) {
+        let mut choices = self.model_choices();
+        for model in recommended_models(&self.provider) {
+            if !choices.iter().any(|m| m == model) {
+                choices.push((*model).to_owned());
+            }
+        }
+        self.models = choices;
+    }
+}
+
+/// 各服务商的内置推荐模型（2026-10 核对官方模型列表），首个为新配置的默认模型。
+/// 本地服务商的模型取决于用户机器上已拉取的模型，不在此列。
+pub fn recommended_models(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "anthropic" => &[
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+        ],
+        "open_ai" => &["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"],
+        "google" => &[
+            "gemini-3.1-pro-preview",
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+        ],
+        "groq" => &[
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "llama-3.3-70b-versatile",
+            "qwen/qwen3.8-27b",
+        ],
+        "xai" => &["grok-4.7", "grok-4.6", "grok-4.5", "grok-build-0.1"],
+        "cerebras" => &["gpt-oss-120b", "qwen-3.8-27b"],
+        "open_router" => &[
+            "anthropic/claude-opus-5.5",
+            "anthropic/claude-sonnet-5.5",
+            "openai/gpt-6-astra",
+            "openai/gpt-6.1-sol",
+            "google/gemini-3.1-pro-preview",
+            "google/gemini-3.8-flash",
+        ],
+        "deep_seek" => &["deepseek-v4-pro", "deepseek-flash"],
+        "mistral" => &[
+            "mistral-large-latest",
+            "mistral-medium-latest",
+            "mistral-small-latest",
+            "codestral-latest",
+        ],
+        _ => &[],
+    }
+}
+
+/// 早期版本内置的默认模型（多数已下线）。迁移时仅当 profile 仍停留在这些值上
+/// 才换成新推荐默认，用户手动改过的模型保持不变。
+fn legacy_default_model(provider: &str) -> Option<&'static str> {
+    Some(match provider {
+        "anthropic" => "claude-sonnet-4",
+        "open_ai" => "gpt-4o",
+        "google" => "gemini-2.5-pro",
+        "groq" => "llama-3.3-70b-versatile",
+        "xai" => "grok-3",
+        "cerebras" => "llama-3.3-70b",
+        "open_router" => "openai/gpt-4o",
+        "deep_seek" => "deepseek-chat",
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -161,7 +279,7 @@ impl Default for ModelSettings {
                 "anthropic",
                 "Anthropic",
                 "https://api.anthropic.com/v1",
-                "claude-sonnet-4",
+                "claude-opus-5-5",
                 false,
             ),
             (
@@ -169,7 +287,7 @@ impl Default for ModelSettings {
                 "open_ai",
                 "OpenAI",
                 "https://api.openai.com/v1",
-                "gpt-4o",
+                "gpt-6-astra",
                 false,
             ),
             (
@@ -177,7 +295,7 @@ impl Default for ModelSettings {
                 "google",
                 "Google Gemini",
                 "https://generativelanguage.googleapis.com/v1beta",
-                "gemini-2.5-pro",
+                "gemini-3.1-pro-preview",
                 false,
             ),
             (
@@ -185,16 +303,23 @@ impl Default for ModelSettings {
                 "groq",
                 "Groq",
                 "https://api.groq.com/openai/v1",
-                "llama-3.3-70b-versatile",
+                "openai/gpt-oss-120b",
                 false,
             ),
-            ("xai", "xai", "xAI", "https://api.x.ai/v1", "grok-3", false),
+            (
+                "xai",
+                "xai",
+                "xAI",
+                "https://api.x.ai/v1",
+                "grok-4.7",
+                false,
+            ),
             (
                 "cerebras",
                 "cerebras",
                 "Cerebras",
                 "https://api.cerebras.ai/v1",
-                "llama-3.3-70b",
+                "gpt-oss-120b",
                 false,
             ),
             (
@@ -202,7 +327,7 @@ impl Default for ModelSettings {
                 "open_router",
                 "OpenRouter",
                 "https://openrouter.ai/api/v1",
-                "openai/gpt-4o",
+                "anthropic/claude-opus-5.5",
                 false,
             ),
             (
@@ -210,7 +335,7 @@ impl Default for ModelSettings {
                 "deep_seek",
                 "DeepSeek",
                 "https://api.deepseek.com/v1",
-                "deepseek-chat",
+                "deepseek-v4-pro",
                 false,
             ),
             (
@@ -257,23 +382,56 @@ impl Default for ModelSettings {
         Self {
             profiles: definitions
                 .into_iter()
-                .map(
-                    |(id, provider, display_name, base_url, model, local)| ModelProviderSettings {
+                .map(|(id, provider, display_name, base_url, model, local)| {
+                    let recommended = recommended_models(provider);
+                    ModelProviderSettings {
                         id: id.into(),
                         provider: provider.into(),
                         display_name: display_name.into(),
                         base_url: base_url.into(),
                         model: model.into(),
+                        models: if recommended.is_empty() {
+                            vec![model.into()]
+                        } else {
+                            recommended.iter().map(|m| (*m).to_owned()).collect()
+                        },
                         local,
                         enabled: local,
-                    },
-                )
+                    }
+                })
                 .collect(),
             active_chat_profile: None,
             active_completion_profile: None,
             favorite_models: Vec::new(),
             recent_models: Vec::new(),
         }
+    }
+}
+
+impl ModelSettings {
+    /// v2 → v3：为旧 profile 补齐可选模型列表，并把仍停留在旧内置默认的模型升级到新推荐。
+    pub fn adopt_model_catalog(&mut self) {
+        for profile in &mut self.profiles {
+            let recommended = recommended_models(&profile.provider);
+            let Some(new_default) = recommended.first() else {
+                profile.models = profile.model_choices();
+                continue;
+            };
+            let legacy = legacy_default_model(&profile.provider);
+            if profile.model.trim().is_empty() || legacy == Some(profile.model.as_str()) {
+                profile.model = (*new_default).to_owned();
+            }
+            profile.models.retain(|m| Some(m.as_str()) != legacy);
+            profile.merge_recommended_models();
+        }
+    }
+
+    /// Agent 默认使用的 profile（需已启用）。
+    pub fn active_chat(&self) -> Option<&ModelProviderSettings> {
+        let id = self.active_chat_profile.as_deref()?;
+        self.profiles
+            .iter()
+            .find(|profile| profile.id == id && profile.enabled)
     }
 }
 
@@ -491,6 +649,43 @@ mod tests {
         );
         assert_eq!(settings.terminal.font_size, 14);
         assert_eq!(settings.terminal.shell_detection, ShellDetection::Auto);
+    }
+
+    #[test]
+    fn default_profiles_use_recommended_models() {
+        for profile in ModelSettings::default().profiles {
+            let recommended = recommended_models(&profile.provider);
+            if let Some(first) = recommended.first() {
+                assert_eq!(&profile.model, first, "{}", profile.id);
+                assert_eq!(profile.models.len(), recommended.len(), "{}", profile.id);
+            } else {
+                assert_eq!(profile.model_choices(), vec![profile.model.clone()]);
+            }
+        }
+    }
+
+    #[test]
+    fn model_list_edits_keep_a_default() {
+        let mut profile = ModelSettings::default().profiles.remove(0);
+        assert!(profile.add_model(" custom-model "));
+        assert!(!profile.add_model("custom-model"));
+        assert!(profile.models.iter().any(|m| m == "custom-model"));
+        let default = profile.model.clone();
+        assert!(profile.remove_model(&default));
+        assert_eq!(profile.model, profile.models[0]);
+        while profile.model_choices().len() > 1 {
+            let last = profile.model_choices().last().unwrap().clone();
+            assert!(profile.remove_model(&last));
+        }
+        assert!(!profile.remove_model(&profile.model.clone()));
+    }
+
+    #[test]
+    fn legacy_profile_without_model_list_still_offers_its_model() {
+        let json = r#"{"id":"x","provider":"open_ai_compatible","display_name":"X",
+            "base_url":"http://h","model":"m1","local":false,"enabled":true}"#;
+        let profile: ModelProviderSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(profile.model_choices(), vec!["m1".to_owned()]);
     }
 
     #[test]

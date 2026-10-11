@@ -6,7 +6,7 @@
 use crate::settings::{Appearance, Settings};
 
 /// 当前 settings schema 版本。
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = crate::settings::SETTINGS_VERSION;
 
 /// 迁移错误。
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +45,9 @@ pub fn migrate(raw: &str) -> Result<Settings, MigrationError> {
 
     if found < 2 {
         migrate_v1_theme_pairing(&mut settings);
+    }
+    if found < 3 {
+        settings.models.adopt_model_catalog();
     }
 
     settings.version = SCHEMA_VERSION;
@@ -144,7 +147,7 @@ mod tests {
             "editor_theme_id": "default"
         }"#;
         let m = migrate(raw).unwrap();
-        assert_eq!(m.version, 2);
+        assert_eq!(m.version, SCHEMA_VERSION);
         assert_eq!(m.appearance, Appearance::FollowSystem);
         assert_eq!(m.light_theme_id, "default-light");
         assert_eq!(m.dark_theme_id, "tokyo-night");
@@ -178,6 +181,35 @@ mod tests {
         assert_eq!(m.appearance, Appearance::Dark);
         assert_eq!(m.theme_id, "tokyo-night");
         assert_eq!(m.dark_theme_id, "tokyo-night");
+    }
+
+    #[test]
+    fn v2_profiles_gain_model_lists_and_untouched_legacy_defaults_upgrade() {
+        let mut v2 = serde_json::to_value(default_settings()).unwrap();
+        v2["version"] = 2.into();
+        let profiles = v2["models"]["profiles"].as_array_mut().unwrap();
+        for profile in profiles.iter_mut() {
+            profile.as_object_mut().unwrap().remove("models");
+            match profile["id"].as_str().unwrap() {
+                "anthropic" => profile["model"] = "claude-sonnet-4".into(),
+                "openai" => profile["model"] = "my-fine-tune".into(),
+                "ollama" => profile["model"] = "qwen3:8b".into(),
+                _ => {}
+            }
+        }
+        let m = migrate(&v2.to_string()).unwrap();
+        let profile = |id: &str| m.models.profiles.iter().find(|p| p.id == id).unwrap();
+        let anthropic = profile("anthropic");
+        assert_eq!(anthropic.model, "claude-opus-5-5");
+        assert!(!anthropic.models.iter().any(|m| m == "claude-sonnet-4"));
+        assert!(anthropic.models.iter().any(|m| m == "claude-haiku-5-5"));
+        // 用户改过的模型保留为默认，推荐模型并入列表。
+        let openai = profile("openai");
+        assert_eq!(openai.model, "my-fine-tune");
+        assert_eq!(openai.models[0], "my-fine-tune");
+        assert!(openai.models.iter().any(|m| m == "gpt-6-astra"));
+        // 本地服务商没有推荐列表，只保留用户自己的模型。
+        assert_eq!(profile("ollama").models, vec!["qwen3:8b".to_owned()]);
     }
 
     #[test]

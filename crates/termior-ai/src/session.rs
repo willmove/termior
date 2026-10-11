@@ -23,6 +23,16 @@ pub struct Session {
     /// 提交模式（FR-AGENT-11）：随会话记住，新会话回落 Auto。
     #[serde(default)]
     pub mode: Mode,
+    /// 本会话选定的模型；`None` 跟随设置里的 Agent 默认模型。
+    #[serde(default)]
+    pub model: Option<SessionModel>,
+}
+
+/// 会话级模型选择：服务商 profile id + 模型 id。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModel {
+    pub profile_id: String,
+    pub model: String,
 }
 
 impl Session {
@@ -33,6 +43,7 @@ impl Session {
             messages: vec![],
             agent_id: None,
             mode: Mode::default(),
+            model: None,
         }
     }
 

@@ -25,8 +25,8 @@ use termior_ai::{
     AgentDefinition, AgentDefinitionStore, ApprovalPolicy, ApprovalRequest, Attachment,
     AttachmentSource, CancellationToken, ChangeSetId, ComposerDraft, EditProposalSummary,
     HttpProvider, KeyringSecretStore, Message, Mode, ProviderConfig, Role, RuntimeBudgets,
-    SecretStore, SessionStore, Snippet, SnippetError, SnippetStore, TaskCommand, TaskConfig,
-    TaskRuntime, TaskState, TaskSummary, TaskSummaryStore, TerminalContext,
+    SecretStore, SessionModel, SessionStore, Snippet, SnippetError, SnippetStore, TaskCommand,
+    TaskConfig, TaskRuntime, TaskState, TaskSummary, TaskSummaryStore, TerminalContext,
     TerminalContextProvider, TodoStore, ToolContract, ToolExecutor, ToolRegistry, WaitingReason,
 };
 use termior_explorer_core::fuzzy::fuzzy_match;
@@ -34,12 +34,13 @@ use termior_platform::AgentStatus;
 use termior_preview::MarkdownDocument;
 use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_store::{
-    CheckpointManifest, CheckpointStore, DataFiles, KeyAction, RecoveryCenter, RecoveryCommand,
-    RecoveryTaskSummary, RestoreAction, Settings,
+    CheckpointManifest, CheckpointStore, DataFiles, KeyAction, ModelProviderSettings,
+    ModelSettings, RecoveryCenter, RecoveryCommand, RecoveryTaskSummary, RestoreAction, Settings,
 };
 use termior_ui_kit::{menu_panel, tokens::icon_size, Icon, Tooltip};
 
 mod agent_menu;
+mod model_menu;
 mod notify;
 mod task_details;
 
@@ -233,6 +234,14 @@ pub struct ComposerView {
     /// Agent 选择器下拉（Stage B 6.1）与打开时探测的 CLI Agent 可用性。
     agent_menu_open: bool,
     cli_agent_available: Vec<bool>,
+    /// 设置里的模型配置（configure 时同步），供会话级模型选择与运行时重建使用。
+    model_settings: ModelSettings,
+    custom_instructions: String,
+    /// 当前会话选定的模型；`None` 跟随 Agent 默认模型。随会话持久化。
+    model_choice: Option<SessionModel>,
+    model_menu_open: bool,
+    /// 打开模型菜单时探测的各 profile 凭据可用性（与 `model_settings.profiles` 对齐）。
+    model_menu_ready: Vec<bool>,
     /// 任务详情面板（Stage B 6.3）所指的任务；任务结束后仍可查看命令结果。
     last_task: Option<TaskRef>,
     /// 活动任务固定使用的运行时：执行器的根即任务的 project_dir，审批/续跑不随全局切换漂移。
@@ -325,6 +334,11 @@ impl ComposerView {
             external_session: None,
             agent_menu_open: false,
             cli_agent_available: Vec::new(),
+            model_settings: ModelSettings::default(),
+            custom_instructions: String::new(),
+            model_choice: None,
+            model_menu_open: false,
+            model_menu_ready: Vec::new(),
             last_task: None,
             active_runtime: None,
             task_project_override: None,
@@ -409,6 +423,7 @@ impl ComposerView {
             .map(|session| {
                 // 模式随会话记住（FR-AGENT-11）。
                 self.mode = session.mode;
+                self.model_choice = session.model.clone();
                 session.messages.clone()
             })
             .unwrap_or_default();
@@ -416,21 +431,47 @@ impl ComposerView {
         // External backends use their own authentication/model source, but attachments still go
         // through Termior's workspace-confined registry.
         let full_tools = ToolRegistry::new(workspace_auth);
-        self.full_tools = Some(full_tools.clone());
+        self.full_tools = Some(full_tools);
+        self.model_settings = settings.models.clone();
+        self.custom_instructions = settings.custom_instructions.clone();
+        self.rebuild_runtime(cx);
+    }
 
-        let profile = settings
-            .models
-            .active_chat_profile
-            .as_deref()
-            .and_then(|id| {
-                settings
-                    .models
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.id == id)
+    /// 选定模型所在 profile（已启用），模型字段替换为所选模型。
+    fn choice_profile(&self, choice: &SessionModel) -> Option<ModelProviderSettings> {
+        self.model_settings
+            .profiles
+            .iter()
+            .find(|profile| profile.id == choice.profile_id && profile.enabled)
+            .map(|profile| ModelProviderSettings {
+                model: choice.model.clone(),
+                ..profile.clone()
             })
-            .filter(|profile| profile.enabled)
-            .cloned();
+    }
+
+    /// 本会话实际使用的模型：会话选择优先，否则为设置里的 Agent 默认模型。
+    fn effective_profile(&self) -> Option<ModelProviderSettings> {
+        self.model_choice
+            .as_ref()
+            .and_then(|choice| self.choice_profile(choice))
+            .or_else(|| self.model_settings.active_chat().cloned())
+    }
+
+    /// 按当前模型选择重建内置 Agent 运行时；进行中的任务持有自己的 `active_runtime`，不受影响。
+    fn rebuild_runtime(&mut self, cx: &mut Context<Self>) {
+        let Some(full_tools) = self.full_tools.clone() else {
+            return;
+        };
+        let root = self.workspace_root.clone();
+        // 所选 profile 被删除或禁用时回落默认，避免会话卡在不可用的模型上。
+        if self
+            .model_choice
+            .as_ref()
+            .is_some_and(|choice| self.choice_profile(choice).is_none())
+        {
+            self.model_choice = None;
+        }
+        let profile = self.effective_profile();
         let Some(profile) = profile else {
             self.runtime = None;
             if self.backend_choice == AgentBackendChoice::CodexAppServer {
@@ -465,7 +506,7 @@ impl ComposerView {
                 return;
             }
         };
-        let executor = match self.build_executor(root, &full_tools) {
+        let executor = match self.build_executor(&root, &full_tools) {
             Ok(executor) => executor,
             Err(error) => {
                 self.runtime = None;
@@ -476,10 +517,10 @@ impl ComposerView {
         };
         let base_system_prompt = format!(
             "You are Termior's coding agent. Work only inside the authorized workspace. Read before editing, use tools when needed, and never claim an action succeeded without its tool result.{}",
-            if settings.custom_instructions.trim().is_empty() {
+            if self.custom_instructions.trim().is_empty() {
                 String::new()
             } else {
-                format!("\n\nGlobal instructions:\n{}", settings.custom_instructions)
+                format!("\n\nGlobal instructions:\n{}", self.custom_instructions)
             }
         );
         let (tools, system_prompt) =
@@ -1063,6 +1104,9 @@ impl ComposerView {
         self.external_session = None;
         self.draft = ComposerDraft::default();
         self.mode = Mode::Auto;
+        if self.model_choice.take().is_some() {
+            self.rebuild_runtime(cx);
+        }
         self.persist_session();
         self.set_status(t!("composer.status.session_new"));
         cx.notify();
@@ -2071,6 +2115,7 @@ impl ComposerView {
             if let Some(session) = self.sessions.get_mut(&id) {
                 session.messages = self.history.clone();
                 session.mode = self.mode;
+                session.model = self.model_choice.clone();
                 if session.title == "New session" {
                     if let Some(first) = self
                         .history
@@ -2319,6 +2364,7 @@ impl ComposerView {
         match event.keystroke.key.as_str() {
             "escape" if self.mode_menu_open => self.mode_menu_open = false,
             "escape" if self.agent_menu_open => self.agent_menu_open = false,
+            "escape" if self.model_menu_open => self.model_menu_open = false,
             "escape" if self.open_center.is_some() => self.open_center = None,
             "enter" | "return" if !event.keystroke.modifiers.shift => self.submit(cx),
             "backspace" if self.cursor > 0 => {
@@ -2733,6 +2779,18 @@ impl gpui::Render for ComposerView {
                 cx,
             )
         });
+        let model_menu = self.model_menu_open.then(|| {
+            self.model_menu(
+                &p,
+                if show_status_row {
+                    MODE_MENU_BOTTOM + STATUS_ROW_HEIGHT
+                } else {
+                    MODE_MENU_BOTTOM
+                },
+                cx,
+            )
+        });
+        let model_label = self.model_chip_label();
         let task_details = self.task_details_center(&p, cx);
         let chips = self
             .draft
@@ -4003,9 +4061,10 @@ impl gpui::Render for ComposerView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.mode_menu_open || this.agent_menu_open {
+                    if this.mode_menu_open || this.agent_menu_open || this.model_menu_open {
                         this.mode_menu_open = false;
                         this.agent_menu_open = false;
+                        this.model_menu_open = false;
                         cx.notify();
                     }
                 }),
@@ -4421,6 +4480,7 @@ impl gpui::Render for ComposerView {
                                         ));
                                     } else {
                                         this.mode_menu_open = !this.mode_menu_open;
+                                        this.model_menu_open = false;
                                     }
                                     cx.notify();
                                 }),
@@ -4464,6 +4524,52 @@ impl gpui::Render for ComposerView {
                                     this.toggle_agent_menu(cx);
                                 }),
                             )
+                    })
+                    // 会话级模型选择；外部后端自带模型来源，不显示。
+                    .when(!external_backend, |toolbar| {
+                        let model_palette = p.clone();
+                        toolbar.child(
+                            div()
+                                .id("composer-model")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(crate::ui::border(&p))
+                                .bg(if self.model_menu_open {
+                                    crate::ui::selected_wash(&p)
+                                } else {
+                                    crate::ui::color(p.elevated)
+                                })
+                                .cursor_pointer()
+                                .flex_none()
+                                .max_w(px(180.0))
+                                .overflow_hidden()
+                                .text_xs()
+                                .flex()
+                                .items_center()
+                                .gap(px(3.0))
+                                .tooltip(move |_window, cx| {
+                                    Tooltip::view(
+                                        t!("composer.model_menu.hint"),
+                                        &model_palette,
+                                        cx,
+                                    )
+                                })
+                                .child(model_label)
+                                .child(crate::ui::icon(
+                                    Icon::ChevronDown,
+                                    icon_size::XS,
+                                    crate::ui::muted(&p),
+                                ))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_model_menu(cx);
+                                    }),
+                                ),
+                        )
                     })
                     .when_some(context_label, |toolbar, label| {
                         let inspector_palette = p.clone();
@@ -4526,6 +4632,7 @@ impl gpui::Render for ComposerView {
                 root.child(mode_menu)
             })
             .when_some(agent_menu, |root, menu| root.child(menu))
+            .when_some(model_menu, |root, menu| root.child(menu))
     }
 }
 
@@ -5000,6 +5107,55 @@ mod layout_tests {
                 2,
                 "busy composer keeps its session"
             );
+        });
+    }
+
+    #[test]
+    fn session_model_choice_overrides_the_default_and_resets_for_new_sessions() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        composer.update(vcx, |view, cx| {
+            let mut models = ModelSettings::default();
+            for profile in &mut models.profiles {
+                profile.enabled = profile.id == "anthropic";
+            }
+            models.active_chat_profile = Some("anthropic".into());
+            view.model_settings = models;
+            view.sessions.create("s1");
+            assert_eq!(view.model_chip_label().as_ref(), "claude-opus-5-5");
+
+            let choice = SessionModel {
+                profile_id: "anthropic".into(),
+                model: "claude-haiku-5-5".into(),
+            };
+            view.choose_model(Some(choice.clone()), cx);
+            assert_eq!(view.model_chip_label().as_ref(), "claude-haiku-5-5");
+            assert_eq!(
+                view.sessions.get("s1").unwrap().model.as_ref(),
+                Some(&choice),
+                "the choice is remembered with the session"
+            );
+
+            // 选到未启用的服务商不生效，回落到 Agent 默认模型。
+            view.choose_model(
+                Some(SessionModel {
+                    profile_id: "openai".into(),
+                    model: "gpt-6.1-sol".into(),
+                }),
+                cx,
+            );
+            assert_eq!(view.model_chip_label().as_ref(), "claude-opus-5-5");
+
+            view.model_choice = Some(choice);
+            view.new_session(cx);
+            assert!(view.model_choice.is_none());
+
+            view.model_menu_open = true;
+            view.model_menu_ready = vec![true; view.model_settings.profiles.len()];
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
         });
     }
 

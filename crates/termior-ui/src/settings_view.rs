@@ -35,7 +35,7 @@ enum EditField {
     Scrollback,
     ShellPath,
     Instructions,
-    Model,
+    AddModel,
     BaseUrl,
     ApiKey,
     BackgroundOpacity,
@@ -458,7 +458,8 @@ impl SettingsView {
                 ShellDetection::Auto => String::new(),
             },
             EditField::Instructions => self.settings.custom_instructions.clone(),
-            EditField::Model => self.profile().map(|p| p.model.clone()).unwrap_or_default(),
+            // 「添加模型」输入框总是从空白开始。
+            EditField::AddModel => String::new(),
             EditField::BaseUrl => self
                 .profile()
                 .map(|p| p.base_url.clone())
@@ -521,9 +522,17 @@ impl SettingsView {
                 self.settings.custom_instructions = self.draft.clone();
                 Ok(())
             }
-            EditField::Model => {
-                if let Some(profile) = self.profile_mut() {
-                    profile.model = value;
+            EditField::AddModel => {
+                if !value.is_empty() {
+                    let added = self
+                        .profile_mut()
+                        .is_some_and(|profile| profile.add_model(&value));
+                    self.status = if added {
+                        tf!("settings.status.model_added", "model" => value)
+                    } else {
+                        tf!("settings.status.model_exists", "model" => value)
+                    }
+                    .to_string();
                 }
                 Ok(())
             }
@@ -778,6 +787,169 @@ impl SettingsView {
         self.settings.models.active_chat_profile = Some(id);
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    /// 设为 Agent 默认模型：成为该服务提供方的默认模型，并让 Agent 使用该服务提供方。
+    /// 与「用于聊天」同理，设默认时自动启用。
+    fn set_agent_default_model(&mut self, model: String, cx: &mut Context<Self>) {
+        self.commit_edit();
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        profile.models = profile.model_choices();
+        profile.model = model.clone();
+        profile.enabled = true;
+        let (id, name) = (profile.id.clone(), profile.display_name.clone());
+        self.settings.models.active_chat_profile = Some(id);
+        self.status = tf!(
+            "settings.status.agent_default_set",
+            "provider" => name,
+            "model" => model
+        )
+        .to_string();
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn remove_model(&mut self, model: &str, cx: &mut Context<Self>) {
+        self.commit_edit();
+        if self
+            .profile_mut()
+            .is_some_and(|profile| profile.remove_model(model))
+        {
+            self.schedule_save(cx);
+        }
+        cx.notify();
+    }
+
+    fn merge_recommended_models(&mut self, cx: &mut Context<Self>) {
+        self.commit_edit();
+        if let Some(profile) = self.profile_mut() {
+            profile.merge_recommended_models();
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// 当前 profile 的模型列表：标注默认，提供设为 Agent 默认 / 移除操作。
+    fn model_list(&self, active_chat: bool, cx: &mut Context<Self>) -> AnyElement {
+        let p = self.palette.clone();
+        let Some(profile) = self.profile() else {
+            return div().into_any_element();
+        };
+        let choices = profile.model_choices();
+        let removable = choices.len() > 1;
+        let has_recommended = !termior_store::recommended_models(&profile.provider).is_empty();
+        let tag = |label: SharedString, color| {
+            div()
+                .px_2()
+                .py(px(1.0))
+                .rounded_md()
+                .flex_none()
+                .text_xs()
+                .bg(crate::ui::alpha(color, 0.14))
+                .child(label)
+        };
+        let small_button = |id: SharedString, label: SharedString| {
+            crate::ui::button(id, label, crate::ui::ButtonKind::Subtle, &p)
+                .flex_none()
+                .px_2()
+                .py_1()
+                .text_xs()
+        };
+        let rows = choices.into_iter().enumerate().map(|(index, model)| {
+            let is_default = model == profile.model;
+            let agent_default = active_chat && is_default;
+            let default_target = model.clone();
+            let remove_target = model.clone();
+            div()
+                .id(SharedString::from(format!("model-row-{index}")))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(crate::ui::alpha(p.foreground, 0.04))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_sm()
+                        .child(SharedString::from(model)),
+                )
+                .when(agent_default, |row| {
+                    row.child(tag(t!("settings.models.tag_agent_default"), p.accent))
+                })
+                .when(is_default && !agent_default, |row| {
+                    row.child(tag(
+                        t!("settings.models.tag_provider_default"),
+                        p.foreground,
+                    ))
+                })
+                .when(!agent_default, |row| {
+                    row.child(
+                        small_button(
+                            SharedString::from(format!("model-set-default-{index}")),
+                            t!("settings.models.set_agent_default"),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.set_agent_default_model(default_target.clone(), cx);
+                            }),
+                        ),
+                    )
+                })
+                .when(removable, |row| {
+                    row.child(
+                        small_button(
+                            SharedString::from(format!("model-remove-{index}")),
+                            t!("settings.models.remove_model"),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.remove_model(&remove_target, cx);
+                            }),
+                        ),
+                    )
+                })
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_sm().child(t!("settings.models.list_label")))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(crate::ui::muted(&p))
+                    .child(t!("settings.models.list_description")),
+            )
+            .children(rows)
+            .when(has_recommended, |list| {
+                list.child(
+                    div().flex().pt_1().child(
+                        Self::button(
+                            t!("settings.models.restore_recommended"),
+                            "merge-recommended-models",
+                            &p,
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.merge_recommended_models(cx);
+                            }),
+                        ),
+                    ),
+                )
+            })
+            .into_any_element()
     }
 
     /// 设为默认补全模型（内联补全使用）。与聊天默认同理，设默认时自动启用。
@@ -1266,7 +1438,9 @@ impl SettingsView {
         let shift = modifiers.shift;
         if event.keystroke.key == "tab" {
             let fields: &[EditField] = match self.page {
-                SettingsPage::Models => &[EditField::Model, EditField::BaseUrl, EditField::ApiKey],
+                SettingsPage::Models => {
+                    &[EditField::AddModel, EditField::BaseUrl, EditField::ApiKey]
+                }
                 SettingsPage::Agents if self.agent_appearance_open => &[
                     EditField::AgentName,
                     EditField::AgentPrompt,
@@ -2133,10 +2307,11 @@ impl SettingsView {
                 t!("settings.models.step2_title"),
                 t!("settings.models.step2_description"),
                 [
+                    self.model_list(active_chat, cx),
                     self.edit_row(
-                        t!("settings.models.model_label"),
-                        t!("settings.models.model_description"),
-                        EditField::Model,
+                        t!("settings.models.add_label"),
+                        t!("settings.models.add_description"),
+                        EditField::AddModel,
                         cx,
                     ),
                     self.edit_row(
@@ -3476,11 +3651,47 @@ mod edit_tests {
     fn view_with_draft(cx: &mut TestAppContext, draft: &str) -> gpui::Entity<SettingsView> {
         cx.new(|cx| {
             let mut view = SettingsView::new(Settings::default(), None, None, None, None, cx);
-            view.edit_field = Some(EditField::Model);
+            view.edit_field = Some(EditField::AddModel);
             view.draft = draft.to_owned();
             view.cursor = draft.chars().count();
             view
         })
+    }
+
+    #[test]
+    fn model_list_adds_sets_agent_default_and_removes() {
+        let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
+        let view = view_with_draft(&mut cx, " claude-custom ");
+        view.update(&mut cx, |view, cx| {
+            assert_eq!(view.profile().unwrap().id, "anthropic");
+            view.commit_edit();
+            assert!(view
+                .profile()
+                .unwrap()
+                .model_choices()
+                .iter()
+                .any(|m| m == "claude-custom"));
+
+            view.set_agent_default_model("claude-sonnet-5-5".into(), cx);
+            let profile = view.profile().unwrap();
+            assert_eq!(profile.model, "claude-sonnet-5-5");
+            assert!(profile.enabled);
+            assert_eq!(
+                view.settings.models.active_chat_profile.as_deref(),
+                Some("anthropic")
+            );
+            // 设默认不打乱列表顺序。
+            assert_eq!(profile.model_choices()[0], "claude-opus-5-5");
+
+            view.remove_model("claude-sonnet-5-5", cx);
+            let profile = view.profile().unwrap();
+            assert!(!profile
+                .model_choices()
+                .iter()
+                .any(|m| m == "claude-sonnet-5-5"));
+            assert_eq!(profile.model, profile.model_choices()[0]);
+        });
     }
 
     #[test]
@@ -3700,7 +3911,7 @@ mod edit_tests {
         let (view, vcx) = cx.add_window_view(|_, cx| {
             let mut view = SettingsView::new(Settings::default(), None, None, None, None, cx);
             view.page = SettingsPage::Models;
-            view.edit_field = Some(EditField::Model);
+            view.edit_field = Some(EditField::AddModel);
             view.draft = "你好model".into();
             view.cursor = "你好".chars().count();
             view

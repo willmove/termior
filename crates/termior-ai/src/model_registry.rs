@@ -77,15 +77,15 @@ impl Default for ModelRegistry {
         // P0 首发：Anthropic + OpenAI + OpenAI-compatible 各一个示例模型
         let models = vec![
             ModelEntry {
-                id: "claude-sonnet-4".into(),
+                id: "claude-opus-5-5".into(),
                 provider: ProviderKind::Anthropic,
-                display_name: "Claude Sonnet 4".into(),
+                display_name: "Claude Opus 5.5".into(),
                 supports_tools: true,
             },
             ModelEntry {
-                id: "gpt-4o".into(),
+                id: "gpt-6-astra".into(),
                 provider: ProviderKind::OpenAi,
-                display_name: "GPT-4o".into(),
+                display_name: "GPT-6 Astra".into(),
                 supports_tools: true,
             },
             ModelEntry {

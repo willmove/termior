@@ -79,7 +79,7 @@ pub use runtime::{
     ToolExecution, UserControlInterrupt,
 };
 pub use secret_store::{InMemorySecretStore, SecretStore, SecretStoreError};
-pub use session::{ProjectMemory, Session, SessionStore};
+pub use session::{ProjectMemory, Session, SessionModel, SessionStore};
 pub use task::{
     AcceptanceCheck, AcceptanceCriterion, AcceptanceReport, AcceptanceStatus, ApprovalPolicy,
     BudgetDimension, ChangeSetId, DecisionSource, RuntimeBudgets, RuntimeUsage, Task, TaskCommand,
