@@ -83,6 +83,14 @@ pub enum ChangeReviewExecution {
     Unknown(String),
 }
 
+/// 用户接管了 Agent 持有的命令会话。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserControlInterrupt {
+    pub session_id: String,
+    /// 检测到接管时的输出游标；交回后 Agent 从这里读取用户期间的输出。
+    pub cursor: u64,
+}
+
 pub trait RuntimeToolExecutor: Send + Sync {
     fn prepare(
         &self,
@@ -123,6 +131,14 @@ pub trait RuntimeToolExecutor: Send + Sync {
 
     fn cancel_active(&self) -> bool {
         true
+    }
+
+    /// 用户是否接管了本任务持有的交互式命令会话（FR-ATERM 控制权）。
+    ///
+    /// Runtime 在每个调度步骤开始时轮询；返回 `Some` 后任务进入 waiting-user，
+    /// 同一次接管只报告一次。
+    fn user_control_interrupt(&self) -> Option<UserControlInterrupt> {
+        None
     }
 }
 
@@ -599,10 +615,33 @@ impl TaskRuntime {
             }
             TaskCommand::ContinueAfterUser => {
                 if self.task.state != TaskState::WaitingUser
-                    || !matches!(self.task.waiting_reason, Some(WaitingReason::User { .. }))
+                    || !matches!(
+                        self.task.waiting_reason,
+                        Some(WaitingReason::User { .. } | WaitingReason::TerminalControl { .. })
+                    )
                 {
                     return Err(self.invalid_command("continue_after_user"));
                 }
+                self.set_state(TaskState::Running, None);
+                self.drive(provider, executor, on_event).await
+            }
+            TaskCommand::HandBack { session_id, cursor } => {
+                let since = match &self.task.waiting_reason {
+                    Some(WaitingReason::TerminalControl {
+                        session_id: waiting,
+                        cursor: since,
+                    }) if self.task.state == TaskState::WaitingUser && *waiting == session_id => {
+                        *since
+                    }
+                    _ => return Err(self.invalid_command("hand_back")),
+                };
+                // 交回控制权只把游标告诉 Agent，不复制滚屏：Agent 用 command_read_output 增量读取。
+                self.add_message(Message::user(format!(
+                    "[Termior] The user handed terminal session {session_id} back to you. \
+                     They controlled it between output cursor {since} and {cursor}; call \
+                     command_read_output with session_id={session_id} and after={since} to see \
+                     what happened, then continue from the running process without restarting it."
+                )));
                 self.set_state(TaskState::Running, None);
                 self.drive(provider, executor, on_event).await
             }
@@ -623,6 +662,22 @@ impl TaskRuntime {
             self.ensure_persistence()?;
             if self.cancellation.is_cancelled() {
                 self.cancel(executor);
+                return Ok(());
+            }
+            if let Some(interrupt) = executor.user_control_interrupt() {
+                self.emit(TaskEventKind::Diagnostic {
+                    message: format!(
+                        "user took over terminal session {} at cursor {}",
+                        interrupt.session_id, interrupt.cursor
+                    ),
+                });
+                self.set_state(
+                    TaskState::WaitingUser,
+                    Some(WaitingReason::TerminalControl {
+                        session_id: interrupt.session_id,
+                        cursor: interrupt.cursor,
+                    }),
+                );
                 return Ok(());
             }
             self.update_elapsed();

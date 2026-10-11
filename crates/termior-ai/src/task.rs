@@ -181,6 +181,12 @@ pub enum WaitingReason {
     User {
         message: String,
     },
+    /// 用户接管了 Agent 持有的交互式命令会话（FR-ATERM 控制权）；Agent 写入在 writer 边界被拒绝，
+    /// 直到用户交回或选择不交回直接继续。`cursor` 为检测到接管时的输出位置。
+    TerminalControl {
+        session_id: String,
+        cursor: u64,
+    },
     BudgetExhausted {
         dimension: BudgetDimension,
         used: u64,
@@ -644,5 +650,10 @@ pub enum TaskCommand {
         message: String,
     },
     ContinueAfterUser,
+    /// 用户把接管的命令会话交回 Agent：Agent 从现有进程继续，不重启命令。
+    HandBack {
+        session_id: String,
+        cursor: u64,
+    },
     Cancel,
 }

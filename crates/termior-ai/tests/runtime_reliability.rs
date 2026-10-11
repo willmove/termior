@@ -6,7 +6,8 @@ use termior_ai::{
     AcceptanceCheck, AcceptanceCriterion, AcceptanceReport, AcceptanceStatus, ApprovalPolicy,
     CancellationToken, ChatEvent, EvaluationSuiteReport, Message, MockProvider, RuntimeBudgets,
     RuntimeToolExecutor, ScenarioReport, Task, TaskCommand, TaskConfig, TaskRuntime, TaskState,
-    ToolCall, ToolExecution, ToolExecutor, ToolRegistry, ToolState, WaitingReason,
+    ToolCall, ToolExecution, ToolExecutor, ToolRegistry, ToolState, UserControlInterrupt,
+    WaitingReason,
 };
 use termior_security::workspace::WorkspaceAuthRegistry;
 
@@ -651,6 +652,147 @@ fn model_step_budget_is_preserved_across_approval_resume() {
     assert_eq!(runtime.task().state, TaskState::CompletedUnverified);
     assert_eq!(runtime.task().usage.model_steps, 2);
     assert_eq!(*calls.lock().unwrap(), vec!["write_file"]);
+}
+
+/// 第一次工具执行后模拟用户在终端里接管 Agent 持有的会话。
+#[derive(Default)]
+struct TakeoverExecutor {
+    executed: AtomicUsize,
+    reported: AtomicUsize,
+}
+
+impl RuntimeToolExecutor for TakeoverExecutor {
+    fn execute(
+        &self,
+        _call_id: &str,
+        _tool: &str,
+        _normalized_arguments: &str,
+        _cancellation: &CancellationToken,
+    ) -> Result<ToolExecution, String> {
+        self.executed.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolExecution::Completed("bytes=6".into()))
+    }
+
+    fn user_control_interrupt(&self) -> Option<UserControlInterrupt> {
+        (self.executed.load(Ordering::SeqCst) == 1
+            && self.reported.fetch_add(1, Ordering::SeqCst) == 0)
+            .then(|| UserControlInterrupt {
+                session_id: "cmd-repl".into(),
+                cursor: 40,
+            })
+    }
+}
+
+#[test]
+fn user_takeover_pauses_the_task_and_hand_back_resumes_without_restarting() {
+    let provider = MockProvider::new(vec![
+        vec![ChatEvent::Done(assistant_with_calls(vec![
+            ToolCall {
+                id: "write-repl".into(),
+                name: "command_write_input".into(),
+                arguments: r#"{"session_id":"cmd-repl","data":"1+1"}"#.into(),
+            },
+            ToolCall {
+                id: "write-repl-2".into(),
+                name: "command_write_input".into(),
+                arguments: r#"{"session_id":"cmd-repl","data":"2+2"}"#.into(),
+            },
+        ]))],
+        vec![ChatEvent::Done(Message::assistant("done"))],
+    ]);
+    let executor = TakeoverExecutor::default();
+    let mut runtime = TaskRuntime::new(
+        TaskConfig::new("repl", "/project", "native", "direct"),
+        RuntimeBudgets::default(),
+        ApprovalPolicy::Yolo,
+    );
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::Start {
+            user_input: "drive the repl".into(),
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+    assert_eq!(runtime.task().state, TaskState::WaitingUser);
+    assert_eq!(
+        runtime.task().waiting_reason,
+        Some(WaitingReason::TerminalControl {
+            session_id: "cmd-repl".into(),
+            cursor: 40,
+        })
+    );
+    // 第二个写入在接管后不再执行，留在队列等用户交回。
+    assert_eq!(executor.executed.load(Ordering::SeqCst), 1);
+
+    let wrong_session = futures::executor::block_on(runtime.handle(
+        TaskCommand::HandBack {
+            session_id: "cmd-other".into(),
+            cursor: 55,
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ));
+    assert!(wrong_session.is_err());
+    assert_eq!(runtime.task().state, TaskState::WaitingUser);
+
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::HandBack {
+            session_id: "cmd-repl".into(),
+            cursor: 55,
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+    assert_eq!(runtime.task().state, TaskState::CompletedUnverified);
+    assert_eq!(executor.executed.load(Ordering::SeqCst), 2);
+    assert!(runtime.history().iter().any(|message| {
+        message.role == termior_ai::Role::User
+            && message
+                .content
+                .contains("handed terminal session cmd-repl back")
+            && message.content.contains("after=40")
+    }));
+}
+
+#[test]
+fn continuing_without_hand_back_is_allowed_after_a_takeover() {
+    let provider = MockProvider::new(vec![
+        vec![ChatEvent::Done(assistant_with_calls(vec![ToolCall {
+            id: "write-repl".into(),
+            name: "command_write_input".into(),
+            arguments: r#"{"session_id":"cmd-repl","data":"1+1"}"#.into(),
+        }]))],
+        vec![ChatEvent::Done(Message::assistant("done"))],
+    ]);
+    let executor = TakeoverExecutor::default();
+    let mut runtime = TaskRuntime::new(
+        TaskConfig::new("repl", "/project", "native", "direct"),
+        RuntimeBudgets::default(),
+        ApprovalPolicy::Yolo,
+    );
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::Start {
+            user_input: "drive the repl".into(),
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+    assert_eq!(runtime.task().state, TaskState::WaitingUser);
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::ContinueAfterUser,
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+    assert_eq!(runtime.task().state, TaskState::CompletedUnverified);
 }
 
 #[test]

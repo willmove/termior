@@ -8,7 +8,7 @@ use crate::task::ChangeSetId;
 use crate::tools::{ToolError, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -66,6 +66,8 @@ pub struct ToolExecutor {
     shell: Mutex<Option<PersistentShell>>,
     terminal: Arc<LocalTerminalService>,
     owner_task: Mutex<String>,
+    /// 本执行器经 `command_claim` 或交回取得控制权的交互式会话（FR-ATERM 控制权）。
+    claimed_sessions: Mutex<BTreeSet<CommandSessionId>>,
     hooks: Option<Arc<termior_hooks::HookPipeline>>,
     checkpoints: Option<Arc<termior_store::CheckpointStore>>,
     checkpoint_sequence: AtomicU64,
@@ -116,6 +118,7 @@ impl ToolExecutor {
             shell: Mutex::new(None),
             terminal: termior_terminal::shared_terminal_service(),
             owner_task: Mutex::new("termior-agent".into()),
+            claimed_sessions: Mutex::new(BTreeSet::new()),
             hooks: None,
             checkpoints: None,
             checkpoint_sequence: AtomicU64::new(1),
@@ -168,6 +171,27 @@ impl ToolExecutor {
         if let Ok(mut owner) = self.owner_task.lock() {
             *owner = task_id.into();
         }
+    }
+
+    /// 用户把接管的会话交回当前任务（Hand back）：控制权回到任务并恢复接管检测。
+    pub fn hand_back_to_task(&self, id: &CommandSessionId) -> Result<OutputCursor, ToolError> {
+        let cursor = self
+            .terminal
+            .hand_back(id, Controller::Task(self.task_owner()))
+            .map_err(terminal_error)?;
+        self.claimed_sessions
+            .lock()
+            .map_err(|_| ToolError::Io("claimed session registry poisoned".into()))?
+            .insert(id.clone());
+        Ok(cursor)
+    }
+
+    /// 本执行器当前持有控制权的会话 ID（任务详情展示用）。
+    pub fn claimed_session_ids(&self) -> Vec<CommandSessionId> {
+        self.claimed_sessions
+            .lock()
+            .map(|claimed| claimed.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Execute a read-only tool. Approval-level tools are rejected at this entry point.
@@ -706,6 +730,9 @@ impl ToolExecutor {
             .terminal
             .hand_back(&id, Controller::Task(self.task_owner()))
             .map_err(terminal_error)?;
+        if let Ok(mut claimed) = self.claimed_sessions.lock() {
+            claimed.insert(id.clone());
+        }
         Ok(format!(
             "session_id={} controller=task cursor={}",
             id.0, cursor.sequence
@@ -890,6 +917,33 @@ impl RuntimeToolExecutor for ToolExecutor {
             Err(ToolError::EditConflict(conflict)) => Ok(ChangeReviewExecution::Conflict(conflict)),
             Err(error) => Err(error.to_string()),
         }
+    }
+
+    fn user_control_interrupt(&self) -> Option<crate::runtime::UserControlInterrupt> {
+        let owner = Controller::Task(self.task_owner());
+        let mut claimed = self.claimed_sessions.lock().ok()?;
+        let mut interrupt = None;
+        claimed.retain(|id| {
+            let Ok(session) = self.terminal.session(id) else {
+                return false;
+            };
+            if session.state.is_terminal() {
+                return false;
+            }
+            if session.controller == owner {
+                return true;
+            }
+            // 控制权已不在本任务（用户接管）：报告一次后放弃该 claim，交回时重新登记。
+            if interrupt.is_none() {
+                interrupt = Some(crate::runtime::UserControlInterrupt {
+                    session_id: id.0.clone(),
+                    cursor: session.output_end.sequence,
+                });
+                return false;
+            }
+            true
+        });
+        interrupt
     }
 
     fn cancel_active(&self) -> bool {
@@ -1218,10 +1272,23 @@ mod tests {
         executor
             .execute_approved("command_write_input", &input)
             .unwrap();
+        assert_eq!(executor.user_control_interrupt(), None);
         service.take_over(&id).unwrap();
         assert!(executor
             .execute_approved("command_write_input", &input)
             .is_err());
+        // 接管只报告一次；Hand back 后 Agent 恢复写入，检测重新武装。
+        let interrupt = executor
+            .user_control_interrupt()
+            .expect("takeover reported");
+        assert_eq!(interrupt.session_id, id.0);
+        assert_eq!(executor.user_control_interrupt(), None);
+        executor.hand_back_to_task(&id).unwrap();
+        assert_eq!(executor.claimed_session_ids(), vec![id.clone()]);
+        executor
+            .execute_approved("command_write_input", &input)
+            .unwrap();
+        assert_eq!(executor.user_control_interrupt(), None);
         service.observe_pane_exit(&id, None).unwrap();
         service.release(&id, false).unwrap();
         let _ = bridge.kill();
