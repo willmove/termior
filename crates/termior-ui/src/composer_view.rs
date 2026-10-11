@@ -1,10 +1,11 @@
+use crate::text_selection::{SegmentKey, SelectableTexts, TextSelection};
 use crate::{ComposerDock, MAX_COMPOSER_HEIGHT, MIN_COMPOSER_HEIGHT};
 use futures::StreamExt;
 use gpui::{
     canvas, div, prelude::*, px, relative, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem,
-    Context, EventEmitter, FocusHandle, Focusable, FontWeight, InputHandler, KeyDownEvent,
-    MouseButton, MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, UTF16Selection,
-    WeakEntity, Window,
+    Context, DispatchPhase, EventEmitter, FocusHandle, Focusable, FontWeight, Hsla, InputHandler,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    ScrollHandle, SharedString, UTF16Selection, WeakEntity, Window,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -242,6 +243,10 @@ pub struct ComposerView {
     model_menu_open: bool,
     /// 打开模型菜单时探测的各 profile 凭据可用性（与 `model_settings.profiles` 对齐）。
     model_menu_ready: Vec<bool>,
+    /// 会话消息的文本选取：本帧已绘制的文本段、当前选区与是否正在拖选。
+    selectable_texts: SelectableTexts,
+    text_selection: Option<TextSelection>,
+    selecting_text: bool,
     /// 任务详情面板（Stage B 6.3）所指的任务；任务结束后仍可查看命令结果。
     last_task: Option<TaskRef>,
     /// 活动任务固定使用的运行时：执行器的根即任务的 project_dir，审批/续跑不随全局切换漂移。
@@ -339,6 +344,9 @@ impl ComposerView {
             model_choice: None,
             model_menu_open: false,
             model_menu_ready: Vec::new(),
+            selectable_texts: SelectableTexts::default(),
+            text_selection: None,
+            selecting_text: false,
             last_task: None,
             active_runtime: None,
             task_project_override: None,
@@ -1084,6 +1092,103 @@ impl ComposerView {
         cx.notify();
     }
 
+    /// 在消息区按下左键：命中文字则开始选取（双击选词、三击选整段、Shift 扩展），
+    /// 否则清除选区。不阻止冒泡，面板的聚焦与收起菜单逻辑照常执行。
+    fn begin_text_selection(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(point) = self.selectable_texts.hit(event.position) else {
+            self.selecting_text = false;
+            if self.text_selection.take().is_some() {
+                cx.notify();
+            }
+            return;
+        };
+        // 复制快捷键要落到面板上，而不是仍持有焦点的终端（那里 Ctrl+C 是中断）。
+        window.focus(&self.focus_handle, cx);
+        self.selecting_text = false;
+        self.text_selection = match event.click_count {
+            2 => self.selectable_texts.word_at(point),
+            count if count >= 3 => self.selectable_texts.segment_at(point),
+            _ => {
+                self.selecting_text = true;
+                match self.text_selection {
+                    Some(selection) if event.modifiers.shift => Some(TextSelection {
+                        anchor: selection.anchor,
+                        head: point,
+                    }),
+                    _ => Some(TextSelection::caret(point)),
+                }
+            }
+        };
+        cx.notify();
+    }
+
+    /// 拖选期间跟踪整个窗口的鼠标：拖出消息区仍能延伸选区，任意位置松开结束。
+    fn text_drag_tracker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let selecting = self.selecting_text;
+        let view = cx.entity().downgrade();
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                if !selecting {
+                    return;
+                }
+                let moved = view.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Bubble
+                        || event.pressed_button != Some(MouseButton::Left)
+                    {
+                        return;
+                    }
+                    let _ = moved.update(cx, |this, cx| {
+                        this.extend_text_selection(event.position, cx)
+                    });
+                });
+                let released = view.clone();
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        let _ = released.update(cx, |this, _| this.selecting_text = false);
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_0()
+    }
+
+    fn extend_text_selection(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(selection) = self.text_selection.as_mut() else {
+            return;
+        };
+        if let Some(head) = self.selectable_texts.nearest(position) {
+            if selection.head != head {
+                selection.head = head;
+                cx.notify();
+            }
+        }
+    }
+
+    /// 复制选中的消息文本；没有选区时不做任何事。
+    fn copy_text_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(selection) = self
+            .text_selection
+            .filter(|selection| !selection.is_empty())
+        else {
+            return;
+        };
+        let text = self.selectable_texts.selected_text(selection);
+        if text.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.set_status(t!("composer.status.selection_copied"));
+        cx.notify();
+    }
+
     /// 开始一个新的命名会话；当前会话已镜像落盘，忙碌或有挂起审批时拒绝。
     fn new_session(&mut self, cx: &mut Context<Self>) {
         if self.busy
@@ -1097,6 +1202,7 @@ impl ComposerView {
         self.persist_session();
         self.sessions.create(new_session_id());
         self.history.clear();
+        self.text_selection = None;
         self.active_task = None;
         self.last_context_plan = None;
         self.awaiting_plan_confirmation = false;
@@ -2262,6 +2368,10 @@ impl ComposerView {
         } else {
             modifiers.control
         };
+        if primary && event.keystroke.key.eq_ignore_ascii_case("c") {
+            self.copy_text_selection(cx);
+            return;
+        }
         if primary && event.keystroke.key.eq_ignore_ascii_case("v") {
             self.schedule_attach_clipboard(cx);
             return;
@@ -2365,6 +2475,7 @@ impl ComposerView {
             "escape" if self.mode_menu_open => self.mode_menu_open = false,
             "escape" if self.agent_menu_open => self.agent_menu_open = false,
             "escape" if self.model_menu_open => self.model_menu_open = false,
+            "escape" if self.text_selection.is_some() => self.text_selection = None,
             "escape" if self.open_center.is_some() => self.open_center = None,
             "enter" | "return" if !event.keystroke.modifiers.shift => self.submit(cx),
             "backspace" if self.cursor > 0 => {
@@ -2702,16 +2813,22 @@ impl gpui::Render for ComposerView {
         if scroll_max + scroll_offset <= px(8.0) {
             self.scroll_handle.scroll_to_bottom();
         }
-        let messages = self
-            .history
-            .iter()
-            .filter(|message| matches!(message.role, Role::User | Role::Assistant))
-            .rev()
-            .take(COMPOSER_RENDERED_MESSAGES)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
+        // 选区坐标以消息在会话中的序号分组：历史只追加，序号在流式更新间保持稳定。
+        let conversation = || {
+            self.history
+                .iter()
+                .filter(|message| matches!(message.role, Role::User | Role::Assistant))
+        };
+        let skipped = conversation()
+            .count()
+            .saturating_sub(COMPOSER_RENDERED_MESSAGES);
+        let texts = self.selectable_texts.clone();
+        texts.clear();
+        let selection = self.text_selection;
+        let selection_background: Hsla = crate::ui::alpha(p.accent, 0.35).into();
+        let messages = conversation()
             .enumerate()
+            .skip(skipped)
             .map(|(index, message)| {
                 let is_user = message.role == Role::User;
                 let label = if is_user {
@@ -2728,29 +2845,45 @@ impl gpui::Render for ComposerView {
                 // 管线，见 SDD 依赖决策）；用户消息保持原样，避免输入里的
                 // *、# 等字符被误解析成格式。
                 let body = if is_user {
-                    div()
-                        .flex()
-                        .flex_col()
-                        .text_xs()
-                        .children(message.content.lines().map(|line| {
-                            // 空行用不断行空格占位，避免塌陷成零高度。
-                            let text = if line.is_empty() { "\u{00A0}" } else { line };
-                            div().child(SharedString::from(text))
-                        }))
+                    // 整条消息作为一段多行文本，复制结果与原文一致；
+                    // 空消息用不断行空格占位，避免塌陷成零高度。
+                    let content = message.content.replace("\r\n", "\n");
+                    let content = if content.is_empty() {
+                        "\u{00A0}".to_owned()
+                    } else {
+                        content
+                    };
+                    div().text_xs().cursor_text().children(texts.text(
+                        SegmentKey {
+                            group: index,
+                            seq: 0,
+                        },
+                        content.into(),
+                        Vec::new(),
+                        selection,
+                        selection_background,
+                    ))
                 } else {
                     // 流式期间每个增量都会重渲染并重新解析；消息量已被
                     // COMPOSER_RENDERED_MESSAGES 截断，解析成本可接受。
                     let document = MarkdownDocument::parse(&message.content);
-                    let blocks = crate::markdown_render::render_blocks(
+                    let blocks = crate::markdown_render::render_selectable_blocks(
                         &document,
                         crate::markdown_render::Density::CHAT,
                         &format!("composer-md-{index}"),
                         &p,
+                        crate::markdown_render::Selectable {
+                            texts: &texts,
+                            group: index,
+                            selection,
+                            background: selection_background,
+                        },
                     );
                     div()
                         .flex()
                         .flex_col()
                         .min_w(px(0.0))
+                        .cursor_text()
                         .text_size(px(crate::markdown_render::Density::CHAT.base))
                         .line_height(relative(1.5))
                         // 首个增量到达前内容为空，用占位空行维持行高。
@@ -2791,6 +2924,7 @@ impl gpui::Render for ComposerView {
             )
         });
         let model_label = self.model_chip_label();
+        let text_drag_tracker = self.text_drag_tracker(cx);
         let task_details = self.task_details_center(&p, cx);
         let chips = self
             .draft
@@ -4318,6 +4452,9 @@ impl gpui::Render for ComposerView {
                     div()
                         .id("composer-messages")
                         .debug_selector(|| "composer-messages".into())
+                        .relative()
+                        .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_text_selection))
+                        .child(text_drag_tracker)
                         .flex()
                         .flex_col()
                         .flex_1()
@@ -4814,6 +4951,66 @@ fn requested_skill_names(input: &str, skills: &[SkillMetadata]) -> Vec<String> {
 mod layout_tests {
     use super::*;
     use gpui::TestAppContext;
+
+    fn draw(vcx: &mut gpui::VisualTestContext) {
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+    }
+
+    /// 真实布局下拖选跨越用户消息与 Agent 回复的多个段落，复制得到原文。
+    #[test]
+    fn dragging_over_messages_selects_and_copies_text() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        composer.update(vcx, |view, _| {
+            // 面板足够高，内容不触发贴底滚动，第一条消息完整可见。
+            view.panel_height = 600.0;
+            view.history.push(Message::user("请解释一下"));
+            view.history.push(Message::assistant(
+                "First paragraph\n\nSecond **bold** line",
+            ));
+        });
+        draw(vcx);
+        let segments = composer.update(vcx, |view, _| view.selectable_texts.segment_bounds());
+        let keys = segments.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                SegmentKey { group: 0, seq: 0 },
+                SegmentKey { group: 1, seq: 0 },
+                SegmentKey { group: 1, seq: 1 },
+            ]
+        );
+        let start = segments[0].1.origin + gpui::point(px(1.0), segments[0].1.size.height / 2.0);
+        let last = segments[2].1;
+        let end = gpui::point(last.right() + px(40.0), last.bottom() + px(4.0));
+
+        vcx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+        draw(vcx);
+        vcx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+
+        vcx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+        composer.update(vcx, |view, _| {
+            assert!(!view.selecting_text, "mouse up ends the drag")
+        });
+        vcx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        });
+        let copied = vcx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("selection copied");
+        assert_eq!(copied, "请解释一下\n\nFirst paragraph\nSecond bold line");
+
+        // 点在消息区内、文字之外的空白处清除选区。
+        let blank = gpui::point(start.x, last.bottom() + px(40.0));
+        vcx.simulate_mouse_down(blank, MouseButton::Left, gpui::Modifiers::none());
+        composer.update(vcx, |view, _| assert!(view.text_selection.is_none()));
+    }
 
     /// 用真实 ComposerView 渲染，防止输入行结构改动把文本压成逐字换行（竖排）。
     /// CJK 输入 + 光标在开头是用户踩过的状态；断言输入文本保持单行高度。

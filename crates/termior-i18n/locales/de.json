@@ -181,6 +181,7 @@
   "composer.status.running_tool": "Genehmigtes Tool wird ausgeführt: {tool}",
   "composer.status.session_busy": "Beende oder stoppe die aktuelle Aufgabe, bevor du eine neue Sitzung beginnst",
   "composer.status.session_new": "Neue Sitzung gestartet",
+  "composer.status.selection_copied": "Ausgewählten Text kopiert",
   "composer.status.skill_failed": "Agent-Skill konnte nicht aktiviert werden: {error}",
   "composer.status.skill_named_failed": "Agent-Skill ${name} konnte nicht aktiviert werden: {error}",
   "composer.status.task_failed": "Agent-Aufgabe fehlgeschlagen; letztes Tool-Ergebnis prüfen",

@@ -181,6 +181,7 @@
   "composer.status.running_tool": "承認されたツールを実行中：{tool}",
   "composer.status.session_busy": "新しいセッションを始める前に、現在のタスクを完了または停止してください",
   "composer.status.session_new": "新しいセッションを開始しました",
+  "composer.status.selection_copied": "選択したテキストをコピーしました",
   "composer.status.skill_failed": "Agent スキルを有効化できませんでした：{error}",
   "composer.status.skill_named_failed": "Agent スキル ${name} を有効化できませんでした：{error}",
   "composer.status.task_failed": "Agent タスクが失敗しました。最後のツール結果を確認してください",

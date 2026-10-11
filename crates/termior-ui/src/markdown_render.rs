@@ -4,9 +4,10 @@
 //! （[`Density::CHAT`]），对应 SDD 的依赖决策：pulldown-cmark 解析 + GPUI 原生
 //! 渲染，不为同一能力引入第二套管线。视图层只负责外壳（工具栏、滚动容器等）。
 
+use crate::text_selection::{SegmentKey, SelectableTexts, TextSelection};
 use crate::ui;
 use gpui::{
-    div, prelude::*, px, AnyElement, FontStyle, FontWeight, HighlightStyle, SharedString,
+    div, prelude::*, px, AnyElement, FontStyle, FontWeight, HighlightStyle, Hsla, SharedString,
     StrikethroughStyle, StyledText, UnderlineStyle,
 };
 use std::ops::Range;
@@ -95,259 +96,348 @@ pub(crate) fn render_blocks(
     id_prefix: &str,
     p: &ResolvedPalette,
 ) -> Vec<AnyElement> {
-    let mut seq = 0usize;
-    document
-        .blocks
-        .iter()
-        .map(|node| render_block(node, density, id_prefix, &mut seq, p))
-        .collect()
+    Renderer::new(density, id_prefix, p, None).blocks(document)
 }
 
-fn next_id(id_prefix: &str, kind: &str, seq: &mut usize) -> SharedString {
-    let id = SharedString::from(format!("{id_prefix}-{kind}-{seq}"));
-    *seq += 1;
-    id
+/// 可选取渲染：每段文字登记到 `texts`，并按 `selection` 绘制选区背景。
+pub(crate) struct Selectable<'a> {
+    pub texts: &'a SelectableTexts,
+    /// 本文档在选区坐标中的分组（聊天里为消息序号）。
+    pub group: usize,
+    pub selection: Option<TextSelection>,
+    pub background: Hsla,
 }
 
-fn render_block(
-    node: &MarkdownNode,
+/// 与 [`render_blocks`] 相同，但文字可被鼠标选取。
+pub(crate) fn render_selectable_blocks(
+    document: &MarkdownDocument,
     density: Density,
     id_prefix: &str,
-    seq: &mut usize,
     p: &ResolvedPalette,
-) -> AnyElement {
-    match node {
-        MarkdownNode::Heading { level, children } => {
-            let index = (*level as usize).saturating_sub(1).min(3);
-            let (size, top, bottom) = density.headings[index];
-            div()
-                .mt(px(top))
-                .mb(px(bottom))
-                .text_size(px(size))
-                .font_weight(FontWeight::BOLD)
-                .when(*level <= 2, |heading| {
-                    heading.pb_2().border_b_1().border_color(ui::border(p))
-                })
-                .child(styled_inline(children, p))
-                .into_any_element()
-        }
-        MarkdownNode::Paragraph(children) => div()
-            .mb(px(density.block_gap))
-            .text_size(px(density.base))
-            .child(styled_inline(children, p))
-            .into_any_element(),
-        MarkdownNode::BlockQuote(children) => div()
-            .mb(px(density.block_gap))
-            .pl(px(density.quote_indent))
-            .py_1()
-            .border_l_2()
-            .border_color(ui::color(p.accent))
-            .text_color(ui::muted(p))
-            .children(
-                children
-                    .iter()
-                    .map(|child| render_block(child, density, id_prefix, seq, p)),
-            )
-            .into_any_element(),
-        MarkdownNode::CodeBlock { language, code } => div()
-            .mb(px(density.major_gap))
-            .rounded_md()
-            .border_1()
-            .border_color(ui::border(p))
-            .bg(ui::color(p.elevated))
-            .when_some(language.clone(), |block, language| {
-                block.child(
-                    div()
-                        .px_3()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(ui::border(p))
-                        .text_size(px(density.base - 2.0))
-                        .text_color(ui::muted(p))
-                        .child(SharedString::from(language)),
-                )
-            })
-            .child(
-                div()
-                    .id(next_id(id_prefix, "code", seq))
-                    .overflow_x_scroll()
-                    .p(px(density.code_padding))
-                    .font_family(crate::monospace_font::default_family())
-                    .text_size(px(density.base))
-                    .whitespace_nowrap()
-                    .child(SharedString::from(code.clone())),
-            )
-            .into_any_element(),
-        MarkdownNode::List { start, items } => {
-            let start = start.unwrap_or(1);
-            div()
-                .mb(px(density.block_gap))
-                .children(items.iter().enumerate().map(|(index, item)| {
-                    let marker = if node_has_task_marker(item) {
-                        String::new()
-                    } else if start > 0 && matches!(node, MarkdownNode::List { start: Some(_), .. })
-                    {
-                        format!("{}. ", start + index as u64)
-                    } else {
-                        "• ".to_owned()
-                    };
-                    div()
-                        .flex()
-                        .items_start()
-                        .gap_2()
-                        .mb(px(density.item_gap))
-                        .child(
-                            div()
-                                .w(px(density.marker_width))
-                                .flex_shrink_0()
-                                .text_right()
-                                .text_color(ui::muted(p))
-                                .child(SharedString::from(marker)),
-                        )
-                        .child(
-                            div().flex_1().min_w(px(0.0)).children(
-                                item_children(item)
-                                    .iter()
-                                    .map(|child| render_block(child, density, id_prefix, seq, p)),
-                            ),
-                        )
-                }))
-                .into_any_element()
-        }
-        MarkdownNode::Item(children) => div()
-            .children(
-                children
-                    .iter()
-                    .map(|child| render_block(child, density, id_prefix, seq, p)),
-            )
-            .into_any_element(),
-        MarkdownNode::Table(children) => {
-            render_table(children, next_id(id_prefix, "table", seq), density, p)
-        }
-        MarkdownNode::Rule => div()
-            .w_full()
-            .h(px(1.0))
-            .my(px(density.rule_gap))
-            .bg(ui::border(p))
-            .into_any_element(),
-        MarkdownNode::RawHtml(html) => div()
-            .mb(px(density.block_gap))
-            .rounded_md()
-            .border_1()
-            .border_color(ui::border(p))
-            .bg(ui::color(p.elevated))
-            .p(px(density.code_padding))
-            .font_family(crate::monospace_font::default_family())
-            .text_size(px(density.base - 2.0))
-            .text_color(ui::muted(p))
-            .child(SharedString::from(html.clone()))
-            .into_any_element(),
-        MarkdownNode::DisplayMath(math) => div()
-            .mb(px(density.block_gap))
-            .rounded_md()
-            .bg(ui::color(p.elevated))
-            .p(px(density.code_padding))
-            .font_family(crate::monospace_font::default_family())
-            .text_center()
-            .child(SharedString::from(math.clone()))
-            .into_any_element(),
-        MarkdownNode::FootnoteDefinition { label, children } => div()
-            .flex()
-            .gap_2()
-            .mb_2()
-            .text_size(px(density.base - 2.0))
-            .child(
-                div()
-                    .text_color(ui::color(p.accent))
-                    .child(SharedString::from(format!("[^{label}]"))),
-            )
-            .child(
-                div().flex_1().children(
-                    children
-                        .iter()
-                        .map(|child| render_block(child, density, id_prefix, seq, p)),
-                ),
-            )
-            .into_any_element(),
-        MarkdownNode::DefinitionList(children)
-        | MarkdownNode::DefinitionTitle(children)
-        | MarkdownNode::Definition(children)
-        | MarkdownNode::Container(children)
-        | MarkdownNode::TableHead(children)
-        | MarkdownNode::TableRow(children)
-        | MarkdownNode::TableCell(children) => div()
-            .children(
-                children
-                    .iter()
-                    .map(|child| render_block(child, density, id_prefix, seq, p)),
-            )
-            .into_any_element(),
-        _ => div()
-            .mb_2()
-            .text_size(px(density.base))
-            .child(styled_inline(std::slice::from_ref(node), p))
-            .into_any_element(),
-    }
+    selectable: Selectable<'_>,
+) -> Vec<AnyElement> {
+    Renderer::new(density, id_prefix, p, Some(selectable)).blocks(document)
 }
 
-fn render_table(
-    children: &[MarkdownNode],
-    element_id: SharedString,
+struct Renderer<'a> {
     density: Density,
-    p: &ResolvedPalette,
-) -> AnyElement {
-    let mut rows = Vec::<(&[MarkdownNode], bool)>::new();
-    for child in children {
-        match child {
-            MarkdownNode::TableHead(head) => {
-                if head
+    id_prefix: &'a str,
+    p: &'a ResolvedPalette,
+    /// 可滚动块的 id 序号。
+    seq: usize,
+    selectable: Option<Selectable<'a>>,
+    /// 文字段序号（选区坐标）。
+    text_seq: usize,
+}
+
+impl<'a> Renderer<'a> {
+    fn new(
+        density: Density,
+        id_prefix: &'a str,
+        p: &'a ResolvedPalette,
+        selectable: Option<Selectable<'a>>,
+    ) -> Self {
+        Self {
+            density,
+            id_prefix,
+            p,
+            seq: 0,
+            selectable,
+            text_seq: 0,
+        }
+    }
+
+    fn blocks(mut self, document: &MarkdownDocument) -> Vec<AnyElement> {
+        document
+            .blocks
+            .iter()
+            .map(|node| self.block(node))
+            .collect()
+    }
+
+    fn next_id(&mut self, kind: &str) -> SharedString {
+        let id = SharedString::from(format!("{}-{kind}-{}", self.id_prefix, self.seq));
+        self.seq += 1;
+        id
+    }
+
+    /// 一段文字：可选取时附带登记元素，否则就是普通 `StyledText`。
+    fn text(
+        &mut self,
+        text: String,
+        highlights: Vec<(Range<usize>, HighlightStyle)>,
+    ) -> Vec<AnyElement> {
+        match &self.selectable {
+            Some(selectable) => {
+                let key = SegmentKey {
+                    group: selectable.group,
+                    seq: self.text_seq,
+                };
+                self.text_seq += 1;
+                selectable
+                    .texts
+                    .text(
+                        key,
+                        text.into(),
+                        highlights,
+                        selectable.selection,
+                        selectable.background,
+                    )
+                    .into()
+            }
+            None => vec![StyledText::new(text)
+                .with_highlights(highlights)
+                .into_any_element()],
+        }
+    }
+
+    fn inline(&mut self, nodes: &[MarkdownNode]) -> Vec<AnyElement> {
+        let mut text = String::new();
+        let mut highlights = Vec::<(Range<usize>, HighlightStyle)>::new();
+        append_inline(
+            nodes,
+            InlineStyle::default(),
+            &mut text,
+            &mut highlights,
+            self.p,
+        );
+        self.text(text, highlights)
+    }
+
+    fn children(&mut self, children: &[MarkdownNode]) -> Vec<AnyElement> {
+        children.iter().map(|child| self.block(child)).collect()
+    }
+
+    fn block(&mut self, node: &MarkdownNode) -> AnyElement {
+        let density = self.density;
+        let p = self.p;
+        match node {
+            MarkdownNode::Heading { level, children } => {
+                let index = (*level as usize).saturating_sub(1).min(3);
+                let (size, top, bottom) = density.headings[index];
+                div()
+                    .mt(px(top))
+                    .mb(px(bottom))
+                    .text_size(px(size))
+                    .font_weight(FontWeight::BOLD)
+                    .when(*level <= 2, |heading| {
+                        heading.pb_2().border_b_1().border_color(ui::border(p))
+                    })
+                    .children(self.inline(children))
+                    .into_any_element()
+            }
+            MarkdownNode::Paragraph(children) => div()
+                .mb(px(density.block_gap))
+                .text_size(px(density.base))
+                .children(self.inline(children))
+                .into_any_element(),
+            MarkdownNode::BlockQuote(children) => div()
+                .mb(px(density.block_gap))
+                .pl(px(density.quote_indent))
+                .py_1()
+                .border_l_2()
+                .border_color(ui::color(p.accent))
+                .text_color(ui::muted(p))
+                .children(self.children(children))
+                .into_any_element(),
+            MarkdownNode::CodeBlock { language, code } => {
+                let id = self.next_id("code");
+                let body = self.text(code.clone(), Vec::new());
+                div()
+                    .mb(px(density.major_gap))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(ui::border(p))
+                    .bg(ui::color(p.elevated))
+                    .when_some(language.clone(), |block, language| {
+                        block.child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .border_b_1()
+                                .border_color(ui::border(p))
+                                .text_size(px(density.base - 2.0))
+                                .text_color(ui::muted(p))
+                                .child(SharedString::from(language)),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id(id)
+                            .overflow_x_scroll()
+                            .p(px(density.code_padding))
+                            .font_family(crate::monospace_font::default_family())
+                            .text_size(px(density.base))
+                            .whitespace_nowrap()
+                            .children(body),
+                    )
+                    .into_any_element()
+            }
+            MarkdownNode::List { start, items } => {
+                let start = start.unwrap_or(1);
+                let numbered = matches!(node, MarkdownNode::List { start: Some(_), .. });
+                let items = items
                     .iter()
-                    .all(|node| matches!(node, MarkdownNode::TableCell(_)))
-                {
-                    rows.push((head, true));
-                } else {
-                    for row in head {
-                        if let MarkdownNode::TableRow(cells) = row {
-                            rows.push((cells, true));
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let marker = if node_has_task_marker(item) {
+                            String::new()
+                        } else if start > 0 && numbered {
+                            format!("{}. ", start + index as u64)
+                        } else {
+                            "• ".to_owned()
+                        };
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .mb(px(density.item_gap))
+                            .child(
+                                div()
+                                    .w(px(density.marker_width))
+                                    .flex_shrink_0()
+                                    .text_right()
+                                    .text_color(ui::muted(p))
+                                    .child(SharedString::from(marker)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .children(self.children(item_children(item))),
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                div()
+                    .mb(px(density.block_gap))
+                    .children(items)
+                    .into_any_element()
+            }
+            MarkdownNode::Item(children) => {
+                div().children(self.children(children)).into_any_element()
+            }
+            MarkdownNode::Table(children) => self.table(children),
+            MarkdownNode::Rule => div()
+                .w_full()
+                .h(px(1.0))
+                .my(px(density.rule_gap))
+                .bg(ui::border(p))
+                .into_any_element(),
+            MarkdownNode::RawHtml(html) => div()
+                .mb(px(density.block_gap))
+                .rounded_md()
+                .border_1()
+                .border_color(ui::border(p))
+                .bg(ui::color(p.elevated))
+                .p(px(density.code_padding))
+                .font_family(crate::monospace_font::default_family())
+                .text_size(px(density.base - 2.0))
+                .text_color(ui::muted(p))
+                .children(self.text(html.clone(), Vec::new()))
+                .into_any_element(),
+            MarkdownNode::DisplayMath(math) => div()
+                .mb(px(density.block_gap))
+                .rounded_md()
+                .bg(ui::color(p.elevated))
+                .p(px(density.code_padding))
+                .font_family(crate::monospace_font::default_family())
+                .text_center()
+                .children(self.text(math.clone(), Vec::new()))
+                .into_any_element(),
+            MarkdownNode::FootnoteDefinition { label, children } => div()
+                .flex()
+                .gap_2()
+                .mb_2()
+                .text_size(px(density.base - 2.0))
+                .child(
+                    div()
+                        .text_color(ui::color(p.accent))
+                        .child(SharedString::from(format!("[^{label}]"))),
+                )
+                .child(div().flex_1().children(self.children(children)))
+                .into_any_element(),
+            MarkdownNode::DefinitionList(children)
+            | MarkdownNode::DefinitionTitle(children)
+            | MarkdownNode::Definition(children)
+            | MarkdownNode::Container(children)
+            | MarkdownNode::TableHead(children)
+            | MarkdownNode::TableRow(children)
+            | MarkdownNode::TableCell(children) => {
+                div().children(self.children(children)).into_any_element()
+            }
+            _ => div()
+                .mb_2()
+                .text_size(px(density.base))
+                .children(self.inline(std::slice::from_ref(node)))
+                .into_any_element(),
+        }
+    }
+
+    fn table(&mut self, children: &[MarkdownNode]) -> AnyElement {
+        let density = self.density;
+        let p = self.p;
+        let element_id = self.next_id("table");
+        let mut rows = Vec::<(&[MarkdownNode], bool)>::new();
+        for child in children {
+            match child {
+                MarkdownNode::TableHead(head) => {
+                    if head
+                        .iter()
+                        .all(|node| matches!(node, MarkdownNode::TableCell(_)))
+                    {
+                        rows.push((head, true));
+                    } else {
+                        for row in head {
+                            if let MarkdownNode::TableRow(cells) = row {
+                                rows.push((cells, true));
+                            }
                         }
                     }
                 }
+                MarkdownNode::TableRow(cells) => rows.push((cells, false)),
+                _ => {}
             }
-            MarkdownNode::TableRow(cells) => rows.push((cells, false)),
-            _ => {}
         }
+        let rows = rows
+            .into_iter()
+            .map(|(cells, header)| {
+                let cells = cells
+                    .iter()
+                    .map(|cell| {
+                        let content = match cell {
+                            MarkdownNode::TableCell(children) => children.as_slice(),
+                            _ => std::slice::from_ref(cell),
+                        };
+                        div()
+                            .flex_1()
+                            .min_w(px(density.cell_min_width))
+                            .px(px(density.cell_px))
+                            .py(px(density.cell_py))
+                            .border_r_1()
+                            .border_color(ui::border(p))
+                            .when(header, |cell| cell.font_weight(FontWeight::SEMIBOLD))
+                            .children(self.inline(content))
+                    })
+                    .collect::<Vec<_>>();
+                div()
+                    .flex()
+                    .w_full()
+                    .border_b_1()
+                    .border_color(ui::border(p))
+                    .when(header, |row| row.bg(ui::color(p.elevated)))
+                    .children(cells)
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id(element_id)
+            .mb(px(density.major_gap))
+            .overflow_x_scroll()
+            .rounded_md()
+            .border_1()
+            .border_color(ui::border(p))
+            .children(rows)
+            .into_any_element()
     }
-    div()
-        .id(element_id)
-        .mb(px(density.major_gap))
-        .overflow_x_scroll()
-        .rounded_md()
-        .border_1()
-        .border_color(ui::border(p))
-        .children(rows.into_iter().map(|(cells, header)| {
-            div()
-                .flex()
-                .w_full()
-                .border_b_1()
-                .border_color(ui::border(p))
-                .when(header, |row| row.bg(ui::color(p.elevated)))
-                .children(cells.iter().map(|cell| {
-                    let content = match cell {
-                        MarkdownNode::TableCell(children) => children.as_slice(),
-                        _ => std::slice::from_ref(cell),
-                    };
-                    div()
-                        .flex_1()
-                        .min_w(px(density.cell_min_width))
-                        .px(px(density.cell_px))
-                        .py(px(density.cell_py))
-                        .border_r_1()
-                        .border_color(ui::border(p))
-                        .when(header, |cell| cell.font_weight(FontWeight::SEMIBOLD))
-                        .child(styled_inline(content, p))
-                }))
-        }))
-        .into_any_element()
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -358,13 +448,6 @@ struct InlineStyle {
     code: bool,
     link: bool,
     muted: bool,
-}
-
-fn styled_inline(nodes: &[MarkdownNode], p: &ResolvedPalette) -> StyledText {
-    let mut text = String::new();
-    let mut highlights = Vec::<(Range<usize>, HighlightStyle)>::new();
-    append_inline(nodes, InlineStyle::default(), &mut text, &mut highlights, p);
-    StyledText::new(text).with_highlights(highlights)
 }
 
 fn append_inline(

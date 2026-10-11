@@ -181,6 +181,7 @@
   "composer.status.running_tool": "正在运行已批准的工具：{tool}",
   "composer.status.session_busy": "请先完成或停止当前任务，再开始新会话",
   "composer.status.session_new": "已开始新会话",
+  "composer.status.selection_copied": "已复制所选文本",
   "composer.status.skill_failed": "无法激活 Agent 技能：{error}",
   "composer.status.skill_named_failed": "无法激活 Agent 技能 ${name}：{error}",
   "composer.status.task_failed": "Agent 任务失败；请检查最后一条工具结果",

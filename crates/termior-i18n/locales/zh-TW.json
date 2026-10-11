@@ -181,6 +181,7 @@
   "composer.status.running_tool": "正在執行已核准的工具:{tool}",
   "composer.status.session_busy": "請先完成或停止目前任務，再開始新工作階段",
   "composer.status.session_new": "已開始新工作階段",
+  "composer.status.selection_copied": "已複製所選文字",
   "composer.status.skill_failed": "無法啟用 Agent 技能:{error}",
   "composer.status.skill_named_failed": "無法啟用 Agent 技能 ${name}:{error}",
   "composer.status.task_failed": "Agent 任務失敗;請檢查最後的工具結果",

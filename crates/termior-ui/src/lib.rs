@@ -28,6 +28,7 @@ mod shell_select;
 pub mod ssh_askpass;
 mod ssh_view;
 mod terminal_view;
+mod text_selection;
 mod ui;
 mod updater;
 pub mod workspace_view;

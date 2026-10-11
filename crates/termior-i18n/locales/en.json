@@ -181,6 +181,7 @@
   "composer.status.running_tool": "Running approved tool: {tool}",
   "composer.status.session_busy": "Finish or stop the current task before starting a new session",
   "composer.status.session_new": "Started a new session",
+  "composer.status.selection_copied": "Copied selected text",
   "composer.status.skill_failed": "Could not activate Agent Skill: {error}",
   "composer.status.skill_named_failed": "Could not activate Agent Skill ${name}: {error}",
   "composer.status.task_failed": "Agent task failed; inspect the last tool result",

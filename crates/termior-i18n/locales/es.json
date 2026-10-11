@@ -181,6 +181,7 @@
   "composer.status.running_tool": "Ejecutando la herramienta aprobada: {tool}",
   "composer.status.session_busy": "Termina o detén la tarea actual antes de iniciar una nueva sesión",
   "composer.status.session_new": "Nueva sesión iniciada",
+  "composer.status.selection_copied": "Texto seleccionado copiado",
   "composer.status.skill_failed": "No se pudo activar la habilidad del agente: {error}",
   "composer.status.skill_named_failed": "No se pudo activar la habilidad del agente ${name}: {error}",
   "composer.status.task_failed": "La tarea del agente falló; revisar el último resultado de herramienta",
