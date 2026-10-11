@@ -440,6 +440,15 @@ impl TaskRuntime {
         &self.task
     }
 
+    pub fn approval_policy(&self) -> ApprovalPolicy {
+        self.approval_policy
+    }
+
+    /// 运行中切换审批策略（例如任务进行中切到 Yolo）；从下一个待决工具调用起生效。
+    pub fn set_approval_policy(&mut self, policy: ApprovalPolicy) {
+        self.approval_policy = policy;
+    }
+
     pub fn history(&self) -> &[Message] {
         &self.history
     }
@@ -1105,8 +1114,13 @@ impl TaskRuntime {
                     summary,
                 }) => {
                     self.invocations[index].change_set_id = Some(change_set_id.clone());
-                    self.invocations[index].change_summary = Some(summary);
+                    self.invocations[index].change_summary = Some(summary.clone());
                     self.transition_tool(index, ToolState::AwaitingChangeReview)?;
+                    if let Some(paused) =
+                        self.auto_accept_change(&change_set_id, &summary, executor)?
+                    {
+                        return Ok(paused);
+                    }
                     let call_id = self.invocations[index].call_id.clone();
                     self.set_state(
                         TaskState::WaitingChangeReview,
@@ -1233,6 +1247,9 @@ impl TaskRuntime {
                     self.invocations[index].change_summary = Some(summary.clone());
                     self.transition_tool(index, ToolState::AwaitingChangeReview)?;
                 }
+                if let Some(paused) = self.auto_accept_change(&change_set_id, &summary, executor)? {
+                    return Ok(paused);
+                }
                 let call_id = self.invocations[approved[0]].call_id.clone();
                 self.set_state(
                     TaskState::WaitingChangeReview,
@@ -1269,6 +1286,84 @@ impl TaskRuntime {
         }
     }
 
+    fn awaiting_review_indices(&self, change_set_id: &ChangeSetId) -> Vec<usize> {
+        self.invocations
+            .iter()
+            .enumerate()
+            .filter(|(_, invocation)| {
+                invocation.state == ToolState::AwaitingChangeReview
+                    && invocation.change_set_id.as_ref() == Some(change_set_id)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Yolo 下变更集不停下等人工审阅：直接接受全部 hunk 落盘。
+    /// 返回 None 表示需走人工审阅（非 Yolo，或摘要里拿不到 hunk 列表）；
+    /// Some(paused) 表示已自动处理，paused 为 true 时任务需暂停（落盘结果未知）。
+    /// 冲突不再等人工处理，而是作为失败结果回给模型，让它重新读取文件后重试。
+    fn auto_accept_change(
+        &mut self,
+        change_set_id: &ChangeSetId,
+        summary: &str,
+        executor: &dyn RuntimeToolExecutor,
+    ) -> Result<Option<bool>, RuntimeError> {
+        if self.approval_policy != ApprovalPolicy::Yolo {
+            return Ok(None);
+        }
+        let Some(hunks) = serde_json::from_str::<serde_json::Value>(summary)
+            .ok()
+            .and_then(|value| {
+                serde_json::from_value::<Vec<usize>>(value.get("hunk_ids")?.clone()).ok()
+            })
+        else {
+            return Ok(None);
+        };
+        self.ensure_persistence()?;
+        let execution = executor
+            .review_change(change_set_id, &hunks, &self.cancellation)
+            .map_err(RuntimeError::Invariant)?;
+        let indices = self.awaiting_review_indices(change_set_id);
+        match execution {
+            ChangeReviewExecution::Applied(output) => {
+                self.record_output_bytes(output.len() as u64);
+                for index in indices {
+                    self.transition_tool(index, ToolState::Succeeded)?;
+                    let result = ToolResult::success(
+                        self.invocations[index].call_id.clone(),
+                        output.clone(),
+                    );
+                    self.invocations[index].result = Some(result.clone());
+                    self.add_tool_result(result);
+                }
+                Ok(Some(false))
+            }
+            ChangeReviewExecution::Conflict(conflict) => {
+                let message = format!(
+                    "change set could not be applied because the file changed on disk: {conflict}; re-read the file and retry"
+                );
+                for index in indices {
+                    self.transition_tool(index, ToolState::Failed)?;
+                    let result = ToolResult::failure(
+                        self.invocations[index].call_id.clone(),
+                        message.clone(),
+                    );
+                    self.invocations[index].result = Some(result.clone());
+                    self.add_tool_result(result);
+                }
+                Ok(Some(false))
+            }
+            ChangeReviewExecution::Unknown(message) => {
+                for index in indices {
+                    self.transition_tool(index, ToolState::Unknown)?;
+                }
+                self.set_state(TaskState::Unknown, None);
+                self.emit(TaskEventKind::Diagnostic { message });
+                Ok(Some(true))
+            }
+        }
+    }
+
     async fn review_change(
         &mut self,
         change_set_id: ChangeSetId,
@@ -1295,16 +1390,7 @@ impl TaskRuntime {
         {
             ChangeReviewExecution::Applied(output) => {
                 self.record_output_bytes(output.len() as u64);
-                let indices = self
-                    .invocations
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, invocation)| {
-                        invocation.state == ToolState::AwaitingChangeReview
-                            && invocation.change_set_id.as_ref() == Some(&change_set_id)
-                    })
-                    .map(|(index, _)| index)
-                    .collect::<Vec<_>>();
+                let indices = self.awaiting_review_indices(&change_set_id);
                 for index in indices {
                     self.transition_tool(index, ToolState::Succeeded)?;
                     let result = ToolResult::success(
@@ -1330,16 +1416,7 @@ impl TaskRuntime {
                 Ok(())
             }
             ChangeReviewExecution::Unknown(message) => {
-                let indices = self
-                    .invocations
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, invocation)| {
-                        invocation.state == ToolState::AwaitingChangeReview
-                            && invocation.change_set_id.as_ref() == Some(&change_set_id)
-                    })
-                    .map(|(index, _)| index)
-                    .collect::<Vec<_>>();
+                let indices = self.awaiting_review_indices(&change_set_id);
                 for index in indices {
                     self.transition_tool(index, ToolState::Unknown)?;
                 }

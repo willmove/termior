@@ -1060,6 +1060,106 @@ fn multiple_sequential_writes_share_one_reviewable_change_set() {
 }
 
 #[test]
+fn yolo_applies_change_sets_without_waiting_for_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    std::fs::write(&a, "a\n").unwrap();
+    std::fs::write(&b, "b\n").unwrap();
+    let registry = ToolRegistry::new(WorkspaceAuthRegistry::with_roots([dir
+        .path()
+        .display()
+        .to_string()]));
+    let executor = ToolExecutor::new(dir.path(), registry.clone()).unwrap();
+    let provider = MockProvider::new(vec![
+        vec![ChatEvent::Done(assistant_with_calls(vec![
+            ToolCall {
+                id: "write-a".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"a.txt","content":"A\n"}"#.into(),
+            },
+            ToolCall {
+                id: "write-b".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"b.txt","content":"B\n"}"#.into(),
+            },
+        ]))],
+        vec![ChatEvent::Done(Message::assistant("done"))],
+    ]);
+    let mut runtime = TaskRuntime::new(
+        TaskConfig::new("two files", dir.path(), "native", "direct"),
+        RuntimeBudgets::default(),
+        ApprovalPolicy::Yolo,
+    )
+    .with_tools(registry);
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::Start {
+            user_input: "edit both".into(),
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+    assert_eq!(runtime.task().state, TaskState::CompletedUnverified);
+    assert_eq!(std::fs::read_to_string(a).unwrap(), "A\n");
+    assert_eq!(std::fs::read_to_string(b).unwrap(), "B\n");
+    assert!(runtime
+        .invocations()
+        .iter()
+        .all(|invocation| invocation.state == ToolState::Succeeded));
+}
+
+#[test]
+fn switching_a_paused_task_to_yolo_skips_the_remaining_approvals() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.txt");
+    std::fs::write(&a, "a\n").unwrap();
+    let registry = ToolRegistry::new(WorkspaceAuthRegistry::with_roots([dir
+        .path()
+        .display()
+        .to_string()]));
+    let executor = ToolExecutor::new(dir.path(), registry.clone()).unwrap();
+    let provider = MockProvider::new(vec![
+        vec![ChatEvent::Done(assistant_with_calls(vec![ToolCall {
+            id: "write-a".into(),
+            name: "write_file".into(),
+            arguments: r#"{"path":"a.txt","content":"A\n"}"#.into(),
+        }]))],
+        vec![ChatEvent::Done(Message::assistant("done"))],
+    ]);
+    let mut runtime = TaskRuntime::new(
+        TaskConfig::new("one file", dir.path(), "native", "direct"),
+        RuntimeBudgets::default(),
+        ApprovalPolicy::Prompt,
+    )
+    .with_tools(registry);
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::Start {
+            user_input: "edit".into(),
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+    assert_eq!(runtime.task().state, TaskState::WaitingApproval);
+    runtime.set_approval_policy(ApprovalPolicy::Yolo);
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::ResolveApproval {
+            call_id: "write-a".into(),
+            approved: true,
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+    assert_eq!(runtime.task().state, TaskState::CompletedUnverified);
+    assert_eq!(std::fs::read_to_string(a).unwrap(), "A\n");
+}
+
+#[test]
 fn per_tool_output_limit_truncates_before_returning_content_to_the_model() {
     let provider = MockProvider::new(vec![
         vec![ChatEvent::Done(assistant_with_calls(vec![ToolCall {

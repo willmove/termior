@@ -1,7 +1,8 @@
 //! Composer 提交模式（FR-AGENT-11）：三档互斥的审批策略。
 //!
 //! 语义见 `CONTEXT.md`「提交模式」与 `docs/adr/0004-yolo-auto-approve-at-gate.md`：
-//! Yolo 只跳过人工审批（审批门自动应答 approve），不改变任何安全护栏。
+//! Yolo 即 Agent 完全自主：跳过人工审批（审批门自动应答 approve）与变更审阅（自动接受全部 hunk），
+//! 不改变任何安全护栏。
 
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +14,7 @@ pub enum Mode {
     Auto,
     /// 先产出计划，确认前零写入；确认后执行阶段照常出审批卡。
     Plan,
-    /// 门控工具自动批准（含 shell 执行）；安全护栏不变。
+    /// 完全自主：门控工具自动批准（含 shell 执行）、文件变更自动应用；安全护栏不变。
     Yolo,
 }
 
@@ -32,7 +33,7 @@ impl Mode {
         match self {
             Mode::Auto => "Approve gated tools manually",
             Mode::Plan => "Plan first, zero writes until confirmed",
-            Mode::Yolo => "Auto-approve gated tools (incl. shell)",
+            Mode::Yolo => "Fully autonomous: no confirmations for tools or file changes",
         }
     }
 }

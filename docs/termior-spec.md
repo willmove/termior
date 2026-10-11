@@ -315,7 +315,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | FR-AGENT-08 | Agent 循环：流式响应、工具调用、步数上限（`MAX_AGENT_STEPS`）、系统提示词可配置；支持派生子代理（6.11） | P0 |
 | FR-AGENT-09 | 工具分两级 — 自动执行（只读）：`read_file`、`list_directory`、`fs_search`、`fs_grep`；审批门控：`write_file`、`create_directory`、`rename`、`delete`、`run_command`（一次性子 shell）、`shell_session_run`（持久代理 shell）、`shell_bg_spawn`（长驻后台进程） | P0 |
 | FR-AGENT-10 | 审批卡片在 Composer 内联渲染，展示精确参数；Agent 循环挂起等待接受/拒绝，接受后自动续跑 | P0 |
-| FR-AGENT-11 | 提交模式三档互斥（Composer 工具栏下拉）：`Auto`（默认，门控工具弹审批卡）/ `Plan`（先计划，确认前零写入）/ `Yolo`（门控工具含 shell 自动批准，首次启用弹一次确认）；模式随会话持久化；Yolo 仅跳过人工审批，安全护栏不变（ADR-0004） | P0 |
+| FR-AGENT-11 | 提交模式三档互斥（Composer 工具栏下拉）：`Auto`（默认，门控工具弹审批卡）/ `Plan`（先计划，确认前零写入）/ `Yolo`（Agent 完全自主：门控工具含 shell 自动批准，变更集自动接受全部 hunk 不进人工审阅，首次启用弹一次确认）；模式随会话持久化；Yolo 仅跳过人工审批与审阅，安全护栏不变（ADR-0004） | P0 |
 
 **技术要点**：审批门实现为工具执行前的 `oneshot` channel 等待，UI 决议后 resolve；Agent 状态机（idle/busy/awaiting-approval/finished/error）作为 Entity 供通知路由与状态栏消费；工具全部经 `Termior-security` API（INV-2）。
 

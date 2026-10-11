@@ -87,7 +87,7 @@ _Avoid_: Plan 开关(旧说法,已是三档之一)、auto-approve 开关
 _Avoid_: 正常模式、标准模式
 
 **Yolo**:
-门控工具自动批准、不弹卡片的档位;含 `run_command`/`shell_bg_spawn` 等 shell 执行。安全护栏(路径约束、workspace 授权、secret deny-list、SSRF guard)不变——跳过的是人工审批,不是安全层。首次切换需确认一次。
+Agent 完全自主的档位:门控工具自动批准、不弹卡片(含 `run_command`/`shell_bg_spawn` 等 shell 执行),写文件产生的变更集自动接受全部 hunk、不进人工审阅(落盘冲突作为失败结果回给模型重试);任务挂起后再切到 Yolo,挂起的审批/审阅也随即自动放行。安全护栏(路径约束、workspace 授权、secret deny-list、SSRF guard)不变——跳过的是人工审批,不是安全层。首次切换需确认一次。
 _Avoid_: 危险模式、无审批模式、bypass
 
 ### SSH 与远程

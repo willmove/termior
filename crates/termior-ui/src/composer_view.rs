@@ -1580,11 +1580,7 @@ impl ComposerView {
         } else {
             runtime.tools.clone()
         };
-        let policy = if self.mode == Mode::Yolo {
-            ApprovalPolicy::Yolo
-        } else {
-            ApprovalPolicy::Prompt
-        };
+        let policy = self.approval_policy();
         // 终端快捷入口把任务固定到命令所在项目：执行器以该目录为根，任务的 project_dir 随之固定。
         let mut runtime = runtime;
         let project_dir = match self.task_project_override.take() {
@@ -1921,7 +1917,7 @@ impl ComposerView {
         if self.busy {
             return;
         }
-        let Some(task_runtime) = self.active_task.take() else {
+        let Some(mut task_runtime) = self.active_task.take() else {
             self.set_status(t!("composer.status.no_task"));
             cx.emit(AgentStatus::Error);
             cx.notify();
@@ -1934,6 +1930,8 @@ impl ComposerView {
             cx.notify();
             return;
         };
+        // 续跑时按当前模式同步审批策略：任务挂起期间切到 Yolo，后续调用即不再询问。
+        task_runtime.set_approval_policy(self.approval_policy());
         self.active_cancellation = Some(task_runtime.cancellation_token());
         self.busy = true;
         self.set_status(status);
@@ -2031,7 +2029,10 @@ impl ComposerView {
                 self.set_status(t!("composer.status.review_hunks"));
                 self.active_task = Some(result.task);
                 cx.emit(status);
-                cx.emit(review_request);
+                // Yolo 下随后自动接受全部 hunk，不再弹审阅面板。
+                if self.mode != Mode::Yolo {
+                    cx.emit(review_request);
+                }
             }
             TaskState::WaitingUser => {
                 match result.task.task().waiting_reason.as_ref() {
@@ -2114,6 +2115,30 @@ impl ComposerView {
         }
         if self.active_task.is_none() {
             self.active_runtime = None;
+        }
+        self.auto_resolve_in_yolo(cx);
+    }
+
+    /// Yolo 即 Agent 完全自主：挂起中的工具审批直接批准、变更审阅直接接受全部 hunk。
+    /// 正常 Yolo 任务在运行时内部就已自动放行；这里兜底任务在 Auto 下挂起后才切到 Yolo 的情形。
+    fn auto_resolve_in_yolo(&mut self, cx: &mut Context<Self>) {
+        if self.mode != Mode::Yolo || self.busy {
+            return;
+        }
+        if self.pending_approval.is_some() {
+            self.approve_tool(cx);
+        } else if let Some(edit) = self.pending_edit.as_ref() {
+            let id = edit.summary.id.clone();
+            let hunks = edit.summary.hunk_ids.clone();
+            let _ = self.apply_reviewed_edit(&id, &hunks, cx);
+        }
+    }
+
+    fn approval_policy(&self) -> ApprovalPolicy {
+        if self.mode == Mode::Yolo {
+            ApprovalPolicy::Yolo
+        } else {
+            ApprovalPolicy::Prompt
         }
     }
 
@@ -2275,19 +2300,18 @@ impl ComposerView {
         }
     }
 
-    /// 切换提交模式。Plan/挂起审批期间不允许切换，避免计划流状态错乱。
-    /// 首次切到 Yolo 弹一次确认（本次应用运行内不再重复）。
+    /// 切换提交模式。运行中不允许切换；挂起审批期间只允许切到 Yolo（随即自动放行），
+    /// 避免计划流状态错乱。首次切到 Yolo 弹一次确认（本次应用运行内不再重复）。
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         if self.backend_choice == AgentBackendChoice::CodexAppServer {
             self.set_status(t!("composer.status.codex_owns_approvals"));
             cx.notify();
             return;
         }
-        if self.busy
-            || self.pending_approval.is_some()
+        let pending = self.pending_approval.is_some()
             || self.external_pending_approval.is_some()
-            || self.pending_edit.is_some()
-        {
+            || self.pending_edit.is_some();
+        if self.busy || (pending && mode != Mode::Yolo) {
             return;
         }
         if mode == Mode::Yolo && !self.yolo_confirmed {
@@ -2323,6 +2347,7 @@ impl ComposerView {
             Mode::Yolo => self.set_status(t!("composer.mode.status_yolo")),
         }
         self.persist_session();
+        self.auto_resolve_in_yolo(cx);
         cx.notify();
     }
 
