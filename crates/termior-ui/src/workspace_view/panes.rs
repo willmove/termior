@@ -348,7 +348,7 @@ impl WorkspaceView {
             if self
                 .remote_explorers
                 .get(&tab_id)
-                .map_or(true, |state| state.error.is_none())
+                .is_none_or(|state| state.error.is_none())
             {
                 self.schedule_remote_explorer_scan(tab_id, profile, path, cx);
             }

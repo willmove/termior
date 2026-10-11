@@ -190,7 +190,7 @@ impl WorkspaceView {
         let root_changed = self
             .explorer
             .as_ref()
-            .map_or(true, |current| current.root() != index.root());
+            .is_none_or(|current| current.root() != index.root());
         if root_changed || self.explorer_watcher.is_none() {
             self.explorer_watcher = WorkspaceWatcher::watch(index.root()).ok();
         }

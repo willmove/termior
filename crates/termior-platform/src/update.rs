@@ -178,7 +178,7 @@ fn parse_checksum(bytes: &[u8], name: &str) -> Result<[u8; 32], String> {
         return Err("Invalid SHA-256 checksum file".into());
     }
     let mut digest = [0; 32];
-    for (index, chunk) in fields[0].as_bytes().chunks_exact(2).enumerate() {
+    for (index, chunk) in fields[0].as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let hex = std::str::from_utf8(chunk).map_err(|e| e.to_string())?;
         digest[index] = u8::from_str_radix(hex, 16).map_err(|_| "Invalid SHA-256 digest")?;
     }

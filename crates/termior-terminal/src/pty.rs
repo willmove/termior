@@ -923,7 +923,9 @@ fn decode_wsl_output(bytes: &[u8]) -> String {
         return decode_utf16_be(stripped);
     }
     // 启发式：全是对齐的零高字节 → 视作 UTF-16LE。
-    if bytes.len() % 2 == 0 && bytes.iter().skip(1).step_by(2).all(|&b| b == 0) && !bytes.is_empty()
+    if bytes.len().is_multiple_of(2)
+        && bytes.iter().skip(1).step_by(2).all(|&b| b == 0)
+        && !bytes.is_empty()
     {
         return decode_utf16_le(bytes);
     }
@@ -932,14 +934,18 @@ fn decode_wsl_output(bytes: &[u8]) -> String {
 
 fn decode_utf16_le(bytes: &[u8]) -> String {
     let units = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]));
     String::from_utf16_lossy(&units.collect::<Vec<u16>>())
 }
 
 fn decode_utf16_be(bytes: &[u8]) -> String {
     let units = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]));
     String::from_utf16_lossy(&units.collect::<Vec<u16>>())
 }

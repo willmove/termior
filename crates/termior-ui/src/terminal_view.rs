@@ -1567,7 +1567,7 @@ fn snapshot_to_text(
         if *column < *next_column {
             continue;
         }
-        line.extend(std::iter::repeat(' ').take(*column - *next_column));
+        line.extend(std::iter::repeat_n(' ', *column - *next_column));
         *next_column = *column + 1;
         if !cell
             .flags

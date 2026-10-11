@@ -722,7 +722,7 @@ impl ComposerView {
         if self
             .pending_edit
             .as_ref()
-            .map_or(true, |edit| edit.summary.id != proposal_id)
+            .is_none_or(|edit| edit.summary.id != proposal_id)
         {
             return Err(t!("composer.edit.no_longer_pending").to_string());
         }
@@ -746,7 +746,7 @@ impl ComposerView {
         if self
             .pending_edit
             .as_ref()
-            .map_or(true, |edit| edit.summary.id != proposal_id)
+            .is_none_or(|edit| edit.summary.id != proposal_id)
         {
             return Err(t!("composer.edit.no_longer_pending").to_string());
         }

@@ -1602,7 +1602,7 @@ impl TaskRuntime {
                         .iter()
                         .rev()
                         .find(|check| check.criterion_id == criterion.id)
-                        .map_or(true, |check| check.status != AcceptanceStatus::Passed)
+                        .is_none_or(|check| check.status != AcceptanceStatus::Passed)
             })
             .cloned();
         let Some(criterion) = criterion else {

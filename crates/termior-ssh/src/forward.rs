@@ -265,9 +265,10 @@ pub fn parse(entry: &str) -> Result<Forward, Error> {
     // A letter only acts as the kind when it stands apart from the spec, so a
     // bare host-like entry is diagnosed as such instead of losing its first letter.
     let separated = flagged
-        || chars.clone().next().map_or(true, |c| {
-            c.is_whitespace() || c.is_ascii_digit() || matches!(c, '[' | '*')
-        });
+        || chars
+            .clone()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || c.is_ascii_digit() || matches!(c, '[' | '*'));
     let (kind, spec) = match first {
         Some(letter @ ('L' | 'R' | 'D')) if separated => (
             match letter {

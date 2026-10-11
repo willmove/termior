@@ -162,7 +162,7 @@ impl ToolRegistry {
     pub fn allows(&self, tool_name: &str) -> bool {
         self.allowed_tools
             .as_ref()
-            .map_or(true, |tools| tools.contains(tool_name))
+            .is_none_or(|tools| tools.contains(tool_name))
     }
 
     fn ensure_allowed(&self, tool_name: &str) -> Result<(), ToolError> {

@@ -93,7 +93,7 @@ impl OscStreamFilter {
         } else {
             output
                 .event_offsets
-                .extend(std::iter::repeat(output.visible.len()).take(events.len()));
+                .extend(std::iter::repeat_n(output.visible.len(), events.len()));
             output.events.extend(events);
             self.sequence.clear();
         }

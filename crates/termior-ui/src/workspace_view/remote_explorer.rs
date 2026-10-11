@@ -258,7 +258,7 @@ impl WorkspaceView {
                             let changed_directory = state
                                 .listing
                                 .as_ref()
-                                .map_or(true, |previous| previous.cwd != listing.cwd);
+                                .is_none_or(|previous| previous.cwd != listing.cwd);
                             workspace
                                 .remote_explorer_paths
                                 .insert(tab_id, listing.cwd.clone());

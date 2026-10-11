@@ -32,7 +32,7 @@ version = "0.2.1"
 edition = "2021"
 license = "MIT"
 authors = ["Termior Contributors"]
-repository = "https://github.com/termior/termior"
+repository = "https://github.com/willmove/termior"
 
 # 统一版本管理（对齐 Spec §3.1「版本与依赖纪律」）
 [workspace.dependencies]
