@@ -3199,6 +3199,49 @@ impl SettingsView {
                 ),
             )
             .child(div().text_sm().child(state.status.clone()))
+            .when_some(state.progress.as_ref(), |view, progress| {
+                let mut detail = tf!(
+                    "updater.progress",
+                    "downloaded" => crate::updater::format_bytes(progress.downloaded),
+                    "total" => crate::updater::format_bytes(progress.total),
+                    "percent" => (progress.fraction() * 100.0).floor() as u32
+                )
+                .to_string();
+                if let (Some(speed), Some(eta)) = (progress.speed(), progress.eta()) {
+                    detail.push_str(" · ");
+                    detail.push_str(&tf!(
+                        "updater.progress_eta",
+                        "speed" => crate::updater::format_bytes(speed as u64),
+                        "eta" => crate::updater::format_eta(eta)
+                    ));
+                }
+                view.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .h(px(6.0))
+                                .w_full()
+                                .rounded_full()
+                                .bg(crate::ui::border(&self.palette))
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(gpui::relative(progress.fraction()))
+                                        .rounded_full()
+                                        .bg(crate::ui::color(self.palette.accent)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(crate::ui::muted(&self.palette))
+                                .child(detail),
+                        ),
+                )
+            })
             .child(
                 div()
                     .text_xs()

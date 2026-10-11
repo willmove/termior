@@ -636,6 +636,8 @@
   "ssh.transfer.upload_button": "Subir…",
   "terminal.find_counter": "{current}/{total} · {case}",
   "terminal.find_prompt": "Buscar: {query}",
+  "updater.progress": "{downloaded} de {total} · {percent} %",
+  "updater.progress_eta": "{speed}/s · quedan unos {eta}",
   "updater.status_check_failed": "Error al buscar actualizaciones: {error}",
   "updater.status_checking": "Buscando actualizaciones…",
   "updater.status_disabled": "Las actualizaciones automáticas están desactivadas",

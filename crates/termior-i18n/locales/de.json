@@ -636,6 +636,8 @@
   "ssh.transfer.upload_button": "Hochladen…",
   "terminal.find_counter": "{current}/{total} · {case}",
   "terminal.find_prompt": "Suchen: {query}",
+  "updater.progress": "{downloaded} von {total} · {percent} %",
+  "updater.progress_eta": "{speed}/s · noch etwa {eta}",
   "updater.status_check_failed": "Update-Prüfung fehlgeschlagen: {error}",
   "updater.status_checking": "Nach Updates wird gesucht…",
   "updater.status_disabled": "Automatische Updates sind deaktiviert",

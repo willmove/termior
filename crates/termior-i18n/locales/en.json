@@ -636,6 +636,8 @@
   "ssh.transfer.upload_button": "Upload…",
   "terminal.find_counter": "{current}/{total} · {case}",
   "terminal.find_prompt": "Find: {query}",
+  "updater.progress": "{downloaded} of {total} · {percent}%",
+  "updater.progress_eta": "{speed}/s · about {eta} left",
   "updater.status_check_failed": "Update check failed: {error}",
   "updater.status_checking": "Checking for updates…",
   "updater.status_disabled": "Automatic updates are off",

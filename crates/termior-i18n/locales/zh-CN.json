@@ -636,6 +636,8 @@
   "ssh.transfer.upload_button": "选择上传…",
   "terminal.find_counter": "{current}/{total} · {case}",
   "terminal.find_prompt": "查找：{query}",
+  "updater.progress": "{downloaded} / {total} · {percent}%",
+  "updater.progress_eta": "{speed}/s · 剩余约 {eta}",
   "updater.status_check_failed": "检查更新失败：{error}",
   "updater.status_checking": "正在检查更新…",
   "updater.status_disabled": "自动更新已关闭",

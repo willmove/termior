@@ -636,6 +636,8 @@
   "ssh.transfer.upload_button": "アップロード…",
   "terminal.find_counter": "{current}/{total} · {case}",
   "terminal.find_prompt": "検索：{query}",
+  "updater.progress": "{downloaded} / {total} · {percent}%",
+  "updater.progress_eta": "{speed}/s · 残り約 {eta}",
   "updater.status_check_failed": "アップデートの確認に失敗しました：{error}",
   "updater.status_checking": "アップデートを確認しています…",
   "updater.status_disabled": "自動アップデートは無効です",

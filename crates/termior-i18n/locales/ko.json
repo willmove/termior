@@ -636,6 +636,8 @@
   "ssh.transfer.upload_button": "업로드…",
   "terminal.find_counter": "{current}/{total} · {case}",
   "terminal.find_prompt": "찾기: {query}",
+  "updater.progress": "{downloaded} / {total} · {percent}%",
+  "updater.progress_eta": "{speed}/s · 약 {eta} 남음",
   "updater.status_check_failed": "업데이트 확인 실패: {error}",
   "updater.status_checking": "업데이트 확인 중…",
   "updater.status_disabled": "자동 업데이트가 꺼져 있습니다",

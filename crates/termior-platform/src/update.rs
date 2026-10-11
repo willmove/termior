@@ -9,6 +9,7 @@ use std::{
     fs::File,
     io::{Read, Write},
     path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -39,6 +40,13 @@ pub struct AvailableUpdate {
     url: String,
     checksum_url: String,
     size: u64,
+}
+
+impl AvailableUpdate {
+    /// Installer size in bytes, as published in the release metadata.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
 }
 
 pub struct PreparedUpdate {
@@ -190,6 +198,7 @@ fn copy_verified(
     mut writer: impl Write,
     size: u64,
     expected: [u8; 32],
+    mut on_progress: impl FnMut(u64),
 ) -> Result<(), String> {
     let mut hash = Sha256::new();
     let mut total = 0;
@@ -207,6 +216,7 @@ fn copy_verified(
         writer
             .write_all(&buffer[..count])
             .map_err(|e| e.to_string())?;
+        on_progress(total);
     }
     if total != size || <[u8; 32]>::from(hash.finalize()) != expected {
         return Err("Installer SHA-256 or size mismatch; update rejected".into());
@@ -214,7 +224,8 @@ fn copy_verified(
     Ok(())
 }
 
-pub fn download(update: AvailableUpdate) -> Result<PreparedUpdate, String> {
+/// `progress` receives the installer bytes written so far; the UI polls it.
+pub fn download(update: AvailableUpdate, progress: &AtomicU64) -> Result<PreparedUpdate, String> {
     let client = client()?;
     let checksum = client
         .get(&update.checksum_url)
@@ -234,7 +245,9 @@ pub fn download(update: AvailableUpdate) -> Result<PreparedUpdate, String> {
         .send()
         .and_then(|r| r.error_for_status())
         .map_err(|e| e.to_string())?;
-    copy_verified(response, &mut file, update.size, digest)?;
+    copy_verified(response, &mut file, update.size, digest, |total| {
+        progress.store(total, Ordering::Relaxed)
+    })?;
     file.sync_all().map_err(|e| e.to_string())?;
     Ok(PreparedUpdate {
         version: update.version,
@@ -250,7 +263,7 @@ impl PreparedUpdate {
     pub fn launch(self) -> Result<PathBuf, String> {
         let file = File::open(&self.path).map_err(|e| e.to_string())?;
         let size = file.metadata().map_err(|e| e.to_string())?.len();
-        copy_verified(file, std::io::sink(), size, self.digest)?;
+        copy_verified(file, std::io::sink(), size, self.digest, |_| {})?;
         super::open_local_file(&self.path).map_err(|e| e.to_string())?;
         let _ = self.directory.keep();
         Ok(self.path)
@@ -268,7 +281,12 @@ mod tests {
         let update = check_for("0.0.0")
             .unwrap()
             .expect("published stable release");
-        let prepared = download(update).unwrap();
+        let progress = AtomicU64::new(0);
+        let prepared = download(update, &progress).unwrap();
+        assert_eq!(
+            progress.load(Ordering::Relaxed),
+            prepared.path.metadata().unwrap().len()
+        );
         assert!(prepared.path.is_file());
         let path = prepared.path.clone();
         drop(prepared);
@@ -340,10 +358,19 @@ mod tests {
     fn rejects_corruption_truncation_oversize_and_wrong_checksum_filename() {
         let data = b"installer fixture";
         let digest: [u8; 32] = Sha256::digest(data).into();
-        assert!(copy_verified(&data[..], Vec::new(), data.len() as u64, digest).is_ok());
-        assert!(copy_verified(&data[..], Vec::new(), data.len() as u64 + 1, digest).is_err());
-        assert!(copy_verified(&data[..], Vec::new(), 1, digest).is_err());
-        assert!(copy_verified(&data[..], Vec::new(), data.len() as u64, [0; 32]).is_err());
+        let mut reported = 0;
+        assert!(
+            copy_verified(&data[..], Vec::new(), data.len() as u64, digest, |total| {
+                reported = total
+            })
+            .is_ok()
+        );
+        assert_eq!(reported, data.len() as u64);
+        assert!(
+            copy_verified(&data[..], Vec::new(), data.len() as u64 + 1, digest, |_| {}).is_err()
+        );
+        assert!(copy_verified(&data[..], Vec::new(), 1, digest, |_| {}).is_err());
+        assert!(copy_verified(&data[..], Vec::new(), data.len() as u64, [0; 32], |_| {}).is_err());
         let checksum = format!("{:x}  setup.exe\n", Sha256::digest(data));
         assert_eq!(
             parse_checksum(checksum.as_bytes(), "setup.exe").unwrap(),
