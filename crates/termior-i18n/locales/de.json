@@ -71,6 +71,7 @@
   "composer.environment_external": "Host={host} · Root={root} · Dateien=Schreibrechte im Arbeitsbereich · Netzwerk=vom Backend deklariert · Anmeldedaten=von Codex verwaltet · Prozesse=vom Backend deklariert · Vertrauen=gemeldet/unbekannt",
   "composer.header": "Agent",
   "composer.hide_panel": "Agent-Bereich ausblenden (Ctrl+I)",
+  "composer.close_center": "Bereich schließen (Esc)",
   "composer.memory.accept": "Annehmen",
   "composer.memory.action_failed": "Gedächtnisaktion fehlgeschlagen: {error}",
   "composer.memory.badge": "Gedächtnis {count}",

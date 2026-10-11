@@ -110,7 +110,7 @@ impl ComposerView {
         p: &ResolvedPalette,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.task_details_open {
+        if !self.center_open(ComposerCenter::TaskDetails) {
             return None;
         }
         let Some(task) = self.last_task.as_ref() else {

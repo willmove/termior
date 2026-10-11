@@ -69,6 +69,20 @@ struct TaskRunResult {
     error: Option<String>,
 }
 
+/// Composer 的检查面板（任务详情、上下文检查器、恢复中心等），互斥展开。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerCenter {
+    TaskDetails,
+    ContextInspector,
+    Recovery,
+    Automations,
+    Checkpoints,
+    Skills,
+    Memory,
+    Snippets,
+    Todos,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentBackendChoice {
     BuiltIn,
@@ -195,10 +209,8 @@ pub struct ComposerView {
     /// `#handle` 片段补全候选（FR-AGENT-04）。
     snippet_suggestions: Vec<Snippet>,
     selected_snippet_suggestion: usize,
-    snippet_center_open: bool,
     /// 与 ToolExecutor 共享的应用内 TODO（FR-SESS-04），Agent 与用户读写同一份。
     todos: Arc<Mutex<TodoStore>>,
-    todo_center_open: bool,
     /// 停靠位置与底部停靠高度，由 WorkspaceView 在恢复/拖拽/切换后同步。
     dock: ComposerDock,
     fill_workspace: bool,
@@ -206,27 +218,22 @@ pub struct ComposerView {
     /// 会话消息区的滚动容器；贴底时跟随新输出自动下滚。
     scroll_handle: ScrollHandle,
     last_context_plan: Option<ContextPlan>,
-    context_inspector_open: bool,
+    /// 当前展开的检查面板；同一时间至多一个，避免多个面板堆叠挤占对话区。
+    open_center: Option<ComposerCenter>,
     recovery_tasks: Vec<RecoveryTaskSummary>,
-    recovery_center_open: bool,
     automations: AutomationStore,
-    automation_center_open: bool,
     checkpoints: Vec<CheckpointManifest>,
-    checkpoint_center_open: bool,
     skills: Vec<SkillMetadata>,
     skill_scan_error: Option<String>,
     active_skills: Vec<String>,
-    skill_center_open: bool,
     memory: MemoryStore,
-    memory_center_open: bool,
     backend_choice: AgentBackendChoice,
     backend_capability_summary: Option<String>,
     external_session: Option<Arc<Mutex<ManagedAgentSession>>>,
     /// Agent 选择器下拉（Stage B 6.1）与打开时探测的 CLI Agent 可用性。
     agent_menu_open: bool,
     cli_agent_available: Vec<bool>,
-    /// 任务详情面板（Stage B 6.3）及其所指任务；任务结束后仍可查看命令结果。
-    task_details_open: bool,
+    /// 任务详情面板（Stage B 6.3）所指的任务；任务结束后仍可查看命令结果。
     last_task: Option<TaskRef>,
     /// 活动任务固定使用的运行时：执行器的根即任务的 project_dir，审批/续跑不随全局切换漂移。
     active_runtime: Option<AgentRuntime>,
@@ -249,6 +256,8 @@ const MODE_MENU_LEFT: f32 = 12.0;
 const MODE_MENU_BOTTOM: f32 = 68.0;
 /// 状态行显示时菜单再抬高一个状态行高度。
 const STATUS_ROW_HEIGHT: f32 = 24.0;
+/// 检查面板区最多占 Composer 高度的比例，其余留给对话。
+const CENTER_DOCK_MAX_FRACTION: f32 = 0.45;
 
 impl ComposerView {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -297,33 +306,25 @@ impl ComposerView {
             selected_slash_suggestion: 0,
             snippet_suggestions: Vec::new(),
             selected_snippet_suggestion: 0,
-            snippet_center_open: false,
             todos: Arc::new(Mutex::new(TodoStore::default())),
-            todo_center_open: false,
             dock: ComposerDock::Bottom,
             fill_workspace: false,
             panel_height: crate::DEFAULT_COMPOSER_HEIGHT,
             scroll_handle: ScrollHandle::new(),
             last_context_plan: None,
-            context_inspector_open: false,
+            open_center: None,
             recovery_tasks: Vec::new(),
-            recovery_center_open: false,
             automations: AutomationStore::default(),
-            automation_center_open: false,
             checkpoints: Vec::new(),
-            checkpoint_center_open: false,
             skills: Vec::new(),
             skill_scan_error: None,
             active_skills: Vec::new(),
-            skill_center_open: false,
             memory: MemoryStore::default(),
-            memory_center_open: false,
             backend_choice: AgentBackendChoice::BuiltIn,
             backend_capability_summary: None,
             external_session: None,
             agent_menu_open: false,
             cli_agent_available: Vec::new(),
-            task_details_open: false,
             last_task: None,
             active_runtime: None,
             task_project_override: None,
@@ -1011,17 +1012,13 @@ impl ComposerView {
                 ComposerCommand::AttachFile => self.pick_attachment(cx),
                 ComposerCommand::ToggleDock => cx.emit(ComposerDockToggle),
                 ComposerCommand::ContextInspector => {
-                    self.context_inspector_open = !self.context_inspector_open
+                    self.toggle_center(ComposerCenter::ContextInspector)
                 }
-                ComposerCommand::Skills => self.skill_center_open = !self.skill_center_open,
-                ComposerCommand::Memory => self.memory_center_open = !self.memory_center_open,
-                ComposerCommand::Recovery => self.recovery_center_open = !self.recovery_center_open,
-                ComposerCommand::Checkpoints => {
-                    self.checkpoint_center_open = !self.checkpoint_center_open
-                }
-                ComposerCommand::Automations => {
-                    self.automation_center_open = !self.automation_center_open
-                }
+                ComposerCommand::Skills => self.toggle_center(ComposerCenter::Skills),
+                ComposerCommand::Memory => self.toggle_center(ComposerCenter::Memory),
+                ComposerCommand::Recovery => self.toggle_center(ComposerCenter::Recovery),
+                ComposerCommand::Checkpoints => self.toggle_center(ComposerCenter::Checkpoints),
+                ComposerCommand::Automations => self.toggle_center(ComposerCenter::Automations),
                 ComposerCommand::SaveSnippet => match self.snippets.define(args) {
                     Ok(handle) => {
                         self.set_status(tf!("composer.snippet.saved", "handle" => handle));
@@ -1039,8 +1036,8 @@ impl ComposerView {
                         });
                     }
                 },
-                ComposerCommand::Snippets => self.snippet_center_open = !self.snippet_center_open,
-                ComposerCommand::Todos => self.todo_center_open = !self.todo_center_open,
+                ComposerCommand::Snippets => self.toggle_center(ComposerCenter::Snippets),
+                ComposerCommand::Todos => self.toggle_center(ComposerCenter::Todos),
             },
         }
         cx.notify();
@@ -1513,7 +1510,8 @@ impl ComposerView {
             let keep_going = view
                 .update(cx, |view, cx| {
                     // 面板关闭时只需要状态，不取输出尾部。
-                    let digests = view.task_digests_with_tail(view.task_details_open);
+                    let digests =
+                        view.task_digests_with_tail(view.center_open(ComposerCenter::TaskDetails));
                     for notice in view.command_watch.observe(&digests) {
                         cx.emit(ComposerCommandNotice {
                             session_id: notice.session_id.0,
@@ -1521,7 +1519,7 @@ impl ComposerView {
                             status: notice.status,
                         });
                     }
-                    if view.task_details_open {
+                    if view.center_open(ComposerCenter::TaskDetails) {
                         cx.notify();
                     }
                     // 运行中的 Turn 会暂时取走 active_task（busy 期间为 None），不能据此停止。
@@ -1885,7 +1883,7 @@ impl ComposerView {
                         "limit" => limit
                     )),
                     Some(WaitingReason::TerminalControl { session_id, cursor }) => {
-                        self.task_details_open = true;
+                        self.open_center = Some(ComposerCenter::TaskDetails);
                         self.set_status(tf!(
                             "composer.status.terminal_taken_over",
                             "session" => session_id,
@@ -2321,6 +2319,7 @@ impl ComposerView {
         match event.keystroke.key.as_str() {
             "escape" if self.mode_menu_open => self.mode_menu_open = false,
             "escape" if self.agent_menu_open => self.agent_menu_open = false,
+            "escape" if self.open_center.is_some() => self.open_center = None,
             "enter" | "return" if !event.keystroke.modifiers.shift => self.submit(cx),
             "backspace" if self.cursor > 0 => {
                 let start = char_to_byte(&self.draft.input, self.cursor - 1);
@@ -2375,15 +2374,16 @@ impl ComposerView {
 
     /// 任一检查面板展开时都不能收缩成 compact，否则面板被裁掉（`/skills` 等在空会话中也要可见）。
     fn any_center_open(&self) -> bool {
-        self.task_details_open
-            || self.context_inspector_open
-            || self.recovery_center_open
-            || self.automation_center_open
-            || self.checkpoint_center_open
-            || self.skill_center_open
-            || self.memory_center_open
-            || self.snippet_center_open
-            || self.todo_center_open
+        self.open_center.is_some()
+    }
+
+    fn center_open(&self, center: ComposerCenter) -> bool {
+        self.open_center == Some(center)
+    }
+
+    /// 打开某个面板时收起其它面板；再次触发同一面板则收起。
+    fn toggle_center(&mut self, center: ComposerCenter) {
+        self.open_center = (!self.center_open(center)).then_some(center);
     }
 
     /// 工作区在恢复、拖拽或停靠切换后同步布局参数。
@@ -2889,7 +2889,7 @@ impl gpui::Render for ComposerView {
                         },
                     ))
             });
-        let todo_center = self.todo_center_open.then(|| {
+        let todo_center = self.center_open(ComposerCenter::Todos).then(|| {
             let todos = self
                 .todos
                 .lock()
@@ -2978,7 +2978,7 @@ impl gpui::Render for ComposerView {
                 })
                 .children(rows)
         });
-        let snippet_center = self.snippet_center_open.then(|| {
+        let snippet_center = self.center_open(ComposerCenter::Snippets).then(|| {
             let rows = self
                 .snippets
                 .snippets
@@ -3236,7 +3236,7 @@ impl gpui::Render for ComposerView {
                 )
         });
         let context_inspector = self
-            .context_inspector_open
+            .center_open(ComposerCenter::ContextInspector)
             .then_some(self.last_context_plan.as_ref())
             .flatten()
             .map(|plan| {
@@ -3286,7 +3286,7 @@ impl gpui::Render for ComposerView {
                     )
                     .children(rows)
             });
-        let recovery_center = self.recovery_center_open.then(|| {
+        let recovery_center = self.center_open(ComposerCenter::Recovery).then(|| {
             let rows = self.recovery_tasks.iter().enumerate().map(|(index, task)| {
                 let retry_task_id = task.task_id.clone();
                 let abandon_task_id = task.task_id.clone();
@@ -3423,7 +3423,7 @@ impl gpui::Render for ComposerView {
                 })
                 .children(rows)
         });
-        let automation_center = self.automation_center_open.then(|| {
+        let automation_center = self.center_open(ComposerCenter::Automations).then(|| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -3518,7 +3518,7 @@ impl gpui::Render for ComposerView {
                 })
                 .children(rows)
         });
-        let checkpoint_center = self.checkpoint_center_open.then(|| {
+        let checkpoint_center = self.center_open(ComposerCenter::Checkpoints).then(|| {
             let rows = self
                 .checkpoints
                 .iter()
@@ -3598,7 +3598,7 @@ impl gpui::Render for ComposerView {
                 )
                 .children(rows)
         });
-        let skill_center = self.skill_center_open.then(|| {
+        let skill_center = self.center_open(ComposerCenter::Skills).then(|| {
             let rows = self.skills.iter().enumerate().map(|(index, skill)| {
                 let active = self.active_skills.iter().any(|name| name == &skill.name);
                 div()
@@ -3660,7 +3660,7 @@ impl gpui::Render for ComposerView {
                 })
                 .children(rows)
         });
-        let memory_center = self.memory_center_open.then(|| {
+        let memory_center = self.center_open(ComposerCenter::Memory).then(|| {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -3967,6 +3967,16 @@ impl gpui::Render for ComposerView {
                     }),
                 ))
         };
+        // 面板互斥展开，至多一个为 Some。
+        let center_panel = task_details
+            .or(todo_center.map(IntoElement::into_any_element))
+            .or(snippet_center.map(IntoElement::into_any_element))
+            .or(memory_center.map(IntoElement::into_any_element))
+            .or(skill_center.map(IntoElement::into_any_element))
+            .or(checkpoint_center.map(IntoElement::into_any_element))
+            .or(automation_center.map(IntoElement::into_any_element))
+            .or(recovery_center.map(IntoElement::into_any_element))
+            .or(context_inspector.map(IntoElement::into_any_element));
         div()
             .flex()
             .flex_col()
@@ -4039,8 +4049,8 @@ impl gpui::Render for ComposerView {
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
                                                 cx.stop_propagation();
-                                                this.task_details_open = !this.task_details_open;
-                                                if this.task_details_open {
+                                                this.toggle_center(ComposerCenter::TaskDetails);
+                                                if this.center_open(ComposerCenter::TaskDetails) {
                                                     this.ensure_command_watch(cx);
                                                 }
                                                 cx.notify();
@@ -4066,8 +4076,7 @@ impl gpui::Render for ComposerView {
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
                                                 cx.stop_propagation();
-                                                this.recovery_center_open =
-                                                    !this.recovery_center_open;
+                                                this.toggle_center(ComposerCenter::Recovery);
                                                 cx.notify();
                                             }),
                                         ),
@@ -4090,8 +4099,7 @@ impl gpui::Render for ComposerView {
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
                                             cx.stop_propagation();
-                                            this.automation_center_open =
-                                                !this.automation_center_open;
+                                            this.toggle_center(ComposerCenter::Automations);
                                             cx.notify();
                                         }),
                                     ),
@@ -4114,8 +4122,7 @@ impl gpui::Render for ComposerView {
                                             MouseButton::Left,
                                             cx.listener(|this, _, _, cx| {
                                                 cx.stop_propagation();
-                                                this.checkpoint_center_open =
-                                                    !this.checkpoint_center_open;
+                                                this.toggle_center(ComposerCenter::Checkpoints);
                                                 cx.notify();
                                             }),
                                         ),
@@ -4142,8 +4149,7 @@ impl gpui::Render for ComposerView {
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, _, cx| {
                                                     cx.stop_propagation();
-                                                    this.skill_center_open =
-                                                        !this.skill_center_open;
+                                                    this.toggle_center(ComposerCenter::Skills);
                                                     cx.notify();
                                                 }),
                                             ),
@@ -4173,8 +4179,7 @@ impl gpui::Render for ComposerView {
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, _, cx| {
                                                     cx.stop_propagation();
-                                                    this.memory_center_open =
-                                                        !this.memory_center_open;
+                                                    this.toggle_center(ComposerCenter::Memory);
                                                     cx.notify();
                                                 }),
                                             ),
@@ -4253,6 +4258,7 @@ impl gpui::Render for ComposerView {
                 root.child(
                     div()
                         .id("composer-messages")
+                        .debug_selector(|| "composer-messages".into())
                         .flex()
                         .flex_col()
                         .flex_1()
@@ -4264,20 +4270,50 @@ impl gpui::Render for ComposerView {
                         .pb_1()
                         .gap_2()
                         .children(messages)
-                        .children(task_details)
-                        .children(todo_center)
-                        .children(snippet_center)
-                        .children(memory_center)
-                        .children(skill_center)
-                        .children(checkpoint_center)
-                        .children(automation_center)
-                        .children(recovery_center)
-                        .children(context_inspector)
                         .children(approval)
                         .children(edit_review)
                         .children(budget_resume)
                         .children(plan_review),
                 )
+                // 检查面板独立于对话流：限高并自带滚动，展开后最近的回复仍然可见。
+                .when_some(center_panel, |root, panel| {
+                    root.child(
+                        div()
+                            .id("composer-center-dock")
+                            .debug_selector(|| "composer-center-dock".into())
+                            .flex()
+                            .flex_row()
+                            .flex_none()
+                            .max_h(relative(CENTER_DOCK_MAX_FRACTION))
+                            .mx_3()
+                            .mb_1()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id("composer-center-scroll")
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_y_scroll()
+                                    .child(panel),
+                            )
+                            .child(
+                                crate::ui::icon_button(
+                                    "composer-center-close",
+                                    Icon::Close,
+                                    t!("composer.close_center"),
+                                    &p,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_center = None;
+                                        cx.notify();
+                                    }),
+                                ),
+                            ),
+                    )
+                })
             })
             .child(div().flex().flex_row().px_3().gap_1().children(chips))
             .children(slash_suggestions)
@@ -4454,7 +4490,7 @@ impl gpui::Render for ComposerView {
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.context_inspector_open = !this.context_inspector_open;
+                                        this.toggle_center(ComposerCenter::ContextInspector);
                                         cx.notify();
                                     }),
                                 ),
@@ -4862,7 +4898,7 @@ mod layout_tests {
         composer.update(vcx, |view, cx| {
             assert!(view.is_compact());
             view.invoke_slash_command(slash::find_command("snippets").unwrap(), "", cx);
-            assert!(view.snippet_center_open);
+            assert!(view.center_open(ComposerCenter::Snippets));
             assert!(!view.is_compact());
         });
         vcx.update(|window, cx| {
@@ -4872,13 +4908,65 @@ mod layout_tests {
     }
 
     #[test]
+    fn opening_a_panel_closes_the_previous_one() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        composer.update(vcx, |view, cx| {
+            view.invoke_slash_command(slash::find_command("snippets").unwrap(), "", cx);
+            view.invoke_slash_command(slash::find_command("todos").unwrap(), "", cx);
+            assert!(view.center_open(ComposerCenter::Todos));
+            assert!(!view.center_open(ComposerCenter::Snippets));
+            view.invoke_slash_command(slash::find_command("todos").unwrap(), "", cx);
+            assert!(!view.any_center_open());
+        });
+    }
+
+    #[test]
+    fn a_tall_panel_is_capped_and_leaves_room_for_the_conversation() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        let panel_height = composer.update(vcx, |view, cx| {
+            for index in 0..40 {
+                view.todos
+                    .lock()
+                    .unwrap()
+                    .add(format!("todo-{index}"), "a long backlog item");
+            }
+            view.invoke_slash_command(slash::find_command("todos").unwrap(), "", cx);
+            view.panel_height
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let dock = vcx
+            .debug_bounds("composer-center-dock")
+            .expect("panel dock rendered");
+        let messages = vcx
+            .debug_bounds("composer-messages")
+            .expect("conversation rendered");
+        assert!(
+            dock.size.height <= px(panel_height * CENTER_DOCK_MAX_FRACTION + 1.0),
+            "panel dock not capped: {dock:?}"
+        );
+        assert!(
+            dock.size.height >= px(panel_height * CENTER_DOCK_MAX_FRACTION - 1.0),
+            "overflowing panel should fill its cap: {dock:?}"
+        );
+        assert!(
+            messages.size.height > px(0.0),
+            "conversation squeezed out: {messages:?}"
+        );
+    }
+
+    #[test]
     fn todo_panel_shows_agent_items_and_user_edits_update_the_shared_store() {
         let mut cx = TestAppContext::single();
         let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
         composer.update(vcx, |view, cx| {
             view.todos.lock().unwrap().add("todo-1", "write tests");
             view.invoke_slash_command(slash::find_command("todos").unwrap(), "", cx);
-            assert!(view.todo_center_open);
+            assert!(view.center_open(ComposerCenter::Todos));
         });
         vcx.update(|window, cx| {
             window.refresh();
@@ -5006,7 +5094,7 @@ mod layout_tests {
                 backend_id: "native".into(),
                 environment_id: "direct".into(),
             });
-            view.task_details_open = true;
+            view.open_center = Some(ComposerCenter::TaskDetails);
             assert!(view.any_center_open());
             assert!(view.task_digests().is_empty());
             view.hand_back_terminal(&termior_terminal::CommandSessionId("cmd-x".into()), cx);

@@ -71,6 +71,7 @@
   "composer.environment_external": "主機={host} · 根目錄={root} · 檔案=工作區可寫 · 網路=後端宣告 · 憑證=由 Codex 管理 · 程序=後端宣告 · 信任=回報/未知",
   "composer.header": "Agent",
   "composer.hide_panel": "隱藏 Agent 面板 (Ctrl+I)",
+  "composer.close_center": "關閉面板（Esc）",
   "composer.memory.accept": "接受",
   "composer.memory.action_failed": "記憶操作失敗:{error}",
   "composer.memory.badge": "記憶 {count}",

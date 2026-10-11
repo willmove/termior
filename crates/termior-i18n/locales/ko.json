@@ -71,6 +71,7 @@
   "composer.environment_external": "호스트={host} · 루트={root} · 파일=작업 공간 쓰기 · 네트워크=백엔드 선언됨 · 자격 증명=Codex 관리 · 프로세스=백엔드 선언됨 · 신뢰=보고됨/알 수 없음",
   "composer.header": "Agent",
   "composer.hide_panel": "Agent 패널 숨기기 (Ctrl+I)",
+  "composer.close_center": "패널 닫기 (Esc)",
   "composer.memory.accept": "수락",
   "composer.memory.action_failed": "메모리 작업 실패: {error}",
   "composer.memory.badge": "메모리 {count}",

@@ -71,6 +71,7 @@
   "composer.environment_external": "host={host} · root={root} · file=workspace-write · network=backend-declared · credentials=Codex-managed · process=backend-declared · trust=reported/unknown",
   "composer.header": "Agent",
   "composer.hide_panel": "Hide agent panel (Ctrl+I)",
+  "composer.close_center": "Close panel (Esc)",
   "composer.memory.accept": "Accept",
   "composer.memory.action_failed": "Memory action failed: {error}",
   "composer.memory.badge": "Memory {count}",
