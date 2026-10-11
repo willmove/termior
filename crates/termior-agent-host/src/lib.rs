@@ -8,6 +8,7 @@
 mod acp;
 mod acp_host;
 mod backend;
+mod cli;
 mod codex;
 mod environment;
 mod in_process;
@@ -22,6 +23,7 @@ pub use backend::{
     AgentBackend, BackendBinding, BackendDecision, BackendError, BackendEvent, BackendInfo,
     CapabilityProfile, CapabilitySupport, TaskLaunch, TurnLaunch,
 };
+pub use cli::{find_program, AgentBackendKind, CliAgentFeatures, CliAgentProfile, CLI_AGENTS};
 pub use codex::{map_codex_message, CodexBackend, CodexProtocol, CODEX_COMPATIBLE_MINOR};
 pub use environment::{
     ensure_confined, EnvironmentKind, ExecutionEnvironment, PlatformSandbox, SandboxBackend,
