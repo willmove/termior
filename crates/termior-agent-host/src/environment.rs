@@ -145,6 +145,11 @@ impl SandboxCommand {
         if self.clear_environment {
             command.env_clear().env("PATH", safe_path());
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         command
             .spawn()
             .map_err(|error| SandboxError::Io(error.to_string()))

@@ -178,7 +178,12 @@ pub struct TaskRuntime {
     max_consecutive_compactions: u32,
     journal_data_root: Option<PathBuf>,
     persistence_error: Option<String>,
+    message_observer: Option<MessageObserver>,
 }
+
+/// 消息追加到任务历史时的实时回调：UI 借此在任务运行中展示工具调用与结果，
+/// 不必等到命令处理返回。只是旁路通知，不影响历史、事件与持久化。
+pub type MessageObserver = std::sync::Arc<dyn Fn(&Message) + Send + Sync>;
 
 impl TaskRuntime {
     pub fn new(
@@ -222,6 +227,7 @@ impl TaskRuntime {
             max_consecutive_compactions: 2,
             journal_data_root: None,
             persistence_error: None,
+            message_observer: None,
         }
     }
 
@@ -353,6 +359,7 @@ impl TaskRuntime {
             max_consecutive_compactions: 2,
             journal_data_root: Some(data_root.to_path_buf()),
             persistence_error: None,
+            message_observer: None,
         })
     }
 
@@ -447,6 +454,12 @@ impl TaskRuntime {
 
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    /// 设置或清除 [`MessageObserver`]。观察者常持有 channel 发送端，用完须清除，
+    /// 否则接收端永远等不到流结束。
+    pub fn set_message_observer(&mut self, observer: Option<MessageObserver>) {
+        self.message_observer = observer;
     }
 
     /// Append event deltas to the hash-chained journal and atomically snapshot the reduced task.
@@ -1438,6 +1451,9 @@ impl TaskRuntime {
     }
 
     fn add_message(&mut self, message: Message) {
+        if let Some(observer) = self.message_observer.as_ref() {
+            observer(&message);
+        }
         self.history.push(message.clone());
         self.emit(TaskEventKind::MessageAdded { message });
     }

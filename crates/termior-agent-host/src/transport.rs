@@ -69,11 +69,18 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     pub fn spawn(spec: &TransportCommand) -> Result<Self, BackendError> {
-        let mut child = Command::new(&spec.program)
+        let mut command = Command::new(&spec.program);
+        command
             .args(&spec.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let mut child = command
             .spawn()
             .map_err(|error| BackendError::Unavailable(error.to_string()))?;
         let stdin = child

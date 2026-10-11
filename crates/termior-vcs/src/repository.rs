@@ -468,6 +468,11 @@ impl GitRepository {
     ) -> Result<String, GitError> {
         let mut command = Command::new("git");
         command.arg("-C").arg(&self.root).args(args);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
         if stdin.is_some() {
             command.stdin(Stdio::piped());
         }

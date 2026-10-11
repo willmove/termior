@@ -198,11 +198,18 @@ impl HookRunner {
         args: &[String],
         event: &HookEvent,
     ) -> Result<HookRun, HookError> {
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let mut child = command
             .spawn()
             .map_err(|error| self.failure(error.to_string()))?;
         let stdout = child

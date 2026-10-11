@@ -165,7 +165,10 @@ impl TerminalService for LocalTerminalService {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
+            // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW：Termior 是 GUI 子系统进程，没有控制台；
+            // 不加 CREATE_NO_WINDOW 时每条 Agent 命令都会弹出一个 cmd 窗口。子进程拿到的是无窗口
+            // 的控制台，孙进程（cargo → rustc 等）继承它，也不会再各自弹窗。
+            command.creation_flags(0x0000_0200 | 0x0800_0000);
         }
         #[cfg(unix)]
         {
@@ -514,8 +517,10 @@ fn spawn_watcher(
 
 #[cfg(windows)]
 fn terminate_process_tree(pid: u32) {
+    use std::os::windows::process::CommandExt;
     let _ = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();

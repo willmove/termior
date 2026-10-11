@@ -99,8 +99,14 @@ impl CodexBackend {
 
 impl AgentBackend for CodexBackend {
     fn initialize(&mut self) -> Result<BackendInfo, BackendError> {
-        let version = Command::new(&self.executable)
-            .arg("--version")
+        let mut command = Command::new(&self.executable);
+        command.arg("--version");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let version = command
             .output()
             .map_err(|error| BackendError::Unavailable(error.to_string()))?;
         let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();

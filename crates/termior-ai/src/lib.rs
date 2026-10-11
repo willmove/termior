@@ -75,8 +75,8 @@ pub use plan::{
 };
 pub use provider::{MockProvider, Provider, ProviderRequest};
 pub use runtime::{
-    CancellationToken, ChangeReviewExecution, RuntimeError, RuntimeToolExecutor, TaskRuntime,
-    ToolExecution, UserControlInterrupt,
+    CancellationToken, ChangeReviewExecution, MessageObserver, RuntimeError, RuntimeToolExecutor,
+    TaskRuntime, ToolExecution, UserControlInterrupt,
 };
 pub use secret_store::{InMemorySecretStore, SecretStore, SecretStoreError};
 pub use session::{ProjectMemory, Session, SessionModel, SessionStore};

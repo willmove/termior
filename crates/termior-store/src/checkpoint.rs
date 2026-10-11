@@ -256,9 +256,11 @@ fn hard_link_count(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
 
 #[cfg(windows)]
 fn hard_link_count(path: &Path, _metadata: &std::fs::Metadata) -> u64 {
+    use std::os::windows::process::CommandExt;
     std::process::Command::new("fsutil")
         .args(["hardlink", "list"])
         .arg(path)
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .output()
         .ok()
         .filter(|output| output.status.success())

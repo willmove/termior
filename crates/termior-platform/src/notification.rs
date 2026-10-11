@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::process::Command;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
@@ -67,6 +70,7 @@ impl SystemNotifier for NativeNotifier {
                 xml_escape(&notification.title),
                 xml_escape(&notification.body)
             ))
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .status();
 
         #[cfg(target_os = "macos")]

@@ -8,7 +8,7 @@ use gpui::{
     ScrollHandle, SharedString, UTF16Selection, WeakEntity, Window,
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -44,6 +44,7 @@ mod agent_menu;
 mod model_menu;
 mod notify;
 mod task_details;
+mod tool_blocks;
 
 pub use agent_menu::ComposerLaunchCliAgent;
 use task_details::TaskRef;
@@ -256,6 +257,10 @@ pub struct ComposerView {
     /// 任务命令会话的状态边沿检测（Stage B 6.4）。
     command_watch: notify::CommandWatch,
     command_watch_running: bool,
+    /// 会话里已展开输出的工具调用（按 call_id）；默认折叠，只显示命令与状态。
+    expanded_tools: HashSet<String>,
+    /// history 末尾是否为流式文本占位：运行时实时推送的定稿消息到达时替换它。
+    streaming_draft: bool,
 }
 
 /// 消息区最多渲染的最近消息条数，超出部分丢弃以约束流式期间的重排成本。
@@ -352,6 +357,8 @@ impl ComposerView {
             task_project_override: None,
             command_watch: notify::CommandWatch::default(),
             command_watch_running: false,
+            expanded_tools: HashSet::new(),
+            streaming_draft: false,
         }
     }
 
@@ -1202,6 +1209,7 @@ impl ComposerView {
         self.persist_session();
         self.sessions.create(new_session_id());
         self.history.clear();
+        self.expanded_tools.clear();
         self.text_selection = None;
         self.active_task = None;
         self.last_context_plan = None;
@@ -1931,21 +1939,26 @@ impl ComposerView {
         self.set_status(status);
         cx.emit(AgentStatus::Working);
         cx.spawn(async move |view, cx| {
-            let (event_tx, mut event_rx) =
-                futures::channel::mpsc::unbounded::<termior_ai::ChatEvent>();
+            let (event_tx, event_rx) = futures::channel::mpsc::unbounded::<LiveTaskEvent>();
             let task = cx.background_executor().spawn(async move {
                 run_task_command(runtime, task_runtime, command, event_tx).await
             });
-            while let Some(event) = event_rx.next().await {
-                if let termior_ai::ChatEvent::TextDelta(delta) = event {
-                    let _ = view.update(cx, |view, cx| {
-                        view.append_text_delta(delta);
-                        cx.notify();
-                    });
-                }
+            // 一批到达的增量合并成一次重渲染，长输出流式期间不逐字触发布局。
+            let mut event_rx = event_rx.ready_chunks(64);
+            while let Some(events) = event_rx.next().await {
+                let _ = view.update(cx, |view, cx| {
+                    for event in events {
+                        match event {
+                            LiveTaskEvent::TextDelta(delta) => view.append_text_delta(delta),
+                            LiveTaskEvent::Message(message) => view.apply_live_message(message),
+                        }
+                    }
+                    cx.notify();
+                });
             }
             let result = task.await;
             let _ = view.update(cx, |view, cx| {
+                view.streaming_draft = false;
                 view.apply_task_result(result, cx);
                 view.persist_session();
                 cx.notify();
@@ -2170,13 +2183,34 @@ impl ComposerView {
     /// 若 history 末尾不是 assistant，先 push 一条空 assistant 作为流式占位。
     /// 最终消息会在 apply_agent_result 时被 AgentOutcome.messages 整体覆盖。
     fn append_text_delta(&mut self, delta: String) {
-        let needs_new = matches!(self.history.last(), Some(m) if m.role != Role::Assistant);
-        if needs_new {
+        let draft_open = self.streaming_draft
+            && matches!(self.history.last(), Some(m) if m.role == Role::Assistant);
+        if !draft_open {
             self.history.push(Message::assistant(String::new()));
         }
+        self.streaming_draft = true;
         if let Some(last) = self.history.last_mut() {
             last.content.push_str(&delta);
         }
+    }
+
+    /// 运行时追加到历史的定稿消息（实时推送）：assistant 消息替换流式占位，工具结果直接追加；
+    /// 用户/系统消息在提交时已显示或不属于会话视图，忽略。命令处理返回后
+    /// apply_task_result 仍以运行时历史整体覆盖，这里只负责运行期间的即时显示。
+    fn apply_live_message(&mut self, message: Message) {
+        match message.role {
+            Role::Assistant => {
+                let draft_open = self.streaming_draft
+                    && matches!(self.history.last(), Some(m) if m.role == Role::Assistant);
+                match self.history.last_mut() {
+                    Some(last) if draft_open => *last = message,
+                    _ => self.history.push(message),
+                }
+            }
+            Role::Tool => self.history.push(message),
+            Role::User | Role::System => return,
+        }
+        self.streaming_draft = false;
     }
 
     fn decide_hunk(&mut self, id: usize, accept: bool, cx: &mut Context<Self>) {
@@ -2579,11 +2613,17 @@ impl EventEmitter<ComposerAppAction> for ComposerView {}
 impl EventEmitter<ComposerLaunchCliAgent> for ComposerView {}
 impl EventEmitter<ComposerCommandNotice> for ComposerView {}
 
+/// 任务运行中推给 UI 的实时事件：模型文本增量，以及追加到历史的定稿消息（含工具调用与结果）。
+enum LiveTaskEvent {
+    TextDelta(String),
+    Message(Message),
+}
+
 async fn run_task_command(
     runtime: AgentRuntime,
     mut task_runtime: TaskRuntime,
     command: TaskCommand,
-    event_tx: futures::channel::mpsc::UnboundedSender<termior_ai::ChatEvent>,
+    event_tx: futures::channel::mpsc::UnboundedSender<LiveTaskEvent>,
 ) -> TaskRunResult {
     let provider = match HttpProvider::new(runtime.config) {
         Ok(provider) => provider,
@@ -2594,14 +2634,22 @@ async fn run_task_command(
             }
         }
     };
+    let message_tx = event_tx.clone();
+    task_runtime.set_message_observer(Some(Arc::new(move |message: &Message| {
+        let _ = message_tx.unbounded_send(LiveTaskEvent::Message(message.clone()));
+    })));
     let mut on_event = move |event: &termior_ai::ChatEvent| {
-        let _ = event_tx.unbounded_send(event.clone());
+        if let termior_ai::ChatEvent::TextDelta(delta) = event {
+            let _ = event_tx.unbounded_send(LiveTaskEvent::TextDelta(delta.clone()));
+        }
     };
     let error = task_runtime
         .handle(command, &provider, runtime.executor.as_ref(), &mut on_event)
         .await
         .err()
         .map(|error| error.to_string());
+    // 观察者持有发送端；不清除的话 UI 侧的接收循环永远等不到结束。
+    task_runtime.set_message_observer(None);
     TaskRunResult {
         task: task_runtime,
         error,
@@ -2813,24 +2861,55 @@ impl gpui::Render for ComposerView {
         if scroll_max + scroll_offset <= px(8.0) {
             self.scroll_handle.scroll_to_bottom();
         }
+        // 工具结果按 call_id 并入发起它的 assistant 消息显示；找不到发起方的结果单独成块。
+        let issued_calls: HashSet<&str> = self
+            .history
+            .iter()
+            .flat_map(|message| message.tool_calls.iter().map(|call| call.id.as_str()))
+            .collect();
+        let tool_results: HashMap<&str, &termior_ai::ToolResult> = self
+            .history
+            .iter()
+            .filter_map(|message| message.tool_result.as_ref())
+            .map(|result| (result.call_id.as_str(), result))
+            .collect();
         // 选区坐标以消息在会话中的序号分组：历史只追加，序号在流式更新间保持稳定。
-        let conversation = || {
-            self.history
-                .iter()
-                .filter(|message| matches!(message.role, Role::User | Role::Assistant))
-        };
-        let skipped = conversation()
-            .count()
+        let conversation = self
+            .history
+            .iter()
+            .filter(|message| match message.role {
+                Role::User | Role::Assistant => true,
+                Role::Tool => message
+                    .tool_result
+                    .as_ref()
+                    .is_some_and(|result| !issued_calls.contains(result.call_id.as_str())),
+                Role::System => false,
+            })
+            .enumerate()
+            .collect::<Vec<_>>();
+        let skipped = conversation
+            .len()
             .saturating_sub(COMPOSER_RENDERED_MESSAGES);
         let texts = self.selectable_texts.clone();
         texts.clear();
         let selection = self.text_selection;
         let selection_background: Hsla = crate::ui::alpha(p.accent, 0.35).into();
-        let messages = conversation()
+        let tool_style = tool_blocks::ToolBlockStyle {
+            palette: &p,
+            texts: &texts,
+            selection,
+            selection_background,
+        };
+        let messages = conversation
+            .iter()
             .enumerate()
             .skip(skipped)
-            .map(|(index, message)| {
+            .map(|(position, &(index, message))| {
                 let is_user = message.role == Role::User;
+                // 同一轮里连续的 Agent 输出（文本与工具调用）只在开头标一次名字。
+                let show_label = is_user
+                    || position == skipped
+                    || conversation[position - 1].1.role == Role::User;
                 let label = if is_user {
                     t!("composer.message_you")
                 } else {
@@ -2853,7 +2932,7 @@ impl gpui::Render for ComposerView {
                     } else {
                         content
                     };
-                    div().text_xs().cursor_text().children(texts.text(
+                    Some(div().text_xs().cursor_text().children(texts.text(
                         SegmentKey {
                             group: index,
                             seq: 0,
@@ -2862,8 +2941,10 @@ impl gpui::Render for ComposerView {
                         Vec::new(),
                         selection,
                         selection_background,
-                    ))
-                } else {
+                    )))
+                } else if message.role == Role::Assistant
+                    && (message.tool_calls.is_empty() || !message.content.trim().is_empty())
+                {
                     // 流式期间每个增量都会重渲染并重新解析；消息量已被
                     // COMPOSER_RENDERED_MESSAGES 截断，解析成本可接受。
                     let document = MarkdownDocument::parse(&message.content);
@@ -2879,27 +2960,52 @@ impl gpui::Render for ComposerView {
                             background: selection_background,
                         },
                     );
-                    div()
-                        .flex()
-                        .flex_col()
-                        .min_w(px(0.0))
-                        .cursor_text()
-                        .text_size(px(crate::markdown_render::Density::CHAT.base))
-                        .line_height(relative(1.5))
-                        // 首个增量到达前内容为空，用占位空行维持行高。
-                        .when(blocks.is_empty(), |body| {
-                            body.child(SharedString::from("\u{00A0}"))
-                        })
-                        .children(blocks)
+                    Some(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .min_w(px(0.0))
+                            .cursor_text()
+                            .text_size(px(crate::markdown_render::Density::CHAT.base))
+                            .line_height(relative(1.5))
+                            // 首个增量到达前内容为空，用占位空行维持行高。
+                            .when(blocks.is_empty(), |body| {
+                                body.child(SharedString::from("\u{00A0}"))
+                            })
+                            .children(blocks),
+                    )
+                } else {
+                    None
                 };
+                let tool_blocks = message
+                    .tool_calls
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, call)| {
+                        let result = tool_results.get(call.id.as_str()).copied();
+                        self.tool_block(index, ordinal, call, result, &tool_style, cx)
+                    })
+                    .chain(message.tool_result.as_ref().map(|result| {
+                        let call = termior_ai::ToolCall {
+                            id: result.call_id.clone(),
+                            name: t!("composer.tool.result_label").to_string(),
+                            arguments: String::new(),
+                        };
+                        self.tool_block(index, 0, &call, Some(result), &tool_style, cx)
+                    }))
+                    .collect::<Vec<_>>();
                 div()
                     .flex()
                     .flex_col()
                     .min_w(px(0.0))
                     .gap(px(2.0))
-                    .child(div().text_xs().text_color(label_color).child(label))
-                    .child(body)
-            });
+                    .when(show_label, |item| {
+                        item.child(div().text_xs().text_color(label_color).child(label))
+                    })
+                    .children(body)
+                    .children(tool_blocks)
+            })
+            .collect::<Vec<_>>();
         // 菜单与任务详情需要 &mut cx 注册监听，须在惰性的 chips 迭代器借用 cx 之前构建。
         let agent_menu = self.agent_menu_open.then(|| {
             self.agent_menu(
@@ -5010,6 +5116,99 @@ mod layout_tests {
         let blank = gpui::point(start.x, last.bottom() + px(40.0));
         vcx.simulate_mouse_down(blank, MouseButton::Left, gpui::Modifiers::none());
         composer.update(vcx, |view, _| assert!(view.text_selection.is_none()));
+    }
+
+    fn segment_keys(
+        composer: &gpui::Entity<ComposerView>,
+        vcx: &mut gpui::VisualTestContext,
+    ) -> Vec<SegmentKey> {
+        composer.update(vcx, |view, _| {
+            view.selectable_texts
+                .segment_bounds()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect()
+        })
+    }
+
+    /// Agent 的命令在会话里显示为折叠块：默认只有命令与状态，展开后输出可选取复制。
+    #[test]
+    fn tool_calls_render_as_collapsible_blocks() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        composer.update(vcx, |view, _| {
+            view.panel_height = 600.0;
+            view.history.push(Message::user("跑一下测试"));
+            view.history.push(Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![termior_ai::ToolCall {
+                    id: "call-1".into(),
+                    name: "run_command".into(),
+                    arguments: r#"{"command":"cargo test"}"#.into(),
+                }],
+                tool_result: None,
+            });
+            view.history.push(Message {
+                role: Role::Tool,
+                content: String::new(),
+                tool_calls: Vec::new(),
+                tool_result: Some(termior_ai::ToolResult::success(
+                    "call-1",
+                    "session_id=s1 state=Exited exit=0 timed_out=false cursor=2\ntest result: ok",
+                )),
+            });
+        });
+        draw(vcx);
+        assert_eq!(
+            segment_keys(&composer, vcx),
+            vec![SegmentKey { group: 0, seq: 0 }],
+            "collapsed block shows no output text"
+        );
+
+        composer.update(vcx, |view, cx| view.toggle_tool_block("call-1", cx));
+        draw(vcx);
+        let keys = segment_keys(&composer, vcx);
+        assert_eq!(keys.len(), 2, "expanded block adds the output segment");
+        assert_eq!(keys[1].group, 1, "output belongs to the issuing message");
+    }
+
+    /// 运行中实时推送的定稿 assistant 消息替换流式占位，工具结果随即追加。
+    #[test]
+    fn live_messages_replace_the_streaming_draft() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        composer.update(vcx, |view, _| {
+            view.history.push(Message::user("hi"));
+            view.append_text_delta("Let me ".into());
+            view.append_text_delta("check".into());
+            let mut assistant = Message::assistant("Let me check");
+            assistant.tool_calls.push(termior_ai::ToolCall {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.rs"}"#.into(),
+            });
+            view.apply_live_message(Message::user("hi"));
+            view.apply_live_message(assistant);
+            view.apply_live_message(Message {
+                role: Role::Tool,
+                content: String::new(),
+                tool_calls: Vec::new(),
+                tool_result: Some(termior_ai::ToolResult::success("call-1", "fn main() {}")),
+            });
+            view.append_text_delta("Done".into());
+            let roles = view
+                .history
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                roles,
+                vec![Role::User, Role::Assistant, Role::Tool, Role::Assistant]
+            );
+            assert_eq!(view.history[1].tool_calls.len(), 1);
+            assert_eq!(view.history[3].content, "Done");
+        });
     }
 
     /// 用真实 ComposerView 渲染，防止输入行结构改动把文本压成逐字换行（竖排）。

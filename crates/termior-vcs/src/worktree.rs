@@ -126,11 +126,14 @@ impl WorktreeManager {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .stdin(Stdio::null())
+    let mut command = Command::new("git");
+    command.arg("-C").arg(cwd).args(args).stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let output = command
         .output()
         .map_err(|error| WorktreeError::Git(error.to_string()))?;
     if output.status.success() {
