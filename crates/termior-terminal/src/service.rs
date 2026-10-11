@@ -10,9 +10,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_terminal_core::command::{
-    CommandCapabilities, CommandCreate, CommandSession, CommandSessionId, Controller,
-    FakeTerminalService, OutputCursor, OutputRead, OutputStream, TerminalService,
-    TerminalServiceError, WaitResult,
+    CommandCapabilities, CommandCreate, CommandDigest, CommandSession, CommandSessionId,
+    CommandState, Controller, FakeTerminalService, OutputCursor, OutputRead, OutputStream,
+    TerminalService, TerminalServiceError, WaitResult,
 };
 
 use crate::{PtySessionConfig, TerminalBridge, WriterHandle};
@@ -121,6 +121,22 @@ impl LocalTerminalService {
             all_stopped &= self.kill(&id).is_ok();
         }
         all_stopped
+    }
+
+    /// 某任务拥有或当前控制的命令会话摘要（不含已释放会话），按启动时间排序。
+    pub fn task_digests(&self, task_id: &str, tail_bytes: usize) -> Vec<CommandDigest> {
+        self.state
+            .sessions()
+            .into_iter()
+            .filter(|session| {
+                session.state != CommandState::Released
+                    && CommandDigest::belongs_to(session, task_id)
+            })
+            .filter_map(|session| {
+                let tail = self.state.tail_output(&session.id, tail_bytes).ok()?;
+                Some(CommandDigest::from_tail(session, &tail))
+            })
+            .collect()
     }
 }
 

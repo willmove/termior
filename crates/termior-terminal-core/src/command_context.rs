@@ -186,6 +186,18 @@ fn normalize_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// 一次性去除整段输出的终端控制序列（规则同 [`ControlStripper`]），用于展示保留输出的尾部。
+/// 开头若切在 UTF-8 字符中间，跳过续字节。
+pub fn strip_control_sequences(bytes: &[u8]) -> String {
+    let start = bytes
+        .iter()
+        .position(|byte| byte & 0b1100_0000 != 0b1000_0000)
+        .unwrap_or(bytes.len());
+    let mut out = Vec::with_capacity(bytes.len() - start);
+    ControlStripper::default().feed(&bytes[start..], Some(&mut out));
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// 流式去除终端控制序列，得到用户在屏幕上看到的文本近似：
 /// CSI/OSC/DCS 等转义序列整体丢弃，`\r\n` 视为换行，单独的 `\r` 视为回到行首
 /// （进度条只保留最后一次重绘），其余 C0 控制字符除 `\n`/`\t` 外丢弃。

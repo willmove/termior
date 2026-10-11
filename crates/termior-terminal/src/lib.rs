@@ -19,9 +19,9 @@ pub use pty::{
 pub use service::shared_terminal_service;
 pub use service::LocalTerminalService;
 pub use termior_terminal_core::command::{
-    CommandCapabilities, CommandCreate, CommandOwner, CommandSession, CommandSessionId,
-    CommandState, Controller, OutputChunk, OutputCursor, OutputRead, OutputStream, TerminalService,
-    TerminalServiceError, WaitResult,
+    CommandCapabilities, CommandCreate, CommandDigest, CommandOwner, CommandSession,
+    CommandSessionId, CommandState, Controller, OutputChunk, OutputCursor, OutputRead,
+    OutputStream, TerminalService, TerminalServiceError, WaitResult,
 };
 pub use termior_terminal_core::shell_integration::ShellKind;
 pub use termior_terminal_core::{TerminalCommandRecord, TerminalContextReference};

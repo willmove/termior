@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use termior_terminal_core::command::{
-    CommandCapabilities, CommandCreate, CommandOwner, CommandSessionId, CommandState, Controller,
-    FakeTerminalService, OutputStream, TerminalService, TerminalServiceError,
+    CommandCapabilities, CommandCreate, CommandDigest, CommandOwner, CommandSessionId,
+    CommandState, Controller, FakeTerminalService, OutputStream, TerminalService,
+    TerminalServiceError,
 };
 
 fn command() -> CommandCreate {
@@ -142,4 +143,62 @@ fn command_ids_are_stable_and_never_reused() {
         TerminalServiceError::NotFound(first)
     );
     assert_ne!(second, CommandSessionId(String::new()));
+}
+
+#[test]
+fn tail_output_returns_the_newest_chunks_and_reports_hidden_history() {
+    let service = FakeTerminalService::with_output_budget(1024);
+    let id = service.create(command()).unwrap();
+    for chunk in ["one\n", "two\n", "\x1b[31mthree\x1b[0m\n"] {
+        service
+            .push_output(&id, OutputStream::Pty, chunk.as_bytes().to_vec())
+            .unwrap();
+    }
+
+    let tail = service.tail_output(&id, 20).unwrap();
+    assert_eq!(tail.chunks.len(), 2);
+    assert_eq!(tail.truncated_before.map(|cursor| cursor.sequence), Some(1));
+    assert_eq!(tail.next.sequence, 3);
+
+    let digest = CommandDigest::from_tail(service.session(&id).unwrap(), &tail);
+    assert_eq!(digest.tail, "two\nthree\n");
+    assert!(digest.tail_truncated);
+    assert!(!digest.buffer_truncated);
+
+    let whole = service.tail_output(&id, 1024).unwrap();
+    assert_eq!(whole.truncated_before, None);
+}
+
+#[test]
+fn digest_marks_buffer_truncation_and_task_membership() {
+    let service = FakeTerminalService::with_output_budget(4);
+    let id = service.create(command()).unwrap();
+    service
+        .push_output(&id, OutputStream::Stdout, b"aaaa".to_vec())
+        .unwrap();
+    service
+        .push_output(&id, OutputStream::Stdout, b"bbbb".to_vec())
+        .unwrap();
+    let session = service.session(&id).unwrap();
+    let digest = CommandDigest::from_tail(session.clone(), &service.tail_output(&id, 64).unwrap());
+    assert!(digest.buffer_truncated);
+    assert!(digest.tail_truncated);
+    assert!(CommandDigest::belongs_to(&session, "task-7"));
+    assert!(!CommandDigest::belongs_to(&session, "task-8"));
+
+    // 用户 pane 被任务 claim 后同样属于该任务。
+    let pane = service
+        .create(CommandCreate {
+            owner: CommandOwner::User,
+            ..command()
+        })
+        .unwrap();
+    service
+        .hand_back(&pane, Controller::Task("task-8".into()))
+        .unwrap();
+    assert!(CommandDigest::belongs_to(
+        &service.session(&pane).unwrap(),
+        "task-8"
+    ));
+    assert_eq!(service.sessions().len(), 2);
 }

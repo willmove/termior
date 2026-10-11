@@ -7,7 +7,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CommandSessionId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,11 +360,96 @@ impl FakeTerminalService {
         Ok(())
     }
 
+    /// 所有会话快照，按启动时间与 ID 排序。
+    pub fn sessions(&self) -> Vec<CommandSession> {
+        let mut sessions: Vec<CommandSession> = self
+            .entries
+            .lock()
+            .map(|entries| {
+                entries
+                    .values()
+                    .map(|entry| entry.session.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        sessions.sort_by(|a, b| (a.started_at_ms, &a.id).cmp(&(b.started_at_ms, &b.id)));
+        sessions
+    }
+
+    /// 读取保留输出的末尾至多 `max_bytes`（至少一个 chunk）。
+    ///
+    /// `truncated_before` 表示尾部之前还有不在本次结果里的输出（被保留预算丢弃或未被选入尾部），
+    /// 调用方据此提示截断，而不是把尾部当作完整日志。
+    pub fn tail_output(
+        &self,
+        id: &CommandSessionId,
+        max_bytes: usize,
+    ) -> Result<OutputRead, TerminalServiceError> {
+        let entries = self.entries.lock().map_err(|_| lock_error())?;
+        let entry = entries
+            .get(id)
+            .ok_or_else(|| TerminalServiceError::NotFound(id.clone()))?;
+        let mut used = 0usize;
+        let mut chunks = Vec::new();
+        for chunk in entry.chunks.iter().rev() {
+            if !chunks.is_empty() && used.saturating_add(chunk.bytes.len()) > max_bytes {
+                break;
+            }
+            used = used.saturating_add(chunk.bytes.len());
+            chunks.push(chunk.clone());
+        }
+        chunks.reverse();
+        let first = chunks
+            .first()
+            .map_or(entry.session.output_end.sequence + 1, |chunk| {
+                chunk.sequence
+            });
+        let truncated_before = (first > 1).then_some(OutputCursor {
+            sequence: first - 1,
+        });
+        Ok(OutputRead {
+            next: entry.session.output_end,
+            chunks,
+            truncated_before,
+            state: entry.session.state,
+            exit_code: entry.session.exit_code,
+        })
+    }
+
     fn capabilities(
         &self,
         id: &CommandSessionId,
     ) -> Result<CommandCapabilities, TerminalServiceError> {
         Ok(self.session(id)?.capabilities)
+    }
+}
+
+/// 任务详情中一条命令会话的展示摘要（Stage B 6.3）：状态、控制者、退出码与去控制序列的输出尾部。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandDigest {
+    pub session: CommandSession,
+    pub tail: String,
+    /// 尾部之前还有未展示或已被保留预算丢弃的输出。
+    pub tail_truncated: bool,
+    /// 有输出已因保留预算被永久丢弃（Agent 读取时也会看到 truncated）。
+    pub buffer_truncated: bool,
+}
+
+impl CommandDigest {
+    pub fn from_tail(session: CommandSession, tail: &OutputRead) -> Self {
+        let buffer_truncated = session.output_start > OutputCursor::START;
+        Self {
+            tail: crate::command_context::strip_control_sequences(&tail.bytes()),
+            tail_truncated: tail.truncated_before.is_some(),
+            buffer_truncated,
+            session,
+        }
+    }
+
+    /// 会话是否属于该任务：由任务创建，或当前由任务控制（经 claim 取得的可见 pane）。
+    pub fn belongs_to(session: &CommandSession, task_id: &str) -> bool {
+        matches!(&session.owner, CommandOwner::Task(owner) if owner == task_id)
+            || matches!(&session.controller, Controller::Task(controller) if controller == task_id)
     }
 }
 
