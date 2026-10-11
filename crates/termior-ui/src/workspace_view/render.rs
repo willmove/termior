@@ -848,6 +848,11 @@ impl gpui::Render for WorkspaceView {
                 this.perform_key_action(action, window, cx)
             });
         }
+        for agent in std::mem::take(&mut self.pending_cli_launches) {
+            cx.defer_in(window, move |this, window, cx| {
+                this.launch_cli_agent(agent, window, cx)
+            });
+        }
         let (cwd, preview_url) = self.sync_terminal_context(cx);
         let p = self.palette.clone();
         let active = self.model.active;
@@ -1698,6 +1703,24 @@ impl gpui::Render for WorkspaceView {
                                 "terminal-ask-ai-failed",
                                 has_failed,
                                 TerminalMenuAction::AskAiLastFailed,
+                                terminal.clone(),
+                                &p,
+                                cx,
+                            ))
+                            .child(terminal_menu_item(
+                                t!("ws.explain_last_failed"),
+                                "terminal-explain-failed",
+                                has_failed,
+                                TerminalMenuAction::ExplainLastFailed,
+                                terminal.clone(),
+                                &p,
+                                cx,
+                            ))
+                            .child(terminal_menu_item(
+                                t!("ws.fix_last_failed"),
+                                "terminal-fix-failed",
+                                has_failed,
+                                TerminalMenuAction::FixLastFailed,
                                 terminal,
                                 &p,
                                 cx,

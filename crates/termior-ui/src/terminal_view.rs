@@ -37,7 +37,7 @@ use termior_terminal_core::{
     OscCommandTracker, OutputCursor, TerminalCommandRecord, TerminalSearch,
 };
 use termior_theme::{Color as ThemeColor, ResolvedPalette, TerminalPalette};
-use termior_ui_kit::{tokens, SearchOverlay};
+use termior_ui_kit::{tokens, Icon, SearchOverlay};
 
 use crate::keystroke::{encode_paste, keystroke_to_pty_bytes};
 
@@ -82,6 +82,17 @@ pub enum TerminalViewEvent {
     TitleChanged(Option<String>),
     Bell,
     Exited(Option<i32>),
+    /// 用户请求把接管的会话交回 Agent（Stage B 3.4）；由工作区转给 Composer。
+    HandBack(CommandSessionId),
+}
+
+/// 终端 pane 的人机控制权横幅状态（Stage B 3.4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlBanner {
+    /// Agent 任务持有写权限；用户可显式接管（键入同样即接管）。
+    Agent,
+    /// 用户接管了 Agent 曾持有的会话，可交回。
+    UserTookOver,
 }
 
 /// GPUI 终端视图。
@@ -140,6 +151,8 @@ pub struct TerminalView {
     keymap: UserKeymap,
     command_service: Arc<LocalTerminalService>,
     command_session_id: Option<CommandSessionId>,
+    /// 最近持有本会话控制权的 Agent 任务；用户接管后据此提供“交还”操作，关闭横幅时清空。
+    agent_controller: Option<String>,
 }
 
 impl TerminalView {
@@ -381,7 +394,44 @@ impl TerminalView {
             keymap,
             command_service,
             command_session_id,
+            agent_controller: None,
         }
+    }
+
+    /// 本帧的控制权横幅：读取会话的 controller，而不是推断屏幕内容。
+    fn control_banner(&mut self) -> Option<ControlBanner> {
+        let id = self.command_session_id.as_ref()?;
+        let session = self.command_service.session(id).ok()?;
+        if session.state.is_terminal() {
+            self.agent_controller = None;
+            return None;
+        }
+        match session.controller {
+            Controller::Task(task) => {
+                self.agent_controller = Some(task);
+                Some(ControlBanner::Agent)
+            }
+            Controller::User if self.agent_controller.is_some() => {
+                Some(ControlBanner::UserTookOver)
+            }
+            Controller::User => None,
+        }
+    }
+
+    /// 显式接管（横幅按钮）；与“键入即接管”走同一 writer 边界检查。
+    pub fn take_over(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.take_over_user() {
+            log::warn!("terminal take over failed: {error}");
+        }
+        cx.notify();
+    }
+
+    /// 请求交还 Agent：控制权变更由 Composer 的执行器完成，以便同时续跑等待中的任务。
+    pub fn request_hand_back(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.command_session_id.clone() {
+            cx.emit(TerminalViewEvent::HandBack(id));
+        }
+        cx.notify();
     }
 
     pub fn latest_cwd(&self) -> Option<&str> {
@@ -1079,6 +1129,7 @@ impl Render for TerminalView {
             })
             .collect();
         let hovered_link = self.hovered_link.clone();
+        let control_banner = self.control_banner();
         let marked_text = self.marked_text.clone();
         let marked_col = snapshot.cursor.col;
         let marked_row = snapshot.cursor.row.max(0) as usize;
@@ -1248,6 +1299,80 @@ impl Render for TerminalView {
                                 "aa"
                             }
                         )),
+                )
+            })
+            .when_some(control_banner, |element, banner| {
+                let p = &self.palette;
+                let (message, action, primary) = match banner {
+                    ControlBanner::Agent => (
+                        t!("terminal.control.agent"),
+                        t!("terminal.control.take_over"),
+                        false,
+                    ),
+                    ControlBanner::UserTookOver => (
+                        t!("terminal.control.user"),
+                        t!("terminal.control.hand_back"),
+                        true,
+                    ),
+                };
+                element.child(
+                    div()
+                        .absolute()
+                        .top(px(6.0))
+                        .left(px(8.0))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(crate::ui::color(p.accent))
+                        .bg(crate::ui::alpha(p.overlay, 0.95))
+                        .text_color(crate::ui::color(p.foreground))
+                        .text_xs()
+                        .shadow_md()
+                        .child(message)
+                        .child(
+                            crate::ui::button(
+                                "terminal-control-action",
+                                action,
+                                if primary {
+                                    crate::ui::ButtonKind::Primary
+                                } else {
+                                    crate::ui::ButtonKind::Subtle
+                                },
+                                p,
+                            )
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |view, _, _, cx| {
+                                    cx.stop_propagation();
+                                    match banner {
+                                        ControlBanner::Agent => view.take_over(cx),
+                                        ControlBanner::UserTookOver => view.request_hand_back(cx),
+                                    }
+                                }),
+                            ),
+                        )
+                        .when(banner == ControlBanner::UserTookOver, |bar| {
+                            bar.child(
+                                crate::ui::icon_button(
+                                    "terminal-control-dismiss",
+                                    Icon::Close,
+                                    t!("terminal.control.dismiss"),
+                                    p,
+                                )
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(|view, _, _, cx| {
+                                        cx.stop_propagation();
+                                        view.agent_controller = None;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                        }),
                 )
             })
             .when_some(hovered_link, |element, url| {
@@ -2510,6 +2635,59 @@ mod protocol_tests {
             assert_eq!(shifted.origin.y, anchor.origin.y);
         })
         .unwrap();
+    }
+
+    #[test]
+    fn control_banner_follows_the_session_controller_and_requests_hand_back() {
+        let mut cx = TestAppContext::single();
+        let bridge = TerminalBridge::spawn(&PtySessionConfig::default()).expect("PTY spawn");
+        let window = cx.open_window(size(px(640.0), px(480.0)), move |_, cx| {
+            TerminalView::from_bridge(
+                bridge,
+                default_theme().palette().clone(),
+                TerminalSettings::default(),
+                UserKeymap::default(),
+                cx,
+            )
+        });
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = events.clone();
+        let id = cx
+            .update_window(window.into(), |terminal, window, cx| {
+                let terminal = terminal.downcast::<TerminalView>().expect("terminal root");
+                cx.subscribe(&terminal, move |_, event: &TerminalViewEvent, _| {
+                    sink.borrow_mut().push(event.clone());
+                })
+                .detach();
+                let id = terminal
+                    .read(cx)
+                    .command_session_id
+                    .clone()
+                    .expect("local pane is registered");
+                terminal.update(cx, |view, _| {
+                    assert_eq!(view.control_banner(), None);
+                    // Agent claim 了该 pane：横幅提示 Agent 控制并可接管。
+                    view.command_service
+                        .hand_back(&id, Controller::Task("task-banner".into()))
+                        .unwrap();
+                    assert_eq!(view.control_banner(), Some(ControlBanner::Agent));
+                });
+                // 横幅随 controller 渲染（含按钮监听），绘制不得 panic。
+                window.draw(cx).clear();
+                terminal.update(cx, |view, cx| {
+                    view.take_over(cx);
+                    assert_eq!(view.control_banner(), Some(ControlBanner::UserTookOver));
+                    view.request_hand_back(cx);
+                    view.agent_controller = None;
+                    assert_eq!(view.control_banner(), None);
+                });
+                id
+            })
+            .unwrap();
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[TerminalViewEvent::HandBack(id)]
+        );
     }
 
     #[test]

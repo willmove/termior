@@ -443,6 +443,10 @@ pub(super) enum TerminalMenuAction {
     AskAi,
     /// 最近失败命令的输出附加到 Composer（FR-ATERM-05）。
     AskAiLastFailed,
+    /// 让 Agent 解释最近失败的命令（Stage B 3.3），任务固定到当前项目。
+    ExplainLastFailed,
+    /// 让 Agent 修复并在原 cwd 重跑最近失败的命令（Stage B 3.3）。
+    FixLastFailed,
 }
 
 /// 菜单项右侧的快捷键提示，须与 terminal_view 的按键处理及键位表保持一致
@@ -484,7 +488,9 @@ pub(super) fn terminal_menu_shortcut(action: TerminalMenuAction) -> &'static str
                 "Ctrl+L"
             }
         }
-        TerminalMenuAction::AskAiLastFailed => "",
+        TerminalMenuAction::AskAiLastFailed
+        | TerminalMenuAction::ExplainLastFailed
+        | TerminalMenuAction::FixLastFailed => "",
     }
 }
 
@@ -505,6 +511,17 @@ pub(super) fn terminal_menu_item(
         move |this: &mut WorkspaceView, window: &mut Window, cx: &mut Context<WorkspaceView>| {
             cx.stop_propagation();
             this.pane_context_menu = None;
+            let agent_action = match action {
+                TerminalMenuAction::ExplainLastFailed => Some(TerminalAgentAction::Explain),
+                TerminalMenuAction::FixLastFailed => Some(TerminalAgentAction::FixAndRerun),
+                _ => None,
+            };
+            if let Some(agent_action) = agent_action {
+                if let Some(attachment) = terminal.read(cx).last_failed_attachment() {
+                    this.run_terminal_agent_action(agent_action, attachment, cx);
+                }
+                return;
+            }
             let attachment = match action {
                 TerminalMenuAction::AskAi => terminal.read(cx).selection_attachment(),
                 TerminalMenuAction::AskAiLastFailed => terminal.read(cx).last_failed_attachment(),
@@ -521,7 +538,10 @@ pub(super) fn terminal_menu_item(
                     TerminalMenuAction::Paste => view.paste_clipboard(cx),
                     TerminalMenuAction::SelectAll => view.select_all(cx),
                     TerminalMenuAction::Find => view.open_search(cx),
-                    TerminalMenuAction::AskAi | TerminalMenuAction::AskAiLastFailed => {}
+                    TerminalMenuAction::AskAi
+                    | TerminalMenuAction::AskAiLastFailed
+                    | TerminalMenuAction::ExplainLastFailed
+                    | TerminalMenuAction::FixLastFailed => {}
                 }
             });
             cx.notify();

@@ -120,6 +120,27 @@ impl WorkspaceView {
         self.model.composer_visible = true;
         cx.notify();
     }
+    /// 失败命令的“解释 / 修复并重跑”快捷入口（Stage B 3.3）：任务固定到当前 Tab 的项目目录。
+    pub(super) fn run_terminal_agent_action(
+        &mut self,
+        action: TerminalAgentAction,
+        attachment: crate::terminal_view::TerminalAttachment,
+        cx: &mut Context<Self>,
+    ) {
+        let project_dir = self.model.active_project_dir().to_path_buf();
+        self.composer.update(cx, |composer, cx| {
+            composer.run_terminal_action(
+                action,
+                attachment.label,
+                attachment.text,
+                attachment.command,
+                project_dir,
+                cx,
+            );
+        });
+        self.model.composer_visible = true;
+        cx.notify();
+    }
     fn attach_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.composer.update(cx, |composer, cx| {
             composer.attach_file(path);

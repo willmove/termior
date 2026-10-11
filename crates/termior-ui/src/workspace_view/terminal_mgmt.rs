@@ -12,6 +12,20 @@ impl WorkspaceView {
     ) {
         self.create_terminal_with_shell(private, None, window, cx);
     }
+    /// 在当前项目的新终端里启动普通 CLI Agent（Stage B 6.1）。它只获得 PTY 级增强，
+    /// 不接入 Composer 的结构化任务流程。
+    pub(super) fn launch_cli_agent(
+        &mut self,
+        agent: termior_agent_host::CliAgentProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.create_terminal_with_shell(false, None, window, cx);
+        if let Some(tab_id) = self.model.active {
+            self.pending_terminal_input
+                .insert((tab_id, PaneId(1)), agent.launch_input());
+        }
+    }
     /// 新建终端入口（+ 按钮 / Ctrl+T / 新建菜单项）。`settings.terminal.shell_prompt`
     /// 开启时先弹 shell 选择器（锚点优先取触发点，否则窗口中央），本次选择
     /// 不改默认；关闭时直接按默认创建。
@@ -197,6 +211,7 @@ impl WorkspaceView {
                 Err(error) => {
                     let _ = workspace.update(cx, |workspace, cx| {
                         workspace.pending_terminals.remove(&(tab_id, pane_id));
+                        workspace.pending_terminal_input.remove(&(tab_id, pane_id));
                         if let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                             if let Some(pane) = tab.panes.get_mut(&pane_id) {
                                 *pane = PaneContent::Placeholder(
@@ -257,6 +272,13 @@ impl WorkspaceView {
                         // A shell that exits (e.g. via `exit`) closes its pane — and the
                         // whole tab when it was the tab's final pane — regardless of
                         // which pane is focused.
+                        if let TerminalViewEvent::HandBack(session_id) = event {
+                            let session_id = session_id.clone();
+                            workspace.composer.update(cx, |composer, cx| {
+                                composer.hand_back_terminal(&session_id, cx);
+                            });
+                            return;
+                        }
                         if let TerminalViewEvent::Exited(code) = event {
                             workspace.handle_terminal_exited(
                                 tab_id,
@@ -289,7 +311,8 @@ impl WorkspaceView {
                                     TerminalViewEvent::Bell => {
                                         log::debug!("terminal bell in tab {}", tab_id.0);
                                     }
-                                    TerminalViewEvent::Exited(_) => {}
+                                    TerminalViewEvent::Exited(_)
+                                    | TerminalViewEvent::HandBack(_) => {}
                                 }
                             }
                         }
@@ -297,6 +320,12 @@ impl WorkspaceView {
                     },
                 )
                 .detach();
+                if let Some(input) = workspace.pending_terminal_input.remove(&(tab_id, pane_id)) {
+                    // PTY 会缓冲输入，shell 就绪后读取；无需等待提示符。
+                    if let Err(error) = entity.read(cx).write_input(input.as_bytes()) {
+                        log::warn!("failed to start CLI agent in new terminal: {error}");
+                    }
+                }
                 if let Some(tab) = workspace.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                     if let Some(pane) = tab.panes.get_mut(&pane_id) {
                         *pane = PaneContent::Terminal(entity);

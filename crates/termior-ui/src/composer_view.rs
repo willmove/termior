@@ -1,9 +1,10 @@
 use crate::{ComposerDock, MAX_COMPOSER_HEIGHT, MIN_COMPOSER_HEIGHT};
 use futures::StreamExt;
 use gpui::{
-    canvas, div, prelude::*, px, relative, App, Bounds, ClipboardEntry, ClipboardItem, Context,
-    EventEmitter, FocusHandle, Focusable, FontWeight, InputHandler, KeyDownEvent, MouseButton,
-    MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, UTF16Selection, WeakEntity, Window,
+    canvas, div, prelude::*, px, relative, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem,
+    Context, EventEmitter, FocusHandle, Focusable, FontWeight, InputHandler, KeyDownEvent,
+    MouseButton, MouseDownEvent, Pixels, Point, ScrollHandle, SharedString, UTF16Selection,
+    WeakEntity, Window,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -37,6 +38,13 @@ use termior_store::{
     RecoveryTaskSummary, RestoreAction, Settings,
 };
 use termior_ui_kit::{menu_panel, tokens::icon_size, Icon, Tooltip};
+
+mod agent_menu;
+mod notify;
+mod task_details;
+
+pub use agent_menu::ComposerLaunchCliAgent;
+use task_details::TaskRef;
 
 #[derive(Clone)]
 struct AgentRuntime {
@@ -107,6 +115,23 @@ pub struct ComposerCollapse;
 /// `/` 命令面板选中了应用级动作（FR-AGENT-05），由 WorkspaceView 按快捷键同一路径执行。
 #[derive(Debug, Clone, Copy)]
 pub struct ComposerAppAction(pub KeyAction);
+
+/// 任务拥有的命令会话结束（由 CommandState 驱动，Stage B 6.4），供工作区路由通知。
+#[derive(Debug, Clone)]
+pub struct ComposerCommandNotice {
+    pub session_id: String,
+    pub command: String,
+    pub status: AgentStatus,
+}
+
+/// 终端里对失败命令的快捷入口（Stage B 3.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalAgentAction {
+    /// 解释失败原因，不修改文件。
+    Explain,
+    /// 修复原因并在同一 cwd 重跑命令验证。
+    FixAndRerun,
+}
 
 struct LiveTerminalContext {
     snapshot: Mutex<TerminalContext>,
@@ -197,6 +222,19 @@ pub struct ComposerView {
     backend_choice: AgentBackendChoice,
     backend_capability_summary: Option<String>,
     external_session: Option<Arc<Mutex<ManagedAgentSession>>>,
+    /// Agent 选择器下拉（Stage B 6.1）与打开时探测的 CLI Agent 可用性。
+    agent_menu_open: bool,
+    cli_agent_available: Vec<bool>,
+    /// 任务详情面板（Stage B 6.3）及其所指任务；任务结束后仍可查看命令结果。
+    task_details_open: bool,
+    last_task: Option<TaskRef>,
+    /// 活动任务固定使用的运行时：执行器的根即任务的 project_dir，审批/续跑不随全局切换漂移。
+    active_runtime: Option<AgentRuntime>,
+    /// 下一次提交要固定到的项目目录（终端快捷入口设置，Stage B 3.3）。
+    task_project_override: Option<PathBuf>,
+    /// 任务命令会话的状态边沿检测（Stage B 6.4）。
+    command_watch: notify::CommandWatch,
+    command_watch_running: bool,
 }
 
 /// 消息区最多渲染的最近消息条数，超出部分丢弃以约束流式期间的重排成本。
@@ -283,7 +321,20 @@ impl ComposerView {
             backend_choice: AgentBackendChoice::BuiltIn,
             backend_capability_summary: None,
             external_session: None,
+            agent_menu_open: false,
+            cli_agent_available: Vec::new(),
+            task_details_open: false,
+            last_task: None,
+            active_runtime: None,
+            task_project_override: None,
+            command_watch: notify::CommandWatch::default(),
+            command_watch_running: false,
         }
+    }
+
+    /// 活动任务固定的运行时；没有活动任务时为全局配置的运行时。
+    fn task_runtime(&self) -> Option<&AgentRuntime> {
+        self.active_runtime.as_ref().or(self.runtime.as_ref())
     }
 
     /// 覆盖状态行文案；非「模型未配置」引导类状态统一走这里，
@@ -413,18 +464,8 @@ impl ComposerView {
                 return;
             }
         };
-        let executor = match ToolExecutor::new(root, full_tools.clone()) {
-            Ok(executor) => {
-                let executor = executor
-                    .with_terminal_context(self.terminal_context.clone())
-                    .with_todo_store(self.todos.clone(), self.data_dir.clone());
-                let executor = if let Some(data_dir) = self.data_dir.as_ref() {
-                    executor.with_checkpoint_store(data_dir.join("agent-checkpoints"))
-                } else {
-                    executor
-                };
-                Arc::new(executor)
-            }
+        let executor = match self.build_executor(root, &full_tools) {
+            Ok(executor) => executor,
             Err(error) => {
                 self.runtime = None;
                 self.set_status(error.to_string());
@@ -465,6 +506,21 @@ impl ComposerView {
             "agent" => self.active_agent_name()
         ));
         cx.notify();
+    }
+
+    /// 以 `root` 为工作区根构建工具执行器（共享终端上下文、TODO 与检查点存储）。
+    fn build_executor(
+        &self,
+        root: &Path,
+        tools: &ToolRegistry,
+    ) -> Result<Arc<ToolExecutor>, termior_ai::ToolError> {
+        let executor = ToolExecutor::new(root, tools.clone())?
+            .with_terminal_context(self.terminal_context.clone())
+            .with_todo_store(self.todos.clone(), self.data_dir.clone());
+        Ok(Arc::new(match self.data_dir.as_ref() {
+            Some(data_dir) => executor.with_checkpoint_store(data_dir.join("agent-checkpoints")),
+            None => executor,
+        }))
     }
 
     fn selected_agent_runtime(
@@ -512,24 +568,44 @@ impl ComposerView {
         {
             return;
         }
-        match (self.backend_choice, self.active_custom_agent) {
-            (AgentBackendChoice::CodexAppServer, _) => {
-                self.backend_choice = AgentBackendChoice::BuiltIn;
-                self.active_custom_agent = None;
-                self.external_session = None;
-                self.backend_capability_summary = None;
-            }
+        let (choice, custom) = match (self.backend_choice, self.active_custom_agent) {
+            (AgentBackendChoice::CodexAppServer, _) => (AgentBackendChoice::BuiltIn, None),
             (AgentBackendChoice::BuiltIn, None) if !self.custom_agents.is_empty() => {
-                self.active_custom_agent = Some(0);
+                (AgentBackendChoice::BuiltIn, Some(0))
             }
             (AgentBackendChoice::BuiltIn, Some(index)) if index + 1 < self.custom_agents.len() => {
-                self.active_custom_agent = Some(index + 1);
+                (AgentBackendChoice::BuiltIn, Some(index + 1))
             }
-            (AgentBackendChoice::BuiltIn, _) => {
-                self.backend_choice = AgentBackendChoice::CodexAppServer;
-                self.active_custom_agent = None;
-            }
+            (AgentBackendChoice::BuiltIn, _) => (AgentBackendChoice::CodexAppServer, None),
+        };
+        self.select_backend(choice, custom, cx);
+    }
+
+    /// 切换到指定后端（内置可带自定义 Agent 序号）；有进行中的审批/评审时不切换。
+    fn select_backend(
+        &mut self,
+        choice: AgentBackendChoice,
+        custom: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy
+            || self.pending_approval.is_some()
+            || self.external_pending_approval.is_some()
+            || self.pending_edit.is_some()
+        {
+            return;
         }
+        if self.backend_choice == AgentBackendChoice::CodexAppServer
+            && choice != AgentBackendChoice::CodexAppServer
+        {
+            self.external_session = None;
+            self.backend_capability_summary = None;
+        }
+        self.backend_choice = choice;
+        self.active_custom_agent = match choice {
+            AgentBackendChoice::BuiltIn => custom.filter(|index| *index < self.custom_agents.len()),
+            AgentBackendChoice::CodexAppServer => None,
+        };
         if let Some(full_tools) = self.full_tools.clone() {
             match self.selected_agent_runtime(&full_tools, &self.base_system_prompt) {
                 Ok((tools, prompt)) => {
@@ -1354,13 +1430,35 @@ impl ComposerView {
         } else {
             ApprovalPolicy::Prompt
         };
+        // 终端快捷入口把任务固定到命令所在项目：执行器以该目录为根，任务的 project_dir 随之固定。
+        let mut runtime = runtime;
+        let project_dir = match self.task_project_override.take() {
+            Some(dir) if dir != self.workspace_root => {
+                let tools = self
+                    .full_tools
+                    .clone()
+                    .unwrap_or_else(|| runtime.tools.clone());
+                match self.build_executor(&dir, &tools) {
+                    Ok(executor) => {
+                        runtime.executor = executor;
+                        dir
+                    }
+                    Err(error) => {
+                        self.set_status(tf!(
+                            "composer.status.project_pin_failed",
+                            "dir" => dir.display(),
+                            "error" => error
+                        ));
+                        cx.emit(AgentStatus::Error);
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            _ => self.workspace_root.clone(),
+        };
         let task = TaskRuntime::new(
-            TaskConfig::new(
-                user_input.clone(),
-                self.workspace_root.clone(),
-                "native",
-                "direct",
-            ),
+            TaskConfig::new(user_input.clone(), project_dir, "native", "direct"),
             RuntimeBudgets::default(),
             policy,
         )
@@ -1387,6 +1485,9 @@ impl ComposerView {
             task
         };
         runtime.executor.set_task_owner(task.task().id.0.clone());
+        self.last_task = Some(TaskRef::from_task(task.task()));
+        self.command_watch = notify::CommandWatch::default();
+        self.active_runtime = Some(runtime);
         self.active_cancellation = Some(task.cancellation_token());
         self.active_task = Some(task);
         self.active_plan_request = plan_request;
@@ -1395,6 +1496,94 @@ impl ComposerView {
             t!("composer.status.agent_working"),
             cx,
         );
+        self.ensure_command_watch(cx);
+    }
+
+    /// 轮询当前任务的命令会话，在“运行中 → 终态”边沿发出结构化通知（Stage B 6.4）。
+    /// 任务结束且没有运行中的会话时停止。
+    fn ensure_command_watch(&mut self, cx: &mut Context<Self>) {
+        if self.command_watch_running {
+            return;
+        }
+        self.command_watch_running = true;
+        cx.spawn(async move |view, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(750))
+                .await;
+            let keep_going = view
+                .update(cx, |view, cx| {
+                    // 面板关闭时只需要状态，不取输出尾部。
+                    let digests = view.task_digests_with_tail(view.task_details_open);
+                    for notice in view.command_watch.observe(&digests) {
+                        cx.emit(ComposerCommandNotice {
+                            session_id: notice.session_id.0,
+                            command: notice.command,
+                            status: notice.status,
+                        });
+                    }
+                    if view.task_details_open {
+                        cx.notify();
+                    }
+                    // 运行中的 Turn 会暂时取走 active_task（busy 期间为 None），不能据此停止。
+                    let keep_going =
+                        view.busy || view.active_task.is_some() || view.command_watch.has_running();
+                    if !keep_going {
+                        view.command_watch_running = false;
+                    }
+                    keep_going
+                })
+                .unwrap_or(false);
+            if !keep_going {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// 终端失败命令的快捷入口（Stage B 3.3）：附加命令及输出，固定任务到命令所在项目并提交。
+    pub fn run_terminal_action(
+        &mut self,
+        action: TerminalAgentAction,
+        label: String,
+        text: String,
+        command: Option<termior_ai::CommandProvenance>,
+        project_dir: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy || self.active_task.is_some() {
+            // 不打断进行中的任务：只附加，交给用户决定何时提交。
+            self.draft.attach_terminal_output(label, text, command);
+            self.set_status(t!("composer.status.terminal_action_attached"));
+            cx.notify();
+            return;
+        }
+        let (command_text, cwd) = command
+            .as_ref()
+            .map(|command| {
+                (
+                    command.command.clone().unwrap_or_default(),
+                    command.cwd.clone(),
+                )
+            })
+            .unwrap_or_default();
+        self.draft.attach_terminal_output(label, text, command);
+        let prompt = match action {
+            TerminalAgentAction::Explain => t!("composer.terminal_action.explain_prompt"),
+            TerminalAgentAction::FixAndRerun => tf!(
+                "composer.terminal_action.fix_prompt",
+                "command" => command_text,
+                "cwd" => cwd
+            ),
+        };
+        self.draft.input = prompt.to_string();
+        self.cursor = self.draft.input.len();
+        if self.backend_choice == AgentBackendChoice::BuiltIn {
+            self.task_project_override = Some(project_dir);
+        }
+        self.submit(cx);
+        // submit 提前返回（如未配置模型）时不让固定目录泄漏到之后的手动提交。
+        self.task_project_override = None;
+        cx.notify();
     }
 
     fn submit_external(&mut self, cx: &mut Context<Self>) {
@@ -1582,7 +1771,7 @@ impl ComposerView {
             cx.notify();
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(runtime) = self.task_runtime().cloned() else {
             self.active_task = Some(task_runtime);
             self.set_status(t!("composer.status.no_runtime"));
             cx.emit(AgentStatus::Error);
@@ -1636,10 +1825,13 @@ impl ComposerView {
 
         if let Some(error) = result.error {
             self.set_status(tf!("composer.status.agent_error", "error" => error));
+            self.active_runtime = None;
             cx.emit(AgentStatus::Error);
             return;
         }
 
+        // 通知级别只由结构化 TaskState 决定（Stage B 6.4），不解析状态文案。
+        let status = notify::status_for_task(result.task.task().state, self.active_plan_request);
         match result.task.task().state {
             TaskState::WaitingApproval => {
                 let Some(request) = result.task.pending_approval() else {
@@ -1658,7 +1850,7 @@ impl ComposerView {
                 ));
                 self.pending_approval = Some(PendingApproval { request, contract });
                 self.active_task = Some(result.task);
-                cx.emit(AgentStatus::Attention);
+                cx.emit(status);
             }
             TaskState::WaitingChangeReview => {
                 let summary = result
@@ -1677,7 +1869,7 @@ impl ComposerView {
                 });
                 self.set_status(t!("composer.status.review_hunks"));
                 self.active_task = Some(result.task);
-                cx.emit(AgentStatus::Attention);
+                cx.emit(status);
                 cx.emit(review_request);
             }
             TaskState::WaitingUser => {
@@ -1692,6 +1884,14 @@ impl ComposerView {
                         "used" => used,
                         "limit" => limit
                     )),
+                    Some(WaitingReason::TerminalControl { session_id, cursor }) => {
+                        self.task_details_open = true;
+                        self.set_status(tf!(
+                            "composer.status.terminal_taken_over",
+                            "session" => session_id,
+                            "cursor" => cursor
+                        ))
+                    }
                     Some(reason) => self.set_status(tf!(
                         "composer.status.needs_input_reason",
                         "reason" => format!("{reason:?}")
@@ -1699,16 +1899,16 @@ impl ComposerView {
                     None => self.set_status(t!("composer.status.needs_input")),
                 }
                 self.active_task = Some(result.task);
-                cx.emit(AgentStatus::Attention);
+                cx.emit(status);
             }
             TaskState::CompletedVerified => {
                 if self.active_plan_request {
                     self.awaiting_plan_confirmation = true;
                     self.set_status(t!("composer.plan.ready"));
-                    cx.emit(AgentStatus::Attention);
+                    cx.emit(status);
                 } else {
                     self.set_status(t!("composer.status.finished_verified"));
-                    cx.emit(AgentStatus::Finished);
+                    cx.emit(status);
                 }
                 self.active_task = None;
             }
@@ -1716,27 +1916,27 @@ impl ComposerView {
                 if self.active_plan_request {
                     self.awaiting_plan_confirmation = true;
                     self.set_status(t!("composer.plan.ready"));
-                    cx.emit(AgentStatus::Attention);
+                    cx.emit(status);
                 } else {
                     self.set_status(t!("composer.status.finished_unverified"));
-                    cx.emit(AgentStatus::Finished);
+                    cx.emit(status);
                 }
                 self.active_task = None;
             }
             TaskState::Cancelled => {
                 self.set_status(t!("composer.status.cancelled"));
                 self.active_task = None;
-                cx.emit(AgentStatus::Finished);
+                cx.emit(status);
             }
             TaskState::Unknown => {
                 self.set_status(t!("composer.status.unknown_result"));
                 self.active_task = None;
-                cx.emit(AgentStatus::Attention);
+                cx.emit(status);
             }
             TaskState::Failed => {
                 self.set_status(t!("composer.status.task_failed"));
                 self.active_task = None;
-                cx.emit(AgentStatus::Error);
+                cx.emit(status);
             }
             state => {
                 self.set_status(tf!(
@@ -1744,12 +1944,15 @@ impl ComposerView {
                     "state" => format!("{state:?}")
                 ));
                 self.active_task = Some(result.task);
-                cx.emit(AgentStatus::Attention);
+                cx.emit(status);
             }
         }
         if !self.active_plan_request && self.active_task.is_none() {
             self.plan_confirmed = false;
             self.awaiting_plan_confirmation = false;
+        }
+        if self.active_task.is_none() {
+            self.active_runtime = None;
         }
     }
 
@@ -2117,6 +2320,7 @@ impl ComposerView {
         }
         match event.keystroke.key.as_str() {
             "escape" if self.mode_menu_open => self.mode_menu_open = false,
+            "escape" if self.agent_menu_open => self.agent_menu_open = false,
             "enter" | "return" if !event.keystroke.modifiers.shift => self.submit(cx),
             "backspace" if self.cursor > 0 => {
                 let start = char_to_byte(&self.draft.input, self.cursor - 1);
@@ -2171,7 +2375,8 @@ impl ComposerView {
 
     /// 任一检查面板展开时都不能收缩成 compact，否则面板被裁掉（`/skills` 等在空会话中也要可见）。
     fn any_center_open(&self) -> bool {
-        self.context_inspector_open
+        self.task_details_open
+            || self.context_inspector_open
             || self.recovery_center_open
             || self.automation_center_open
             || self.checkpoint_center_open
@@ -2214,6 +2419,8 @@ impl EventEmitter<EditReviewRequested> for ComposerView {}
 impl EventEmitter<ComposerDockToggle> for ComposerView {}
 impl EventEmitter<ComposerCollapse> for ComposerView {}
 impl EventEmitter<ComposerAppAction> for ComposerView {}
+impl EventEmitter<ComposerLaunchCliAgent> for ComposerView {}
+impl EventEmitter<ComposerCommandNotice> for ComposerView {}
 
 async fn run_task_command(
     runtime: AgentRuntime,
@@ -2514,6 +2721,19 @@ impl gpui::Render for ComposerView {
                     .child(div().text_xs().text_color(label_color).child(label))
                     .child(body)
             });
+        // 菜单与任务详情需要 &mut cx 注册监听，须在惰性的 chips 迭代器借用 cx 之前构建。
+        let agent_menu = self.agent_menu_open.then(|| {
+            self.agent_menu(
+                &p,
+                if show_status_row {
+                    MODE_MENU_BOTTOM + STATUS_ROW_HEIGHT
+                } else {
+                    MODE_MENU_BOTTOM
+                },
+                cx,
+            )
+        });
+        let task_details = self.task_details_center(&p, cx);
         let chips = self
             .draft
             .attachments
@@ -3773,8 +3993,9 @@ impl gpui::Render for ComposerView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if this.mode_menu_open {
+                    if this.mode_menu_open || this.agent_menu_open {
                         this.mode_menu_open = false;
+                        this.agent_menu_open = false;
                         cx.notify();
                     }
                 }),
@@ -3803,6 +4024,30 @@ impl gpui::Render for ComposerView {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(t!("composer.header")),
                             )
+                            .when(self.last_task.is_some(), |header| {
+                                header.child(
+                                    div()
+                                        .id("composer-task-details-badge")
+                                        .px_2()
+                                        .py(px(2.0))
+                                        .rounded_md()
+                                        .bg(crate::ui::alpha(p.status[0], 0.12))
+                                        .text_xs()
+                                        .cursor_pointer()
+                                        .child(t!("composer.task.badge"))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.task_details_open = !this.task_details_open;
+                                                if this.task_details_open {
+                                                    this.ensure_command_watch(cx);
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ),
+                                )
+                            })
                             .when(!self.recovery_tasks.is_empty(), |header| {
                                 header.child(
                                     div()
@@ -4019,6 +4264,7 @@ impl gpui::Render for ComposerView {
                         .pb_1()
                         .gap_2()
                         .children(messages)
+                        .children(task_details)
                         .children(todo_center)
                         .children(snippet_center)
                         .children(memory_center)
@@ -4163,10 +4409,24 @@ impl gpui::Render for ComposerView {
                             .tooltip(move |_window, cx| {
                                 Tooltip::view(agent_tooltip.clone(), &agent_palette, cx)
                             })
+                            .flex()
+                            .items_center()
+                            .gap(px(3.0))
+                            .when(self.agent_menu_open, |chip| {
+                                chip.bg(crate::ui::selected_wash(&p))
+                            })
                             .child(agent_name)
+                            .child(crate::ui::icon(
+                                Icon::ChevronDown,
+                                icon_size::XS,
+                                crate::ui::muted(&p),
+                            ))
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _, _, cx| this.cycle_custom_agent(cx)),
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_agent_menu(cx);
+                                }),
                             )
                     })
                     .when_some(context_label, |toolbar, label| {
@@ -4229,6 +4489,7 @@ impl gpui::Render for ComposerView {
             .when(self.mode_menu_open && !external_backend, |root| {
                 root.child(mode_menu)
             })
+            .when_some(agent_menu, |root, menu| root.child(menu))
     }
 }
 
@@ -4669,5 +4930,94 @@ mod layout_tests {
             requested_skill_names("please use $review-code, now", &skills),
             vec!["review-code"]
         );
+    }
+
+    #[test]
+    fn agent_menu_separates_backend_kinds_and_launches_cli_agents_in_a_terminal() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        let launched = Arc::new(Mutex::new(Vec::new()));
+        let sink = launched.clone();
+        vcx.update(|_, cx| {
+            cx.subscribe(&composer, move |_, launch: &ComposerLaunchCliAgent, _| {
+                sink.lock().unwrap().push(launch.0.program);
+            })
+            .detach();
+        });
+        composer.update(vcx, |view, cx| {
+            view.toggle_agent_menu(cx);
+            assert!(view.agent_menu_open);
+            assert_eq!(
+                view.cli_agent_available.len(),
+                termior_agent_host::CLI_AGENTS.len()
+            );
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        composer.update(vcx, |view, cx| {
+            view.choose_agent(agent_menu::AgentMenuChoice::Codex, cx);
+            assert_eq!(view.backend_choice, AgentBackendChoice::CodexAppServer);
+            assert!(!view.agent_menu_open);
+            view.choose_agent(agent_menu::AgentMenuChoice::BuiltIn(None), cx);
+            assert_eq!(view.backend_choice, AgentBackendChoice::BuiltIn);
+            // 普通 CLI Agent 不改变 Composer 后端，只请求在终端里启动。
+            view.choose_agent(agent_menu::AgentMenuChoice::Cli(0), cx);
+            assert_eq!(view.backend_choice, AgentBackendChoice::BuiltIn);
+        });
+        assert_eq!(*launched.lock().unwrap(), vec!["claude"]);
+    }
+
+    #[test]
+    fn terminal_action_without_a_model_keeps_the_attachment_and_drops_the_project_pin() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        composer.update(vcx, |view, cx| {
+            view.run_terminal_action(
+                TerminalAgentAction::FixAndRerun,
+                "$ cargo test (exit 101)".into(),
+                "error[E0425]".into(),
+                Some(termior_ai::CommandProvenance {
+                    id: "cmd-1".into(),
+                    cwd: "/project".into(),
+                    command: Some("cargo test".into()),
+                    exit_code: Some(101),
+                }),
+                PathBuf::from("/project"),
+                cx,
+            );
+            assert_eq!(view.draft.attachments.len(), 1);
+            assert!(view.draft.input.contains("cargo test"));
+            assert!(view.needs_model_setup);
+            assert_eq!(view.task_project_override, None);
+            assert!(view.active_task.is_none());
+        });
+    }
+
+    #[test]
+    fn task_details_panel_renders_for_the_last_task_and_hand_back_needs_an_agent() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        composer.update(vcx, |view, cx| {
+            view.last_task = Some(TaskRef {
+                task_id: "task-details-without-commands".into(),
+                project_dir: PathBuf::from("/project"),
+                backend_id: "native".into(),
+                environment_id: "direct".into(),
+            });
+            view.task_details_open = true;
+            assert!(view.any_center_open());
+            assert!(view.task_digests().is_empty());
+            view.hand_back_terminal(&termior_terminal::CommandSessionId("cmd-x".into()), cx);
+            assert_eq!(
+                view.status,
+                t!("composer.task.no_agent_to_hand_back").to_string()
+            );
+        });
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
     }
 }

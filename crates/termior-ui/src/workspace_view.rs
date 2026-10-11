@@ -5,7 +5,8 @@ use crate::{
     ai_diff_view::{AiDiffAction, AiDiffView},
     app_identity,
     composer_view::{
-        ComposerAppAction, ComposerCollapse, ComposerDockToggle, ComposerView, EditReviewRequested,
+        ComposerAppAction, ComposerCollapse, ComposerCommandNotice, ComposerDockToggle,
+        ComposerLaunchCliAgent, ComposerView, EditReviewRequested, TerminalAgentAction,
     },
     editor_view::EditorView,
     git_views::{GitDiffAction, GitDiffView, GitHistoryAction, GitHistoryView},
@@ -310,6 +311,10 @@ pub struct WorkspaceView {
     pending_agent_updates: BTreeMap<String, PendingAgentUpdate>,
     /// Composer `/` 命令面板选中的应用级动作；订阅回调拿不到 window，留到下一帧执行。
     pending_composer_actions: Vec<KeyAction>,
+    /// Agent 选择器选中的普通 CLI Agent（Stage B 6.1），下一帧在新终端里启动。
+    pending_cli_launches: Vec<termior_agent_host::CliAgentProfile>,
+    /// 终端就绪后写入的首条输入（启动 CLI Agent 的命令行）。
+    pending_terminal_input: HashMap<(TabId, PaneId), String>,
     toasts: Vec<InAppToast>,
     next_toast_id: u64,
     bell_open: bool,
@@ -547,6 +552,29 @@ impl WorkspaceView {
         .detach();
         cx.subscribe(
             &composer,
+            |workspace, _composer, launch: &ComposerLaunchCliAgent, cx| {
+                workspace.pending_cli_launches.push(launch.0);
+                cx.notify();
+            },
+        )
+        .detach();
+        // 任务命令会话结束：通知级别来自 CommandState（Stage B 6.4）。
+        cx.subscribe(
+            &composer,
+            |workspace, _composer, notice: &ComposerCommandNotice, cx| {
+                workspace.queue_agent_update(
+                    &format!("agent-command-{}", notice.session_id),
+                    &format!("$ {}", notice.command),
+                    None,
+                    NotificationTarget::Composer,
+                    notice.status,
+                    cx,
+                );
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &composer,
             |workspace, _composer, _: &ComposerDockToggle, cx| {
                 workspace.toggle_composer_dock(cx);
             },
@@ -649,6 +677,8 @@ impl WorkspaceView {
             notification_router,
             pending_agent_updates: BTreeMap::new(),
             pending_composer_actions: Vec::new(),
+            pending_cli_launches: Vec::new(),
+            pending_terminal_input: HashMap::new(),
             toasts: Vec::new(),
             next_toast_id: 1,
             bell_open: false,
