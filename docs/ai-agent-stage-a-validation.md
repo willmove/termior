@@ -1,6 +1,6 @@
 # Stage A 验证指南：可靠 Agent Runtime
 
-本文用于验证 `agent-stage-a-reliable-runtime` 的实现结果。自动化验证不需要真实模型或网络；手工验证需要在 Termior 设置中配置一个可用模型。
+本文用于验证 `agent-stage-a-reliable-runtime` 的实现结果（该 change 已于 2026-10-11 归档到 `openspec/changes/archive/`，归档后可用 `openspec validate --specs` 校验主规格）。自动化验证不需要真实模型或网络；手工验证需要在 Termior 设置中配置一个可用模型。
 
 ## 自动化验证
 

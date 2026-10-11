@@ -57,7 +57,7 @@
 
 ## 明确边界
 
-- “已实现”指领域模型、协议适配与自动化测试已落地；各阶段仍有未完成的 UI、平台验收与收尾项，逐项清单见 `openspec/changes/agent-stage-{b,c,d,e}-*/tasks.md` 末尾的“实施核对（2026-09-30）”。B–E 尚未归档。
+- “已实现”指领域模型、协议适配与自动化测试已落地；各阶段仍有未完成的 UI、平台验收与收尾项，逐项清单见 `openspec/changes/agent-stage-{b,c,d,e}-*/tasks.md` 末尾的“实施核对”。A 已于 2026-10-11 归档；B 在 2026-10-11 补齐了 Take over/Hand back、任务详情、三类 Agent 选择器、失败命令快捷入口与结构化通知路由，只剩手工验收与三平台 smoke；C–E 尚未归档。
 
 - 当前验证主机是 Windows。Linux `bwrap` 与 macOS `sandbox-exec` 代码通过条件编译和契约测试，但没有在本次 Windows 运行中得到对应平台的黑盒验证；UI 必须按 capability probe 结果显示，required capability 不满足时拒绝运行。
 - Windows 当前仅验证进程树控制，不宣称完整的文件、网络或凭据 sandbox；这些能力报告为 unsupported，sandboxed 任务 fail closed。

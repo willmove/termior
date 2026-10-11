@@ -1,7 +1,7 @@
 ## 0. 阶段门禁
 
-- [ ] 0.1 确认 `agent-stage-a-reliable-runtime` 已归档且 M6 固定评测全绿
-- [ ] 0.2 重新核验 Codex app-server 官方 stable/experimental 方法与兼容版本，记录链接和锁定策略
+- [x] 0.1 确认 `agent-stage-a-reliable-runtime` 已归档且 M6 固定评测全绿
+- [x] 0.2 重新核验 Codex app-server 官方 stable/experimental 方法与兼容版本，记录链接和锁定策略
 
 ## 1. CommandSession 领域模型
 
@@ -25,8 +25,8 @@
 
 - [x] 3.1 将 OSC 133 command start/end/exit 关联为用户命令记录，缺失字段保留 unknown
 - [x] 3.2 为终端选区和失败命令构建 Context Item，引用 terminal/session/output range 而非复制整个滚屏
-- [ ] 3.3 Composer 增加“解释/修复并重跑/附加到任务”入口，并固定目标任务的 project_dir
-- [ ] 3.4 实现 Take over / Hand back 状态和快捷操作；接管时 TaskRuntime 进入 waiting-user
+- [x] 3.3 Composer 增加“解释/修复并重跑/附加到任务”入口，并固定目标任务的 project_dir
+- [x] 3.4 实现 Take over / Hand back 状态和快捷操作；接管时 TaskRuntime 进入 waiting-user
 - [x] 3.5 添加长输出、UTF-8 分块、ANSI/OSC 过滤、慢消费者和截断测试
 
 ## 4. AgentBackend 契约
@@ -48,10 +48,10 @@
 
 ## 6. UI 与验证
 
-- [ ] 6.1 Agent 选择器区分内置后端、结构化外部后端和普通 CLI Agent
+- [x] 6.1 Agent 选择器区分内置后端、结构化外部后端和普通 CLI Agent
 - [x] 6.2 根据 CapabilityProfile 显示/禁用 resume/fork/steer/cancel/model/terminal 动作
-- [ ] 6.3 任务详情显示绑定项目、命令会话、controller、增量输出、退出码和截断提示
-- [ ] 6.4 通知路由使用 TaskState/CommandState，不解析屏幕词语
+- [x] 6.3 任务详情显示绑定项目、命令会话、controller、增量输出、退出码和截断提示
+- [x] 6.4 通知路由使用 TaskState/CommandState，不解析屏幕词语
 - [ ] 6.5 运行长构建、后台服务、REPL 接管、跨 Tab、后端退出和取消的自动/手工验收
 - [ ] 6.6 运行相关 crate tests、三平台 smoke、`cargo clippy --workspace` 与 NFR 体积/启动回归
 - [ ] 6.7 全部退出场景通过后记录实现偏差并严格验证本 change
@@ -67,3 +67,21 @@
 - 6.3 任务详情未展示命令会话、controller、增量输出与截断提示。
 - 6.4 通知路由尚未改为消费 TaskState/CommandState。
 - 6.5–6.7 手工验收、三平台 smoke 与 strict 验证未完成。
+
+## 实施核对（2026-10-11）
+
+本轮补齐的项目与证据：
+
+- 0.1 `agent-stage-a-reliable-runtime` 已用 `openspec archive` 归档（`openspec/changes/archive/2026-10-11-agent-stage-a-reliable-runtime`，主规格 `openspec/specs/reliable-agent-runtime`）；M6 离线 scenario harness 与 `runtime_reliability` 全绿。
+- 0.2 Codex app-server 官方方法、实验面与锁定策略记录在 `docs/codex-app-server-compat.md`。本机未安装 `codex`，真实 smoke 未重跑。
+- 3.3 终端右键菜单新增“解释最近失败的命令 / 修复并重跑最近失败的命令”。附件带命令元数据；内置后端的任务以当前 Tab 项目目录为执行器根，`TaskConfig.project_dir` 随之固定；审批和续跑使用同一个任务运行时（`ComposerView::active_runtime`），不随全局配置漂移。
+- 3.4 `ToolExecutor` 记录经 `command_claim` 取得的会话。用户接管后，`RuntimeToolExecutor::user_control_interrupt` 在下一个调度步骤报告一次，任务进入 `WaitingUser { TerminalControl }`。终端 pane 显示控制权横幅（接管 / 交还 Agent / 保留控制权），任务详情里也有同样的按钮。交还时调用 `TaskCommand::HandBack`，Agent 拿到接管期间的输出游标后从原进程继续。不交还也可以直接 `ContinueAfterUser`。
+- 6.1 Agent 选择器改为下拉菜单，分“内置后端 / 结构化外部后端 / 终端 CLI Agent”三组。CLI Agent（`termior_agent_host::CLI_AGENTS`）的结构化能力全部报告为 unsupported，选中后在当前项目的新终端里启动。
+- 6.3 Composer 面板头新增“任务”入口，任务详情展示绑定项目、后端、环境，以及各命令会话的 controller、状态、退出码、输出序号范围、截断提示和去控制序列后的输出尾部（`LocalTerminalService::task_digests`）。
+- 6.4 Composer 的通知级别统一由 `notify::status_for_task(TaskState)` 计算；任务命令会话的结束由 `CommandWatch` 依据 `CommandState` 的边沿发出 `ComposerCommandNotice`；普通 CLI Agent 仍只消费 OSC 777。
+
+仍未完成（本 change 暂不归档）：
+
+- 6.5 长构建、后台服务、REPL 接管、跨 Tab、后端退出和取消的**手工**验收需要在真实桌面会话中执行；自动部分由 `runtime_reliability`、`command_session`、`terminal_view::control_banner_*` 与 Composer GPUI 测试覆盖。
+- 6.6 三平台 smoke 依赖 CI（本机只有 Windows）。2026-10-11 在 Windows 本机上：release 二进制 37.32 MiB（门槛 60 MiB），`TERMIOR_SMOKE_TEST` 与 `TERMIOR_SPLIT_PANE_SMOKE` 均通过；`cargo test --workspace --all-targets` 801 passed / 0 failed / 5 ignored；`cargo clippy --workspace --all-targets -D warnings` 通过。
+- 6.7 待 6.5/6.6 完成后执行 `openspec validate --strict` 并归档。
