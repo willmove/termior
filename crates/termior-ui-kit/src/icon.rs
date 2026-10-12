@@ -73,6 +73,7 @@ icon_set! {
     PanelRight => "layout-panel-right",
     Paperclip => "paperclip",
     Send => "send",
+    Stop => "stop",
     Loader => "loader-circle",
     ArrowLeftRight => "arrow-left-right",
 }

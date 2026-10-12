@@ -76,6 +76,10 @@ impl TextSelection {
 struct Segment {
     key: SegmentKey,
     text: SharedString,
+    /// 该段对应的 Markdown 源码（如 `**bold**`）。渲染文本是它的展开；
+    /// `None` 表示该段没有对应的 Markdown（用户消息、工具输出），复制
+    /// 只能按渲染文本。
+    source: Option<SharedString>,
     layout: TextLayout,
 }
 
@@ -89,11 +93,14 @@ impl SelectableTexts {
     }
 
     /// 渲染一段可选文本：在原有样式上叠加选区背景，并登记布局供命中测试。
-    /// 返回文本元素与登记用的零尺寸 canvas，调用方把两者都作为子元素挂上。
+    /// `source` 是该段的 Markdown 源码（渲染文本是它的展开），供完整选区
+    /// 复制时保留格式标记。返回文本元素与登记用的零尺寸 canvas，调用方
+    /// 把两者都作为子元素挂上。
     pub(crate) fn text(
         &self,
         key: SegmentKey,
         text: SharedString,
+        source: Option<String>,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
         selection: Option<TextSelection>,
         selection_background: Hsla,
@@ -102,6 +109,7 @@ impl SelectableTexts {
         let highlights = overlay_selection(highlights, selected, selection_background);
         let styled = StyledText::new(text.clone()).with_highlights(highlights);
         let layout = styled.layout().clone();
+        let source = source.map(SharedString::from);
         let registry = self.0.clone();
         let register = canvas(
             |_, _, _| {},
@@ -109,8 +117,9 @@ impl SelectableTexts {
                 registry.borrow_mut().push(Segment {
                     key,
                     text: text.clone(),
+                    source: source.clone(),
                     layout: layout.clone(),
-                })
+                });
             },
         )
         .absolute()
@@ -204,26 +213,34 @@ impl SelectableTexts {
         bounds
     }
 
-    /// 选中的纯文本：同一消息内的段以换行分隔，消息之间空一行。
+    /// 选中的文本：同一消息内的段以换行分隔，消息之间空一行。
+    /// 完整选中的段若带 Markdown 源码，复制源码（保留 `**`、链接、代码
+    /// 围栏等标记），且 Markdown 段之间用空行分隔，保证粘贴后再解析块
+    /// 结构不塌；部分选取的段按渲染文本精确截取，双击选词等行为不变。
     pub(crate) fn selected_text(&self, selection: TextSelection) -> String {
         let segments = self.0.borrow();
         let mut ordered = segments.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|segment| segment.key);
         let mut out = String::new();
         let mut previous: Option<SegmentKey> = None;
+        let mut previous_markdown = false;
         for segment in ordered {
             let Some(range) = selection.range_in(segment.key, &segment.text) else {
                 continue;
             };
+            let full = range.start == 0 && range.end == segment.text.len();
+            let markdown = full && segment.source.is_some();
             if let Some(previous) = previous {
-                out.push_str(if previous.group == segment.key.group {
-                    "\n"
-                } else {
-                    "\n\n"
-                });
+                let blank_line =
+                    previous.group != segment.key.group || previous_markdown || markdown;
+                out.push_str(if blank_line { "\n\n" } else { "\n" });
             }
-            out.push_str(&segment.text[range]);
+            match (&segment.source, markdown) {
+                (Some(source), true) => out.push_str(source),
+                _ => out.push_str(&segment.text[range]),
+            }
             previous = Some(segment.key);
+            previous_markdown = markdown;
         }
         out
     }

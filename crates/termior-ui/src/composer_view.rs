@@ -1279,6 +1279,17 @@ impl ComposerView {
         cx.notify();
     }
 
+    /// 在光标处插入文本，光标按字符数推进到插入内容之后。键盘输入、IME
+    /// 提交与剪贴板粘贴共用；同时清空预编辑串并刷新补全建议。
+    fn insert_text_at_cursor(&mut self, text: &str, cx: &mut Context<Self>) {
+        let byte = char_to_byte(&self.draft.input, self.cursor);
+        self.draft.input.insert_str(byte, text);
+        self.cursor += text.chars().count();
+        self.marked_text.clear();
+        self.update_suggestions();
+        cx.notify();
+    }
+
     /// 把剪贴板读取推迟到当前 entity 更新结束之后。Windows 上打开剪贴板会往
     /// wndproc 回派 sent message，若此时 entity 的 RefCell 仍被借着就会重入崩溃。
     fn schedule_attach_clipboard(&mut self, cx: &mut Context<Self>) {
@@ -1314,7 +1325,8 @@ impl ComposerView {
                         }
                     }
                 }
-                ClipboardEntry::String(_) => {}
+                // 剪贴板是纯文本时插入输入框光标处；图片/外部路径才作为附件。
+                ClipboardEntry::String(text) => self.insert_text_at_cursor(&text.text, cx),
             }
         }
         if attached {
@@ -2967,6 +2979,7 @@ impl gpui::Render for ComposerView {
                             seq: 0,
                         },
                         content.into(),
+                        None,
                         Vec::new(),
                         selection,
                         selection_background,
@@ -4878,7 +4891,7 @@ impl gpui::Render for ComposerView {
                     .child(
                         crate::ui::icon_button(
                             "composer-send",
-                            if self.busy { Icon::Close } else { Icon::Send },
+                            if self.busy { Icon::Stop } else { Icon::Send },
                             if self.busy {
                                 t!("composer.stop_task")
                             } else {
@@ -4958,12 +4971,7 @@ impl InputHandler for ComposerInputHandler {
     ) {
         if let Some(view) = self.view.upgrade() {
             view.update(cx, |view, cx| {
-                let byte = char_to_byte(&view.draft.input, view.cursor);
-                view.draft.input.insert_str(byte, text);
-                view.cursor += text.chars().count();
-                view.marked_text.clear();
-                view.update_suggestions();
-                cx.notify();
+                view.insert_text_at_cursor(text, cx);
             });
         }
     }
@@ -5139,12 +5147,65 @@ mod layout_tests {
             .read_from_clipboard()
             .and_then(|item| item.text())
             .expect("selection copied");
-        assert_eq!(copied, "请解释一下\n\nFirst paragraph\nSecond bold line");
+        assert_eq!(
+            copied,
+            "请解释一下\n\nFirst paragraph\n\nSecond **bold** line"
+        );
 
         // 点在消息区内、文字之外的空白处清除选区。
         let blank = gpui::point(start.x, last.bottom() + px(40.0));
         vcx.simulate_mouse_down(blank, MouseButton::Left, gpui::Modifiers::none());
         composer.update(vcx, |view, _| assert!(view.text_selection.is_none()));
+    }
+
+    /// 完整选中的 Markdown 段复制源码：标记、链接、列表标记与代码围栏保留，
+    /// 段间空行分隔；部分选取的段仍按渲染文本精确截取。
+    #[test]
+    fn selecting_markdown_blocks_copies_markdown_source() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        let message = concat!(
+            "修复 `run()` 里的 **竞态**，见 [笔记](https://example.com/a)。\n\n",
+            "- 先停任务\n",
+            "- 再清理缓存\n\n",
+            "```rust\nfn main() {}\n```"
+        );
+        composer.update(vcx, |view, _| {
+            view.panel_height = 600.0;
+            view.history.push(Message::assistant(message));
+        });
+        draw(vcx);
+        let segments = composer.update(vcx, |view, _| view.selectable_texts.segment_bounds());
+        // 段落、两个列表项、代码块各一段。
+        assert_eq!(segments.len(), 4, "paragraph + two items + code block");
+        let first = segments[0].1;
+        let last = segments[3].1;
+        // 按下必须命中段内（hit 而非 nearest）才会开始选取；拖动与抬起可用
+        // 段外坐标，nearest 把端点吸附到首/末段边界，得到全选。
+        let start = first.origin + gpui::point(px(1.0), first.size.height / 2.0);
+        let end = gpui::point(last.right() + px(4.0), last.bottom() + px(4.0));
+        vcx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+        draw(vcx);
+        vcx.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+        vcx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+        vcx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-c"
+        } else {
+            "ctrl-c"
+        });
+        let copied = vcx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("selection copied");
+        assert_eq!(
+            copied,
+            concat!(
+                "修复 `run()` 里的 **竞态**，见 [笔记](https://example.com/a)。\n\n",
+                "- 先停任务\n\n",
+                "- 再清理缓存\n\n",
+                "```rust\nfn main() {}\n```"
+            )
+        );
     }
 
     fn segment_keys(
@@ -5297,6 +5358,32 @@ mod layout_tests {
                 "CJK prefix must shift anchor right: {bounds:?} vs {text:?}"
             );
             assert!(bounds.size.height > px(0.0));
+        });
+    }
+
+    /// Ctrl+V 把剪贴板纯文本插入输入框光标处（含多行），不产生附件。
+    #[test]
+    fn ctrl_v_pastes_clipboard_text_at_cursor() {
+        let mut cx = TestAppContext::single();
+        cx.write_to_clipboard(ClipboardItem::new_string(" the bug\nsee log".to_string()));
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        composer.update(vcx, |view, _| {
+            view.draft.input = "fix".into();
+            view.cursor = "fix".chars().count();
+        });
+        press(
+            &composer,
+            vcx,
+            if cfg!(target_os = "macos") {
+                "cmd-v"
+            } else {
+                "ctrl-v"
+            },
+        );
+        composer.update(vcx, |view, _| {
+            assert_eq!(view.draft.input, "fix the bug\nsee log");
+            assert_eq!(view.cursor, "fix the bug\nsee log".chars().count());
+            assert!(view.draft.attachments.is_empty());
         });
     }
 

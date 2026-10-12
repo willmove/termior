@@ -150,6 +150,7 @@ impl ComposerView {
                             seq: key_seq,
                         },
                         text.into(),
+                        None,
                         Vec::new(),
                         style.selection,
                         style.selection_background,

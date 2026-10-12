@@ -128,6 +128,9 @@ struct Renderer<'a> {
     selectable: Option<Selectable<'a>>,
     /// 文字段序号（选区坐标）。
     text_seq: usize,
+    /// 待前置到下一段 Markdown 源码的前缀（标题的 `## `、列表项的 `- `）。
+    /// 渲染文本不受影响；`text()` 消费一次，消费后立即清空防泄漏。
+    pending_source_prefix: Option<String>,
 }
 
 impl<'a> Renderer<'a> {
@@ -144,6 +147,7 @@ impl<'a> Renderer<'a> {
             seq: 0,
             selectable,
             text_seq: 0,
+            pending_source_prefix: None,
         }
     }
 
@@ -162,11 +166,19 @@ impl<'a> Renderer<'a> {
     }
 
     /// 一段文字：可选取时附带登记元素，否则就是普通 `StyledText`。
+    /// `source` 是该段渲染文本对应的 Markdown 源码，完整选区复制时保留
+    /// 格式标记。
     fn text(
         &mut self,
         text: String,
+        source: Option<String>,
         highlights: Vec<(Range<usize>, HighlightStyle)>,
     ) -> Vec<AnyElement> {
+        let source = match (source, self.pending_source_prefix.take()) {
+            (Some(source), Some(prefix)) => Some(prefix + &source),
+            (Some(source), None) => Some(source),
+            (None, _) => None,
+        };
         match &self.selectable {
             Some(selectable) => {
                 let key = SegmentKey {
@@ -179,6 +191,7 @@ impl<'a> Renderer<'a> {
                     .text(
                         key,
                         text.into(),
+                        source,
                         highlights,
                         selectable.selection,
                         selectable.background,
@@ -201,7 +214,8 @@ impl<'a> Renderer<'a> {
             &mut highlights,
             self.p,
         );
-        self.text(text, highlights)
+        let source = inline_markdown(nodes);
+        self.text(text, Some(source), highlights)
     }
 
     fn children(&mut self, children: &[MarkdownNode]) -> Vec<AnyElement> {
@@ -215,6 +229,9 @@ impl<'a> Renderer<'a> {
             MarkdownNode::Heading { level, children } => {
                 let index = (*level as usize).saturating_sub(1).min(3);
                 let (size, top, bottom) = density.headings[index];
+                self.pending_source_prefix = Some(format!("{} ", "#".repeat(*level as usize)));
+                let inline = self.inline(children);
+                self.pending_source_prefix = None;
                 div()
                     .mt(px(top))
                     .mb(px(bottom))
@@ -223,7 +240,7 @@ impl<'a> Renderer<'a> {
                     .when(*level <= 2, |heading| {
                         heading.pb_2().border_b_1().border_color(ui::border(p))
                     })
-                    .children(self.inline(children))
+                    .children(inline)
                     .into_any_element()
             }
             MarkdownNode::Paragraph(children) => div()
@@ -242,7 +259,7 @@ impl<'a> Renderer<'a> {
                 .into_any_element(),
             MarkdownNode::CodeBlock { language, code } => {
                 let id = self.next_id("code");
-                let body = self.text(code.clone(), Vec::new());
+                let body = self.text(code.clone(), Some(fence_code(language, code)), Vec::new());
                 div()
                     .mb(px(density.major_gap))
                     .rounded_md()
@@ -287,6 +304,18 @@ impl<'a> Renderer<'a> {
                         } else {
                             "• ".to_owned()
                         };
+                        // 源码前缀：任务项的 `[x] ` 由 TaskMarker 子节点自己带出，
+                        // 这里只补列表标记。
+                        let source_marker = if node_has_task_marker(item) {
+                            "- ".to_owned()
+                        } else if start > 0 && numbered {
+                            format!("{}. ", start + index as u64)
+                        } else {
+                            "- ".to_owned()
+                        };
+                        self.pending_source_prefix = Some(source_marker);
+                        let body = self.children(item_children(item));
+                        self.pending_source_prefix = None;
                         div()
                             .flex()
                             .items_start()
@@ -300,12 +329,7 @@ impl<'a> Renderer<'a> {
                                     .text_color(ui::muted(p))
                                     .child(SharedString::from(marker)),
                             )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .children(self.children(item_children(item))),
-                            )
+                            .child(div().flex_1().min_w(px(0.0)).children(body))
                     })
                     .collect::<Vec<_>>();
                 div()
@@ -333,7 +357,7 @@ impl<'a> Renderer<'a> {
                 .font_family(crate::monospace_font::default_family())
                 .text_size(px(density.base - 2.0))
                 .text_color(ui::muted(p))
-                .children(self.text(html.clone(), Vec::new()))
+                .children(self.text(html.clone(), Some(html.clone()), Vec::new()))
                 .into_any_element(),
             MarkdownNode::DisplayMath(math) => div()
                 .mb(px(density.block_gap))
@@ -342,7 +366,11 @@ impl<'a> Renderer<'a> {
                 .p(px(density.code_padding))
                 .font_family(crate::monospace_font::default_family())
                 .text_center()
-                .children(self.text(math.clone(), Vec::new()))
+                .children(self.text(
+                    math.clone(),
+                    Some(format!("$$\n{}$$", ensure_trailing_newline(math))),
+                    Vec::new(),
+                ))
                 .into_any_element(),
             MarkdownNode::FootnoteDefinition { label, children } => div()
                 .flex()
@@ -656,6 +684,126 @@ fn node_has_task_marker(node: &MarkdownNode) -> bool {
     }
 }
 
+/// 把内联节点序列化回 Markdown 源码，供选区复制保留 `**`、链接、行内码
+/// 等标记。语法树不保留软换行等原文细节（解析时已折成空格），得到的是
+/// 语义等价的 Markdown，不是逐字节还原。
+fn inline_markdown(nodes: &[MarkdownNode]) -> String {
+    let mut out = String::new();
+    push_inline_markdown(nodes, &mut out);
+    out
+}
+
+fn push_inline_markdown(nodes: &[MarkdownNode], out: &mut String) {
+    for node in nodes {
+        match node {
+            MarkdownNode::Text(value) => out.push_str(value),
+            MarkdownNode::InlineCode(value) => {
+                // 围栏反引号数必须多于内容里最长的连续反引号串；首尾是
+                // 反引号或空格时补一个空格隔离，否则围栏失效。
+                let longest_run = value
+                    .split(|c| c != '`')
+                    .filter(|run| !run.is_empty())
+                    .map(str::len)
+                    .max()
+                    .unwrap_or(0);
+                let fence = "`".repeat(longest_run + 1);
+                let pad = value.starts_with('`')
+                    || value.ends_with('`')
+                    || value.starts_with(' ')
+                    || value.ends_with(' ');
+                out.push_str(&fence);
+                if pad {
+                    out.push(' ');
+                }
+                out.push_str(value);
+                if pad {
+                    out.push(' ');
+                }
+                out.push_str(&fence);
+            }
+            MarkdownNode::InlineMath(math) => {
+                out.push('$');
+                out.push_str(math);
+                out.push('$');
+            }
+            MarkdownNode::DisplayMath(math) => {
+                out.push_str("$$");
+                out.push_str(math);
+                out.push_str("$$");
+            }
+            MarkdownNode::RawHtml(html) => out.push_str(html),
+            MarkdownNode::TaskMarker(checked) => {
+                out.push_str(if *checked { "[x] " } else { "[ ] " })
+            }
+            MarkdownNode::Rule => out.push_str("\n---\n"),
+            MarkdownNode::CodeBlock { language, code } => {
+                out.push_str(&fence_code(language, code))
+            }
+            MarkdownNode::Emphasis(children) => wrap_inline(children, "*", out),
+            MarkdownNode::Strong(children) => wrap_inline(children, "**", out),
+            MarkdownNode::Strikethrough(children) => wrap_inline(children, "~~", out),
+            MarkdownNode::Superscript(children) => wrap_inline(children, "^", out),
+            MarkdownNode::Subscript(children) => wrap_inline(children, "~", out),
+            MarkdownNode::Link { destination, children } => {
+                out.push('[');
+                push_inline_markdown(children, out);
+                out.push_str("](");
+                out.push_str(destination);
+                out.push(')');
+            }
+            MarkdownNode::Image { destination, children } => {
+                out.push_str("![");
+                push_inline_markdown(children, out);
+                out.push_str("](");
+                out.push_str(destination);
+                out.push(')');
+            }
+            // 容器节点出现在内联上下文（如单元格里的段落）时按子节点递归；
+            // 结构标记（缩进、管道、引用符）不在此重建。
+            MarkdownNode::Paragraph(children)
+            | MarkdownNode::Heading { children, .. }
+            | MarkdownNode::BlockQuote(children)
+            | MarkdownNode::Item(children)
+            | MarkdownNode::Table(children)
+            | MarkdownNode::TableHead(children)
+            | MarkdownNode::TableRow(children)
+            | MarkdownNode::TableCell(children)
+            | MarkdownNode::FootnoteDefinition { children, .. }
+            | MarkdownNode::DefinitionList(children)
+            | MarkdownNode::DefinitionTitle(children)
+            | MarkdownNode::Definition(children)
+            | MarkdownNode::Container(children) => push_inline_markdown(children, out),
+            MarkdownNode::List { items, .. } => push_inline_markdown(items, out),
+        }
+    }
+}
+
+fn wrap_inline(children: &[MarkdownNode], marker: &str, out: &mut String) {
+    out.push_str(marker);
+    push_inline_markdown(children, out);
+    out.push_str(marker);
+}
+
+/// 重建带语言标注的代码围栏；`code` 保证以换行结尾再闭合。
+fn fence_code(language: &Option<String>, code: &str) -> String {
+    let mut fenced = String::from("```");
+    if let Some(language) = language {
+        fenced.push_str(language);
+    }
+    fenced.push('\n');
+    fenced.push_str(&ensure_trailing_newline(code));
+    fenced.push_str("```");
+    fenced
+}
+
+fn ensure_trailing_newline(text: &str) -> String {
+    if text.ends_with('\n') {
+        text.to_owned()
+    } else {
+        format!("{text}\n")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +833,33 @@ mod tests {
             // 标题/段落/引用/列表/代码块/表格/分隔线/段落 = 8 个块。
             assert_eq!(blocks.len(), 8, "density base {}", density.base);
         }
+    }
+
+    #[test]
+    fn inline_markdown_round_trips_markers() {
+        let document = MarkdownDocument::parse(concat!(
+            "段落：**粗体**、*强调*、~~删除~~、`code`、",
+            "[链接](https://example.com/a)、![图](https://example.com/b.png)"
+        ));
+        let [MarkdownNode::Paragraph(children), ..] = &document.blocks[..] else {
+            panic!("expected a paragraph");
+        };
+        assert_eq!(
+            inline_markdown(children),
+            concat!(
+                "段落：**粗体**、*强调*、~~删除~~、`code`、",
+                "[链接](https://example.com/a)、![图](https://example.com/b.png)"
+            )
+        );
+    }
+
+    #[test]
+    fn inline_code_fence_grows_past_embedded_backticks() {
+        let document = MarkdownDocument::parse("双引号 ``a ` b`` 与单 `x`");
+        let [MarkdownNode::Paragraph(children), ..] = &document.blocks[..] else {
+            panic!("expected a paragraph");
+        };
+        assert_eq!(inline_markdown(children), "双引号 ``a ` b`` 与单 `x`");
     }
 
     #[test]
