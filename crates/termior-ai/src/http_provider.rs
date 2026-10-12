@@ -103,6 +103,12 @@ pub enum ProviderTransportError {
     InvalidUrl(String),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+    /// 非 2xx 响应：带上 provider 错误体的摘要（见 [`check_status`]）。
+    #[error("HTTP error: {status}: {body}")]
+    HttpStatus {
+        status: reqwest::StatusCode,
+        body: String,
+    },
     #[error("response I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("provider response error: {0}")]
@@ -331,19 +337,13 @@ fn send_openai(
 ) -> Result<(), ProviderTransportError> {
     let endpoint = join_endpoint(&ctx.base_url, "chat/completions")?;
     ctx.check_endpoint(endpoint.as_str())?;
-    let body = json!({
-        "model": req.model,
-        "stream": true,
-        "messages": openai_messages(&req.messages, req.system_prompt_extra.as_deref()),
-        "tools": openai_tools(req),
-    });
-    let response = ctx
-        .client
-        .post(endpoint)
-        .headers(ctx.headers(false)?)
-        .json(&body)
-        .send()?
-        .error_for_status()?;
+    let response = check_status(
+        ctx.client
+            .post(endpoint)
+            .headers(ctx.headers(false)?)
+            .json(&openai_body(req))
+            .send()?,
+    )?;
     parse_sse_streaming(BufReader::new(response), OpenAiAccumulator::default(), tx);
     Ok(())
 }
@@ -364,13 +364,13 @@ fn send_anthropic(
         "messages": messages,
         "tools": anthropic_tools(req),
     });
-    let response = ctx
-        .client
-        .post(endpoint)
-        .headers(ctx.headers(true)?)
-        .json(&body)
-        .send()?
-        .error_for_status()?;
+    let response = check_status(
+        ctx.client
+            .post(endpoint)
+            .headers(ctx.headers(true)?)
+            .json(&body)
+            .send()?,
+    )?;
     parse_sse_streaming(
         BufReader::new(response),
         AnthropicAccumulator::default(),
@@ -390,13 +390,13 @@ fn send_google(
     )?;
     ctx.check_endpoint(endpoint.as_str())?;
     let body = google_body(req);
-    let response = ctx
-        .client
-        .post(endpoint)
-        .headers(ctx.headers(false)?)
-        .json(&body)
-        .send()?
-        .error_for_status()?;
+    let response = check_status(
+        ctx.client
+            .post(endpoint)
+            .headers(ctx.headers(false)?)
+            .json(&body)
+            .send()?,
+    )?;
     parse_sse_streaming(BufReader::new(response), GoogleAccumulator::default(), tx);
     Ok(())
 }
@@ -414,13 +414,13 @@ fn send_ollama(
         "messages": openai_messages(&req.messages, req.system_prompt_extra.as_deref()),
         "tools": openai_tools(req),
     });
-    let response = ctx
-        .client
-        .post(endpoint)
-        .headers(ctx.headers(false)?)
-        .json(&body)
-        .send()?
-        .error_for_status()?;
+    let response = check_status(
+        ctx.client
+            .post(endpoint)
+            .headers(ctx.headers(false)?)
+            .json(&body)
+            .send()?,
+    )?;
     parse_ndjson_streaming(BufReader::new(response), OllamaAccumulator::default(), tx);
     Ok(())
 }
@@ -430,6 +430,52 @@ fn join_endpoint(base: &str, suffix: &str) -> Result<Url, ProviderTransportError
     Url::parse(&base)
         .and_then(|url| url.join(suffix))
         .map_err(|_| ProviderTransportError::InvalidUrl(base))
+}
+
+/// reqwest 的 `error_for_status` 只保留状态码、丢弃响应体，而 provider 的非 2xx
+/// 响应体里带有具体原因（如 DeepSeek 的 "Invalid Format: ..."）。这里读出响应体
+/// 拼进错误，Agent 面板才能显示真实原因。
+fn check_status(
+    response: reqwest::blocking::Response,
+) -> Result<reqwest::blocking::Response, ProviderTransportError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().unwrap_or_default();
+    Err(ProviderTransportError::HttpStatus {
+        status,
+        body: summarize_error_body(&body),
+    })
+}
+
+/// 提取 OpenAI 风格错误体 `{"error":{"message":...}}` 中的 message；
+/// 其余情况返回截断到 500 字符的原文。
+fn summarize_error_body(body: &str) -> String {
+    if let Some(message) = serde_json::from_str::<Value>(body).ok().and_then(|value| {
+        value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }) {
+        return message.chars().take(500).collect();
+    }
+    body.chars().take(500).collect()
+}
+
+fn openai_body(req: &ProviderRequest) -> Value {
+    let mut body = json!({
+        "model": req.model,
+        "stream": true,
+        "messages": openai_messages(&req.messages, req.system_prompt_extra.as_deref()),
+    });
+    let tools = openai_tools(req);
+    if !tools.is_empty() {
+        // 部分 OpenAI 兼容 provider（如 DeepSeek）对空 tools 数组按非法请求处理，
+        // 文档只承诺省略或 null，因此无工具时整个省略字段。
+        body["tools"] = Value::Array(tools);
+    }
+    body
 }
 
 fn openai_messages(messages: &[Message], extra: Option<&str>) -> Vec<Value> {
@@ -931,5 +977,40 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("worker ran the job");
+    }
+
+    #[test]
+    fn error_body_surfaces_provider_message() {
+        let json_error = concat!(
+            r#"{"error":{"message":"Invalid Format: unknown field","type":"invalid_request_error","#,
+            r#""param":null,"code":"invalid_request_error"}}"#
+        );
+        assert_eq!(
+            summarize_error_body(json_error),
+            "Invalid Format: unknown field"
+        );
+        assert_eq!(summarize_error_body("plain text"), "plain text");
+        assert_eq!(summarize_error_body(&"x".repeat(600)).chars().count(), 500);
+    }
+
+    #[test]
+    fn openai_body_omits_empty_tools() {
+        let empty = ProviderRequest {
+            messages: vec![],
+            model: "test".into(),
+            tools: ToolRegistry::default().subset(Vec::<&str>::new()).unwrap(),
+            system_prompt_extra: None,
+        };
+        assert!(openai_body(&empty).get("tools").is_none());
+        let full = ProviderRequest {
+            messages: vec![],
+            model: "test".into(),
+            tools: ToolRegistry::default().subset(["write_file"]).unwrap(),
+            system_prompt_extra: None,
+        };
+        assert_eq!(
+            openai_body(&full).pointer("/tools/0/function/name"),
+            Some(&json!("write_file"))
+        );
     }
 }

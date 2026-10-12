@@ -945,7 +945,30 @@ impl TaskRuntime {
             messages.push(Message::system(prompt));
         }
         messages.extend(self.history.clone());
-        messages
+        repair_tool_pairing(messages)
+    }
+
+    /// 取消/中断路径把调用置为终态却不产生结果消息，这里为历史中缺少结果的
+    /// 已终结调用补写失败结果，避免悬空 tool_calls 进入 journal（已有结果的
+    /// 调用跳过，幂等）。
+    fn record_missing_tool_results(&mut self, note: &str) {
+        let answered: Vec<String> = self
+            .history
+            .iter()
+            .filter_map(|message| message.tool_result.as_ref().map(|r| r.call_id.clone()))
+            .collect();
+        for index in 0..self.invocations.len() {
+            if !self.invocations[index].state.is_terminal() {
+                continue;
+            }
+            let call_id = self.invocations[index].call_id.clone();
+            if answered.iter().any(|id| id == &call_id) {
+                continue;
+            }
+            let result = ToolResult::failure(&call_id, note);
+            self.invocations[index].result = Some(result.clone());
+            self.add_tool_result(result);
+        }
     }
 
     fn compact_history_if_needed(&mut self) -> Result<(), String> {
@@ -1420,6 +1443,9 @@ impl TaskRuntime {
                 for index in indices {
                     self.transition_tool(index, ToolState::Unknown)?;
                 }
+                self.record_missing_tool_results(
+                    "no result was recorded: the change review outcome is unknown",
+                );
                 self.set_state(TaskState::Unknown, None);
                 self.emit(TaskEventKind::Diagnostic { message });
                 Ok(())
@@ -1455,6 +1481,9 @@ impl TaskRuntime {
             }
             self.set_state(TaskState::Unknown, None);
         }
+        self.record_missing_tool_results(
+            "no result was recorded: the task was cancelled before the tool call completed",
+        );
         self.finish_turn();
     }
 
@@ -1832,6 +1861,57 @@ impl TaskRuntime {
     }
 }
 
+/// 保证发送给 provider 的历史满足"每条带 tool_calls 的助手消息之后，每个
+/// tool_call_id 都有一条紧跟的 tool 结果消息"（OpenAI/DeepSeek 的硬性校验，
+/// 违反即 400）。取消、终端接管、重启恢复路径会把调用置为 Cancelled/Unknown
+/// 而不写结果，历史里因此会留下悬空 tool_calls；这里在发送前补写占位结果、
+/// 丢弃配不上调用方的孤儿结果。只修请求视图，不改持久化历史。
+fn repair_tool_pairing(messages: Vec<Message>) -> Vec<Message> {
+    let mut repaired = Vec::with_capacity(messages.len());
+    let mut pending: Vec<String> = Vec::new();
+    for message in messages {
+        if message.role == Role::Tool {
+            let answered = message
+                .tool_result
+                .as_ref()
+                .map(|result| result.call_id.clone())
+                .is_some_and(|call_id| {
+                    let matches = pending.iter().any(|pending_id| pending_id == &call_id);
+                    if matches {
+                        pending.retain(|pending_id| pending_id != &call_id);
+                    }
+                    matches
+                });
+            if answered {
+                repaired.push(message);
+            }
+            continue;
+        }
+        flush_unanswered_calls(&mut repaired, &mut pending);
+        if message.role == Role::Assistant {
+            pending.extend(message.tool_calls.iter().map(|call| call.id.clone()));
+        }
+        repaired.push(message);
+    }
+    flush_unanswered_calls(&mut repaired, &mut pending);
+    repaired
+}
+
+/// 为仍未得到结果消息的 tool_call 补写占位失败结果。
+fn flush_unanswered_calls(out: &mut Vec<Message>, pending: &mut Vec<String>) {
+    for call_id in pending.drain(..) {
+        out.push(Message {
+            role: Role::Tool,
+            content: String::new(),
+            tool_calls: Vec::new(),
+            tool_result: Some(ToolResult::failure(
+                call_id,
+                "no result was recorded: the tool call was cancelled or interrupted",
+            )),
+        });
+    }
+}
+
 fn truncate_utf8(value: &str, limit: usize) -> &str {
     let mut boundary = value.len().min(limit);
     while !value.is_char_boundary(boundary) {
@@ -1970,5 +2050,97 @@ fn summarize_call(tool: &str, arguments: &str) -> String {
             .and_then(serde_json::Value::as_str)
             .map_or_else(|| tool.to_owned(), |path| format!("{tool} {path}")),
         Err(_) => tool.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tool_pairing_tests {
+    use super::*;
+    use crate::message::ToolCall;
+
+    fn assistant_with_calls(ids: &[&str]) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: ids
+                .iter()
+                .map(|id| ToolCall {
+                    id: (*id).to_owned(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                })
+                .collect(),
+            tool_result: None,
+        }
+    }
+
+    fn tool_result(call_id: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: String::new(),
+            tool_calls: Vec::new(),
+            tool_result: Some(ToolResult::success(call_id, "ok")),
+        }
+    }
+
+    #[test]
+    fn unanswered_tool_calls_get_placeholder_results_in_the_request_view() {
+        let repaired = repair_tool_pairing(vec![
+            Message::user("run it"),
+            assistant_with_calls(&["a", "b"]),
+            tool_result("a"),
+        ]);
+        assert_eq!(repaired[2].tool_result.as_ref().unwrap().call_id, "a");
+        let placeholder = repaired.last().unwrap();
+        assert_eq!(placeholder.role, Role::Tool);
+        let result = placeholder.tool_result.as_ref().unwrap();
+        assert_eq!(result.call_id, "b");
+        assert!(!result.ok);
+    }
+
+    #[test]
+    fn placeholder_is_inserted_before_the_next_non_tool_message() {
+        let repaired =
+            repair_tool_pairing(vec![assistant_with_calls(&["a"]), Message::user("next")]);
+        assert_eq!(repaired[1].role, Role::Tool);
+        assert_eq!(repaired[1].tool_result.as_ref().unwrap().call_id, "a");
+        assert_eq!(repaired[2], Message::user("next"));
+    }
+
+    #[test]
+    fn orphan_tool_results_are_dropped_from_the_request_view() {
+        let repaired = repair_tool_pairing(vec![
+            Message::user("hi"),
+            tool_result("ghost"),
+            Message::user("again"),
+        ]);
+        assert_eq!(repaired.len(), 2);
+        assert!(repaired.iter().all(|message| message.role != Role::Tool));
+    }
+
+    #[test]
+    fn well_formed_history_is_passed_through_unchanged() {
+        let history = vec![
+            Message::user("hi"),
+            assistant_with_calls(&["a"]),
+            tool_result("a"),
+            Message::assistant("done"),
+        ];
+        assert_eq!(repair_tool_pairing(history.clone()), history);
+    }
+
+    #[test]
+    fn provider_messages_repairs_a_cancelled_history() {
+        let mut runtime = TaskRuntime::new(
+            TaskConfig::new("pairing", "/project", "native", "direct"),
+            RuntimeBudgets::default(),
+            ApprovalPolicy::Prompt,
+        );
+        runtime.add_message(Message::user("go"));
+        runtime.add_message(assistant_with_calls(&["lost-call"]));
+        let messages = runtime.provider_messages();
+        let last = messages.last().unwrap();
+        assert_eq!(last.role, Role::Tool);
+        assert_eq!(last.tool_result.as_ref().unwrap().call_id, "lost-call");
     }
 }

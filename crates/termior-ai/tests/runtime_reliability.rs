@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 use futures::stream::BoxStream;
 use termior_ai::{
     AcceptanceCheck, AcceptanceCriterion, AcceptanceReport, AcceptanceStatus, ApprovalPolicy,
-    CancellationToken, ChatEvent, EvaluationSuiteReport, Message, MockProvider, RuntimeBudgets,
-    RuntimeToolExecutor, ScenarioReport, Task, TaskCommand, TaskConfig, TaskRuntime, TaskState,
-    ToolCall, ToolExecution, ToolExecutor, ToolRegistry, ToolState, UserControlInterrupt,
-    WaitingReason,
+    CancellationToken, ChatEvent, EvaluationSuiteReport, Message, MockProvider, Role,
+    RuntimeBudgets, RuntimeToolExecutor, ScenarioReport, Task, TaskCommand, TaskConfig,
+    TaskEventKind, TaskRuntime, TaskState, ToolCall, ToolExecution, ToolExecutor, ToolRegistry,
+    ToolState, UserControlInterrupt, WaitingReason,
 };
 use termior_security::workspace::WorkspaceAuthRegistry;
 
@@ -849,6 +849,61 @@ fn cancelling_while_waiting_for_approval_prevents_all_remaining_calls() {
         &mut |_| {},
     ));
     assert!(approval.is_err());
+}
+
+#[test]
+fn cancelling_while_waiting_for_approval_records_placeholder_tool_results() {
+    let provider = MockProvider::single(vec![ChatEvent::Done(assistant_with_calls(vec![
+        ToolCall {
+            id: "write-cancel".into(),
+            name: "write_file".into(),
+            arguments: r#"{"path":"a.txt","content":"x"}"#.into(),
+        },
+        ToolCall {
+            id: "run-cancel".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command":"test"}"#.into(),
+        },
+    ]))]);
+    let executor = RecordingExecutor::default();
+    let mut runtime = TaskRuntime::new(
+        TaskConfig::new("cancel-results", "/project", "native", "direct"),
+        RuntimeBudgets::default(),
+        ApprovalPolicy::Prompt,
+    );
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::Start {
+            user_input: "write and test".into(),
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::Cancel,
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+
+    // 取消必须为每个 tool_call 补一条结果消息，否则下一轮请求会被
+    // provider 以 "insufficient tool messages following tool_calls" 拒绝。
+    let answered: Vec<String> = runtime
+        .events()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TaskEventKind::MessageAdded { message }
+                if message.role == Role::Tool && message.tool_result.is_some() =>
+            {
+                Some(message.tool_result.as_ref().unwrap().call_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(answered.contains(&"write-cancel".to_owned()));
+    assert!(answered.contains(&"run-cancel".to_owned()));
 }
 
 #[test]
