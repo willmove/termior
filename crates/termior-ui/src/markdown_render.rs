@@ -736,22 +736,26 @@ fn push_inline_markdown(nodes: &[MarkdownNode], out: &mut String) {
                 out.push_str(if *checked { "[x] " } else { "[ ] " })
             }
             MarkdownNode::Rule => out.push_str("\n---\n"),
-            MarkdownNode::CodeBlock { language, code } => {
-                out.push_str(&fence_code(language, code))
-            }
+            MarkdownNode::CodeBlock { language, code } => out.push_str(&fence_code(language, code)),
             MarkdownNode::Emphasis(children) => wrap_inline(children, "*", out),
             MarkdownNode::Strong(children) => wrap_inline(children, "**", out),
             MarkdownNode::Strikethrough(children) => wrap_inline(children, "~~", out),
             MarkdownNode::Superscript(children) => wrap_inline(children, "^", out),
             MarkdownNode::Subscript(children) => wrap_inline(children, "~", out),
-            MarkdownNode::Link { destination, children } => {
+            MarkdownNode::Link {
+                destination,
+                children,
+            } => {
                 out.push('[');
                 push_inline_markdown(children, out);
                 out.push_str("](");
                 out.push_str(destination);
                 out.push(')');
             }
-            MarkdownNode::Image { destination, children } => {
+            MarkdownNode::Image {
+                destination,
+                children,
+            } => {
                 out.push_str("![");
                 push_inline_markdown(children, out);
                 out.push_str("](");
