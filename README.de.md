@@ -14,6 +14,18 @@
 
 Termior bündelt ein echtes PTY-Terminal, einen schlanken Code-Editor, einen Datei-Explorer, Git, eine Web-Vorschau sowie einen eingebauten/externen Agenten mit Werkzeugaufrufen, Freigaben, Änderungsprüfung und Wiederherstellung in einem einzigen nativen Fenster. Die maßgebliche Produkt- und Engineering-Spezifikation liegt unter [docs/termior-spec.md](docs/termior-spec.md) (englisch).
 
+### Installation
+
+Lade das Artefakt für deine Plattform vom [neuesten Release](https://github.com/willmove/termior/releases/latest) herunter: einen Inno-Setup-`*-setup.exe` oder ein portables `*.zip` unter Windows, ein per Drag-and-Drop zu installierendes `*.dmg` oder ein portables `*.tar.gz` unter macOS sowie ein `*.deb` oder `*.tar.gz` unter Linux. Jedes Artefakt enthält eine SHA-256-Prüfsumme. Die aktuellen macOS-Builds zielen auf macOS 13+ mit Apple Silicon; ein Intel-Paket gibt es noch nicht.
+
+**Hinweis zu macOS Gatekeeper.** Läuft die Release-Pipeline mit konfigurierten Apple-Developer-Zugangsdaten, werden App-Bundle und DMG signiert und notarisiert und öffnen sich normal. Bei unsignierten Builds zeigt Gatekeeper den irreführenden Dialog „Termior ist beschädigt und kann nicht geöffnet werden“ — der Download selbst ist intakt. Falls er erscheint, ziehe `Termior.app` nach `/Applications`, entferne das Quarantäne-Attribut und öffne die App:
+
+```bash
+xattr -cr /Applications/Termior.app
+```
+
+Weder Rechtsklick → Öffnen noch Systemeinstellungen → Datenschutz & Sicherheit → „Trotzdem öffnen“ hebt diesen speziellen Dialog auf — nur das Entfernen des Attributs hilft.
+
 ### Kernwerte
 
 1. **Natürliche niedrige Latenz** — Die Kern-UI hat keine JS-Laufzeit und keine IPC-Serialisierungsgrenze. Terminal und Editor rendern direkt auf der GPU, mit dem Ziel von 60 fps im Dauerbetrieb und 120 fps auf Displays mit hoher Bildwiederholrate.
@@ -142,7 +154,7 @@ cargo run -p termior
 
 #### Release
 
-Ein Release-Tag (`v<workspace-version>`) löst einen dreiplattformigen Release-Build aus, der portable ZIP/TAR-Archive mit SHA-256-Prüfsummen sowie plattformspezifische Installer erzeugt: ein Inno-Setup-`*-setup.exe` unter Windows, ein per Drag-and-Drop zu installierendes `.dmg` unter macOS und ein per `cargo-deb` erzeugtes `.deb` unter Linux. Die Pipeline erzwingt die 60-MiB-Grenze für einzelne Binärdateien und die 100-MiB-Grenze für Archive/Installer aus Spec NFR-05. Lokal lassen sich Prüfung und Paketierung mit `scripts/check-release-binary.ps1` und `scripts/package-release.ps1` reproduzieren (der Windows-Installer erfordert Inno Setup 6 auf dem Rechner).
+Ein Release-Tag (`v<workspace-version>`) löst einen dreiplattformigen Release-Build aus, der portable ZIP/TAR-Archive mit SHA-256-Prüfsummen sowie plattformspezifische Installer erzeugt: ein Inno-Setup-`*-setup.exe` unter Windows, ein per Drag-and-Drop zu installierendes `.dmg` unter macOS und ein per `cargo-deb` erzeugtes `.deb` unter Linux. Die Pipeline erzwingt die 60-MiB-Grenze für einzelne Binärdateien und die 100-MiB-Grenze für Archive/Installer aus Spec NFR-05. Sind die in `release.yml` aufgeführten Apple-Developer-Secrets im Repository konfiguriert, signiert das macOS-Packaging zusätzlich App-Bundle und DMG, notarisiert und stapelt (staple) das DMG und erzeugt seine Prüfsumme neu; ohne sie werden die Artefakte unsigniert veröffentlicht. Lokal lassen sich Prüfung und Paketierung mit `scripts/check-release-binary.ps1` und `scripts/package-release.ps1` reproduzieren (der Windows-Installer erfordert Inno Setup 6 auf dem Rechner; mit `-MacosSigningIdentity` lässt sich ein lokaler macOS-Build signieren).
 
 Die Release-Größe stammt vor allem aus dem nativen GPUI-Rendering-Stack, der Terminal-/VTE-Schicht, den pro Sprache eingebundenen tree-sitter-Grammatiken sowie TLS-, Schlüsselbund- und Provider-Clients. Die Web-Vorschau übergibt an den Systembrowser, statt ein WebView einzubetten (ADR 0002), wodurch die Abhängigkeitsoberfläche plattformidentisch bleibt; PNG-Dekodierung und tree-sitter-Sprachen nutzen explizite Minimal-Features — neue UI-, Vorschau- oder Grammatikfähigkeiten müssen gegen die Abhängigkeitsbaum- und Größenberichte der CI bewertet werden.
 
@@ -152,7 +164,7 @@ Provider-Endpunkte, Modelle und Aktivierung liegen in `Termior-settings.json`; A
 
 **Einstellungen → About** bietet einen Auto-Update-Schalter (standardmäßig an), eine manuelle Prüfung und Release Notes. Die App prüft 15 Sekunden nach dem Start und danach alle 6 Stunden die stabilen GitHub-Releases, lädt den zu OS und CPU-Architektur passenden Installer herunter und verifiziert dessen SHA-256. Nach Abschluss des Downloads zeigt die Titelleiste **Update available**; About öffnen und **Install update…** wählen, um das System-Installationsprogramm zu starten. Beende oder stoppe Terminal-Aufgaben, bevor du die App schließt, um die Installation abzuschließen — der Updater beendet die App und ihre Terminals nie von selbst. Mit deaktiviertem Auto-Update funktionieren manuelle Prüfungen weiterhin.
 
-Windows nutzt Inno Setup, macOS öffnet ein DMG zum Ziehen-und-Ersetzen der App, Linux verwendet den DEB-Installer. Bei portablen Builds, Distributionen ohne DEB-Unterstützung oder fehlenden Architekturpaketen bitte manuell über die Release-Download-Seite aktualisieren. Netzwerk- oder Prüfsummenfehler zeigen einen Fehler an und behalten die aktuelle Version; an das System-Installationsprogramm übergebene Dateien bleiben im temporären Verzeichnis und können nach der Installation gelöscht werden. Prüfsummen verifizieren nur die Dateiintegrität — die aktuellen Windows- und macOS-Installer sind noch nicht signiert.
+Windows nutzt Inno Setup, macOS öffnet ein DMG zum Ziehen-und-Ersetzen der App, Linux verwendet den DEB-Installer. Bei portablen Builds, Distributionen ohne DEB-Unterstützung oder fehlenden Architekturpaketen bitte manuell über die Release-Download-Seite aktualisieren. Netzwerk- oder Prüfsummenfehler zeigen einen Fehler an und behalten die aktuelle Version; an das System-Installationsprogramm übergebene Dateien bleiben im temporären Verzeichnis und können nach der Installation gelöscht werden. Prüfsummen verifizieren nur die Dateiintegrität, nicht die Identität: macOS-Artefakte werden nur dann signiert und notarisiert, wenn die Apple-Developer-Secrets in `release.yml` konfiguriert sind, und Windows-Installer sind derzeit unsigniert.
 
 ### Datenschutz und Sicherheit
 

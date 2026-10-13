@@ -16,6 +16,18 @@
 
 Termior brings a real PTY terminal, a lightweight code editor, a file explorer, Git, web preview, and a built-in/external agent with tool calling, approvals, change review, and recovery into a single native window. The authoritative product and engineering specification is [docs/termior-spec.md](docs/termior-spec.md).
 
+### Installation
+
+Download the artifact for your platform from the [latest release](https://github.com/willmove/termior/releases/latest): an Inno Setup `*-setup.exe` or a portable `*.zip` on Windows, a drag-to-install `*.dmg` or a portable `*.tar.gz` on macOS, and a `*.deb` or `*.tar.gz` on Linux. Every asset carries a SHA-256 checksum. The current macOS builds target macOS 13+ on Apple Silicon; there is no Intel package yet.
+
+**macOS Gatekeeper note.** When the release pipeline runs with Apple Developer credentials configured, the app bundle and DMG are signed and notarized and open normally. On unsigned builds, Gatekeeper shows a misleading "Termior is damaged and can't be opened" dialog — the download itself is intact. If you see it, drag `Termior.app` to `/Applications`, then clear the quarantine attribute and open the app:
+
+```bash
+xattr -cr /Applications/Termior.app
+```
+
+Neither right-click → Open nor System Settings → Privacy & Security → Open Anyway dismisses that particular dialog; removing the attribute does.
+
 ### Core values
 
 1. **Native low latency** — The core UI has no JS runtime and no IPC serialization boundary. The terminal and editor render directly on the GPU, targeting 60 fps in steady state and 120 fps on high-refresh displays.
@@ -144,7 +156,7 @@ cargo run -p termior
 
 #### Release
 
-A release tag (`v<workspace-version>`) triggers a three-platform release build that produces portable ZIP/TAR archives with SHA-256 checksums plus per-platform installers: an Inno Setup `*-setup.exe` on Windows, a drag-to-install `.dmg` on macOS, and a `cargo-deb`-generated `.deb` on Linux. The pipeline enforces the 60 MiB single-binary limit and the 100 MiB archive/installer limit from Spec NFR-05. Locally you can reproduce the check and packaging with `scripts/check-release-binary.ps1` and `scripts/package-release.ps1` (the Windows installer requires Inno Setup 6 on the machine).
+A release tag (`v<workspace-version>`) triggers a three-platform release build that produces portable ZIP/TAR archives with SHA-256 checksums plus per-platform installers: an Inno Setup `*-setup.exe` on Windows, a drag-to-install `.dmg` on macOS, and a `cargo-deb`-generated `.deb` on Linux. The pipeline enforces the 60 MiB single-binary limit and the 100 MiB archive/installer limit from Spec NFR-05. When the Apple Developer secrets listed in `release.yml` are configured on the repository, macOS packaging additionally code-signs the app bundle and DMG, notarizes and staples the DMG, and regenerates its checksum; without them the artifacts are published unsigned. Locally you can reproduce the check and packaging with `scripts/check-release-binary.ps1` and `scripts/package-release.ps1` (the Windows installer requires Inno Setup 6 on the machine; pass `-MacosSigningIdentity` to sign a local macOS build).
 
 Release size comes mainly from the GPUI native rendering stack, the terminal/VTE layer, per-language tree-sitter grammars, and TLS, keychain, and provider clients. Web preview hands off to the system browser instead of embedding a WebView (ADR 0002), which keeps the dependency surface identical across platforms; PNG decoding and tree-sitter languages use explicit minimal features, so new UI, preview, or grammar capabilities must be evaluated against the CI dependency-tree and size reports.
 
@@ -154,7 +166,7 @@ Provider endpoints, models, and enablement live in `Termior-settings.json`; API 
 
 **Settings → About** exposes an auto-update toggle (on by default), a manual check, and release notes. The app checks GitHub stable releases 15 seconds after launch and every 6 hours after that, downloads the installer matching the OS and CPU architecture, and verifies its SHA-256. When the download completes, the title bar shows **Update available**; open About and choose **Install update…** to launch the system installer. Finish or stop terminal tasks before quitting the app to complete the installation — the updater never closes the app or its terminals on its own. With auto-update off, manual checks still work.
 
-Windows uses Inno Setup, macOS opens a DMG to drag-replace the app, and Linux uses the DEB installer. For portable builds, distributions without DEB support, or missing architecture packages, update manually from the release download page. Network or checksum failures show an error and keep the current version; files handed to the system installer stay in the system temp directory and can be deleted after installation. Checksums only verify file integrity — the current Windows and macOS installers are not yet signed.
+Windows uses Inno Setup, macOS opens a DMG to drag-replace the app, and Linux uses the DEB installer. For portable builds, distributions without DEB support, or missing architecture packages, update manually from the release download page. Network or checksum failures show an error and keep the current version; files handed to the system installer stay in the system temp directory and can be deleted after installation. Checksums only verify file integrity, not identity: macOS artifacts are signed and notarized only when the Apple Developer secrets in `release.yml` are configured, and Windows installers are currently unsigned.
 
 ### Privacy and security
 
@@ -181,6 +193,18 @@ The project itself is under the [MIT License](LICENSE). Third-party dependency l
 > 开源、跨平台、终端优先的 AI 原生开发工作台（ADE）。BYOK、本地优先、无账号、无遥测。
 
 Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、文件浏览器、Git、Web 预览，以及具有工具调用、审批、变更审阅与恢复能力的内置/外部 Agent。产品与工程规格见 [docs/termior-spec.md](docs/termior-spec.md)。
+
+### 安装
+
+从[最新 release](https://github.com/willmove/termior/releases/latest) 下载对应平台产物：Windows 为 Inno Setup 安装器 `*-setup.exe` 或便携版 `*.zip`，macOS 为拖拽安装的 `*.dmg` 或便携版 `*.tar.gz`，Linux 为 `*.deb` 或 `*.tar.gz`。所有产物均附带 SHA-256 校验文件。当前 macOS 构建面向 macOS 13+ 的 Apple Silicon，暂无 Intel 版本。
+
+**macOS Gatekeeper 说明。** 发布流水线配置了 Apple Developer 凭据时，应用与 DMG 会完成签名与公证，可正常打开。在未签名构建上，Gatekeeper 会弹出误导性的「“Termior”已损坏，无法打开」提示——下载文件本身并未损坏。遇到该提示时，把 `Termior.app` 拖入 `/Applications`，清除隔离属性后再打开：
+
+```bash
+xattr -cr /Applications/Termior.app
+```
+
+右键「打开」与「系统设置 → 隐私与安全性 → 仍要打开」对这类提示无效，必须移除该属性。
 
 ### 核心价值
 
@@ -314,7 +338,7 @@ cargo run -p termior
 
 #### 发布
 
-发布 tag（`v<workspace-version>`）会触发三平台 release 构建，产出 portable ZIP/TAR 与 SHA-256 校验文件，并附带各平台安装包：Windows 为 Inno Setup 安装器 `*-setup.exe`，macOS 为拖拽安装的 `.dmg`，Linux 为 `cargo-deb` 生成的 `.deb`。流水线按 Spec NFR-05 将单二进制限制为 60 MiB，并将压缩包/安装包限制为 100 MiB；本地可用 `scripts/check-release-binary.ps1` 和 `scripts/package-release.ps1` 复现检查与打包（Windows 安装器需本机装有 Inno Setup 6）。
+发布 tag（`v<workspace-version>`）会触发三平台 release 构建，产出 portable ZIP/TAR 与 SHA-256 校验文件，并附带各平台安装包：Windows 为 Inno Setup 安装器 `*-setup.exe`，macOS 为拖拽安装的 `.dmg`，Linux 为 `cargo-deb` 生成的 `.deb`。流水线按 Spec NFR-05 将单二进制限制为 60 MiB，并将压缩包/安装包限制为 100 MiB；仓库配置了 `release.yml` 中列出的 Apple Developer secrets 时，macOS 打包会额外对 app bundle 与 DMG 代码签名、对 DMG 公证并 staple、并重新生成其校验文件，否则产物以未签名形式发布；本地可用 `scripts/check-release-binary.ps1` 和 `scripts/package-release.ps1` 复现检查与打包（Windows 安装器需本机装有 Inno Setup 6，本地 macOS 打包可传 `-MacosSigningIdentity` 完成签名）。
 
 Release 体积主要来自 GPUI 原生渲染栈、终端/VTE、按语言引入的 tree-sitter grammar，以及 TLS、钥匙串和 Provider 客户端。Web 预览统一交系统浏览器打开、不内嵌 WebView（ADR 0002），三平台依赖面一致；PNG 解码和 tree-sitter 语言均采用显式最小 feature，新增 UI、预览或语法能力时须结合 CI 的依赖树和体积报告评估增量。
 
@@ -324,7 +348,7 @@ Provider 的 endpoint、模型和启用状态保存在 `Termior-settings.json`�
 
 设置 → **About** 提供自动更新开关（默认开启）、手动检查和发行说明入口。应用在启动15 秒后、此后每 6 小时检查 GitHub 稳定版；发现新版本时按系统和 CPU 架构下载安装包，并核验 SHA-256。下载完成后标题栏显示 **Update available**，点击进入 About，选择 **Install update…** 打开系统安装程序。请先结束终端任务，再关闭应用完成安装；更新器不会自动关闭应用或终端。关闭自动更新后仍可手动检查。
 
-Windows 使用 Inno Setup，macOS 打开 DMG 后拖拽替换应用，Linux 使用 DEB 安装器。便携版、不支持 DEB 的发行版、缺少对应架构安装包时，请使用发行下载页手动更新。网络或校验失败会显示错误并保留当前版本；交给系统安装器的文件保留在系统临时目录，安装完成后可删除。校验和只用于检查文件完整性；当前 Windows 与 macOS 安装包尚未签名。
+Windows 使用 Inno Setup，macOS 打开 DMG 后拖拽替换应用，Linux 使用 DEB 安装器。便携版、不支持 DEB 的发行版、缺少对应架构安装包时，请使用发行下载页手动更新。网络或校验失败会显示错误并保留当前版本；交给系统安装器的文件保留在系统临时目录，安装完成后可删除。校验和只验证文件完整性、不验证来源：macOS 产物仅在 `release.yml` 配置了 Apple Developer secrets 时才完成签名与公证，Windows 安装包目前未签名。
 
 ### 隐私与安全
 

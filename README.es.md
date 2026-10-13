@@ -14,6 +14,18 @@
 
 Termior reúne en una sola ventana nativa un terminal PTY real, un editor de código ligero, un explorador de archivos, Git, una vista previa web y un agente integrado/externo con llamadas a herramientas, aprobaciones, revisión de cambios y recuperación. La especificación autoritativa de producto e ingeniería está en [docs/termior-spec.md](docs/termior-spec.md) (en inglés).
 
+### Instalación
+
+Descarga el artefacto de tu plataforma desde el [último release](https://github.com/willmove/termior/releases/latest): un `*-setup.exe` de Inno Setup o un `*.zip` portable en Windows, un `.dmg` de arrastrar-para-instalar o un `*.tar.gz` portable en macOS, y un `*.deb` o `*.tar.gz` en Linux. Cada artefacto incluye un checksum SHA-256. Las builds actuales de macOS son para macOS 13+ en Apple Silicon; todavía no hay paquete para Intel.
+
+**Nota sobre Gatekeeper en macOS.** Cuando el pipeline de release se ejecuta con credenciales de Apple Developer configuradas, el bundle de la app y el DMG se firman y notarizan, y se abren con normalidad. En builds sin firmar, Gatekeeper muestra el engañoso diálogo "Termior está dañado y no se puede abrir" — la descarga está intacta. Si te aparece, arrastra `Termior.app` a `/Applications`, borra el atributo de cuarentena y abre la app:
+
+```bash
+xattr -cr /Applications/Termior.app
+```
+
+Ni el clic derecho → Abrir ni Ajustes del Sistema → Privacidad y seguridad → Abrir igualmente descartan ese diálogo en concreto; lo que lo resuelve es eliminar el atributo.
+
 ### Valores fundamentales
 
 1. **Latencia nativa baja** — La interfaz principal no tiene runtime de JS ni frontera de serialización por IPC. El terminal y el editor se renderizan directamente en la GPU, con objetivo de 60 fps en estado estable y 120 fps en pantallas de alta frecuencia.
@@ -142,7 +154,7 @@ cargo run -p termior
 
 #### Publicación
 
-Una etiqueta de release (`v<versión-del-workspace>`) dispara una build de release en tres plataformas que produce archivos ZIP/TAR portables con checksums SHA-256 además de instaladores por plataforma: un `*-setup.exe` de Inno Setup en Windows, un `.dmg` de arrastrar-para-instalar en macOS y un `.deb` generado con `cargo-deb` en Linux. El pipeline aplica los límites de 60 MiB por binario y 100 MiB por archivo/instalador de la Spec NFR-05. Localmente puedes reproducir la comprobación y el empaquetado con `scripts/check-release-binary.ps1` y `scripts/package-release.ps1` (el instalador de Windows requiere Inno Setup 6 en la máquina).
+Una etiqueta de release (`v<versión-del-workspace>`) dispara una build de release en tres plataformas que produce archivos ZIP/TAR portables con checksums SHA-256 además de instaladores por plataforma: un `*-setup.exe` de Inno Setup en Windows, un `.dmg` de arrastrar-para-instalar en macOS y un `.deb` generado con `cargo-deb` en Linux. El pipeline aplica los límites de 60 MiB por binario y 100 MiB por archivo/instalador de la Spec NFR-05. Cuando los secrets de Apple Developer listados en `release.yml` están configurados en el repositorio, el empaquetado de macOS además firma el bundle de la app y el DMG, notariza y grapa (staple) el DMG y regenera su checksum; sin ellos, los artefactos se publican sin firmar. Localmente puedes reproducir la comprobación y el empaquetado con `scripts/check-release-binary.ps1` y `scripts/package-release.ps1` (el instalador de Windows requiere Inno Setup 6 en la máquina; con `-MacosSigningIdentity` puedes firmar un empaquetado local de macOS).
 
 El tamaño de la release proviene sobre todo de la pila de renderizado nativa de GPUI, la capa de terminal/VTE, las gramáticas de tree-sitter por lenguaje y los clientes de TLS, llavero y providers. La vista previa web se traspasa al navegador del sistema en lugar de embeber un WebView (ADR 0002), lo que mantiene la superficie de dependencias idéntica entre plataformas; la decodificación PNG y los lenguajes de tree-sitter usan features mínimas explícitas, de modo que las nuevas capacidades de UI, vista previa o gramáticas deben evaluarse contra los informes de árbol de dependencias y tamaño de CI.
 
@@ -152,7 +164,7 @@ Los endpoints, modelos y habilitación de providers viven en `Termior-settings.j
 
 **Ajustes → About** ofrece un interruptor de actualización automática (activado por defecto), una comprobación manual y las notas de la versión. La app comprueba las releases estables de GitHub 15 segundos tras el arranque y cada 6 horas después, descarga el instalador que coincide con el sistema operativo y la arquitectura de CPU y verifica su SHA-256. Al completarse la descarga, la barra de título muestra **Update available**; abre About y elige **Install update…** para lanzar el instalador del sistema. Finaliza o detén las tareas del terminal antes de cerrar la app para completar la instalación — el actualizador nunca cierra por sí solo la app ni sus terminales. Con la actualización automática desactivada, las comprobaciones manuales siguen funcionando.
 
-Windows usa Inno Setup, macOS abre un DMG para reemplazar la app por arrastre y Linux usa el instalador DEB. Para builds portables, distribuciones sin soporte DEB o arquitecturas sin paquete, actualiza manualmente desde la página de descargas de la release. Los fallos de red o checksum muestran un error y conservan la versión actual; los archivos entregados al instalador del sistema permanecen en el directorio temporal y pueden borrarse tras la instalación. Los checksums solo verifican la integridad del archivo — los instaladores actuales de Windows y macOS aún no están firmados.
+Windows usa Inno Setup, macOS abre un DMG para reemplazar la app por arrastre y Linux usa el instalador DEB. Para builds portables, distribuciones sin soporte DEB o arquitecturas sin paquete, actualiza manualmente desde la página de descargas de la release. Los fallos de red o checksum muestran un error y conservan la versión actual; los archivos entregados al instalador del sistema permanecen en el directorio temporal y pueden borrarse tras la instalación. Los checksums solo verifican la integridad del archivo, no su identidad: los artefactos de macOS se firman y notarizan solo cuando los secrets de Apple Developer de `release.yml` están configurados, y los instaladores de Windows siguen sin firmar.
 
 ### Privacidad y seguridad
 

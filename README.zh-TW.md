@@ -14,6 +14,18 @@
 
 Termior 在單一原生視窗中組合真 PTY 終端機、輕量程式碼編輯器、檔案瀏覽器、Git、Web 預覽，以及具有工具呼叫、審批、變更審閱與復原能力的內建/外部 Agent。產品與工程規格見 [docs/termior-spec.md](docs/termior-spec.md)。
 
+### 安裝
+
+從[最新 release](https://github.com/willmove/termior/releases/latest) 下載對應平台產物：Windows 為 Inno Setup 安裝器 `*-setup.exe` 或可攜版 `*.zip`，macOS 為拖曳安裝的 `*.dmg` 或可攜版 `*.tar.gz`，Linux 為 `*.deb` 或 `*.tar.gz`。所有產物均附帶 SHA-256 校驗檔案。目前 macOS 建置面向 macOS 13+ 的 Apple Silicon，尚無 Intel 版本。
+
+**macOS Gatekeeper 說明。** 發布流水線設定了 Apple Developer 憑據時，應用與 DMG 會完成簽署與公證，可正常開啟。在未簽署建置上，Gatekeeper 會彈出誤導性的「"Termior"已損毀，無法開啟」提示——下載檔案本身並未損壞。遇到該提示時，把 `Termior.app` 拖入 `/Applications`，清除隔離屬性後再開啟：
+
+```bash
+xattr -cr /Applications/Termior.app
+```
+
+右鍵「打開」與「系統設定 → 隱私權與安全性 → 仍要開啟」對這類提示無效，必須移除該屬性。
+
 ### 核心價值
 
 1. **原生低延遲**：核心 UI 無 JS 執行環境與 IPC 序列化邊界，終端機與編輯器直接使用原生 GPU 渲染，常態目標 60 fps，高更新率螢幕目標 120 fps。
@@ -146,7 +158,7 @@ cargo run -p termior
 
 #### 發布
 
-發布 tag（`v<workspace-version>`）會觸發三平台 release 建置，產出 portable ZIP/TAR 與 SHA-256 校驗檔案，並附帶各平台安裝包：Windows 為 Inno Setup 安裝器 `*-setup.exe`，macOS 為拖曳安裝的 `.dmg`，Linux 為 `cargo-deb` 產生的 `.deb`。流水線按 Spec NFR-05 將單一二進位限制為 60 MiB，並將壓縮包/安裝包限制為 100 MiB；本機可用 `scripts/check-release-binary.ps1` 和 `scripts/package-release.ps1` 重現檢查與打包（Windows 安裝器需本機裝有 Inno Setup 6）。
+發布 tag（`v<workspace-version>`）會觸發三平台 release 建置，產出 portable ZIP/TAR 與 SHA-256 校驗檔案，並附帶各平台安裝包：Windows 為 Inno Setup 安裝器 `*-setup.exe`，macOS 為拖曳安裝的 `.dmg`，Linux 為 `cargo-deb` 產生的 `.deb`。流水線按 Spec NFR-05 將單一二進位限制為 60 MiB，並將壓縮包/安裝包限制為 100 MiB；倉庫設定了 `release.yml` 中列出的 Apple Developer secrets 時，macOS 打包會額外對 app bundle 與 DMG 簽署程式碼、對 DMG 公證並 staple、並重新產生其校驗檔案，否則產物以未簽署形式發布；本機可用 `scripts/check-release-binary.ps1` 和 `scripts/package-release.ps1` 重現檢查與打包（Windows 安裝器需本機裝有 Inno Setup 6，本機 macOS 打包可傳 `-MacosSigningIdentity` 完成簽署）。
 
 Release 體積主要來自 GPUI 原生渲染堆疊、終端機/VTE、按語言引入的 tree-sitter grammar，以及 TLS、鑰匙圈與 Provider 用戶端。Web 預覽統一交系統瀏覽器開啟、不內嵌 WebView（ADR 0002），三平台相依面一致；PNG 解碼和 tree-sitter 語言均採用顯式最小 feature，新增 UI、預覽或語法能力時須結合 CI 的相依樹和體積報告評估增量。
 
@@ -156,7 +168,7 @@ Provider 的 endpoint、模型與啟用狀態保存在 `Termior-settings.json`�
 
 設定 → **About** 提供自動更新開關（預設開啟）、手動檢查與發行說明入口。應用程式在啟動 15 秒後、此後每 6 小時檢查 GitHub 穩定版；發現新版本時按系統與 CPU 架構下載安裝包，並核驗 SHA-256。下載完成後標題列顯示 **Update available**，點擊進入 About，選擇 **Install update…** 開啟系統安裝程式。請先結束終端機任務，再關閉應用完成安裝；更新器不會自動關閉應用或終端機。關閉自動更新後仍可手動檢查。
 
-Windows 使用 Inno Setup，macOS 開啟 DMG 後拖曳替換應用，Linux 使用 DEB 安裝器。可攜版、不支援 DEB 的發行版、缺少對應架構安裝包時，請使用發行下載頁手動更新。網路或校驗失敗會顯示錯誤並保留目前版本；交給系統安裝程式的檔案保留在系統暫存目錄，安裝完成後可刪除。校驗和只用於檢查檔案完整性；目前 Windows 與 macOS 安裝包尚未簽署。
+Windows 使用 Inno Setup，macOS 開啟 DMG 後拖曳替換應用，Linux 使用 DEB 安裝器。可攜版、不支援 DEB 的發行版、缺少對應架構安裝包時，請使用發行下載頁手動更新。網路或校驗失敗會顯示錯誤並保留目前版本；交給系統安裝程式的檔案保留在系統暫存目錄，安裝完成後可刪除。校驗和只驗證檔案完整性、不驗證來源：macOS 產物僅在 `release.yml` 設定了 Apple Developer secrets 時才完成簽署與公證，Windows 安裝包目前未簽署。
 
 ### 隱私與安全
 

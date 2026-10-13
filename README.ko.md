@@ -14,6 +14,18 @@
 
 Termior는 실제 PTY 터미널, 가벼운 코드 에디터, 파일 탐색기, Git, 웹 미리보기, 그리고 도구 호출·승인·변경 검토·복구 기능을 갖춘 내장/외부 에이전트를 하나의 네이티브 창에 통합합니다. 제품 및 엔지니어링 사양은 [docs/termior-spec.md](docs/termior-spec.md)를 참고하세요.
 
+### 설치
+
+[최신 릴리스](https://github.com/willmove/termior/releases/latest)에서 플랫폼에 맞는 아티팩트를 내려받으세요. Windows는 Inno Setup 설치 관리자 `*-setup.exe` 또는 포터블 `*.zip`, macOS는 드래그 설치 `*.dmg` 또는 포터블 `*.tar.gz`, Linux는 `*.deb` 또는 `*.tar.gz`입니다. 모든 아티팩트에는 SHA-256 체크섬이 따릅니다. 현재 macOS 빌드는 macOS 13+ Apple Silicon 대상이며 Intel 패키지는 아직 없습니다.
+
+**macOS Gatekeeper 안내.** 릴리스 파이프라인에 Apple Developer 자격 증명이 설정되어 있으면 앱 번들과 DMG가 코드 서명·공증되어 정상적으로 열립니다. 미서명 빌드에서는 Gatekeeper가 "Termior가 손상되어 열 수 없습니다"라는 오도하는 대화상자를 보여줍니다 — 내려받은 파일 자체는 문제 없습니다. 이 대화상자가 뜨면 `Termior.app`을 `/Applications`로 드래그한 뒤 격리 속성을 제거하고 실행하세요:
+
+```bash
+xattr -cr /Applications/Termior.app
+```
+
+우클릭 "열기"나 시스템 설정 → 개인 정보 보호 및 보안 → "그래도 열기"로는 이 대화상자를 넘길 수 없으며, 속성 제거가 필요합니다.
+
 ### 핵심 가치
 
 1. **네이티브 저지연** — 코어 UI에는 JS 런타임과 IPC 직렬화 경계가 없습니다. 터미널과 에디터는 GPU에서 직접 렌더링하며, 상시 60 fps, 고주사율 디스플레이에서 120 fps를 목표로 합니다.
@@ -142,7 +154,7 @@ cargo run -p termior
 
 #### 릴리스
 
-릴리스 태그(`v<workspace-version>`)는 3 플랫폼 릴리스 빌드를 트리거하여 SHA-256 체크섬이 딸린 포터블 ZIP/TAR 아카이브와 각 플랫폼 설치 관리자(Windows는 Inno Setup `*-setup.exe`, macOS는 드래그 설치 `.dmg`, Linux는 `cargo-deb`가 만든 `.deb`)를 생성합니다. 파이프라인은 Spec NFR-05에 따라 단일 바이너리를 60 MiB, 아카이브/설치 관리자를 100 MiB로 제한합니다. 로컬에서는 `scripts/check-release-binary.ps1`과 `scripts/package-release.ps1`로 동일한 검사와 패키징을 재현할 수 있습니다(Windows 설치 관리자에는 Inno Setup 6 필요).
+릴리스 태그(`v<workspace-version>`)는 3 플랫폼 릴리스 빌드를 트리거하여 SHA-256 체크섬이 딸린 포터블 ZIP/TAR 아카이브와 각 플랫폼 설치 관리자(Windows는 Inno Setup `*-setup.exe`, macOS는 드래그 설치 `.dmg`, Linux는 `cargo-deb`가 만든 `.deb`)를 생성합니다. 파이프라인은 Spec NFR-05에 따라 단일 바이너리를 60 MiB, 아카이브/설치 관리자를 100 MiB로 제한합니다. 저장소에 `release.yml`에 나열된 Apple Developer 시크릿이 설정되어 있으면 macOS 패키징은 앱 번들과 DMG에 코드 서명하고 DMG를 공증·스테이플한 뒤 체크섬을 다시 생성하며, 설정되어 있지 않으면 미서명 상태로 게시합니다. 로컬에서는 `scripts/check-release-binary.ps1`과 `scripts/package-release.ps1`로 동일한 검사와 패키징을 재현할 수 있습니다(Windows 설치 관리자에는 Inno Setup 6 필요, 로컬 macOS 패키징은 `-MacosSigningIdentity`를 전달하면 서명 가능).
 
 릴리스 크기는 주로 GPUI 네이티브 렌더링 스택, 터미널/VTE 레이어, 언어별 tree-sitter 그래머, TLS·키체인·프로바이더 클라이언트에서 나옵니다. 웹 미리보기는 WebView를 내장하지 않고 시스템 브라우저에 위임하므로(ADR 0002) 의존성 면이 플랫폼 간 동일합니다. PNG 디코딩과 tree-sitter 언어는 명시적 최소 feature를 사용하며, 새 UI·미리보기·그래머 기능을 추가할 때는 CI의 의존성 트리와 크기 보고서로 평가해야 합니다.
 
@@ -152,7 +164,7 @@ cargo run -p termior
 
 **설정 → About**에서 자동 업데이트 토글(기본 켜짐), 수동 확인, 릴리스 노트를 제공합니다. 앱은 시작 15초 후와 이후 6시간마다 GitHub 안정 릴리스를 확인하고, OS와 CPU 아키텍처에 맞는 설치 관리자를 내려받아 SHA-256을 검증합니다. 내려받기가 완료되면 제목 표시줄에 **Update available**이 표시되고, About을 열어 **Install update…**를 선택하면 시스템 설치 관리자가 실행됩니다. 설치를 마치려면 앱을 종료하기 전에 터미널 작업을 끝내거나 중지하세요. 업데이터가 스스로 앱이나 터미널을 닫지 않습니다. 자동 업데이트를 꺼도 수동 확인은 계속 동작합니다.
 
-Windows는 Inno Setup, macOS는 DMG를 열어 앱을 드래그로 교체, Linux는 DEB 설치 관리자를 사용합니다. 포터블 빌드, DEB를 지원하지 않는 배포판, 해당 아키텍처 패키지가 없는 경우 릴리스 다운로드 페이지에서 수동으로 업데이트하세요. 네트워크나 체크섬 실패 시 오류를 표시하고 현재 버전을 유지합니다. 시스템 설치 관리자에 전달된 파일은 시스템 임시 디렉터리에 남으며 설치 후 삭제할 수 있습니다. 체크섬은 파일 무결성 검증에만 사용됩니다. 현재 Windows와 macOS 설치 관리자는 서명되지 않았습니다.
+Windows는 Inno Setup, macOS는 DMG를 열어 앱을 드래그로 교체, Linux는 DEB 설치 관리자를 사용합니다. 포터블 빌드, DEB를 지원하지 않는 배포판, 해당 아키텍처 패키지가 없는 경우 릴리스 다운로드 페이지에서 수동으로 업데이트하세요. 네트워크나 체크섬 실패 시 오류를 표시하고 현재 버전을 유지합니다. 시스템 설치 관리자에 전달된 파일은 시스템 임시 디렉터리에 남으며 설치 후 삭제할 수 있습니다. 체크섬은 파일 무결성만 검증하며 출처는 보증하지 않습니다. macOS 아티팩트는 `release.yml`에 Apple Developer 시크릿이 설정된 경우에만 서명·공증되며, Windows 설치 관리자는 현재 서명되지 않았습니다.
 
 ### 프라이버시와 보안
 
