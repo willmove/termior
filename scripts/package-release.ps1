@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateSet("windows", "macos", "linux")]
     [string]$Platform,
+    [string]$MacosSigningIdentity = "",
     [int]$MaxBinaryMiB = 60,
     [int]$MaxArchiveMiB = 100
 )
@@ -115,6 +116,13 @@ switch ($Platform) {
 </dict></plist>
 "@
         Set-Content -LiteralPath (Join-Path $contents "Info.plist") -Value $plist -Encoding utf8NoBOM
+        if ($MacosSigningIdentity) {
+            # Hardened runtime is required for notarization; notarytool checks are skipped when unsigned.
+            & codesign --force --timestamp --options runtime --sign $MacosSigningIdentity $app
+            if ($LASTEXITCODE -ne 0) { throw "codesign failed for $app" }
+            & codesign --verify --strict --verbose=2 $app
+            if ($LASTEXITCODE -ne 0) { throw "codesign verification failed for $app" }
+        }
         $archive = Join-Path $distRoot "$artifactName.tar.gz"
         if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
         & tar -C $distRoot -czf $archive $artifactName
@@ -130,6 +138,10 @@ switch ($Platform) {
         & hdiutil create -volname "Termior $Version" -srcfolder $dmgStage -ov -format UDZO $dmg
         if ($LASTEXITCODE -ne 0) { throw "hdiutil failed with exit code $LASTEXITCODE" }
         Remove-Item -LiteralPath $dmgStage -Recurse -Force
+        if ($MacosSigningIdentity) {
+            & codesign --force --timestamp --sign $MacosSigningIdentity $dmg
+            if ($LASTEXITCODE -ne 0) { throw "codesign failed for $dmg" }
+        }
         Assert-SizeAndChecksum -Path $dmg -MaxMiB $MaxArchiveMiB
     }
     "linux" {

@@ -67,9 +67,67 @@ jobs:
           workspaces: "."
       - name: Build optimized binary
         run: cargo build -p termior --release --locked
+      # macOS signing and notarization activate only when these repository secrets are set:
+      #   MACOS_CERTIFICATE_P12_BASE64       base64-encoded Developer ID Application certificate (.p12)
+      #   MACOS_CERTIFICATE_PASSWORD         password protecting that .p12
+      #   MACOS_SIGNING_IDENTITY             e.g. "Developer ID Application: Willmove (AB12CD34EF)"
+      #   APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID   notarytool credentials
+      # Without them the workflow still publishes, but macOS Gatekeeper will flag the download.
+      - name: Import macOS signing certificate
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$MACOS_CERTIFICATE_P12_BASE64" ]; then
+            echo "MACOS_CERTIFICATE_P12_BASE64 not configured; publishing an unsigned package."
+            exit 0
+          fi
+          certificate="$RUNNER_TEMP/signing-certificate.p12"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          echo -n "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode --output "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security list-keychain -d user -s "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain"
       - name: Package with binary and archive size gates
         shell: pwsh
-        run: ./scripts/package-release.ps1 -Version ${{ steps.version.outputs.version }} -Platform ${{ matrix.platform }} -MaxBinaryMiB 60 -MaxArchiveMiB 100
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          $packageArgs = @{
+            Version = "${{ steps.version.outputs.version }}"
+            Platform = "${{ matrix.platform }}"
+            MaxBinaryMiB = 60
+            MaxArchiveMiB = 100
+          }
+          if ($env:MACOS_SIGNING_IDENTITY) { $packageArgs.MacosSigningIdentity = $env:MACOS_SIGNING_IDENTITY }
+          ./scripts/package-release.ps1 @packageArgs
+      - name: Notarize and staple macOS disk image
+        if: matrix.platform == 'macos'
+        shell: bash
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$MACOS_SIGNING_IDENTITY" ] || [ -z "$APPLE_ID" ] || [ -z "$APPLE_APP_SPECIFIC_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
+            echo "macOS signing/notarization secrets not fully configured; skipping."
+            exit 0
+          fi
+          dmg="$(ls dist/termior-*-macos-*.dmg)"
+          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          # Stapling changes the DMG bytes, so the packaging checksum must be regenerated.
+          # Run inside dist/ so the checksum file records the bare asset name, matching termior-platform's parser.
+          name="$(basename "$dmg")"
+          (cd dist && shasum -a 256 "$name" > "$name.sha256")
       - name: Build Linux .deb installer
         if: matrix.platform == 'linux'
         uses: taiki-e/install-action@v2
