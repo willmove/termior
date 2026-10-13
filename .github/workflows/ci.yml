@@ -44,7 +44,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev
+          sudo apt-get install -y libdbus-1-dev libfontconfig-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -194,7 +194,7 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev
+          sudo apt-get install -y libdbus-1-dev libfontconfig-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
