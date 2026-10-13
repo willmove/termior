@@ -22,7 +22,7 @@
 
 ## 已知差距
 
-- 官方新增了 `item/permissions/requestApproval`（权限审批，scope 为 `session` / `turn`）。适配器目前不识别它，会把它当作带诊断信息的未知事件，不会构造审批卡。后续需要把它映射到审批流程，或在能力档案里明确标为不支持。
+- 官方新增了 `item/permissions/requestApproval`（权限审批，scope 为 `session` / `turn`）。适配器已把它映射为 `ApprovalRequested`（保留原始 request ID，审批卡显示请求的权限 JSON），不再静默挂起。批准时回传 `{permissions: <请求的权限>, scope: "turn"}`，拒绝时回传 `{permissions: {}, scope: "turn"}`；无论服务端提议什么 scope，授权都只限当前 turn。响应形状来自对协议的理解，本机没有 `codex`，尚未用 `generate-json-schema` 与真实 CLI 核验；“按勾选子集授权”也尚未实现（需要审批卡的权限勾选 UI）。
 - 官方已标记弃用 `thread/rollback`、`thread/compacted`、`item/fileChange/outputDelta`；适配器都没有使用。
 
 ## 锁定策略
