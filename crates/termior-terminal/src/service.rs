@@ -528,8 +528,11 @@ fn terminate_process_tree(pid: u32) {
 
 #[cfg(not(windows))]
 fn terminate_process_tree(pid: u32) {
+    // `--` is required. procps parses `kill -TERM -PID` as a one-digit process
+    // group (`'0' - first digit`). A PID starting with 1 becomes `kill -1`,
+    // which signals every process this user can signal, including a CI runner.
     let _ = Command::new("kill")
-        .args(["-TERM", &format!("-{pid}")])
+        .args(["-TERM", "--", &format!("-{pid}")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
