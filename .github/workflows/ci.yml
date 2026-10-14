@@ -146,6 +146,43 @@ jobs:
           if ($proc.ExitCode -ne 0 -or (($output | Out-String) -notmatch "TERMIOR_SPLIT_PANE_SMOKE_OK")) {
             throw "Termior split-pane smoke did not complete successfully"
           }
+      # Linux/macOS launch smokes are non-blocking until they have proven stable on hosted runners
+      # (GPUI needs a GPU context: Linux runs under xvfb with Mesa's software Vulkan). Drop
+      # continue-on-error from these steps to make them required.
+      - name: Install Linux smoke dependencies
+        if: matrix.platform == 'linux'
+        run: sudo apt-get install -y xvfb mesa-vulkan-drivers openbox
+      - name: Linux launch smoke (xvfb)
+        id: smoke_linux_launch
+        if: matrix.platform == 'linux'
+        continue-on-error: true
+        env:
+          SMOKE_TIMEOUT_SECS: 45
+        run: |
+          # The launch smoke counts rendered frames and stalled (exit 124) on a bare Xvfb with
+          # no window manager, so the window never became active; give it a minimal one.
+          ./scripts/ci-smoke.sh TERMIOR_SMOKE_TEST TERMIOR_SMOKE_OK linux-launch -- \
+            xvfb-run -a -s "-screen 0 1920x1080x24" \
+            bash -c 'openbox >/dev/null 2>&1 & sleep 1; exec ./target/release/termior'
+      - name: Linux split-pane smoke (xvfb)
+        id: smoke_linux_split
+        if: matrix.platform == 'linux'
+        continue-on-error: true
+        run: |
+          ./scripts/ci-smoke.sh TERMIOR_SPLIT_PANE_SMOKE TERMIOR_SPLIT_PANE_SMOKE_OK linux-split-pane -- \
+            xvfb-run -a -s "-screen 0 1920x1080x24" ./target/release/termior
+      - name: macOS launch smoke
+        id: smoke_macos_launch
+        if: matrix.platform == 'macos'
+        continue-on-error: true
+        run: ./scripts/ci-smoke.sh TERMIOR_SMOKE_TEST TERMIOR_SMOKE_OK macos-launch -- ./target/release/termior
+      - name: Upload smoke logs
+        if: steps.smoke_linux_launch.outcome == 'failure' || steps.smoke_linux_split.outcome == 'failure' || steps.smoke_macos_launch.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs-${{ matrix.platform }}
+          path: smoke-logs/
+          if-no-files-found: ignore
       - name: NFR process-level gate (cold start / RSS / FPS)
         if: matrix.platform == 'windows' || matrix.platform == 'macos'
         shell: bash
