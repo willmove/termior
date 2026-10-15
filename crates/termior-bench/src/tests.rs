@@ -178,6 +178,9 @@ fn payload_run_expands_to_samples() {
         echo_p99_ms: Some(12.0),
         window_active: Some(true),
         phases_ms: [("fonts".to_owned(), 40.0)].into_iter().collect(),
+        warmup_ms: Some(2100.0),
+        fps_windows: vec![58.0, 59.0, 60.0],
+        runs: Vec::new(),
     };
     let samples = run.to_samples("windows", "typical");
     assert_eq!(samples.len(), 5);
@@ -225,6 +228,89 @@ fn harness_report_parse_and_expand() {
     let samples = parsed.to_samples();
     // 1 pty + 2 run (cold_start + fps; rss None dropped)
     assert_eq!(samples.len(), 3);
+}
+
+fn run(cold_start_ms: f64, fps: f64, window_active: bool) -> RunPayload {
+    RunPayload {
+        cold_start_ms: Some(cold_start_ms),
+        rss_mib: Some(55.0),
+        fps: Some(fps),
+        window_active: Some(window_active),
+        phases_ms: [("fonts".to_owned(), cold_start_ms / 2.0)]
+            .into_iter()
+            .collect(),
+        fps_windows: vec![fps; 5],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn median_of_runs_drops_a_single_slow_launch() {
+    // Windows hosted runner 上实际出现过的形态：一次启动被启动期卡顿拖到 16fps。
+    let merged = RunPayload::median_of(vec![
+        run(180.0, 16.0, true),
+        run(130.0, 27.0, true),
+        run(140.0, 25.0, true),
+    ]);
+    assert_eq!(merged.fps, Some(25.0));
+    assert_eq!(merged.cold_start_ms, Some(140.0));
+    assert_eq!(merged.rss_mib, Some(55.0));
+    assert_eq!(merged.phases_ms.get("fonts"), Some(&70.0));
+    assert_eq!(merged.window_active, Some(true));
+    assert_eq!(merged.runs.len(), 3);
+    assert!(merged.fps_windows.is_empty());
+
+    let baselines = set(&[Baseline::new(
+        MetricKind::Fps,
+        "windows",
+        "typical",
+        27.0,
+        40.0,
+    )]);
+    let report = compare(&merged.to_samples("windows", "typical"), &baselines);
+    assert!(!report.has_regression());
+}
+
+#[test]
+fn median_of_runs_still_fails_a_consistent_regression() {
+    let merged = RunPayload::median_of(vec![
+        run(150.0, 12.0, true),
+        run(150.0, 14.0, true),
+        run(150.0, 30.0, true),
+    ]);
+    assert_eq!(merged.fps, Some(14.0));
+    let baselines = set(&[Baseline::new(
+        MetricKind::Fps,
+        "windows",
+        "typical",
+        27.0,
+        40.0,
+    )]);
+    let report = compare(&merged.to_samples("windows", "typical"), &baselines);
+    assert!(report.has_regression());
+}
+
+#[test]
+fn median_of_runs_handles_even_counts_and_missing_values() {
+    let mut no_fps = run(200.0, 0.0, false);
+    no_fps.fps = None;
+    let merged = RunPayload::median_of(vec![run(100.0, 20.0, true), no_fps]);
+    assert_eq!(merged.cold_start_ms, Some(150.0));
+    assert_eq!(merged.fps, Some(20.0));
+    assert_eq!(merged.window_active, Some(false));
+    assert_eq!(merged.echo_p99_ms, None);
+    assert_eq!(RunPayload::median_of(Vec::new()), RunPayload::default());
+}
+
+#[test]
+fn run_payload_without_new_fields_still_parses() {
+    let json = r#"{"kind":"Run","cold_start_ms":182.9,"rss_mib":54.1,"fps":16.0,"frame_p99_ms":202.6,"echo_p99_ms":223.4,"window_active":true,"phases_ms":{"fonts":64.8}}"#;
+    let NfrPayload::Run(parsed) = serde_json::from_str::<NfrPayload>(json).unwrap() else {
+        panic!("expected a run payload");
+    };
+    assert_eq!(parsed.fps, Some(16.0));
+    assert!(parsed.runs.is_empty());
+    assert!(parsed.fps_windows.is_empty());
 }
 
 #[test]

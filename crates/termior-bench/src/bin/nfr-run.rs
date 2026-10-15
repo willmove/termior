@@ -6,6 +6,8 @@
 //! - 应用退出前打印 `TERMIOR_NFR_FPS=NN` / `TERMIOR_NFR_FRAME_P99_MS=NN.N` = 强制重绘下的帧率与帧间隔 p99。
 //! - `--echo-samples N`（默认 40，0 关闭）时应用接着跑键入回显探针，打印 `TERMIOR_NFR_ECHO_P99_MS`。
 //! - `TERMIOR_NFR_PHASE` 冷启动分阶段时间戳原样收进 payload 并转发到 stderr，便于 CI 日志定位。
+//! - `--runs N`（默认 1）：连续启动 N 次（每次全新数据目录），各指标取中位数，
+//!   原始测量收进 payload 的 `runs`。hosted runner 上单次启动的偶发卡顿由此滤掉。
 //!
 //! 输出一行 `NfrPayload::Run` JSON。
 //!
@@ -28,6 +30,8 @@ struct Args {
     dwell_secs: u64,
     /// 键入回显探针样本数（偶数，`x`/Backspace 交替）；0 = 不测。
     echo_samples: usize,
+    /// 启动次数；报告各指标的中位数。
+    runs: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -35,6 +39,7 @@ fn parse_args() -> Result<Args, String> {
     let mut workspace: Option<PathBuf> = None;
     let mut dwell_secs: u64 = 6;
     let mut echo_samples: usize = 40;
+    let mut runs: usize = 1;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -60,6 +65,16 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e: std::num::ParseIntError| format!("--echo-samples: {e}"))?
             }
+            "--runs" => {
+                runs = args
+                    .next()
+                    .ok_or("--runs needs a value")?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| format!("--runs: {e}"))?;
+                if runs == 0 {
+                    return Err("--runs must be at least 1".into());
+                }
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -68,6 +83,7 @@ fn parse_args() -> Result<Args, String> {
         workspace,
         dwell_secs,
         echo_samples,
+        runs,
     })
 }
 
@@ -77,7 +93,7 @@ fn main() {
         Err(e) => {
             eprintln!("nfr-run: {e}");
             eprintln!(
-                "usage: nfr-run --binary <termior(.exe)> [--workspace <dir>] [--dwell-secs 6] [--echo-samples 40]"
+                "usage: nfr-run --binary <termior(.exe)> [--workspace <dir>] [--dwell-secs 6] [--echo-samples 40] [--runs 1]"
             );
             std::process::exit(2);
         }
@@ -113,13 +129,38 @@ fn run(args: &Args) -> Result<RunPayload, String> {
 }
 
 fn run_with_binary(args: &Args, binary: PathBuf) -> Result<RunPayload, String> {
+    if args.runs == 1 {
+        return run_once(args, &binary);
+    }
+    let mut runs = Vec::with_capacity(args.runs);
+    for index in 1..=args.runs {
+        let report = run_once(args, &binary)?;
+        eprintln!(
+            "nfr-run: run {index}/{}: cold_start_ms={} fps={} fps_windows={:?} frame_p99_ms={} warmup_ms={}",
+            args.runs,
+            fmt_metric(report.cold_start_ms),
+            fmt_metric(report.fps),
+            report.fps_windows,
+            fmt_metric(report.frame_p99_ms),
+            fmt_metric(report.warmup_ms),
+        );
+        runs.push(report);
+    }
+    Ok(RunPayload::median_of(runs))
+}
+
+fn fmt_metric(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |v| format!("{v:.1}"))
+}
+
+fn run_once(args: &Args, binary: &std::path::Path) -> Result<RunPayload, String> {
     // 隔离应用数据目录：每次都从全新状态启动，正是 spec NFR-04 的「空载（1 终端 tab）」
     // 场景；也避免恢复开发者本机的 tab/设置，让本地与 CI 测的是同一场景，且不改动
     // 真实的 workspace/session 文件。
     let data_dir = std::env::temp_dir().join(format!("termior-nfr-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data_dir);
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("create data dir: {e}"))?;
-    let result = run_isolated(args, binary, &data_dir);
+    let result = run_isolated(args, binary.to_path_buf(), &data_dir);
     let _ = std::fs::remove_dir_all(&data_dir);
     result
 }
@@ -204,6 +245,15 @@ fn parse_protocol_line(line: &str, report: &mut RunPayload) {
     };
     if let Some(rest) = line.strip_prefix("TERMIOR_NFR_FPS=") {
         report.fps = number(rest).or(report.fps);
+    } else if let Some(rest) = line.strip_prefix("TERMIOR_NFR_FPS_WINDOWS=") {
+        report.fps_windows = rest
+            .trim()
+            .split(',')
+            .filter_map(|value| value.trim().parse::<f64>().ok())
+            .collect();
+    } else if let Some(rest) = line.strip_prefix("TERMIOR_NFR_WARMUP_MS=") {
+        eprintln!("nfr-run: warm-up {rest}");
+        report.warmup_ms = number(rest).or(report.warmup_ms);
     } else if let Some(rest) = line.strip_prefix("TERMIOR_NFR_FRAME_P99_MS=") {
         report.frame_p99_ms = number(rest).or(report.frame_p99_ms);
     } else if let Some(rest) = line.strip_prefix("TERMIOR_NFR_ECHO_P99_MS=") {
@@ -235,7 +285,9 @@ mod tests {
         let mut report = RunPayload::default();
         for line in [
             "TERMIOR_NFR_PHASE fonts=42.5",
+            "TERMIOR_NFR_WARMUP_MS=2140 shell_ready=1",
             "TERMIOR_NFR_FPS=60",
+            "TERMIOR_NFR_FPS_WINDOWS=58.0,60.0,61.5",
             "TERMIOR_NFR_FRAME_P99_MS=17.9",
             "TERMIOR_NFR_WINDOW_ACTIVE=0",
             "TERMIOR_NFR_ECHO_P99_MS=8.4 samples=40",
@@ -244,6 +296,8 @@ mod tests {
             parse_protocol_line(line, &mut report);
         }
         assert_eq!(report.fps, Some(60.0));
+        assert_eq!(report.fps_windows, vec![58.0, 60.0, 61.5]);
+        assert_eq!(report.warmup_ms, Some(2140.0));
         assert_eq!(report.frame_p99_ms, Some(17.9));
         assert_eq!(report.echo_p99_ms, Some(8.4));
         assert_eq!(report.window_active, Some(false));
