@@ -13,6 +13,13 @@ on:
     # 03:00 UTC daily. audit.yml is Monday 06:00 UTC; keep the offset.
     - cron: "0 3 * * *"
   workflow_dispatch:
+  # GitHub only lists workflow_dispatch workflows that exist on the default
+  # branch. This pull_request trigger lets the job run (and register) on the
+  # introducing PR. It is limited to edits of this file so other PRs do not
+  # pay for the ignored-test compile.
+  pull_request:
+    paths:
+      - .github/workflows/nightly.yml
 
 permissions:
   contents: read
