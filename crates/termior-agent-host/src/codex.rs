@@ -1,11 +1,13 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
 use crate::{
     AgentBackend, BackendBinding, BackendDecision, BackendError, BackendEvent, BackendInfo,
-    CapabilityProfile, CapabilitySupport, StdioTransport, TaskLaunch, TransportCommand, TurnLaunch,
+    CapabilityProfile, CapabilitySupport, StdioCapture, StdioTransport, TaskLaunch,
+    TransportCommand, TurnLaunch,
 };
 
 pub const CODEX_COMPATIBLE_MINOR: &str = "0.153";
@@ -84,6 +86,8 @@ pub struct CodexBackend {
     /// Requested permission profiles of unanswered `item/permissions/requestApproval` requests,
     /// keyed by backend request ID. A grant must echo back (a subset of) this profile.
     pending_permissions: HashMap<String, Value>,
+    stderr_log: Option<PathBuf>,
+    known_secrets: Vec<String>,
 }
 
 impl CodexBackend {
@@ -94,7 +98,20 @@ impl CodexBackend {
             transport: None,
             initialized_version: None,
             pending_permissions: HashMap::new(),
+            stderr_log: None,
+            known_secrets: Vec::new(),
         }
+    }
+
+    /// Persist backend stderr after streaming redaction.
+    pub fn with_stderr_log(
+        mut self,
+        path: impl Into<PathBuf>,
+        known_secrets: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.stderr_log = Some(path.into());
+        self.known_secrets = known_secrets.into_iter().collect();
+        self
     }
 
     fn track_pending_permissions(&mut self, event: &BackendEvent) {
@@ -150,7 +167,13 @@ impl AgentBackend for CodexBackend {
                 CODEX_COMPATIBLE_MINOR,
             )));
         }
-        let mut transport = StdioTransport::spawn(&TransportCommand::codex(&self.executable))?;
+        let mut transport = StdioTransport::spawn_capturing(
+            &TransportCommand::codex(&self.executable),
+            StdioCapture {
+                stderr_log: self.stderr_log.clone(),
+                known_secrets: self.known_secrets.clone(),
+            },
+        )?;
         transport.request(
             "initialize",
             self.protocol.initialize_request(0)["params"].clone(),

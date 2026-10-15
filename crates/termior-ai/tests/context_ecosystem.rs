@@ -248,6 +248,51 @@ fn content_references_round_trip_without_copying_payloads() {
 }
 
 #[test]
+fn context_tool_output_file_redacts_known_secrets_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ContextContentStore::new(dir.path(), ["private-value".into()]);
+    let reference = store
+        .put_tool_output(
+            "task",
+            "call-1",
+            "hello private-value sk-12345678901234567890",
+        )
+        .unwrap();
+    let ContentRef::Artifact { path, .. } = &reference else {
+        panic!("expected artifact reference")
+    };
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(!text.contains("private-value"), "{text}");
+    assert!(!text.contains("sk-123"), "{text}");
+    assert!(text.contains("[REDACTED]"), "{text}");
+}
+
+#[test]
+fn memory_file_redacts_known_secrets_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("memory.json");
+    let mut store = MemoryStore::default();
+    store.entries.insert(
+        "m".into(),
+        MemoryEntry {
+            id: "m".into(),
+            content: "token private-value".into(),
+            scope: ContextScope::Workspace,
+            evidence: vec!["user:event-1".into()],
+            accepted_at_ms: 1,
+            expires_at_ms: None,
+            enabled: true,
+        },
+    );
+    store
+        .persist_redacted(&path, ["private-value".into()])
+        .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("private-value"), "{text}");
+    assert!(text.contains("[REDACTED]"), "{text}");
+}
+
+#[test]
 fn large_tool_content_is_redacted_stored_and_digest_checked() {
     let dir = tempfile::tempdir().unwrap();
     let store = ContextContentStore::new(dir.path(), ["known-secret".into()]);

@@ -1,10 +1,15 @@
 //! Streaming secret redaction used at persistence boundaries.
 
+use std::io::Write;
+use std::path::Path;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedactionReport {
     pub text: String,
     pub replacements: usize,
 }
+
+#[derive(Clone)]
 pub struct StreamingRedactor {
     known: Vec<String>,
 }
@@ -44,5 +49,37 @@ impl StreamingRedactor {
             }
         }
         RedactionReport { text, replacements }
+    }
+
+    /// Atomically persist `text` after redaction. The returned report is what landed on disk.
+    pub fn write_atomic(
+        &self,
+        path: &Path,
+        text: &str,
+    ) -> Result<RedactionReport, crate::AtomicWriteError> {
+        let report = self.redact(text);
+        crate::atomic_write(path, &report.text)?;
+        Ok(report)
+    }
+
+    /// Append one redacted record. Parent directories are created when missing.
+    pub fn append_record(
+        &self,
+        path: &Path,
+        text: &str,
+    ) -> Result<RedactionReport, std::io::Error> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let report = self.redact(text);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(file, "{}", report.text)?;
+        file.sync_data()?;
+        Ok(report)
     }
 }

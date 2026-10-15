@@ -819,8 +819,20 @@ impl MemoryStore {
     }
 
     pub fn persist(&self, path: &Path) -> Result<(), ContextError> {
+        self.persist_redacted(path, std::iter::empty::<String>())
+    }
+
+    /// Persist memory after streaming redaction. Shaped credentials that survive redaction still fail closed.
+    pub fn persist_redacted(
+        &self,
+        path: &Path,
+        known_secrets: impl IntoIterator<Item = String>,
+    ) -> Result<(), ContextError> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|error| ContextError::Store(error.to_string()))?;
+        let json = termior_store::StreamingRedactor::new(known_secrets)
+            .redact(&json)
+            .text;
         termior_store::assert_no_persistent_secret(&json)
             .map_err(|_| ContextError::SensitiveMemory)?;
         termior_store::atomic_write(path, &json)
