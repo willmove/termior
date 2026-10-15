@@ -804,6 +804,12 @@ impl WorkspaceView {
         }));
     }
 
+    /// NFR 帧率预热用：活动终端的 shell 是否已经产生输出。
+    pub fn nfr_terminal_has_output(&self, cx: &App) -> bool {
+        self.active_terminal()
+            .is_some_and(|terminal| terminal.read(cx).has_output())
+    }
+
     /// NFR-02 键入回显 p99 探针（`TERMIOR_NFR_MEASURE` 模式，由 `nfr-run` 驱动）。
     ///
     /// 等活动终端的 shell 起来后，交替键入 `x` / Backspace（行内容不增长），每次等回显
