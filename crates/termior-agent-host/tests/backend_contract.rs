@@ -1,5 +1,5 @@
 use serde_json::json;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use termior_agent_host::{
     map_codex_message, AgentBackend, BackendBinding, BackendDecision, BackendError, BackendEvent,
     BackendInfo, BackendTaskProjector, CapabilityProfile, CapabilitySupport, CodexProtocol,
@@ -112,6 +112,47 @@ fn current_stable_protocol_accepts_each_explicitly_verified_minor_line() {
     assert!(!protocol.accepts_version("codex-cli 0.154.0"));
 }
 
+/// Peer script for the Windows stdio contract test.
+///
+/// `StdioTransport` spawns with `CREATE_NO_WINDOW`, so this child has no console.
+/// `[Console]::In.ReadLine()` reads that missing console rather than the redirected
+/// stdin pipe and can block until the request timeout on a loaded runner. These
+/// standard-handle streams are the pipes the parent actually uses. UTF-8 without a
+/// BOM matches `JsonRpcLineCodec`.
+const WINDOWS_STDIO_PEER: &str = r#"
+$utf8 = New-Object System.Text.UTF8Encoding $false
+$stdinReader = New-Object System.IO.StreamReader ([Console]::OpenStandardInput())
+$stdoutWriter = New-Object System.IO.StreamWriter -ArgumentList ([Console]::OpenStandardOutput()), $utf8
+$stderrWriter = New-Object System.IO.StreamWriter -ArgumentList ([Console]::OpenStandardError()), $utf8
+$stdoutWriter.AutoFlush = $true
+$stderrWriter.AutoFlush = $true
+$null = $stdinReader.ReadLine()
+$stderrWriter.WriteLine('diagnostic-noise sk-12345678901234567890')
+$stdoutWriter.WriteLine('{"jsonrpc":"2.0","method":"future/event","params":{}}')
+$stdoutWriter.WriteLine('{"jsonrpc":"2.0","id":1,"result":{"ok":true}}')
+"#;
+
+fn peer_request_timeout() -> Duration {
+    if cfg!(windows) {
+        // powershell.exe cold start on a busy GitHub runner can exceed a few seconds.
+        // This matches the Codex request budget so the harness is not stricter than production.
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(5)
+    }
+}
+
+fn stderr_until(transport: &StdioTransport, needle: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let stderr = transport.stderr_tail();
+        if stderr.contains(needle) || Instant::now() >= deadline {
+            return stderr;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn stdio_transport_keeps_notifications_and_stderr_separate_from_responses() {
     let (program, args) = if cfg!(windows) {
@@ -119,8 +160,9 @@ fn stdio_transport_keeps_notifications_and_stderr_separate_from_responses() {
             "powershell".to_string(),
             vec![
                 "-NoProfile".into(),
+                "-NonInteractive".into(),
                 "-Command".into(),
-                "$null=[Console]::In.ReadLine(); [Console]::Error.WriteLine('diagnostic-noise sk-12345678901234567890'); [Console]::Out.WriteLine('{\"jsonrpc\":\"2.0\",\"method\":\"future/event\",\"params\":{}}'); [Console]::Out.WriteLine('{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}')".into(),
+                WINDOWS_STDIO_PEER.into(),
             ],
         )
     } else {
@@ -134,7 +176,7 @@ fn stdio_transport_keeps_notifications_and_stderr_separate_from_responses() {
     };
     let mut transport = StdioTransport::spawn(&TransportCommand { program, args }).unwrap();
     let result = transport
-        .request("test", json!({}), Duration::from_secs(5))
+        .request("test", json!({}), peer_request_timeout())
         .unwrap();
     assert_eq!(result["ok"], true);
     let event = transport
@@ -142,8 +184,7 @@ fn stdio_transport_keeps_notifications_and_stderr_separate_from_responses() {
         .unwrap()
         .unwrap();
     assert_eq!(event["method"], "future/event");
-    std::thread::sleep(Duration::from_millis(20));
-    let stderr = transport.stderr_tail();
+    let stderr = stderr_until(&transport, "diagnostic-noise", Duration::from_secs(5));
     assert!(stderr.contains("diagnostic-noise"));
     assert!(stderr.contains("REDACTED"));
     assert!(!stderr.contains("sk-123"));

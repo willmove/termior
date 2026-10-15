@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::process::Command;
 use std::time::Duration;
 
@@ -8,6 +9,8 @@ use crate::{
 };
 
 pub const CODEX_COMPATIBLE_MINOR: &str = "0.153";
+
+const PERMISSIONS_APPROVAL_METHOD: &str = "item/permissions/requestApproval";
 
 #[derive(Debug, Clone)]
 pub struct CodexProtocol {
@@ -78,6 +81,9 @@ pub struct CodexBackend {
     protocol: CodexProtocol,
     transport: Option<StdioTransport>,
     initialized_version: Option<String>,
+    /// Requested permission profiles of unanswered `item/permissions/requestApproval` requests,
+    /// keyed by backend request ID. A grant must echo back (a subset of) this profile.
+    pending_permissions: HashMap<String, Value>,
 }
 
 impl CodexBackend {
@@ -87,6 +93,34 @@ impl CodexBackend {
             protocol: CodexProtocol::stable_verified(),
             transport: None,
             initialized_version: None,
+            pending_permissions: HashMap::new(),
+        }
+    }
+
+    fn track_pending_permissions(&mut self, event: &BackendEvent) {
+        if let BackendEvent::ApprovalRequested {
+            backend_request_id,
+            request_kind,
+            raw,
+            ..
+        } = event
+        {
+            if request_kind == PERMISSIONS_APPROVAL_METHOD {
+                self.pending_permissions.insert(
+                    backend_request_id.clone(),
+                    raw.get("permissions").cloned().unwrap_or(Value::Null),
+                );
+            }
+        }
+    }
+
+    fn approval_result(&mut self, decision: &BackendDecision) -> Value {
+        match self
+            .pending_permissions
+            .remove(&decision.backend_request_id)
+        {
+            Some(requested) => permissions_approval_result(&requested, decision.approved),
+            None => json!({"decision": if decision.approved {"accept"} else {"decline"}}),
         }
     }
 
@@ -196,21 +230,25 @@ impl AgentBackend for CodexBackend {
     }
 
     fn next_event(&mut self, timeout: Duration) -> Result<Option<BackendEvent>, BackendError> {
-        self.transport()
-            .and_then(|transport| transport.next_event(timeout))
-            .map(|event| event.as_ref().map(map_codex_message))
+        let event = self
+            .transport()
+            .and_then(|transport| transport.next_event(timeout))?
+            .as_ref()
+            .map(map_codex_message);
+        if let Some(event) = &event {
+            self.track_pending_permissions(event);
+        }
+        Ok(event)
     }
 
     fn respond(&mut self, decision: BackendDecision) -> Result<(), BackendError> {
+        let result = self.approval_result(&decision);
         let id = decision
             .backend_request_id
             .parse::<u64>()
             .map(Value::from)
             .unwrap_or_else(|_| Value::String(decision.backend_request_id));
-        self.transport()?.respond(
-            id,
-            json!({"decision": if decision.approved {"accept"} else {"decline"}}),
-        )
+        self.transport()?.respond(id, result)
     }
 
     fn cancel(&mut self, binding: &BackendBinding) -> Result<(), BackendError> {
@@ -275,21 +313,21 @@ pub fn map_codex_message(value: &Value) -> BackendEvent {
             item_id,
             raw: params,
         },
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            BackendEvent::ApprovalRequested {
-                backend_request_id: value
-                    .get("id")
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "unknown".into())
-                    .trim_matches('"')
-                    .into(),
-                session_id,
-                turn_id,
-                tool_call_id: item_id,
-                request_kind: method.into(),
-                raw: params,
-            }
-        }
+        "item/commandExecution/requestApproval"
+        | "item/fileChange/requestApproval"
+        | PERMISSIONS_APPROVAL_METHOD => BackendEvent::ApprovalRequested {
+            backend_request_id: value
+                .get("id")
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unknown".into())
+                .trim_matches('"')
+                .into(),
+            session_id,
+            turn_id,
+            tool_call_id: item_id,
+            request_kind: method.into(),
+            raw: params,
+        },
         "turn/completed" => {
             let status = params
                 .pointer("/turn/status")
@@ -319,6 +357,20 @@ pub fn map_codex_message(value: &Value) -> BackendEvent {
     }
 }
 
+/// Response to `item/permissions/requestApproval`: the granted permission profile plus its scope.
+///
+/// Approval grants the requested profile for the current turn only, never for the session, even
+/// when the server proposes a wider scope. Denial grants an empty profile, which Codex treats as
+/// a refusal without failing the turn.
+pub fn permissions_approval_result(requested: &Value, approved: bool) -> Value {
+    let permissions = if approved && requested.is_object() {
+        requested.clone()
+    } else {
+        json!({})
+    };
+    json!({"permissions": permissions, "scope": "turn"})
+}
+
 fn string_at(value: &Value, path: &[&str]) -> String {
     match path {
         [direct, object, nested] => value
@@ -328,5 +380,89 @@ fn string_at(value: &Value, path: &[&str]) -> String {
             .unwrap_or("unknown")
             .into(),
         _ => "unknown".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn permissions_request(scope: &str) -> Value {
+        json!({
+            "jsonrpc":"2.0",
+            "id":7,
+            "method":PERMISSIONS_APPROVAL_METHOD,
+            "params":{
+                "threadId":"th-1", "turnId":"turn-1", "itemId":"item-1",
+                "reason":"needs network",
+                "scope":scope,
+                "permissions":{"network":{"enabled":true}}
+            }
+        })
+    }
+
+    fn decision(approved: bool) -> BackendDecision {
+        BackendDecision {
+            backend_request_id: "7".into(),
+            approved,
+        }
+    }
+
+    #[test]
+    fn permissions_request_maps_to_approval_with_original_request_id() {
+        let event = map_codex_message(&permissions_request("turn"));
+        assert!(matches!(
+            &event,
+            BackendEvent::ApprovalRequested { backend_request_id, tool_call_id, request_kind, raw, .. }
+                if backend_request_id == "7"
+                    && tool_call_id == "item-1"
+                    && request_kind == PERMISSIONS_APPROVAL_METHOD
+                    && raw.pointer("/permissions/network/enabled") == Some(&json!(true))
+        ));
+    }
+
+    #[test]
+    fn approving_permissions_grants_requested_profile_for_the_turn_only() {
+        for scope in ["turn", "session", "something-new"] {
+            let mut backend = CodexBackend::new("codex");
+            backend.track_pending_permissions(&map_codex_message(&permissions_request(scope)));
+            assert_eq!(
+                backend.approval_result(&decision(true)),
+                json!({"permissions":{"network":{"enabled":true}}, "scope":"turn"}),
+                "server scope {scope:?} must not widen the grant"
+            );
+        }
+    }
+
+    #[test]
+    fn denying_permissions_replies_with_an_empty_grant() {
+        let mut backend = CodexBackend::new("codex");
+        backend.track_pending_permissions(&map_codex_message(&permissions_request("session")));
+        assert_eq!(
+            backend.approval_result(&decision(false)),
+            json!({"permissions":{}, "scope":"turn"})
+        );
+        assert!(backend.pending_permissions.is_empty());
+    }
+
+    #[test]
+    fn malformed_permission_profile_is_never_granted() {
+        assert_eq!(
+            permissions_approval_result(&Value::Null, true),
+            json!({"permissions":{}, "scope":"turn"})
+        );
+    }
+
+    #[test]
+    fn command_approvals_keep_the_decision_reply() {
+        let mut backend = CodexBackend::new("codex");
+        assert_eq!(
+            backend.approval_result(&decision(true)),
+            json!({"decision":"accept"})
+        );
+        assert_eq!(
+            backend.approval_result(&decision(false)),
+            json!({"decision":"decline"})
+        );
     }
 }
