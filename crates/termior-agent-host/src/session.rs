@@ -165,9 +165,14 @@ impl ManagedAgentSession {
         }
     }
 
+    /// Resolves the pending approval and keeps pumping.
+    ///
+    /// `granted_permission_ids` is the checked subset of a Codex permissions request.
+    /// `None` does not narrow the grant; command and file-change approvals pass `None`.
     pub fn respond(
         &mut self,
         approved: bool,
+        granted_permission_ids: Option<Vec<String>>,
         on_event: &mut dyn FnMut(&BackendEvent),
         max_wait: Duration,
     ) -> Result<PumpOutcome, BackendError> {
@@ -182,6 +187,7 @@ impl ManagedAgentSession {
         self.backend.respond(BackendDecision {
             backend_request_id,
             approved,
+            granted_permission_ids,
         })?;
         self.state = ManagedSessionState::Running;
         self.pump_for(max_wait, on_event)

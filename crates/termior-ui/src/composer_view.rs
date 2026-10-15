@@ -14,7 +14,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 use termior_agent_host::{
-    BackendEvent, CodexBackend, ManagedAgentSession, PumpOutcome, TaskLaunch,
+    permission_entries, BackendEvent, CodexBackend, ManagedAgentSession, PumpOutcome, TaskLaunch,
+    PERMISSIONS_APPROVAL_METHOD,
 };
 use termior_ai::automation::{next_run_after, AutomationManager, AutomationStore};
 use termior_ai::context_engine::{
@@ -92,16 +93,127 @@ enum AgentBackendChoice {
     CodexAppServer,
 }
 
+/// Codex `item/permissions/requestApproval` 在审批卡上的一项可勾选权限。
+struct PermissionChoice {
+    id: String,
+    label: String,
+    checked: bool,
+}
+
+struct ApprovalCardModel {
+    headline: SharedString,
+    arguments: String,
+    show_arguments: bool,
+    /// 权限审批才有：服务端提议的 scope，空串表示请求里没有该字段。
+    scope: Option<String>,
+    /// `(index, label, checked)`，index 对应 `PermissionChoice` 的位置。
+    choices: Vec<(usize, String, bool)>,
+}
+
+fn scope_element_id(scope: &str) -> String {
+    let token = if scope.is_empty() {
+        "unspecified".to_string()
+    } else {
+        scope
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    format!("permission-scope-{token}")
+}
+
 struct ExternalPendingApproval {
     backend_request_id: String,
     tool_call_id: String,
     request_kind: String,
     arguments: String,
+    /// 服务端提议的 scope（`turn` / `session` / 未知值）。缺省为空串。
+    /// 真正回给 Codex 的授权范围始终是当前 turn。
+    scope: String,
+    permissions: Vec<PermissionChoice>,
+}
+
+impl ExternalPendingApproval {
+    fn from_codex(
+        backend_request_id: String,
+        tool_call_id: String,
+        request_kind: String,
+        raw: &serde_json::Value,
+    ) -> Self {
+        let redactor = termior_store::StreamingRedactor::new(Vec::<String>::new());
+        let arguments = redactor.redact(&raw.to_string()).text;
+        let scope = raw
+            .get("scope")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let permissions = if request_kind == PERMISSIONS_APPROVAL_METHOD {
+            let profile = raw.get("permissions").unwrap_or(&serde_json::Value::Null);
+            permission_entries(profile)
+                .into_iter()
+                .map(|entry| PermissionChoice {
+                    label: redactor.redact(&entry.label).text,
+                    id: entry.id,
+                    checked: true,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            backend_request_id,
+            tool_call_id,
+            request_kind,
+            arguments,
+            scope,
+            permissions,
+        }
+    }
+
+    fn is_permissions(&self) -> bool {
+        self.request_kind == PERMISSIONS_APPROVAL_METHOD
+    }
+
+    /// 权限审批：批准回传勾选子集，拒绝回传空集。其它审批不携带权限 id。
+    fn granted_permission_ids(&self, approved: bool) -> Option<Vec<String>> {
+        if !self.is_permissions() {
+            return None;
+        }
+        if !approved {
+            return Some(Vec::new());
+        }
+        Some(
+            self.permissions
+                .iter()
+                .filter(|choice| choice.checked)
+                .map(|choice| choice.id.clone())
+                .collect(),
+        )
+    }
 }
 
 enum ExternalCommand {
-    Start { task_id: String, text: String },
-    Respond { approved: bool },
+    Start {
+        task_id: String,
+        text: String,
+    },
+    Respond {
+        approved: bool,
+        granted_permission_ids: Option<Vec<String>>,
+    },
+}
+
+/// 审批按钮交给 Codex 会话的决议，供 GPUI 测试断言勾选子集。
+#[cfg(test)]
+struct ExternalApprovalReply {
+    approved: bool,
+    granted_permission_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,6 +305,8 @@ pub struct ComposerView {
     active_plan_request: bool,
     pending_approval: Option<PendingApproval>,
     external_pending_approval: Option<ExternalPendingApproval>,
+    #[cfg(test)]
+    last_external_approval: Option<ExternalApprovalReply>,
     pending_edit: Option<PendingEdit>,
     sessions: SessionStore,
     snippets: SnippetStore,
@@ -301,6 +415,8 @@ impl ComposerView {
             active_plan_request: false,
             pending_approval: None,
             external_pending_approval: None,
+            #[cfg(test)]
+            last_external_approval: None,
             pending_edit: None,
             sessions: SessionStore::default(),
             snippets: SnippetStore::default(),
@@ -1892,15 +2008,12 @@ impl ComposerView {
                 request_kind,
                 raw,
             }) => {
-                let arguments = termior_store::StreamingRedactor::new(Vec::<String>::new())
-                    .redact(&raw.to_string())
-                    .text;
-                self.external_pending_approval = Some(ExternalPendingApproval {
+                self.external_pending_approval = Some(ExternalPendingApproval::from_codex(
                     backend_request_id,
-                    tool_call_id: tool_call_id.clone(),
+                    tool_call_id.clone(),
                     request_kind,
-                    arguments,
-                });
+                    &raw,
+                ));
                 self.set_status(tf!(
                     "composer.status.codex_approval",
                     "call" => tool_call_id
@@ -2178,13 +2291,50 @@ impl ComposerView {
         }
     }
 
+    fn dispatch_external_approval(
+        &mut self,
+        approved: bool,
+        pending: ExternalPendingApproval,
+        status: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let granted_permission_ids = pending.granted_permission_ids(approved);
+        #[cfg(test)]
+        {
+            self.last_external_approval = Some(ExternalApprovalReply {
+                approved,
+                granted_permission_ids: granted_permission_ids.clone(),
+            });
+        }
+        self.dispatch_external_command(
+            ExternalCommand::Respond {
+                approved,
+                granted_permission_ids,
+            },
+            status,
+            cx,
+        );
+    }
+
+    fn toggle_permission(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(pending) = self.external_pending_approval.as_mut() else {
+            return;
+        };
+        let Some(choice) = pending.permissions.get_mut(index) else {
+            return;
+        };
+        choice.checked = !choice.checked;
+        cx.notify();
+    }
+
     fn approve_tool(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
-        if self.external_pending_approval.take().is_some() {
-            self.dispatch_external_command(
-                ExternalCommand::Respond { approved: true },
+        if let Some(pending) = self.external_pending_approval.take() {
+            self.dispatch_external_approval(
+                true,
+                pending,
                 t!("composer.status.returning_approval_codex"),
                 cx,
             );
@@ -2208,9 +2358,10 @@ impl ComposerView {
     }
 
     fn reject_tool(&mut self, cx: &mut Context<Self>) {
-        if self.external_pending_approval.take().is_some() {
-            self.dispatch_external_command(
-                ExternalCommand::Respond { approved: false },
+        if let Some(pending) = self.external_pending_approval.take() {
+            self.dispatch_external_approval(
+                false,
+                pending,
                 t!("composer.status.returning_rejection_codex"),
                 cx,
             );
@@ -2772,8 +2923,12 @@ fn run_external_command(
             ExternalCommand::Start { text, .. } => {
                 guard.start_turn(text).map(|()| PumpOutcome::Pending)
             }
-            ExternalCommand::Respond { approved } => guard.respond(
+            ExternalCommand::Respond {
                 approved,
+                granted_permission_ids,
+            } => guard.respond(
+                approved,
+                granted_permission_ids,
                 &mut |event| {
                     let _ = event_tx.unbounded_send(event.clone());
                 },
@@ -3407,34 +3562,86 @@ impl gpui::Render for ComposerView {
                 })
                 .children(rows)
         });
-        let approval_display = self
-            .pending_approval
-            .as_ref()
-            .map(|pending| {
-                (
-                    tf!(
-                        "composer.approval.headline",
-                        "summary" => pending.request.summary,
-                        "call" => pending.request.call_id,
-                        "effect" => format!("{:?}", pending.contract.side_effect)
-                    ),
-                    pending.request.arguments.clone(),
-                )
+        let approval_model = if let Some(pending) = self.pending_approval.as_ref() {
+            Some(ApprovalCardModel {
+                headline: tf!(
+                    "composer.approval.headline",
+                    "summary" => pending.request.summary,
+                    "call" => pending.request.call_id,
+                    "effect" => format!("{:?}", pending.contract.side_effect)
+                ),
+                arguments: pending.request.arguments.clone(),
+                show_arguments: true,
+                scope: None,
+                choices: Vec::new(),
             })
-            .or_else(|| {
-                self.external_pending_approval.as_ref().map(|pending| {
-                    (
-                        tf!(
-                            "composer.approval.codex_headline",
-                            "kind" => pending.request_kind,
-                            "request" => pending.backend_request_id,
-                            "call" => pending.tool_call_id
-                        ),
-                        pending.arguments.clone(),
-                    )
-                })
+        } else {
+            self.external_pending_approval.as_ref().map(|pending| {
+                let permissions_request = pending.is_permissions();
+                ApprovalCardModel {
+                    headline: tf!(
+                        "composer.approval.codex_headline",
+                        "kind" => pending.request_kind,
+                        "request" => pending.backend_request_id,
+                        "call" => pending.tool_call_id
+                    ),
+                    show_arguments: !permissions_request || pending.permissions.is_empty(),
+                    arguments: pending.arguments.clone(),
+                    scope: permissions_request.then(|| pending.scope.clone()),
+                    choices: pending
+                        .permissions
+                        .iter()
+                        .enumerate()
+                        .map(|(index, choice)| (index, choice.label.clone(), choice.checked))
+                        .collect(),
+                }
+            })
+        };
+        let approval = approval_model.map(|model| {
+            let scope_row = model.scope.as_ref().map(|scope| {
+                let shown: SharedString = if scope.is_empty() {
+                    t!("composer.approval.scope_unspecified")
+                } else {
+                    SharedString::from(scope.clone())
+                };
+                let scope_id = scope_element_id(scope);
+                let scope_debug = scope_id.clone();
+                div()
+                    .id(SharedString::from(scope_id))
+                    .debug_selector(move || scope_debug.clone())
+                    .text_xs()
+                    .text_color(crate::ui::muted(&p))
+                    .child(tf!("composer.approval.permission_scope", "scope" => shown))
             });
-        let approval = approval_display.map(|(headline, arguments)| {
+            let choice_rows = model.choices.into_iter().map(|(index, label, checked)| {
+                let choice_id = format!("permission-choice-{index}");
+                let choice_debug = choice_id.clone();
+                div()
+                    .id(SharedString::from(choice_id))
+                    .debug_selector(move || choice_debug.clone())
+                    .flex()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(if checked {
+                        crate::ui::alpha(p.status[1], 0.18)
+                    } else {
+                        crate::ui::color(p.elevated)
+                    })
+                    .child(SharedString::from(format!(
+                        "{}  {label}",
+                        if checked { "☑" } else { "☐" }
+                    )))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_permission(index, cx);
+                        }),
+                    )
+            });
             div()
                 .flex()
                 .flex_col()
@@ -3445,8 +3652,12 @@ impl gpui::Render for ComposerView {
                 .border_1()
                 .border_color(crate::ui::color(p.status[2]))
                 .bg(crate::ui::alpha(p.status[2], 0.08))
-                .child(headline)
-                .child(div().text_xs().child(SharedString::from(arguments)))
+                .child(model.headline)
+                .children(scope_row)
+                .children(choice_rows)
+                .when(model.show_arguments, |card| {
+                    card.child(div().text_xs().child(SharedString::from(model.arguments)))
+                })
                 .child(
                     div()
                         .flex()
@@ -3454,6 +3665,7 @@ impl gpui::Render for ComposerView {
                         .child(
                             div()
                                 .id("approve-tool")
+                                .debug_selector(|| "approve-tool".into())
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
@@ -3469,6 +3681,7 @@ impl gpui::Render for ComposerView {
                         .child(
                             div()
                                 .id("reject-tool")
+                                .debug_selector(|| "reject-tool".into())
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
@@ -5790,6 +6003,223 @@ mod layout_tests {
         vcx.update(|window, cx| {
             window.refresh();
             let _ = window.draw(cx);
+        });
+    }
+
+    fn sample_permission_profile() -> serde_json::Value {
+        serde_json::json!({
+            "network": {"enabled": true},
+            "fileSystem": {"write": ["/proj", "/shared"]}
+        })
+    }
+
+    fn show_permission_approval(
+        composer: &gpui::Entity<ComposerView>,
+        vcx: &mut gpui::VisualTestContext,
+        scope: &str,
+    ) {
+        let scope = scope.to_string();
+        composer.update(vcx, |view, _| {
+            let raw = serde_json::json!({
+                "threadId": "th-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "reason": "needs access",
+                "scope": scope,
+                "permissions": sample_permission_profile(),
+            });
+            view.panel_height = 600.0;
+            view.external_pending_approval = Some(ExternalPendingApproval::from_codex(
+                "7".into(),
+                "item-1".into(),
+                PERMISSIONS_APPROVAL_METHOD.into(),
+                &raw,
+            ));
+        });
+        draw(vcx);
+    }
+
+    fn click_id(vcx: &mut gpui::VisualTestContext, id: &'static str) {
+        let bounds = vcx
+            .debug_bounds(id)
+            .unwrap_or_else(|| panic!("missing element {id}"));
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    }
+
+    fn click_permission(vcx: &mut gpui::VisualTestContext, index: usize) {
+        match index {
+            0 => click_id(vcx, "permission-choice-0"),
+            1 => click_id(vcx, "permission-choice-1"),
+            2 => click_id(vcx, "permission-choice-2"),
+            other => panic!("unexpected permission choice {other}"),
+        }
+    }
+
+    /// 三项权限默认全选；批准回传完整 profile，scope 固定为 turn。
+    #[test]
+    fn permission_card_approve_all_sends_every_checked_permission() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        show_permission_approval(&composer, vcx, "turn");
+        assert!(vcx.debug_bounds("permission-scope-turn").is_some());
+        assert!(vcx.debug_bounds("permission-choice-0").is_some());
+        assert!(vcx.debug_bounds("permission-choice-1").is_some());
+        assert!(vcx.debug_bounds("permission-choice-2").is_some());
+        let expected_ids = termior_agent_host::permission_entries(&sample_permission_profile())
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        composer.update(vcx, |view, _| {
+            let pending = view.external_pending_approval.as_ref().unwrap();
+            assert!(pending.permissions.iter().all(|choice| choice.checked));
+            assert_eq!(
+                pending
+                    .permissions
+                    .iter()
+                    .map(|choice| choice.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_ids.iter().map(String::as_str).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                pending
+                    .permissions
+                    .iter()
+                    .map(|choice| choice.label.as_str())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "fileSystem.write[0]  /proj",
+                    "fileSystem.write[1]  /shared",
+                    "network  {\"enabled\":true}",
+                ]
+            );
+        });
+        click_id(vcx, "approve-tool");
+        composer.update(vcx, |view, _| {
+            let reply = view.last_external_approval.as_ref().unwrap();
+            assert!(reply.approved);
+            assert_eq!(
+                reply.granted_permission_ids.as_deref(),
+                Some(expected_ids.as_slice())
+            );
+            assert_eq!(
+                termior_agent_host::permissions_approval_result(
+                    &sample_permission_profile(),
+                    true,
+                    reply.granted_permission_ids.as_deref(),
+                ),
+                serde_json::json!({
+                    "permissions": sample_permission_profile(),
+                    "scope": "turn"
+                })
+            );
+        });
+    }
+
+    /// 取消一项后，批准只回传仍勾选的权限，服务端提议的 session 也不会被放大。
+    #[test]
+    fn permission_card_partial_approve_sends_only_checked_permissions() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        show_permission_approval(&composer, vcx, "session");
+        assert!(vcx.debug_bounds("permission-scope-session").is_some());
+        let shared_index = composer.update(vcx, |view, _| {
+            view.external_pending_approval
+                .as_ref()
+                .unwrap()
+                .permissions
+                .iter()
+                .position(|choice| choice.id == "fileSystem.write[1]")
+                .unwrap()
+        });
+        click_permission(vcx, shared_index);
+        composer.update(vcx, |view, _| {
+            let pending = view.external_pending_approval.as_ref().unwrap();
+            assert!(!pending.permissions[shared_index].checked);
+            assert_eq!(
+                pending
+                    .permissions
+                    .iter()
+                    .filter(|choice| choice.checked)
+                    .map(|choice| choice.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["fileSystem.write[0]", "network"]
+            );
+        });
+        draw(vcx);
+        click_id(vcx, "approve-tool");
+        composer.update(vcx, |view, _| {
+            let reply = view.last_external_approval.as_ref().unwrap();
+            assert!(reply.approved);
+            assert_eq!(
+                reply.granted_permission_ids.as_deref(),
+                Some(["fileSystem.write[0]".to_string(), "network".to_string(),].as_slice())
+            );
+            assert_eq!(
+                termior_agent_host::permissions_approval_result(
+                    &sample_permission_profile(),
+                    true,
+                    reply.granted_permission_ids.as_deref(),
+                ),
+                serde_json::json!({
+                    "permissions": {
+                        "network": {"enabled": true},
+                        "fileSystem": {"write": ["/proj"]}
+                    },
+                    "scope": "turn"
+                })
+            );
+        });
+    }
+
+    /// 拒绝忽略勾选，回传空权限集。
+    #[test]
+    fn permission_card_deny_sends_an_empty_permission_set() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        show_permission_approval(&composer, vcx, "session");
+        click_id(vcx, "reject-tool");
+        composer.update(vcx, |view, _| {
+            let reply = view.last_external_approval.as_ref().unwrap();
+            assert!(!reply.approved);
+            assert_eq!(reply.granted_permission_ids.as_deref(), Some([].as_slice()));
+            assert_eq!(
+                termior_agent_host::permissions_approval_result(
+                    &sample_permission_profile(),
+                    false,
+                    reply.granted_permission_ids.as_deref(),
+                ),
+                serde_json::json!({"permissions": {}, "scope": "turn"})
+            );
+        });
+    }
+
+    /// 未知 scope 仍显示在卡片上，批准后的授权范围仍是 turn。
+    #[test]
+    fn permission_card_shows_unknown_scope_and_grants_for_the_turn() {
+        let mut cx = TestAppContext::single();
+        let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+        show_permission_approval(&composer, vcx, "something-new");
+        assert!(vcx.debug_bounds("permission-scope-something-new").is_some());
+        composer.update(vcx, |view, _| {
+            assert_eq!(
+                view.external_pending_approval.as_ref().unwrap().scope,
+                "something-new"
+            );
+        });
+        click_id(vcx, "approve-tool");
+        composer.update(vcx, |view, _| {
+            assert!(view.external_pending_approval.is_none());
+            let reply = view.last_external_approval.as_ref().unwrap();
+            assert!(reply.approved);
+            let result = termior_agent_host::permissions_approval_result(
+                &sample_permission_profile(),
+                reply.approved,
+                reply.granted_permission_ids.as_deref(),
+            );
+            assert_eq!(
+                result.get("scope").and_then(serde_json::Value::as_str),
+                Some("turn")
+            );
         });
     }
 }

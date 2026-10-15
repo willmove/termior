@@ -136,6 +136,12 @@ pub enum BackendEvent {
 pub struct BackendDecision {
     pub backend_request_id: String,
     pub approved: bool,
+    /// Checked permission-entry ids for `item/permissions/requestApproval`.
+    ///
+    /// `None` grants the whole requested profile when `approved` is true.
+    /// An empty list grants nothing. Command and file-change approvals ignore it.
+    #[serde(default)]
+    pub granted_permission_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Error)]
