@@ -193,8 +193,11 @@ jobs:
             BIN=./target/release/termior.exe
           fi
           cargo build -p termior-bench --features run-harness --release --bins
-          # The app exits on its own after FPS + key-echo sampling; dwell is only the upper bound.
-          ./target/release/nfr-run --binary "$BIN" --dwell-secs 20 --echo-samples 40 > nfr-run-payload.json
+          # The app exits on its own after FPS + key-echo sampling; dwell is only the upper bound
+          # per launch. Three launches, gated on the per-metric median: hosted runners (Windows
+          # renders through WARP on shared vCPUs) occasionally stall one launch, while a real
+          # regression slows all of them.
+          ./target/release/nfr-run --binary "$BIN" --dwell-secs 20 --echo-samples 40 --runs 3 > nfr-run-payload.json
           cat nfr-run-payload.json
           ./target/release/nfr-gate --platform ${{ matrix.platform }} \
             --payload nfr-run-payload.json \
@@ -208,10 +211,11 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          sudo apt-get install -y xvfb mesa-vulkan-drivers
+          sudo apt-get install -y xvfb mesa-vulkan-drivers openbox
           cargo build -p termior-bench --features run-harness --release --bins
+          # Without a window manager no frame is ever presented (same as the launch smoke).
           xvfb-run -a -s "-screen 0 1920x1080x24" \
-            ./target/release/nfr-run --binary ./target/release/termior --dwell-secs 20 --echo-samples 40 > nfr-run-payload.json
+            bash -c 'openbox >/dev/null 2>&1 & sleep 1; exec ./target/release/nfr-run --binary ./target/release/termior --dwell-secs 20 --echo-samples 40 --runs 3' > nfr-run-payload.json
           cat nfr-run-payload.json
           ./target/release/nfr-gate --platform linux \
             --payload nfr-run-payload.json \
