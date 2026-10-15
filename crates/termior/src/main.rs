@@ -157,10 +157,13 @@ fn main() {
 /// - `TERMIOR_NFR_FIRST_FRAME`：首帧**上屏之后**打印 → 冷启动终点（NFR-01）。
 ///   GPUI 的 next-frame 回调在同一 tick 的 draw 之前执行，所以在第二次回调里打印，
 ///   才能保证第一帧已经 draw + present（最多多计一个刷新间隔，偏保守）。
-/// - `TERMIOR_NFR_FPS=NN` / `TERMIOR_NFR_FRAME_P99_MS=NN.N`：采样期间**每个 tick 都强制
-///   整窗重绘**（`window.refresh()` 绕过视图缓存），统计真实 draw 的帧率与帧间隔 p99
-///   （NFR-03）。只数 next-frame 回调而不重绘，量到的是显示器刷新节拍而非渲染开销——
-///   空闲零重绘下根本没有帧被画出来。
+/// - `TERMIOR_NFR_WARMUP_MS=NN shell_ready=0|1`：首帧后强制重绘预热，直到 shell 有输出
+///   且稳定（上限 8s），再进入采样。
+/// - `TERMIOR_NFR_FPS=NN` / `TERMIOR_NFR_FPS_WINDOWS=a,b,..` / `TERMIOR_NFR_FRAME_P99_MS=NN.N`：
+///   采样期间**每个 tick 都强制整窗重绘**（`window.refresh()` 绕过视图缓存），按 1s 窗口
+///   统计真实 draw 的帧率，报告窗口中位数，并给出逐窗口值与全程帧间隔 p99（NFR-03）。
+///   只数 next-frame 回调而不重绘，量到的是显示器刷新节拍而非渲染开销——空闲零重绘下
+///   根本没有帧被画出来。
 /// - `TERMIOR_NFR_WINDOW_ACTIVE=0|1`：GPUI 对非前台窗口把帧间隔限到 ~33ms，
 ///   CI 上窗口拿不到前台时帧率上限约 30fps，据此判读。
 /// - 可选 `TERMIOR_NFR_ECHO_P99_MS`：`TERMIOR_NFR_ECHO_SAMPLES=N` 时帧率采样后接着跑
@@ -186,9 +189,12 @@ fn nfr_next_frame(
     echo_samples: Option<usize>,
 ) {
     window.on_next_frame(move |window, cx| {
-        let action = state
-            .borrow_mut()
-            .on_frame(std::time::Instant::now(), window.is_window_active());
+        let shell_ready = workspace.read(cx).nfr_terminal_has_output(cx);
+        let action = state.borrow_mut().on_frame(
+            std::time::Instant::now(),
+            window.is_window_active(),
+            shell_ready,
+        );
         match action {
             NfrAction::Continue { redraw } => {
                 if redraw {
@@ -206,16 +212,34 @@ fn nfr_next_frame(
     });
 }
 
-const NFR_FPS_SAMPLE_SECS: f64 = 1.5;
+/// 预热下限：即便 shell 已就绪，也先强制重绘这么久（填字形图集、渲染管线缓存）。
+const NFR_WARMUP_MIN_SECS: f64 = 1.0;
+/// shell 首次输出后再等这么久，避开 profile 加载 / 提示符绘制的突发输出。
+const NFR_WARMUP_SETTLE_SECS: f64 = 1.0;
+/// 预热上限：shell 迟迟不出输出也按时开始采样，避免测量挂死。
+const NFR_WARMUP_MAX_SECS: f64 = 8.0;
+/// 采样分成若干等长窗口，报告各窗口帧率的中位数：单个窗口里的偶发卡顿
+/// （runner 上的后台进程、WARP 抢 CPU）不会把整次测量拖下去，而真实的渲染退化
+/// 会同时压低所有窗口。
+const NFR_FPS_WINDOWS: usize = 5;
+const NFR_FPS_WINDOW_SECS: f64 = 1.0;
 
 enum NfrPhase {
     /// 等待第一次回调（其后本 tick 画出首帧）。
     AwaitFirstDraw,
     /// 首帧已 draw；下一次回调时它已上屏。
     AwaitFirstPresent,
+    /// 强制重绘预热：等 shell 启动期的 CPU 与 PTY 输出峰值过去。帧率是稳态指标，
+    /// 启动期由冷启动覆盖；在 GitHub-hosted Windows runner（WARP 软件光栅化）上，
+    /// PowerShell 冷启动与首帧后的采样窗口重叠，会注入 100-200ms 的主线程卡顿。
+    Warmup {
+        start: std::time::Instant,
+        shell_ready_at: Option<std::time::Instant>,
+    },
     /// 强制重绘采样中。
     Sampling {
-        start: std::time::Instant,
+        window_start: std::time::Instant,
+        window_frames: usize,
         last: std::time::Instant,
     },
 }
@@ -223,6 +247,7 @@ enum NfrPhase {
 struct NfrFrameState {
     phase: NfrPhase,
     intervals_ms: Vec<f64>,
+    window_fps: Vec<f64>,
     window_active: bool,
 }
 
@@ -237,11 +262,17 @@ impl NfrFrameState {
         Self {
             phase: NfrPhase::AwaitFirstDraw,
             intervals_ms: Vec::new(),
+            window_fps: Vec::new(),
             window_active: true,
         }
     }
 
-    fn on_frame(&mut self, now: std::time::Instant, window_active: bool) -> NfrAction {
+    fn on_frame(
+        &mut self,
+        now: std::time::Instant,
+        window_active: bool,
+        shell_ready: bool,
+    ) -> NfrAction {
         match self.phase {
             NfrPhase::AwaitFirstDraw => {
                 self.phase = NfrPhase::AwaitFirstPresent;
@@ -249,34 +280,87 @@ impl NfrFrameState {
             }
             NfrPhase::AwaitFirstPresent => {
                 termior_ui::nfr::emit("TERMIOR_NFR_FIRST_FRAME");
-                // 从这里开始计采样窗口，避免把首帧冷路径计入稳态。
-                self.phase = NfrPhase::Sampling {
+                self.phase = NfrPhase::Warmup {
                     start: now,
-                    last: now,
+                    shell_ready_at: shell_ready.then_some(now),
                 };
                 NfrAction::Continue { redraw: true }
             }
-            NfrPhase::Sampling { start, last } => {
+            NfrPhase::Warmup {
+                start,
+                shell_ready_at,
+            } => {
+                let shell_ready_at = shell_ready_at.or(shell_ready.then_some(now));
+                let elapsed = now.duration_since(start).as_secs_f64();
+                let settled = shell_ready_at.is_some_and(|ready| {
+                    elapsed >= NFR_WARMUP_MIN_SECS
+                        && now.duration_since(ready).as_secs_f64() >= NFR_WARMUP_SETTLE_SECS
+                });
+                if settled || elapsed >= NFR_WARMUP_MAX_SECS {
+                    termior_ui::nfr::emit(&format!(
+                        "TERMIOR_NFR_WARMUP_MS={:.0} shell_ready={}",
+                        elapsed * 1000.0,
+                        u8::from(shell_ready_at.is_some())
+                    ));
+                    self.phase = NfrPhase::Sampling {
+                        window_start: now,
+                        window_frames: 0,
+                        last: now,
+                    };
+                } else {
+                    self.phase = NfrPhase::Warmup {
+                        start,
+                        shell_ready_at,
+                    };
+                }
+                NfrAction::Continue { redraw: true }
+            }
+            NfrPhase::Sampling {
+                mut window_start,
+                mut window_frames,
+                last,
+            } => {
                 self.intervals_ms
                     .push(now.duration_since(last).as_secs_f64() * 1000.0);
                 self.window_active &= window_active;
-                self.phase = NfrPhase::Sampling { start, last: now };
-                let elapsed = now.duration_since(start).as_secs_f64();
-                if elapsed < NFR_FPS_SAMPLE_SECS {
+                window_frames += 1;
+                let window_elapsed = now.duration_since(window_start).as_secs_f64();
+                if window_elapsed >= NFR_FPS_WINDOW_SECS {
+                    self.window_fps.push(window_frames as f64 / window_elapsed);
+                    window_start = now;
+                    window_frames = 0;
+                }
+                self.phase = NfrPhase::Sampling {
+                    window_start,
+                    window_frames,
+                    last: now,
+                };
+                if self.window_fps.len() < NFR_FPS_WINDOWS {
                     return NfrAction::Continue { redraw: true };
                 }
-                let fps = (self.intervals_ms.len() as f64 / elapsed).round();
-                termior_ui::nfr::emit(&format!("TERMIOR_NFR_FPS={fps:.0}"));
-                if let Some(p99) = termior_ui::nfr::percentile(&self.intervals_ms, 0.99) {
-                    termior_ui::nfr::emit(&format!("TERMIOR_NFR_FRAME_P99_MS={p99:.1}"));
-                }
-                termior_ui::nfr::emit(&format!(
-                    "TERMIOR_NFR_WINDOW_ACTIVE={}",
-                    u8::from(self.window_active)
-                ));
+                self.emit_frame_report();
                 NfrAction::Done
             }
         }
+    }
+
+    fn emit_frame_report(&self) {
+        let fps = termior_ui::nfr::percentile(&self.window_fps, 0.5).unwrap_or(0.0);
+        termior_ui::nfr::emit(&format!("TERMIOR_NFR_FPS={fps:.0}"));
+        let windows = self
+            .window_fps
+            .iter()
+            .map(|fps| format!("{fps:.1}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        termior_ui::nfr::emit(&format!("TERMIOR_NFR_FPS_WINDOWS={windows}"));
+        if let Some(p99) = termior_ui::nfr::percentile(&self.intervals_ms, 0.99) {
+            termior_ui::nfr::emit(&format!("TERMIOR_NFR_FRAME_P99_MS={p99:.1}"));
+        }
+        termior_ui::nfr::emit(&format!(
+            "TERMIOR_NFR_WINDOW_ACTIVE={}",
+            u8::from(self.window_active)
+        ));
     }
 }
 
@@ -423,25 +507,124 @@ mod tests {
         let t0 = Instant::now();
         // 第一次回调：首帧还没 draw，不打点也不强制重绘。
         assert_eq!(
-            state.on_frame(t0, true),
+            state.on_frame(t0, true, false),
             NfrAction::Continue { redraw: false }
         );
-        // 第二次回调：首帧已上屏，开始强制重绘采样。
+        // 第二次回调：首帧已上屏，开始强制重绘（先预热）。
         assert_eq!(
-            state.on_frame(t0 + Duration::from_millis(16), true),
+            state.on_frame(t0 + Duration::from_millis(16), true, true),
             NfrAction::Continue { redraw: true }
         );
         let mut now = t0 + Duration::from_millis(16);
         let mut action = NfrAction::Continue { redraw: true };
         while action != NfrAction::Done {
             now += Duration::from_millis(20);
-            action = state.on_frame(now, false);
+            action = state.on_frame(now, false, true);
         }
         assert!(!state.window_active);
+        assert_eq!(state.window_fps.len(), NFR_FPS_WINDOWS);
         assert!(state
             .intervals_ms
             .iter()
             .all(|interval| (*interval - 20.0).abs() < 0.5));
+    }
+
+    fn drive_until_sampling(
+        state: &mut NfrFrameState,
+        t0: std::time::Instant,
+    ) -> std::time::Instant {
+        use std::time::Duration;
+        state.on_frame(t0, true, false);
+        state.on_frame(t0, true, false);
+        let mut now = t0;
+        while !matches!(state.phase, NfrPhase::Sampling { .. }) {
+            now += Duration::from_millis(20);
+            let shell_ready = now.duration_since(t0) >= Duration::from_millis(2000);
+            state.on_frame(now, true, shell_ready);
+        }
+        now
+    }
+
+    #[test]
+    fn nfr_warmup_waits_for_shell_output_to_settle() {
+        let t0 = std::time::Instant::now();
+        let mut state = NfrFrameState::start();
+        let sampling_at = drive_until_sampling(&mut state, t0);
+        let warmup = sampling_at.duration_since(t0).as_secs_f64();
+        assert!(
+            (warmup - (2.0 + NFR_WARMUP_SETTLE_SECS)).abs() < 0.05,
+            "warmup {warmup}s"
+        );
+        assert!(
+            state.intervals_ms.is_empty(),
+            "warm-up frames are not sampled"
+        );
+    }
+
+    #[test]
+    fn nfr_warmup_is_capped_without_shell_output() {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let mut state = NfrFrameState::start();
+        state.on_frame(t0, true, false);
+        state.on_frame(t0, true, false);
+        let mut now = t0;
+        while !matches!(state.phase, NfrPhase::Sampling { .. }) {
+            now += Duration::from_millis(20);
+            state.on_frame(now, true, false);
+        }
+        let warmup = now.duration_since(t0).as_secs_f64();
+        assert!(
+            (warmup - NFR_WARMUP_MAX_SECS).abs() < 0.05,
+            "warmup {warmup}s"
+        );
+    }
+
+    #[test]
+    fn nfr_fps_is_median_of_windows_so_one_stall_does_not_fail_the_gate() {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let mut state = NfrFrameState::start();
+        let mut now = drive_until_sampling(&mut state, t0);
+        let mut frame = 0;
+        let mut action = NfrAction::Continue { redraw: true };
+        while action != NfrAction::Done {
+            frame += 1;
+            // 40ms 一帧（25fps），第二个窗口里注入一次 600ms 的卡顿。
+            let step = if frame == 30 { 600 } else { 40 };
+            now += Duration::from_millis(step);
+            action = state.on_frame(now, true, true);
+        }
+        let median = termior_ui::nfr::percentile(&state.window_fps, 0.5).unwrap();
+        assert!(
+            (median - 25.0).abs() < 1.0,
+            "median {median}, windows {:?}",
+            state.window_fps
+        );
+        let slowest = state
+            .window_fps
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            slowest < 15.0,
+            "the stalled window is still visible: {slowest}"
+        );
+    }
+
+    #[test]
+    fn nfr_uniform_slowdown_still_lowers_median_fps() {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let mut state = NfrFrameState::start();
+        let mut now = drive_until_sampling(&mut state, t0);
+        let mut action = NfrAction::Continue { redraw: true };
+        while action != NfrAction::Done {
+            now += Duration::from_millis(100);
+            action = state.on_frame(now, true, true);
+        }
+        let median = termior_ui::nfr::percentile(&state.window_fps, 0.5).unwrap();
+        assert!((median - 10.0).abs() < 0.5, "median {median}");
     }
 
     #[test]

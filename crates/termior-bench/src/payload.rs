@@ -55,9 +55,48 @@ pub struct RunPayload {
     /// 冷启动分阶段时间戳（相对 main 入口，ms）。仅供定位，不进门禁。
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub phases_ms: std::collections::BTreeMap<String, f64>,
+    /// 首帧到帧率采样开始的强制重绘预热时长（ms）。仅供判读。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_ms: Option<f64>,
+    /// 逐个 1s 采样窗口的帧率；`fps` 是它们的中位数。仅供判读。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fps_windows: Vec<f64>,
+    /// 多次启动时每次的原始测量；顶层各指标是它们的中位数。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<RunPayload>,
 }
 
 impl RunPayload {
+    /// 把多次启动的测量合并成一份：每个指标取各次的中位数（偶数次取中间两值均值），
+    /// 原始测量放进 `runs`。单次偶发的慢启动（runner 上的后台扫描、软件光栅化抢 CPU）
+    /// 被滤掉；真实回归会同时拉低每一次，中位数照样越线。
+    pub fn median_of(runs: Vec<RunPayload>) -> RunPayload {
+        let pick = |field: fn(&RunPayload) -> Option<f64>| median(runs.iter().filter_map(field));
+        let mut phase_names: Vec<&String> = runs.iter().flat_map(|r| r.phases_ms.keys()).collect();
+        phase_names.sort();
+        phase_names.dedup();
+        let phases_ms = phase_names
+            .into_iter()
+            .filter_map(|name| {
+                median(runs.iter().filter_map(|r| r.phases_ms.get(name).copied()))
+                    .map(|ms| (name.clone(), ms))
+            })
+            .collect();
+        let active: Vec<bool> = runs.iter().filter_map(|r| r.window_active).collect();
+        RunPayload {
+            cold_start_ms: pick(|r| r.cold_start_ms),
+            rss_mib: pick(|r| r.rss_mib),
+            fps: pick(|r| r.fps),
+            frame_p99_ms: pick(|r| r.frame_p99_ms),
+            echo_p99_ms: pick(|r| r.echo_p99_ms),
+            window_active: (!active.is_empty()).then(|| active.iter().all(|a| *a)),
+            phases_ms,
+            warmup_ms: pick(|r| r.warmup_ms),
+            fps_windows: Vec::new(),
+            runs,
+        }
+    }
+
     /// 按平台/场景展开成若干 [`Sample`]。
     pub fn to_samples(&self, platform: &str, scenario: &str) -> Vec<Sample> {
         let mut out = Vec::new();
@@ -107,6 +146,20 @@ impl HarnessReport {
         }
         out
     }
+}
+
+fn median(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut sorted: Vec<f64> = values.collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    Some(if sorted.len().is_multiple_of(2) {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    })
 }
 
 /// 解析 harness 输出的一行 JSON（容忍前后空白与多行 pretty JSON）。
