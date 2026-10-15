@@ -26,7 +26,8 @@
 |---|---|
 | `TERMIOR_NFR_PHASE <name>=<ms>` | 冷启动分阶段时间戳（相对 main 入口）：`settings` / `workspace_root` / `app_init` / `fonts` / `window_created` / `workspace_view` / `runtime_restored` |
 | `TERMIOR_NFR_FIRST_FRAME` | 首帧 **draw + present 之后**打印（GPUI 的 next-frame 回调先于同 tick 的 draw 执行，故在第二次回调里打印；最多多计一个刷新间隔，偏保守） |
-| `TERMIOR_NFR_FPS=NN` / `TERMIOR_NFR_FRAME_P99_MS=NN.N` | 采样 1.5s，**每个 tick 强制整窗重绘**（`window.refresh()` 绕过视图缓存）后的帧率与帧间隔 p99 |
+| `TERMIOR_NFR_WARMUP_MS=NN shell_ready=0\|1` | 首帧后强制重绘预热：至少 1s，且 shell 首次输出后再稳定 1s；上限 8s |
+| `TERMIOR_NFR_FPS=NN` / `TERMIOR_NFR_FPS_WINDOWS=a,b,..` / `TERMIOR_NFR_FRAME_P99_MS=NN.N` | 预热后采样 5 个 1s 窗口，**每个 tick 强制整窗重绘**（`window.refresh()` 绕过视图缓存）；报告窗口帧率中位数、逐窗口值与全程帧间隔 p99 |
 | `TERMIOR_NFR_WINDOW_ACTIVE=0\|1` | 采样期间窗口是否一直在前台 |
 | `TERMIOR_NFR_ECHO_P99_MS=NN.N samples=N` | 键入回显 p99（`TERMIOR_NFR_ECHO_SAMPLES=N` 时，帧率采样后运行），随后应用自行退出 |
 
@@ -36,7 +37,7 @@
 |---|---|---|---|---|
 | NFR-01 | 冷启动 | ms | `nfr-run` 计时：进程 spawn → 应用打印 `TERMIOR_NFR_FIRST_FRAME`（首帧可交互） | 越小越好 |
 | NFR-04 | 常驻 RSS | MiB | `nfr-run` 用 sysinfo 轮询子进程 `Process::memory()`，取 dwell 窗口峰值 | 越小越好 |
-| NFR-03 | 稳态帧率 | fps | 应用内每 tick 强制整窗重绘，采样 1.5s 计真实 draw 帧数 | 越大越好 |
+| NFR-03 | 稳态帧率 | fps | 应用内预热后每 tick 强制整窗重绘，5 个 1s 窗口取中位数；`nfr-run --runs 3` 再取 3 次启动的中位数 | 越大越好 |
 | NFR-03 | 帧间隔 p99 | ms | 同一采样窗口内相邻 draw 的间隔 p99（60Hz ≈ 16.7ms） | 越小越好 |
 | NFR-02 | 键入回显 p99 | ms | `x`/Backspace 交替写入 PTY → shell 回显进入网格 → 包含它的那一帧 `render`；不含该帧剩余 paint/present（由帧间隔 p99 覆盖） | 越小越好 |
 | NFR-03 | 空闲零重绘 | frames | `scripts/idle-redraw-smoke.ps1`：`TERMIOR_IDLE_REDRAW_PROBE` 在 settle 后统计 `WorkspaceView::render` 次数，期望 `TERMIOR_IDLE_REDRAW_FRAMES=0` | 必须为 0 |
@@ -52,6 +53,24 @@ Termior 又要求空闲零重绘。旧口径只数回调次数，量到的是显
 此外 GPUI 对**非前台窗口**把帧间隔限到 ~33ms：CI 窗口拿不到前台时帧率上限约 30fps，
 `window_active=false` 时判读帧率要打折扣。
 
+### 为什么要预热、分窗取中位数、多次启动
+
+旧做法在首帧后立刻采样 1.5s、算一个平均值。GitHub-hosted Windows runner 上，这 1.5s
+正好与 PowerShell 冷启动（.NET JIT、加载 profile、首屏输出）重叠，它和 WARP 软件
+光栅化抢同一批 vCPU，PTY 输出也要在主线程消化，于是窗口里出现 100-200ms 的卡顿：
+2026-09-30 ～ 2026-10-15 同一口径 26 次 CI 实测 16-36fps（中位数 21），`frame_p99_ms`
+92-205ms，低帧率与高 p99 同时出现。门禁因此在代码无关的提交上偶发失败（16fps 对
+基线 27，退化 40.7%，阈值 40%）。现在的测量分三层去掉这类噪声，而不放宽对真实回归的判断：
+
+1. **预热**：首帧后先强制重绘到 shell 有输出并稳定 1s（至少 1s，最多 8s），再开始计数。
+   帧率是稳态指标，启动期已经由冷启动覆盖。
+2. **分窗中位数**：5 个 1s 窗口各算帧率，报告中位数。一次偶发卡顿只拉低一个窗口；
+   渲染变慢则拉低所有窗口，中位数照样越线。逐窗口值写进 payload 的 `fps_windows`。
+3. **多次启动中位数**：CI 用 `nfr-run --runs 3`，每次全新数据目录，冷启动/RSS/帧率等
+   各取 3 次的中位数；原始测量写进 payload 的 `runs`，日志里逐次打印。
+
+门禁本身（基线、阈值、方向）不变；`nfr-gate` 读到的仍是一份 `Run` payload。
+
 ### 为什么 PTY 吞吐是 headless 主干项
 
 NFR-02 的可量化内核是「VTE 解析 + 网格写入速率」，与 GPU/显示无关，故能在无显示的
@@ -62,7 +81,8 @@ ubuntu CI runner 上确定性复现，是回归门禁最稳的项。`cat` 大文
 
 GPUI 需要真实显示环境才能开窗。ubuntu CI runner（headless）只跑 PTY 吞吐 + criterion
 bench；windows/macos 的 desktop job 启用 `nfr-run` 并过门禁。Linux desktop job 在
-`xvfb-run` + Mesa lavapipe（软件 Vulkan）下运行 `nfr-run`，**只记录不判回归**
+`xvfb-run` + openbox + Mesa lavapipe（软件 Vulkan）下运行 `nfr-run`（裸 Xvfb 没有窗口管理器时
+窗口一帧都不会上屏，payload 只剩 RSS），**只记录不判回归**
 （`continue-on-error`，且尚无 `linux` 基线条目）。软件渲染会让帧率/帧耗时偏悲观，冷启动与
 RSS 更有参考价值；数字稳定后再固化为 `linux` 平台基线。
 
@@ -102,7 +122,7 @@ cargo run -p termior-bench --release --bin nfr-gate -- \
 
 # 2) 进程级（需显示；先 cargo build -p termior --release）
 cargo run -p termior-bench --features run-harness --release --bin nfr-run -- \
-  --binary ./target/release/termior --dwell-secs 20 --echo-samples 40 > run.json
+  --binary ./target/release/termior --dwell-secs 20 --echo-samples 40 --runs 3 > run.json
 cargo run -p termior-bench --release --bin nfr-gate -- \
   --platform windows --payload run.json --baselines docs/baselines/nfr-baselines.json
 ```
