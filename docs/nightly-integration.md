@@ -4,7 +4,7 @@
 
 ## 托管 runner 上运行
 
-nightly 安装 `openssh-client`、`openssh-server`、Python 3 虚拟环境，以及 `paramiko==5.0.0`，然后执行：
+nightly 安装 `openssh-client`、`openssh-server`、Python 3 虚拟环境、`paramiko==5.0.0`，以及编译 `termior-ssh` 所需的 `pkg-config` 与 `libdbus-1-dev`（keyring 的链接依赖；凭据库测试本身不在这里跑），然后执行：
 
 ```bash
 python3 -m venv "$RUNNER_TEMP/ssh-test-venv"
