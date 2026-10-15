@@ -134,7 +134,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-CI implementa la misma división: `ci.yml` ejecuta una comprobación de generación de iconos, el job core en las tres plataformas, el job desktop (check, clippy, tests, build de release, puerta de tamaño del binario, frames de humo en Windows, humo de panel dividido, puerta de proceso NFR), un job de cobertura con umbral del 80% de líneas y un job de benchmarks con puerta de rendimiento PTY. `audit.yml` ejecuta `cargo-deny` en cada push y semanalmente para detectar derivas de licencias y CVEs.
+CI implementa la misma división: `ci.yml` ejecuta una comprobación de generación de iconos, el job core en las tres plataformas, el job desktop (check, clippy, tests, build de release, puerta de tamaño del binario, frames de humo en Windows, humo de panel dividido, puerta de proceso NFR), un job de cobertura con umbral del 80% de líneas y un job de benchmarks con puerta de rendimiento PTY. `audit.yml` ejecuta `cargo-deny` en cada push y semanalmente para detectar derivas de licencias y CVEs. `nightly.yml` se ejecuta a diario y con `workflow_dispatch` en Ubuntu: instala OpenSSH y paramiko, y ejecuta las pruebas ignoradas que un runner alojado puede cubrir (`ssh_roundtrip` y `live_release_download`). El smoke de Codex y las pruebas de keyring siguen siendo manuales; véase `docs/nightly-integration.md`.
 
 #### Iconos de la aplicación
 

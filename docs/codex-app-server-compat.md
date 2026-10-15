@@ -30,4 +30,4 @@
 1. 只接受已验证的 CLI 版本线：`CodexProtocol::stable_verified()` 当前允许 `0.137.x` 与 `0.153.x`，其他版本在 `initialize` 前就以 `Unavailable` 拒绝。
 2. 始终以 `experimentalApi = false` 握手，由服务端强制拒绝实验面，而不是依赖客户端自觉。
 3. 新增版本线的流程：本机运行 `generate-json-schema`，对比上表方法与字段；把脱敏后的真实会话录制成 `crates/termior-agent-host/tests/fixtures/codex-<minor>-stable.jsonl`；回归测试通过后再把该 minor 加入 `stable_verified()`。
-4. 真实 Codex smoke（`cargo test -p termior-agent-host --test codex_smoke -- --ignored`）默认 ignored，需要在装有对应 CLI 的机器上手动运行。本次核验所在主机没有安装 `codex`，未重新执行。
+4. 真实 Codex smoke（`cargo test -p termior-agent-host --test codex_smoke -- --ignored`）默认 ignored。需要本机 PATH 上有 `codex-cli 0.137.x` 或 `0.153.x`，并在 CLI 要求时先 `codex login`。托管 runner 没有这份已登录 CLI，nightly 不运行它。手动步骤见 `docs/nightly-integration.md`。本次核验所在主机没有安装 `codex`，未重新执行。

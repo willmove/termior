@@ -1,0 +1,69 @@
+# Nightly ignored integration tests that a GitHub-hosted runner can actually run.
+#
+# Codex smoke and the keyring vault test stay manual: a hosted Ubuntu runner has
+# neither a compatible logged-in Codex CLI nor an unlocked Secret Service.
+# Steps: docs/nightly-integration.md
+#
+# Schedule fires only from the default branch. workflow_dispatch can target a
+# branch once this file is on that branch and GitHub accepts the dispatch.
+name: Nightly
+
+on:
+  schedule:
+    # 03:00 UTC daily. audit.yml is Monday 06:00 UTC; keep the offset.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  ignored-integration:
+    name: Ignored integration (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSH and Python
+        run: |
+          sudo apt-get update
+          sudo mkdir -p /var/run/sshd
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            openssh-client \
+            openssh-server \
+            python3 \
+            python3-venv \
+            python3-pip
+          command -v ssh
+          command -v sftp
+          command -v sshd
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      - name: Install paramiko
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ssh-test-venv"
+          "$RUNNER_TEMP/ssh-test-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/ssh-test-venv/bin/python" -m pip install 'paramiko==5.0.0'
+
+      # Do not set TERMIOR_SSH_ASKPASS_EXE. That branch writes the OS credential vault.
+      - name: SSH and SFTP roundtrip
+        env:
+          TERMIOR_SSH_TEST_PYTHON: ${{ runner.temp }}/ssh-test-venv/bin/python
+        run: cargo test -p termior-terminal --test ssh_roundtrip -- --ignored --nocapture
+
+      - name: Release download
+        run: cargo test -p termior-platform live_release_download -- --ignored --nocapture

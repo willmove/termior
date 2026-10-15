@@ -137,7 +137,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-CI 按同一劃分執行：`ci.yml` 包含圖示產生校驗、三平台 core job、desktop job（check、clippy、測試、release 建置、二進位體積門禁、Windows 渲染煙測、分割窗格煙測、NFR 處理程序門禁）、80% 行覆蓋率的 coverage job，以及帶 PTY 吞吐門禁的 benchmark job；`audit.yml` 在每次 push 與每週定時執行 `cargo-deny`，捕捉授權與 CVE 漂移。
+CI 按同一劃分執行：`ci.yml` 包含圖示產生校驗、三平台 core job、desktop job（check、clippy、測試、release 建置、二進位體積門禁、Windows 渲染煙測、分割窗格煙測、NFR 處理程序門禁）、80% 行覆蓋率的 coverage job，以及帶 PTY 吞吐門禁的 benchmark job；`audit.yml` 在每次 push 與每週定時執行 `cargo-deny`，捕捉授權與 CVE 漂移。`nightly.yml` 在 Ubuntu 上每日以及透過 `workflow_dispatch` 執行：安裝 OpenSSH 與 paramiko 後，執行託管 runner 能跑的 ignored 測試（`ssh_roundtrip` 與 `live_release_download`）。Codex smoke 與 keyring 測試仍為手動，步驟見 `docs/nightly-integration.md`。
 
 #### 應用圖示
 
