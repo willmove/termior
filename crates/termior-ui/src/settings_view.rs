@@ -7,7 +7,15 @@ use gpui::{
     MouseUpEvent, Pixels, Point, SharedString, StatefulInteractiveElement, TextRun, UTF16Selection,
     WeakEntity, Window,
 };
-use std::{ops::Range, path::PathBuf, time::Duration};
+use std::{
+    ops::Range,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 const SETTINGS_NAV_WIDTH: f32 = 180.0;
 const SETTINGS_CONTENT_MAX_WIDTH: f32 = 640.0;
@@ -18,8 +26,8 @@ use termior_ai::{
     SecretStore,
 };
 use termior_store::{
-    atomic_write, default_keymap, settings::Appearance, DataFiles, KeyAction, Platform, Settings,
-    ShellDetection, UserKeyBinding,
+    atomic_write, default_keymap, settings::Appearance, DataFiles, DiskUsage, KeyAction, Platform,
+    RetentionPolicy, Settings, ShellDetection, UserKeyBinding,
 };
 use termior_terminal::DiscoveredShell;
 use termior_theme::{
@@ -44,6 +52,8 @@ enum EditField {
     AgentPrompt,
     AgentIcon,
     AgentColor,
+    RetentionDays,
+    RetentionCapacity,
 }
 
 type SaveCallback = Box<dyn Fn(&Settings, &mut App)>;
@@ -117,6 +127,10 @@ pub struct SettingsView {
     /// 内容区滚动容器句柄 + 拖拽滚动条状态（配置项多时右侧出现滚动条）。
     scroll: gpui::ScrollHandle,
     dragging_scroll: bool,
+    agent_usage: Option<DiskUsage>,
+    agent_usage_error: Option<String>,
+    cleanup_running: bool,
+    cleanup_cancel: Option<Arc<AtomicBool>>,
     _updater_subscription: gpui::Subscription,
 }
 
@@ -177,6 +191,10 @@ impl SettingsView {
             discovered_shells: Vec::new(),
             scroll: gpui::ScrollHandle::new(),
             dragging_scroll: false,
+            agent_usage: None,
+            agent_usage_error: None,
+            cleanup_running: false,
+            cleanup_cancel: None,
         };
         view.refresh_credential_state();
         // shell 探测两段式：原生条目（PATH 检查，即时）先到，WSL 枚举
@@ -209,6 +227,11 @@ impl SettingsView {
         self.page = page;
         self.select_menu = None;
         self.confirm_agent_removal = false;
+        if page == SettingsPage::Agents {
+            self.agent_usage = None;
+            self.agent_usage_error = None;
+            self.refresh_agent_usage(cx);
+        }
         cx.notify();
     }
 
@@ -482,6 +505,10 @@ impl SettingsView {
                 .unwrap_or_default(),
             EditField::AgentIcon => self.agent().map(|a| a.icon.clone()).unwrap_or_default(),
             EditField::AgentColor => self.agent().map(|a| a.color.clone()).unwrap_or_default(),
+            EditField::RetentionDays => self.settings.agent_retention.max_age_days.to_string(),
+            EditField::RetentionCapacity => {
+                bytes_to_mib(self.settings.agent_retention.max_disk_bytes).to_string()
+            }
         }
     }
 
@@ -584,6 +611,24 @@ impl SettingsView {
                 }
                 Ok(())
             }
+            EditField::RetentionDays => value
+                .parse::<u64>()
+                .ok()
+                .filter(|days| {
+                    (RetentionPolicy::MIN_AGE_DAYS..=RetentionPolicy::MAX_AGE_DAYS).contains(days)
+                })
+                .map(|days| self.settings.agent_retention.max_age_days = days)
+                .ok_or_else(|| "retention days out of range".to_owned()),
+            EditField::RetentionCapacity => value
+                .parse::<u64>()
+                .ok()
+                .and_then(|mib| mib.checked_mul(1024 * 1024))
+                .filter(|bytes| {
+                    (RetentionPolicy::MIN_DISK_BYTES..=RetentionPolicy::MAX_DISK_BYTES)
+                        .contains(bytes)
+                })
+                .map(|bytes| self.settings.agent_retention.max_disk_bytes = bytes)
+                .ok_or_else(|| "retention capacity out of range".to_owned()),
         };
         match result {
             Err(error) => {
@@ -1442,12 +1487,19 @@ impl SettingsView {
                     &[EditField::AddModel, EditField::BaseUrl, EditField::ApiKey]
                 }
                 SettingsPage::Agents if self.agent_appearance_open => &[
+                    EditField::RetentionDays,
+                    EditField::RetentionCapacity,
                     EditField::AgentName,
                     EditField::AgentPrompt,
                     EditField::AgentIcon,
                     EditField::AgentColor,
                 ],
-                SettingsPage::Agents => &[EditField::AgentName, EditField::AgentPrompt],
+                SettingsPage::Agents => &[
+                    EditField::RetentionDays,
+                    EditField::RetentionCapacity,
+                    EditField::AgentName,
+                    EditField::AgentPrompt,
+                ],
                 _ => &[],
             };
             if let Some(index) = fields
@@ -2928,6 +2980,206 @@ impl SettingsView {
             .into_any_element()
     }
 
+    fn refresh_agent_usage(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.data_dir.clone() else {
+            self.agent_usage = None;
+            self.agent_usage_error = Some(t!("settings.agents.data_usage_unavailable").to_string());
+            return;
+        };
+        self.agent_usage_error = None;
+        let task = cx.spawn(async move |view, cx| {
+            let usage = cx
+                .background_executor()
+                .spawn(async move { termior_store::measure_agent_disk_usage(&root) })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                match usage {
+                    Ok(usage) => {
+                        view.agent_usage = Some(usage);
+                        view.agent_usage_error = None;
+                    }
+                    Err(error) => {
+                        view.agent_usage = None;
+                        view.agent_usage_error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.track_task(task);
+    }
+
+    fn start_agent_cleanup(&mut self, cx: &mut Context<Self>) {
+        if self.cleanup_running {
+            return;
+        }
+        self.commit_edit();
+        self.schedule_save_if_dirty(cx);
+        if let Err(error) = self.settings.validate() {
+            self.status = error.to_string();
+            cx.notify();
+            return;
+        }
+        let Some(root) = self.data_dir.clone() else {
+            self.status = t!("settings.agents.data_usage_unavailable").to_string();
+            cx.notify();
+            return;
+        };
+        let policy = self.settings.agent_retention.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cleanup_cancel = Some(cancel.clone());
+        self.cleanup_running = true;
+        self.status = t!("settings.agents.data_cleanup_running").to_string();
+        cx.notify();
+        let task = cx.spawn(async move |view, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+                        .unwrap_or(0);
+                    let report = termior_store::cleanup_agent_data(&root, policy, now_ms, &cancel)
+                        .map_err(|error| error.to_string())?;
+                    let usage = termior_store::measure_agent_disk_usage(&root)
+                        .map_err(|error| error.to_string())?;
+                    Ok::<_, String>((report, usage))
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.cleanup_running = false;
+                view.cleanup_cancel = None;
+                match outcome {
+                    Ok((report, usage)) => {
+                        view.agent_usage = Some(usage);
+                        view.agent_usage_error = None;
+                        let freed = report.before_bytes.saturating_sub(report.after_bytes);
+                        let size = crate::updater::format_bytes(freed);
+                        view.status = if report.cancelled {
+                            tf!("settings.agents.data_cleanup_cancelled", "size" => size)
+                                .to_string()
+                        } else if freed == 0 {
+                            t!("settings.agents.data_cleanup_none").to_string()
+                        } else {
+                            tf!("settings.agents.data_cleanup_done", "size" => size).to_string()
+                        };
+                    }
+                    Err(error) => {
+                        view.status = tf!("settings.agents.data_cleanup_failed", "error" => error)
+                            .to_string();
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self.track_task(task);
+    }
+
+    fn cancel_agent_cleanup(&mut self, cx: &mut Context<Self>) {
+        if let Some(flag) = &self.cleanup_cancel {
+            flag.store(true, Ordering::Release);
+        }
+        cx.notify();
+    }
+
+    fn usage_line(&self, id: &'static str, text: SharedString) -> AnyElement {
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .text_sm()
+            .child(text)
+            .into_any_element()
+    }
+
+    fn agent_data_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let usage: Vec<AnyElement> = if let Some(error) = &self.agent_usage_error {
+            vec![self.usage_line("agent-data-usage-error", error.clone().into())]
+        } else if let Some(usage) = self.agent_usage {
+            vec![
+                self.usage_line(
+                    "agent-data-usage-total",
+                    tf!("settings.agents.data_usage_total", "size" => crate::updater::format_bytes(usage.total())),
+                ),
+                self.usage_line(
+                    "agent-data-usage-journal",
+                    tf!("settings.agents.data_usage_journal", "size" => crate::updater::format_bytes(usage.journal)),
+                ),
+                self.usage_line(
+                    "agent-data-usage-blobs",
+                    tf!("settings.agents.data_usage_blobs", "size" => crate::updater::format_bytes(usage.blobs)),
+                ),
+                self.usage_line(
+                    "agent-data-usage-context",
+                    tf!("settings.agents.data_usage_context", "size" => crate::updater::format_bytes(usage.context)),
+                ),
+                self.usage_line(
+                    "agent-data-usage-hook-mcp",
+                    tf!("settings.agents.data_usage_hook_mcp", "size" => crate::updater::format_bytes(usage.hook_mcp)),
+                ),
+                self.usage_line(
+                    "agent-data-usage-crash",
+                    tf!("settings.agents.data_usage_crash", "size" => crate::updater::format_bytes(usage.crash)),
+                ),
+                self.usage_line(
+                    "agent-data-usage-other",
+                    tf!("settings.agents.data_usage_other", "size" => crate::updater::format_bytes(usage.other)),
+                ),
+            ]
+        } else {
+            vec![self.usage_line(
+                "agent-data-usage-loading",
+                t!("settings.agents.data_usage_loading"),
+            )]
+        };
+        let action = if self.cleanup_running {
+            Self::button(
+                t!("settings.agents.data_cancel_cleanup"),
+                "agent-data-cancel-cleanup",
+                &self.palette,
+            )
+            .debug_selector(|| "agent-data-cancel-cleanup".into())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.cancel_agent_cleanup(cx)),
+            )
+            .into_any_element()
+        } else {
+            Self::button(
+                t!("settings.agents.data_cleanup"),
+                "agent-data-cleanup",
+                &self.palette,
+            )
+            .debug_selector(|| "agent-data-cleanup".into())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.start_agent_cleanup(cx)),
+            )
+            .into_any_element()
+        };
+        self.section(
+            t!("settings.agents.data_title"),
+            t!("settings.agents.data_description"),
+            usage
+                .into_iter()
+                .chain([
+                    self.edit_row(
+                        t!("settings.agents.data_retention_days_label"),
+                        t!("settings.agents.data_retention_days_description"),
+                        EditField::RetentionDays,
+                        cx,
+                    ),
+                    self.edit_row(
+                        t!("settings.agents.data_retention_capacity_label"),
+                        t!("settings.agents.data_retention_capacity_description"),
+                        EditField::RetentionCapacity,
+                        cx,
+                    ),
+                    action,
+                ])
+                .collect::<Vec<_>>(),
+        )
+    }
+
     fn agents_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let hook_status = termior_hooks::status()
             .map(|status| {
@@ -3090,6 +3342,7 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_6()
+            .child(self.agent_data_section(cx))
             .child(
                 self.section(
                     t!("settings.agents.title"),
@@ -3348,6 +3601,9 @@ impl SettingsView {
 
 impl Drop for SettingsView {
     fn drop(&mut self) {
+        if let Some(flag) = &self.cleanup_cancel {
+            flag.store(true, Ordering::Release);
+        }
         self.commit_edit();
         if let Err(error) = self.persist_to_disk() {
             log::warn!("failed to persist settings on close: {error}");
@@ -3669,6 +3925,10 @@ fn tool_label(tool: termior_security::gating::ToolId) -> SharedString {
         TodoRead => t!("settings.tools.read_todos"),
         TodoWrite => t!("settings.tools.write_todos"),
     }
+}
+
+fn bytes_to_mib(bytes: u64) -> u64 {
+    bytes / (1024 * 1024)
 }
 
 fn on_off(value: bool) -> SharedString {
@@ -4022,5 +4282,124 @@ mod edit_tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn agent_retention_fields_commit_within_range() {
+        let mut cx = TestAppContext::single();
+        cx.update(crate::updater::init);
+        let view = cx.new(|cx| SettingsView::new(Settings::default(), None, None, None, None, cx));
+        view.update(&mut cx, |view, _| {
+            view.edit_field = Some(EditField::RetentionDays);
+            view.draft = "14".into();
+            view.commit_edit();
+            assert_eq!(view.settings.agent_retention.max_age_days, 14);
+            view.edit_field = Some(EditField::RetentionCapacity);
+            view.draft = "512".into();
+            view.commit_edit();
+            assert_eq!(
+                view.settings.agent_retention.max_disk_bytes,
+                512 * 1024 * 1024
+            );
+            view.edit_field = Some(EditField::RetentionDays);
+            view.draft = "0".into();
+            view.commit_edit();
+            assert_eq!(view.settings.agent_retention.max_age_days, 14);
+            assert!(!view.status.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn agents_page_shows_disk_usage_and_cleanup_keeps_the_journal(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let journal = root.join("agent-tasks/task/events.jsonl");
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        std::fs::write(&journal, b"journal-bytes").unwrap();
+        let blob = root.join("agent-artifacts/blobs/chunk.txt");
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, vec![b'x'; 2048]).unwrap();
+        let context = root.join("agent-artifacts/task/tool-output/body.txt");
+        std::fs::create_dir_all(context.parent().unwrap()).unwrap();
+        std::fs::write(&context, b"context-body").unwrap();
+        std::fs::write(root.join("hooks.json"), b"hook").unwrap();
+        std::fs::write(root.join("mcp.log"), b"mcp").unwrap();
+        std::fs::write(root.join("Termior-crash.log"), b"boom").unwrap();
+        std::fs::write(root.join("Termior-settings.json"), b"{}").unwrap();
+        for path in [
+            &blob,
+            &context,
+            &root.join("hooks.json"),
+            &root.join("mcp.log"),
+            &root.join("Termior-crash.log"),
+        ] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        let journal_bytes = std::fs::read(&journal).unwrap();
+
+        let (view, vcx) = cx.add_window_view(|_, cx| {
+            SettingsView::new(
+                Settings::default(),
+                None,
+                Some(root.to_path_buf()),
+                None,
+                None,
+                cx,
+            )
+        });
+        vcx.simulate_resize(gpui::size(px(880.), px(1400.)));
+        view.update(vcx, |view, cx| view.set_page(SettingsPage::Agents, cx));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        view.update(vcx, |view, _| {
+            let usage = view.agent_usage.expect("usage measured");
+            assert_eq!(usage.journal, journal_bytes.len() as u64);
+            assert_eq!(usage.blobs, 2048);
+            assert_eq!(usage.context, b"context-body".len() as u64);
+            assert_eq!(usage.hook_mcp, (b"hook".len() + b"mcp".len()) as u64);
+            assert_eq!(usage.crash, b"boom".len() as u64);
+            assert_eq!(view.settings.agent_retention.max_age_days, 30);
+        });
+        assert!(vcx.debug_bounds("agent-data-usage-journal").is_some());
+        assert!(vcx.debug_bounds("agent-data-usage-blobs").is_some());
+        assert!(vcx.debug_bounds("agent-data-usage-hook-mcp").is_some());
+        assert!(vcx.debug_bounds("agent-data-usage-crash").is_some());
+        let cleanup = vcx
+            .debug_bounds("agent-data-cleanup")
+            .expect("cleanup action");
+        vcx.simulate_mouse_down(
+            cleanup.center(),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        vcx.run_until_parked();
+
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_bytes);
+        assert!(!blob.exists(), "expired blob is removed");
+        assert!(!context.exists(), "expired context is removed");
+        assert!(!root.join("hooks.json").exists());
+        assert!(!root.join("mcp.log").exists());
+        assert!(!root.join("Termior-crash.log").exists());
+        assert!(root.join("Termior-settings.json").is_file());
+        view.update(vcx, |view, _| {
+            let usage = view.agent_usage.expect("usage refreshed");
+            assert_eq!(usage.journal, journal_bytes.len() as u64);
+            assert_eq!(usage.blobs, 0);
+            assert_eq!(usage.context, 0);
+            assert!(!view.cleanup_running);
+            assert!(
+                view.status.contains("Journal") || view.status.contains("journal"),
+                "status should report that journals stayed intact: {}",
+                view.status
+            );
+        });
     }
 }

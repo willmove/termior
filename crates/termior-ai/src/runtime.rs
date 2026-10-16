@@ -177,6 +177,8 @@ pub struct TaskRuntime {
     consecutive_compactions: u32,
     max_consecutive_compactions: u32,
     journal_data_root: Option<PathBuf>,
+    /// Held for the lifetime of a journaled task so retention skips this session.
+    session_lease: Option<termior_store::SessionLease>,
     persistence_error: Option<String>,
     message_observer: Option<MessageObserver>,
 }
@@ -226,6 +228,7 @@ impl TaskRuntime {
             consecutive_compactions: 0,
             max_consecutive_compactions: 2,
             journal_data_root: None,
+            session_lease: None,
             persistence_error: None,
             message_observer: None,
         }
@@ -275,12 +278,14 @@ impl TaskRuntime {
     }
 
     pub fn try_with_journal(mut self, data_root: impl Into<PathBuf>) -> Result<Self, String> {
-        self.journal_data_root = Some(data_root.into());
-        self.persist_journal(
-            self.journal_data_root
-                .as_deref()
-                .expect("journal root was assigned"),
-        )?;
+        let data_root = data_root.into();
+        // Take the lease before any journal write so a concurrent cleanup sees this session.
+        self.session_lease = Some(
+            termior_store::SessionLease::acquire(data_root.join("agent-tasks"), &self.task.id.0)
+                .map_err(|error| error.to_string())?,
+        );
+        self.journal_data_root = Some(data_root.clone());
+        self.persist_journal(&data_root)?;
         Ok(self)
     }
 
@@ -339,6 +344,10 @@ impl TaskRuntime {
             .last()
             .filter(|turn| turn.finished_at_ms.is_none())
             .map(|turn| turn.id.clone());
+        let session_lease = Some(
+            termior_store::SessionLease::acquire(&tasks_root, task_id)
+                .map_err(|error| error.to_string())?,
+        );
         Ok(Self {
             task,
             approval_policy,
@@ -358,6 +367,7 @@ impl TaskRuntime {
             consecutive_compactions: 0,
             max_consecutive_compactions: 2,
             journal_data_root: Some(data_root.to_path_buf()),
+            session_lease,
             persistence_error: None,
             message_observer: None,
         })
@@ -2144,5 +2154,24 @@ mod tool_pairing_tests {
         let last = messages.last().unwrap();
         assert_eq!(last.role, Role::Tool);
         assert_eq!(last.tool_result.as_ref().unwrap().call_id, "lost-call");
+    }
+
+    #[test]
+    fn journal_lease_is_held_until_the_runtime_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = TaskRuntime::new(
+            TaskConfig::new("lease", "/project", "native", "direct"),
+            RuntimeBudgets::default(),
+            ApprovalPolicy::Prompt,
+        )
+        .with_task_id("task-lease")
+        .unwrap()
+        .try_with_journal(dir.path())
+        .unwrap();
+        let tasks = dir.path().join("agent-tasks");
+        assert!(termior_store::SessionLease::acquire(&tasks, "task-lease").is_err());
+        assert!(tasks.join("task-lease/events.jsonl").is_file());
+        drop(runtime);
+        assert!(termior_store::SessionLease::acquire(&tasks, "task-lease").is_ok());
     }
 }
