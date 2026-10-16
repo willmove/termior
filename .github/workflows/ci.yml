@@ -146,16 +146,14 @@ jobs:
           if ($proc.ExitCode -ne 0 -or (($output | Out-String) -notmatch "TERMIOR_SPLIT_PANE_SMOKE_OK")) {
             throw "Termior split-pane smoke did not complete successfully"
           }
-      # Linux/macOS launch smokes are non-blocking until they have proven stable on hosted runners
-      # (GPUI needs a GPU context: Linux runs under xvfb with Mesa's software Vulkan). Drop
-      # continue-on-error from these steps to make them required.
+      # Linux and macOS launch smokes are required. GPUI needs a GPU context:
+      # Linux runs under xvfb with Mesa's software Vulkan.
       - name: Install Linux smoke dependencies
         if: matrix.platform == 'linux'
         run: sudo apt-get install -y xvfb mesa-vulkan-drivers openbox
       - name: Linux launch smoke (xvfb)
         id: smoke_linux_launch
         if: matrix.platform == 'linux'
-        continue-on-error: true
         env:
           SMOKE_TIMEOUT_SECS: 45
         run: |
@@ -167,17 +165,15 @@ jobs:
       - name: Linux split-pane smoke (xvfb)
         id: smoke_linux_split
         if: matrix.platform == 'linux'
-        continue-on-error: true
         run: |
           ./scripts/ci-smoke.sh TERMIOR_SPLIT_PANE_SMOKE TERMIOR_SPLIT_PANE_SMOKE_OK linux-split-pane -- \
             xvfb-run -a -s "-screen 0 1920x1080x24" ./target/release/termior
       - name: macOS launch smoke
         id: smoke_macos_launch
         if: matrix.platform == 'macos'
-        continue-on-error: true
         run: ./scripts/ci-smoke.sh TERMIOR_SMOKE_TEST TERMIOR_SMOKE_OK macos-launch -- ./target/release/termior
       - name: Upload smoke logs
-        if: steps.smoke_linux_launch.outcome == 'failure' || steps.smoke_linux_split.outcome == 'failure' || steps.smoke_macos_launch.outcome == 'failure'
+        if: failure() && (steps.smoke_linux_launch.outcome == 'failure' || steps.smoke_linux_split.outcome == 'failure' || steps.smoke_macos_launch.outcome == 'failure')
         uses: actions/upload-artifact@v4
         with:
           name: smoke-logs-${{ matrix.platform }}
