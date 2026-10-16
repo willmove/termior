@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -33,6 +34,13 @@ impl JsonRpcLineCodec {
         }
         Ok(messages)
     }
+}
+
+/// Optional on-disk capture for a backend process. Stderr is redacted before it is appended.
+#[derive(Debug, Clone, Default)]
+pub struct StdioCapture {
+    pub stderr_log: Option<PathBuf>,
+    pub known_secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +77,13 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     pub fn spawn(spec: &TransportCommand) -> Result<Self, BackendError> {
+        Self::spawn_capturing(spec, StdioCapture::default())
+    }
+
+    pub fn spawn_capturing(
+        spec: &TransportCommand,
+        capture: StdioCapture,
+    ) -> Result<Self, BackendError> {
         let mut command = Command::new(&spec.program);
         command
             .args(&spec.args)
@@ -102,9 +117,11 @@ impl StdioTransport {
             .map_err(|error| BackendError::Transport(error.to_string()))?;
         let stderr = Arc::new(Mutex::new(VecDeque::new()));
         let stderr_target = stderr.clone();
+        let stderr_log = capture.stderr_log;
+        let redactor = termior_store::StreamingRedactor::new(capture.known_secrets);
         thread::Builder::new()
             .name("termior-agent-host-stderr".into())
-            .spawn(move || read_stderr(stderr_pipe, stderr_target))
+            .spawn(move || read_stderr(stderr_pipe, stderr_target, stderr_log, redactor))
             .map_err(|error| BackendError::Transport(error.to_string()))?;
         Ok(Self {
             child,
@@ -279,9 +296,17 @@ fn read_stdout(stdout: impl Read, tx: mpsc::Sender<TransportMessage>) {
     let _ = tx.send(TransportMessage::Eof);
 }
 
-fn read_stderr(stderr: impl Read, target: Arc<Mutex<VecDeque<String>>>) {
+fn read_stderr(
+    stderr: impl Read,
+    target: Arc<Mutex<VecDeque<String>>>,
+    log: Option<PathBuf>,
+    redactor: termior_store::StreamingRedactor,
+) {
     for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-        let line = termior_store::StreamingRedactor::new([]).redact(&line).text;
+        let line = redactor.redact(&line).text;
+        if let Some(path) = &log {
+            let _ = redactor.append_record(path, &line);
+        }
         if let Ok(mut lines) = target.lock() {
             lines.push_back(line);
             while lines.len() > 100 {

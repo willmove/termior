@@ -1813,6 +1813,7 @@ impl ComposerView {
         }
         let session = self.external_session.clone();
         let project_dir = self.workspace_root.clone();
+        let data_dir = self.data_dir.clone();
         let cancellation = CancellationToken::default();
         self.active_cancellation = Some(cancellation.clone());
         self.busy = true;
@@ -1821,7 +1822,14 @@ impl ComposerView {
         cx.spawn(async move |view, cx| {
             let (event_tx, mut event_rx) = futures::channel::mpsc::unbounded::<BackendEvent>();
             let task = cx.background_executor().spawn(async move {
-                run_external_command(session, command, project_dir, cancellation, event_tx)
+                run_external_command(
+                    session,
+                    command,
+                    project_dir,
+                    data_dir,
+                    cancellation,
+                    event_tx,
+                )
             });
             while let Some(event) = event_rx.next().await {
                 let _ = view.update(cx, |view, cx| {
@@ -2701,6 +2709,7 @@ fn run_external_command(
     existing: Option<Arc<Mutex<ManagedAgentSession>>>,
     command: ExternalCommand,
     project_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     cancellation: CancellationToken,
     event_tx: futures::channel::mpsc::UnboundedSender<BackendEvent>,
 ) -> ExternalRunResult {
@@ -2717,10 +2726,17 @@ fn run_external_command(
                     }
                 }
             };
+            let mut backend = CodexBackend::new(
+                std::env::var("TERMIOR_CODEX_PATH").unwrap_or_else(|_| "codex".into()),
+            );
+            if let Some(dir) = &data_dir {
+                backend = backend.with_stderr_log(
+                    dir.join("agent-backends").join("codex-stderr.log"),
+                    std::iter::empty::<String>(),
+                );
+            }
             let created = ManagedAgentSession::connect(
-                Box::new(CodexBackend::new(
-                    std::env::var("TERMIOR_CODEX_PATH").unwrap_or_else(|_| "codex".into()),
-                )),
+                Box::new(backend),
                 TaskLaunch {
                     task_id,
                     project_dir: project_dir.display().to_string(),

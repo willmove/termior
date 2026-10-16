@@ -94,8 +94,20 @@ impl QualifiedMcpTool {
 pub struct McpCatalog {
     by_server: BTreeMap<String, BTreeMap<String, QualifiedMcpTool>>,
     failures: BTreeMap<String, String>,
+    diagnostic_log: Option<std::path::PathBuf>,
+    known_secrets: Vec<String>,
 }
 impl McpCatalog {
+    pub fn with_diagnostic_log(
+        mut self,
+        path: impl Into<std::path::PathBuf>,
+        known_secrets: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.diagnostic_log = Some(path.into());
+        self.known_secrets = known_secrets.into_iter().collect();
+        self
+    }
+
     pub fn replace_tools(&mut self, server_id: &str, tools: Vec<QualifiedMcpTool>) {
         self.failures.remove(server_id);
         self.by_server.insert(
@@ -107,7 +119,16 @@ impl McpCatalog {
         );
     }
     pub fn mark_disconnected(&mut self, server_id: &str, error: impl Into<String>) {
-        self.failures.insert(server_id.into(), error.into());
+        let error = error.into();
+        let redacted = termior_store::StreamingRedactor::new(self.known_secrets.clone())
+            .redact(&error)
+            .text;
+        if let Some(path) = &self.diagnostic_log {
+            let line = format!("{server_id}\t{error}");
+            let _ = termior_store::StreamingRedactor::new(self.known_secrets.clone())
+                .append_record(path, &line);
+        }
+        self.failures.insert(server_id.into(), redacted);
     }
     pub fn tool(&self, qualified_id: &str) -> Option<&QualifiedMcpTool> {
         self.by_server

@@ -4,7 +4,7 @@ use termior_agent_host::{
     map_codex_message, AgentBackend, BackendBinding, BackendDecision, BackendError, BackendEvent,
     BackendInfo, BackendTaskProjector, CapabilityProfile, CapabilitySupport, CodexProtocol,
     InProcessBackend, JsonRpcLineCodec, ManagedAgentSession, ManagedSessionState, PumpOutcome,
-    StdioTransport, TaskLaunch, TransportCommand, TurnLaunch,
+    StdioCapture, StdioTransport, TaskLaunch, TransportCommand, TurnLaunch,
 };
 
 #[test]
@@ -188,6 +188,50 @@ fn stdio_transport_keeps_notifications_and_stderr_separate_from_responses() {
     assert!(stderr.contains("diagnostic-noise"));
     assert!(stderr.contains("REDACTED"));
     assert!(!stderr.contains("sk-123"));
+}
+
+#[test]
+fn backend_stderr_log_redacts_known_secrets_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("stderr.log");
+    let (program, args) = if cfg!(windows) {
+        (
+            "powershell".to_string(),
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                WINDOWS_STDIO_PEER.replace(
+                    "diagnostic-noise sk-12345678901234567890",
+                    "diagnostic-noise private-value",
+                ),
+            ],
+        )
+    } else {
+        (
+            "sh".to_string(),
+            vec![
+                "-c".into(),
+                "read line; echo 'diagnostic-noise private-value' >&2; echo '{\"jsonrpc\":\"2.0\",\"method\":\"future/event\",\"params\":{}}'; echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}'".into(),
+            ],
+        )
+    };
+    let mut transport = StdioTransport::spawn_capturing(
+        &TransportCommand { program, args },
+        StdioCapture {
+            stderr_log: Some(log.clone()),
+            known_secrets: vec!["private-value".into()],
+        },
+    )
+    .unwrap();
+    transport
+        .request("test", json!({}), peer_request_timeout())
+        .unwrap();
+    let stderr = stderr_until(&transport, "diagnostic-noise", Duration::from_secs(5));
+    assert!(!stderr.contains("private-value"), "{stderr}");
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(!text.contains("private-value"), "{text}");
+    assert!(text.contains("[REDACTED]"), "{text}");
 }
 
 #[test]

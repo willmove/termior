@@ -76,6 +76,52 @@ fn subprocess_runner_parses_a_bounded_json_decision() {
 }
 
 #[test]
+fn hook_audit_file_redacts_known_secrets_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let (program, args) = if cfg!(windows) {
+        (
+            "powershell",
+            vec![
+                "-NoProfile".into(),
+                "-Command".into(),
+                "$null=[Console]::In.ReadToEnd(); [Console]::Error.WriteLine('private-value'); [Console]::Out.Write('{\"decision\":\"allow\"}')".into(),
+            ],
+        )
+    } else {
+        (
+            "sh",
+            vec![
+                "-c".into(),
+                "cat >/dev/null; echo private-value >&2; printf '%s' '{\"decision\":\"allow\"}'"
+                    .into(),
+            ],
+        )
+    };
+    let pipeline = HookPipeline::new(vec![HookConfig {
+        id: "audit".into(),
+        point: HookPoint::PreTool,
+        program: program.into(),
+        args,
+        enabled: true,
+        fail_closed: true,
+    }])
+    .with_known_secrets(["private-value".into()]);
+    let event = HookEvent {
+        schema_version: HOOK_SCHEMA_VERSION,
+        point: HookPoint::PreTool,
+        task_id: "task".into(),
+        tool: Some("read_file".into()),
+        arguments: Some(json!({})),
+    };
+    pipeline.apply_pre_tool(&event, |_| Ok(())).unwrap();
+    let path = dir.path().join("hooks.json");
+    pipeline.persist_audit(&path).unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(!text.contains("private-value"), "{text}");
+    assert!(text.contains("[REDACTED]"), "{text}");
+}
+
+#[test]
 fn subprocess_timeout_follows_fail_closed_policy() {
     let event = HookEvent {
         schema_version: 1,

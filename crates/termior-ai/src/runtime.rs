@@ -1567,6 +1567,8 @@ impl TaskRuntime {
     fn add_tool_result(&mut self, mut result: ToolResult) {
         if result.output.len() > self.output_inline_limit {
             if let Some(root) = self.output_store_root.as_ref() {
+                let _ = termior_store::OutputBlobStore::new(root, Vec::<String>::new())
+                    .put(&result.call_id, &result.output);
                 let store =
                     crate::context_engine::ContextContentStore::new(root, Vec::<String>::new());
                 if let Ok(reference) =

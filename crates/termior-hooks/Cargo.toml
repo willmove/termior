@@ -12,3 +12,6 @@ thiserror = { workspace = true }
 dirs = { workspace = true }
 termior-store = { workspace = true }
 wait-timeout = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

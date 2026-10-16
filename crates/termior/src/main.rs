@@ -12,7 +12,7 @@ use gpui::{
     px, size, App, AppContext, Bounds, Entity, KeyBinding, Window, WindowAppearance, WindowBounds,
 };
 use gpui_platform::application;
-use std::{ffi::OsString, io::Write as _, path::PathBuf};
+use std::{ffi::OsString, path::PathBuf};
 use termior_ui::workspace_view::{self, OpenWorkspace, WorkspaceView};
 
 fn main() {
@@ -463,18 +463,11 @@ fn install_panic_log() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if let Ok(directory) = termior_store::app_data_dir() {
-            let _ = std::fs::create_dir_all(&directory);
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(directory.join("Termior-crash.log"))
-            {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let _ = writeln!(file, "[{timestamp}] {info}");
-            }
+            let _ = termior_store::append_crash_log(
+                &directory,
+                &info.to_string(),
+                std::iter::empty::<String>(),
+            );
         }
         previous(info);
     }));

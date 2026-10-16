@@ -180,6 +180,34 @@ fn checkpoint_rejects_parent_escape_symlinks_and_hard_links() {
 }
 
 #[test]
+fn output_blob_redacts_known_secrets_before_they_reach_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = OutputBlobStore::new(dir.path(), ["private-value".into()]);
+    let path = store
+        .put("chunk-1", "hello private-value sk-12345678901234567890")
+        .unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(!text.contains("private-value"), "{text}");
+    assert!(!text.contains("sk-123"), "{text}");
+    assert!(text.contains("[REDACTED]"), "{text}");
+}
+
+#[test]
+fn crash_log_redacts_known_secrets_before_they_reach_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = append_crash_log(
+        dir.path(),
+        "panic at private-value sk-12345678901234567890",
+        ["private-value".into()],
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(!text.contains("private-value"), "{text}");
+    assert!(!text.contains("sk-123"), "{text}");
+    assert!(text.contains("[REDACTED]"), "{text}");
+}
+
+#[test]
 fn streaming_redactor_covers_known_and_shaped_credentials() {
     let redactor = StreamingRedactor::new(["private-value".into()]);
     let report = redactor.redact("a private-value b sk-123456789012345 c");

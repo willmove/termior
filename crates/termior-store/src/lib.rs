@@ -12,8 +12,10 @@
 #![forbid(unsafe_code)]
 
 pub mod atomic;
+pub mod blob;
 pub mod checkpoint;
 pub mod collections;
+pub mod crash_log;
 pub mod keymap;
 pub mod migrate;
 pub mod paths;
@@ -24,10 +26,12 @@ pub mod settings;
 pub mod task_journal;
 
 pub use atomic::{atomic_write, atomic_write_bytes, AtomicWriteError};
+pub use blob::OutputBlobStore;
 pub use checkpoint::{
     CheckpointError, CheckpointManifest, CheckpointStore, RestoreAction, RestorePlan,
 };
 pub use collections::{DataFiles, JsonStore, JsonStoreError};
+pub use crash_log::append_crash_log;
 pub use keymap::{
     default_keymap, KeyAction, KeyBinding, KeymapConflict, KeymapEntry, Platform, UserKeyBinding,
     UserKeymap,

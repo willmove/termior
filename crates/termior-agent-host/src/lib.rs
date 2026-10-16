@@ -37,4 +37,6 @@ pub use mcp::{
 };
 pub use projection::BackendTaskProjector;
 pub use session::{ManagedAgentSession, ManagedSessionState, PumpOutcome};
-pub use transport::{JsonRpcLineCodec, StdioTransport, TransportCommand, TransportMessage};
+pub use transport::{
+    JsonRpcLineCodec, StdioCapture, StdioTransport, TransportCommand, TransportMessage,
+};

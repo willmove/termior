@@ -61,6 +61,22 @@ fn one_mcp_server_failure_is_isolated() {
 }
 
 #[test]
+fn mcp_diagnostic_log_redacts_known_secrets_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.log");
+    let mut catalog = McpCatalog::default().with_diagnostic_log(&path, ["private-value".into()]);
+    catalog.mark_disconnected("docs", "failed private-value sk-12345678901234567890");
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(!text.contains("private-value"), "{text}");
+    assert!(!text.contains("sk-123"), "{text}");
+    assert!(text.contains("[REDACTED]"), "{text}");
+    assert_eq!(
+        catalog.failure("docs"),
+        Some("failed [REDACTED] [REDACTED]")
+    );
+}
+
+#[test]
 fn oauth_callback_is_bound_to_state_and_resource() {
     let request = OAuthPkceRequest {
         authorization_endpoint: "https://auth.example".into(),

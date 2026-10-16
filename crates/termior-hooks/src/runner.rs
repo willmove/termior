@@ -76,6 +76,7 @@ pub struct HookPipelineResult {
 pub struct HookPipeline {
     hooks: Vec<HookConfig>,
     recent: Mutex<Vec<HookRunRecord>>,
+    known_secrets: Vec<String>,
 }
 
 impl HookPipeline {
@@ -83,7 +84,13 @@ impl HookPipeline {
         Self {
             hooks,
             recent: Mutex::new(vec![]),
+            known_secrets: Vec::new(),
         }
+    }
+
+    pub fn with_known_secrets(mut self, known_secrets: impl IntoIterator<Item = String>) -> Self {
+        self.known_secrets = known_secrets.into_iter().collect();
+        self
     }
 
     pub fn recent(&self) -> Vec<HookRunRecord> {
@@ -118,6 +125,7 @@ impl HookPipeline {
                 } else {
                     FailurePolicy::Warn
                 },
+                known_secrets: self.known_secrets.clone(),
                 ..HookRunner::default()
             };
             let mut hook_event = event.clone();
@@ -130,7 +138,7 @@ impl HookPipeline {
                         task_id: event.task_id.clone(),
                         point: event.point,
                         decision: "warning".into(),
-                        diagnostic: redact_diagnostic(&message),
+                        diagnostic: redact_diagnostic(&message, &self.known_secrets),
                     });
                     continue;
                 }
@@ -147,7 +155,7 @@ impl HookPipeline {
                     HookDecision::Replace { .. } => "replace",
                 }
                 .into(),
-                diagnostic: redact_diagnostic(&run.diagnostics.join("\n")),
+                diagnostic: redact_diagnostic(&run.diagnostics.join("\n"), &self.known_secrets),
             });
         }
         if let Ok(mut recent) = self.recent.lock() {
@@ -163,10 +171,22 @@ impl HookPipeline {
             records,
         })
     }
+
+    /// Persist hook audit records. The serialized log is redacted again at the disk boundary.
+    pub fn persist_audit(&self, path: &std::path::Path) -> Result<(), HookError> {
+        let json = serde_json::to_string_pretty(&self.recent())
+            .map_err(|error| HookError::FailedClosed(error.to_string()))?;
+        termior_store::StreamingRedactor::new(self.known_secrets.clone())
+            .write_atomic(path, &json)
+            .map_err(|error| HookError::FailedClosed(error.to_string()))?;
+        Ok(())
+    }
 }
 
-fn redact_diagnostic(value: &str) -> String {
-    termior_store::StreamingRedactor::new([]).redact(value).text
+fn redact_diagnostic(value: &str, known_secrets: &[String]) -> String {
+    termior_store::StreamingRedactor::new(known_secrets.iter().cloned())
+        .redact(value)
+        .text
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -180,6 +200,7 @@ pub struct HookRunner {
     pub timeout: Duration,
     pub max_output_bytes: usize,
     pub failure_policy: FailurePolicy,
+    pub known_secrets: Vec<String>,
 }
 impl Default for HookRunner {
     fn default() -> Self {
@@ -187,6 +208,7 @@ impl Default for HookRunner {
             timeout: Duration::from_secs(5),
             max_output_bytes: 64 * 1024,
             failure_policy: FailurePolicy::FailClosed,
+            known_secrets: Vec::new(),
         }
     }
 }
@@ -259,7 +281,7 @@ impl HookRunner {
         }
         let decision = serde_json::from_slice(&stdout)
             .map_err(|error| self.failure(format!("invalid hook decision: {error}")))?;
-        let diagnostic = termior_store::StreamingRedactor::new([])
+        let diagnostic = termior_store::StreamingRedactor::new(self.known_secrets.clone())
             .redact(&String::from_utf8_lossy(&stderr))
             .text;
         Ok(HookRun {
