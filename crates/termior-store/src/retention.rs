@@ -208,10 +208,12 @@ impl RetentionManager {
         cancelled: &AtomicBool,
         after_delete: &mut dyn FnMut(&Path),
     ) -> Result<CleanupReport, RetentionError> {
-        let root = match canonicalize_existing(&self.root) {
-            Some(root) => root,
-            None => return Ok(CleanupReport::default()),
-        };
+        if !self.root.exists() {
+            return Ok(CleanupReport::default());
+        }
+        // Keep the caller's path. Canonicalizing here rewrites macOS /var to
+        // /private/var and Windows \\?\ prefixes, so callers cannot match deleted paths.
+        let root = self.root.clone();
         let files = self.scan()?;
         let mut report = CleanupReport {
             before_bytes: files.iter().map(|file| file.bytes).sum(),
@@ -247,7 +249,7 @@ impl RetentionManager {
                 report.preserved.push(candidate.path);
                 continue;
             }
-            if !same_file_snapshot(&candidate) {
+            if !same_file_snapshot(&candidate) || !inside_root(&root, &candidate.path) {
                 report.preserved.push(candidate.path);
                 continue;
             }
@@ -322,13 +324,13 @@ fn deletion_rank(file: &ScannedFile) -> Option<u8> {
 
 impl RetentionManager {
     fn scan(&self) -> Result<Vec<ScannedFile>, RetentionError> {
-        let Some(root) = canonicalize_existing(&self.root) else {
+        if !self.root.exists() {
             return Ok(Vec::new());
-        };
+        }
         let mut files = Vec::new();
         match self.scope {
-            ScanScope::Tree => collect_tree(&root, &root, true, &mut files)?,
-            ScanScope::AppData => collect_tree(&root, &root, false, &mut files)?,
+            ScanScope::Tree => collect_tree(&self.root, &self.root, true, &mut files)?,
+            ScanScope::AppData => collect_tree(&self.root, &self.root, false, &mut files)?,
         }
         Ok(files)
     }
@@ -640,11 +642,14 @@ fn remove_empty_dirs(root: &Path, dir: &Path) {
     }
 }
 
-fn canonicalize_existing(path: &Path) -> Option<PathBuf> {
-    if !path.exists() {
-        return None;
-    }
-    Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+fn inside_root(root: &Path, path: &Path) -> bool {
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    path.starts_with(root)
 }
 
 fn read_dir_optional(path: &Path) -> Result<Option<std::fs::ReadDir>, RetentionError> {
@@ -1033,5 +1038,30 @@ mod tests {
             std::fs::read(root.join("task/events.jsonl")).unwrap(),
             b"journal"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_reports_the_caller_path_when_the_root_is_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let blob = link.join("task/tool-output/a.txt");
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, vec![b'a'; 4000]).unwrap();
+        std::fs::write(link.join("task/events.jsonl"), b"journal").unwrap();
+
+        let report = RetentionManager::new(&link, policy_tight())
+            .cleanup(u64::MAX, &AtomicBool::new(false))
+            .unwrap();
+        assert!(report.deleted.contains(&blob));
+        assert!(!blob.exists());
+        assert_eq!(
+            std::fs::read(link.join("task/events.jsonl")).unwrap(),
+            b"journal"
+        );
+        assert!(!real.join("task/tool-output/a.txt").exists());
     }
 }
