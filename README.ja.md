@@ -134,7 +134,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-CI は同じ分割を実装します：`ci.yml` はアイコン生成チェック、3 プラットフォームの core ジョブ、desktop ジョブ（check、clippy、テスト、リリースビルド、バイナリサイズゲート、Windows スモークフレーム、分割ペインスモーク、NFR プロセスゲート）、行カバレッジ 80% の coverage ジョブ、PTY スループットゲート付き benchmark ジョブで構成されます。`audit.yml` は push ごとと毎週 `cargo-deny` を実行し、ライセンスと CVE のドリフトを検出します。
+CI は同じ分割を実装します：`ci.yml` はアイコン生成チェック、3 プラットフォームの core ジョブ、desktop ジョブ（check、clippy、テスト、リリースビルド、バイナリサイズゲート、Windows スモークフレーム、分割ペインスモーク、NFR プロセスゲート）、行カバレッジ 80% の coverage ジョブ、PTY スループットゲート付き benchmark ジョブで構成されます。`audit.yml` は push ごとと毎週 `cargo-deny` を実行し、ライセンスと CVE のドリフトを検出します。`nightly.yml` は Ubuntu 上で毎日および `workflow_dispatch` により実行され、OpenSSH と paramiko を入れたあと、ホストランナーで実行できる ignored テスト（`ssh_roundtrip` と `live_release_download`）を走らせます。Codex smoke と keyring のテストは手動です。手順は `docs/nightly-integration.md` を参照してください。
 
 #### アプリアイコン
 

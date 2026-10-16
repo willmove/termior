@@ -134,7 +134,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-CI는 같은 분할을 구현합니다: `ci.yml`은 아이콘 생성 검사, 3 플랫폼 core 잡, desktop 잡(check, clippy, 테스트, 릴리스 빌드, 바이너리 크기 게이트, Windows 스모크 프레임, 분할 창 스모크, NFR 프로세스 게이트), 줄 커버리지 80%의 coverage 잡, PTY 처리량 게이트가 있는 benchmark 잡으로 구성됩니다. `audit.yml`은 push마다와 매주 `cargo-deny`를 실행해 라이선스와 CVE 드리프트를 잡아냅니다.
+CI는 같은 분할을 구현합니다: `ci.yml`은 아이콘 생성 검사, 3 플랫폼 core 잡, desktop 잡(check, clippy, 테스트, 릴리스 빌드, 바이너리 크기 게이트, Windows 스모크 프레임, 분할 창 스모크, NFR 프로세스 게이트), 줄 커버리지 80%의 coverage 잡, PTY 처리량 게이트가 있는 benchmark 잡으로 구성됩니다. `audit.yml`은 push마다와 매주 `cargo-deny`를 실행해 라이선스와 CVE 드리프트를 잡아냅니다. `nightly.yml`은 Ubuntu에서 매일 및 `workflow_dispatch`로 실행됩니다. OpenSSH와 paramiko를 설치한 뒤, 호스팅 러너에서 돌릴 수 있는 ignored 테스트(`ssh_roundtrip`, `live_release_download`)를 실행합니다. Codex smoke와 keyring 테스트는 수동이며 `docs/nightly-integration.md`를 참고하세요.
 
 #### 앱 아이콘
 
