@@ -195,11 +195,15 @@ host key、用户密钥、known_hosts 与文件，不接触真实主机或用户
 带引号的 `-o` 参数解析不同，会报 `invalid quotes`。
 Explorer 回归还验证持久连接计数、缓存/强制刷新/写后失效、特殊文件名、已有文件
 防截断、普通错误后连接复用、服务端卡住时的取消和超时、显式恢复以及关闭后拒绝新请求。
+不设置 `TERMIOR_SSH_ASKPASS_EXE` 时，上述 `ssh_roundtrip` 与发布包下载测试
+`live_release_download` 由 `.github/workflows/nightly.yml` 在 Ubuntu 托管 runner 上定时运行，
+步骤见 `docs/nightly-integration.md`。
 设置 `TERMIOR_SSH_ASKPASS_EXE` 为构建后的 Termior 可执行文件路径，可额外测试真实
 系统凭据库中的密码/私钥口令在连续 SSH 连接及 SFTP 下载中复用，以及终端与 Explorer
 并发连接只询问一次、新协调器从凭据库自动认证；测试凭据结束后删除。运行
-`cargo test -p termior first_prompt_remember -- --ignored` 可验证首次提示的保存/清除流程，
-该测试也仅创建并清理隔离的测试凭据。
+`cargo test -p termior-ui first_prompt_remember -- --ignored` 可验证首次提示的保存/清除流程，
+该测试也仅创建并清理隔离的测试凭据。这两项都会写系统凭据库，托管 runner 上不跑，
+手动前提见 `docs/nightly-integration.md`。
 macOS/Linux 尚需在对应平台运行。
 
 Windows 本机已通过上述真实连接测试、相关 crate 回归测试、桌面测试和 Clippy。

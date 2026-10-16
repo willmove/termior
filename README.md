@@ -136,7 +136,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-CI implements the same split: `ci.yml` runs an icon-generation check, the core job on all three platforms, the desktop job (check, clippy, tests, release build, binary-size gate, Windows smoke frames, split-pane smoke, NFR process gate), a coverage job with an 80% line threshold, and a benchmark job with PTY throughput gating. `audit.yml` runs `cargo-deny` on every push and weekly to catch licence and CVE drift.
+CI implements the same split: `ci.yml` runs an icon-generation check, the core job on all three platforms, the desktop job (check, clippy, tests, release build, binary-size gate, Windows smoke frames, split-pane smoke, NFR process gate), a coverage job with an 80% line threshold, and a benchmark job with PTY throughput gating. `audit.yml` runs `cargo-deny` on every push and weekly to catch licence and CVE drift. `nightly.yml` runs daily and on `workflow_dispatch` on Ubuntu: it installs OpenSSH and paramiko, then runs the ignored tests a hosted runner can support (`ssh_roundtrip` and `live_release_download`). Codex smoke and keyring tests stay manual; see `docs/nightly-integration.md`.
 
 #### Application icons
 
@@ -317,7 +317,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-CI 按同一划分执行：`ci.yml` 包含图标生成校验、三平台 core job、desktop job（check、clippy、测试、release 构建、二进制体积门禁、Windows 渲染烟测、分栏烟测、NFR 进程门禁）、80% 行覆盖率的 coverage job，以及带 PTY 吞吐门禁的 benchmark job；`audit.yml` 在每次 push 与每周定时运行 `cargo-deny`，捕捉许可与 CVE 漂移。
+CI 按同一划分执行：`ci.yml` 包含图标生成校验、三平台 core job、desktop job（check、clippy、测试、release 构建、二进制体积门禁、Windows 渲染烟测、分栏烟测、NFR 进程门禁）、80% 行覆盖率的 coverage job，以及带 PTY 吞吐门禁的 benchmark job；`audit.yml` 在每次 push 与每周定时运行 `cargo-deny`，捕捉许可与 CVE 漂移。`nightly.yml` 在 Ubuntu 上每日以及通过 `workflow_dispatch` 运行：安装 OpenSSH 与 paramiko 后，执行托管 runner 能跑的 ignored 测试（`ssh_roundtrip` 与 `live_release_download`）。Codex smoke 与 keyring 测试仍为手动，步骤见 `docs/nightly-integration.md`。
 
 #### 应用图标
 
