@@ -42,6 +42,9 @@ pub struct Settings {
     pub show_dotfiles: bool,
     /// 代理通知开关（FR-NOTIF-05 P1）。
     pub agent_notifications: bool,
+    /// Agent 数据保留策略（天数与磁盘预算）。清理动作在设置 → Agents。
+    #[serde(default)]
+    pub agent_retention: crate::retention::RetentionPolicy,
     /// Check stable releases and download verified installers in the background.
     pub automatic_updates: bool,
     /// WebGL→GPU 渲染等价开关占位（FR-SET-01）。
@@ -481,6 +484,7 @@ pub fn default_settings() -> Settings {
         language: None,
         show_dotfiles: true,
         agent_notifications: true,
+        agent_retention: crate::retention::RetentionPolicy::default(),
         automatic_updates: true,
         prefer_software_rendering: false,
         vim_mode: false,
@@ -530,6 +534,15 @@ impl Settings {
                 value: self.terminal.letter_spacing.to_string(),
             });
         }
+        if !self.agent_retention.in_settings_range() {
+            return Err(SettingsError::OutOfRange {
+                field: "agent_retention".into(),
+                value: format!(
+                    "{} days / {} bytes",
+                    self.agent_retention.max_age_days, self.agent_retention.max_disk_bytes
+                ),
+            });
+        }
         Ok(())
     }
 }
@@ -550,6 +563,8 @@ mod tests {
         assert_eq!(s.version, SETTINGS_VERSION);
         assert!(s.show_dotfiles);
         assert!(s.agent_notifications);
+        assert_eq!(s.agent_retention.max_age_days, 30);
+        assert!(s.agent_retention.in_settings_range());
         assert!(s.automatic_updates);
         assert_eq!(s.theme_id, "default");
         assert_eq!(s.light_theme_id, "default-light");
@@ -699,5 +714,24 @@ mod tests {
         s.terminal.letter_spacing = 0.0;
         s.terminal.line_height = 0.5;
         assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_settings_gain_default_agent_retention_and_roundtrip_custom_values() {
+        let mut old = serde_json::to_value(default_settings()).unwrap();
+        old.as_object_mut().unwrap().remove("agent_retention");
+        let restored: Settings = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            restored.agent_retention,
+            crate::retention::RetentionPolicy::default()
+        );
+        let mut custom = default_settings();
+        custom.agent_retention.max_age_days = 7;
+        custom.agent_retention.max_disk_bytes = 64 * 1024 * 1024;
+        let roundtrip: Settings =
+            serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
+        assert_eq!(roundtrip.agent_retention, custom.agent_retention);
+        custom.agent_retention.max_age_days = 0;
+        assert!(custom.validate().is_err());
     }
 }

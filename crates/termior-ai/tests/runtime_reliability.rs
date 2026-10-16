@@ -276,6 +276,8 @@ fn snapshot_plus_replay_recovers_incomplete_running_state_as_unknown() {
         .append("state_changed", serde_json::to_value(kind).unwrap(), true)
         .unwrap();
     drop(journal);
+    // The live writer holds the session lease; recovery is the next process.
+    drop(runtime);
     let recovered = TaskRuntime::recover_journal(
         data.path(),
         &task_id,

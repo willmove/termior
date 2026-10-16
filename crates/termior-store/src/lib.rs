@@ -43,7 +43,10 @@ pub use recovery::{
     RecoveryTaskSummary,
 };
 pub use redaction::{RedactionReport, StreamingRedactor};
-pub use retention::{CleanupCandidate, CleanupReport, RetentionManager, RetentionPolicy};
+pub use retention::{
+    cleanup_agent_data, measure_agent_disk_usage, CleanupCandidate, CleanupReport, DiskUsage,
+    RetentionManager, RetentionPolicy, SessionLease, UsageKind,
+};
 pub use settings::{
     default_settings, recommended_models, BackgroundSettings, ModelProviderSettings, ModelSettings,
     Settings, ShellDetection, TerminalSettings,
