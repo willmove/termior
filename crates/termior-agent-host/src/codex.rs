@@ -1,5 +1,5 @@
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use crate::{
 
 pub const CODEX_COMPATIBLE_MINOR: &str = "0.153";
 
-const PERMISSIONS_APPROVAL_METHOD: &str = "item/permissions/requestApproval";
+pub const PERMISSIONS_APPROVAL_METHOD: &str = "item/permissions/requestApproval";
 
 #[derive(Debug, Clone)]
 pub struct CodexProtocol {
@@ -136,7 +136,11 @@ impl CodexBackend {
             .pending_permissions
             .remove(&decision.backend_request_id)
         {
-            Some(requested) => permissions_approval_result(&requested, decision.approved),
+            Some(requested) => permissions_approval_result(
+                &requested,
+                decision.approved,
+                decision.granted_permission_ids.as_deref(),
+            ),
             None => json!({"decision": if decision.approved {"accept"} else {"decline"}}),
         }
     }
@@ -380,14 +384,144 @@ pub fn map_codex_message(value: &Value) -> BackendEvent {
     }
 }
 
-/// Response to `item/permissions/requestApproval`: the granted permission profile plus its scope.
+/// One grantable line inside a Codex permission profile.
 ///
-/// Approval grants the requested profile for the current turn only, never for the session, even
-/// when the server proposes a wider scope. Denial grants an empty profile, which Codex treats as
-/// a refusal without failing the turn.
-pub fn permissions_approval_result(requested: &Value, approved: bool) -> Value {
-    let permissions = if approved && requested.is_object() {
-        requested.clone()
+/// Objects without nested arrays (such as `network`) are a single entry. Each array element,
+/// including a filesystem path or sandbox entry, is its own entry so the approval card can
+/// grant a subset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionEntry {
+    pub id: String,
+    pub label: String,
+}
+
+/// Flat list of permissions the approval card can toggle.
+///
+/// A non-object profile yields no entries, and approving it grants nothing.
+pub fn permission_entries(permissions: &Value) -> Vec<PermissionEntry> {
+    let Some(profile) = permissions.as_object() else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for (key, value) in profile {
+        collect_permission_entries(key, value, &mut entries);
+    }
+    // `serde_json::Map` is a `BTreeMap` unless another crate enables `preserve_order`,
+    // so iteration order is not part of the protocol. Sort ids for a stable card.
+    entries.sort_by(|left, right| left.id.cmp(&right.id));
+    entries
+}
+
+fn collect_permission_entries(path: &str, value: &Value, entries: &mut Vec<PermissionEntry>) {
+    match value {
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let id = format!("{path}[{index}]");
+                entries.push(PermissionEntry {
+                    label: permission_label(&id, item),
+                    id,
+                });
+            }
+        }
+        Value::Object(fields) if fields.values().any(contains_permission_array) => {
+            for (key, child) in fields {
+                collect_permission_entries(&format!("{path}.{key}"), child, entries);
+            }
+        }
+        other => entries.push(PermissionEntry {
+            id: path.to_string(),
+            label: permission_label(path, other),
+        }),
+    }
+}
+
+fn contains_permission_array(value: &Value) -> bool {
+    match value {
+        Value::Array(_) => true,
+        Value::Object(fields) => fields.values().any(contains_permission_array),
+        _ => false,
+    }
+}
+
+fn permission_label(path: &str, value: &Value) -> String {
+    let rendered = match value {
+        Value::String(text) => text.clone(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Null => "null".to_string(),
+        other => other.to_string(),
+    };
+    format!("{path}  {rendered}")
+}
+
+fn retain_permission(path: &str, value: &Value, selected: &HashSet<&str>) -> Option<Value> {
+    match value {
+        Value::Array(items) => {
+            let kept = items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    let id = format!("{path}[{index}]");
+                    selected.contains(id.as_str())
+                })
+                .map(|(_, item)| item.clone())
+                .collect::<Vec<_>>();
+            if kept.is_empty() {
+                None
+            } else {
+                Some(Value::Array(kept))
+            }
+        }
+        Value::Object(fields) if fields.values().any(contains_permission_array) => {
+            let mut kept = serde_json::Map::new();
+            for (key, child) in fields {
+                if let Some(value) = retain_permission(&format!("{path}.{key}"), child, selected) {
+                    kept.insert(key.clone(), value);
+                }
+            }
+            if kept.is_empty() {
+                None
+            } else {
+                Some(Value::Object(kept))
+            }
+        }
+        other => selected.contains(path).then(|| other.clone()),
+    }
+}
+
+fn granted_permission_profile(requested: &Value, granted_ids: Option<&[String]>) -> Value {
+    let Some(profile) = requested.as_object() else {
+        return json!({});
+    };
+    let Some(granted_ids) = granted_ids else {
+        return requested.clone();
+    };
+    let selected = granted_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut kept = serde_json::Map::new();
+    for (key, child) in profile {
+        if let Some(value) = retain_permission(key, child, &selected) {
+            kept.insert(key.clone(), value);
+        }
+    }
+    Value::Object(kept)
+}
+
+/// Response to `item/permissions/requestApproval`: the granted profile plus its scope.
+///
+/// `granted_ids` is the checkbox subset. `None` grants the whole requested profile.
+/// Denial, a non-object profile, or an empty subset grants `{}`. The scope is always
+/// `"turn"`, including when the server proposed `"session"` or a value this client
+/// does not recognize.
+pub fn permissions_approval_result(
+    requested: &Value,
+    approved: bool,
+    granted_ids: Option<&[String]>,
+) -> Value {
+    let permissions = if approved {
+        granted_permission_profile(requested, granted_ids)
     } else {
         json!({})
     };
@@ -411,6 +545,33 @@ mod tests {
     use super::*;
 
     fn permissions_request(scope: &str) -> Value {
+        permissions_request_with(scope, json!({"network":{"enabled":true}}))
+    }
+
+    fn rich_permissions() -> Value {
+        json!({
+            "network": {"enabled": true},
+            "fileSystem": {"write": ["/proj", "/shared"]}
+        })
+    }
+
+    fn decision(approved: bool) -> BackendDecision {
+        BackendDecision {
+            backend_request_id: "7".into(),
+            approved,
+            granted_permission_ids: None,
+        }
+    }
+
+    fn decision_with(approved: bool, ids: &[&str]) -> BackendDecision {
+        BackendDecision {
+            backend_request_id: "7".into(),
+            approved,
+            granted_permission_ids: Some(ids.iter().map(|id| (*id).to_string()).collect()),
+        }
+    }
+
+    fn permissions_request_with(scope: &str, permissions: Value) -> Value {
         json!({
             "jsonrpc":"2.0",
             "id":7,
@@ -419,16 +580,9 @@ mod tests {
                 "threadId":"th-1", "turnId":"turn-1", "itemId":"item-1",
                 "reason":"needs network",
                 "scope":scope,
-                "permissions":{"network":{"enabled":true}}
+                "permissions": permissions
             }
         })
-    }
-
-    fn decision(approved: bool) -> BackendDecision {
-        BackendDecision {
-            backend_request_id: "7".into(),
-            approved,
-        }
     }
 
     #[test]
@@ -458,20 +612,89 @@ mod tests {
     }
 
     #[test]
+    fn checking_every_permission_grants_the_full_profile_for_the_turn() {
+        let requested = rich_permissions();
+        let ids = permission_entries(&requested)
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![
+                "fileSystem.write[0]".to_string(),
+                "fileSystem.write[1]".to_string(),
+                "network".to_string(),
+            ]
+        );
+        let mut backend = CodexBackend::new("codex");
+        backend.track_pending_permissions(&map_codex_message(&permissions_request_with(
+            "session",
+            requested.clone(),
+        )));
+        assert_eq!(
+            backend.approval_result(&decision_with(
+                true,
+                &["network", "fileSystem.write[0]", "fileSystem.write[1]"]
+            )),
+            json!({"permissions": requested, "scope": "turn"})
+        );
+    }
+
+    #[test]
+    fn partial_approval_grants_only_the_checked_permissions() {
+        let requested = rich_permissions();
+        let mut backend = CodexBackend::new("codex");
+        backend.track_pending_permissions(&map_codex_message(&permissions_request_with(
+            "session", requested,
+        )));
+        assert_eq!(
+            backend.approval_result(&decision_with(
+                true,
+                &["not-requested", "fileSystem.write[0]"]
+            )),
+            json!({
+                "permissions": {"fileSystem": {"write": ["/proj"]}},
+                "scope": "turn"
+            })
+        );
+        assert!(backend.pending_permissions.is_empty());
+    }
+
+    #[test]
     fn denying_permissions_replies_with_an_empty_grant() {
         let mut backend = CodexBackend::new("codex");
         backend.track_pending_permissions(&map_codex_message(&permissions_request("session")));
         assert_eq!(
-            backend.approval_result(&decision(false)),
+            backend.approval_result(&decision_with(false, &["network"])),
             json!({"permissions":{}, "scope":"turn"})
         );
         assert!(backend.pending_permissions.is_empty());
     }
 
     #[test]
+    fn unknown_permission_scope_is_kept_for_display_and_granted_only_for_the_turn() {
+        let event = map_codex_message(&permissions_request("something-new"));
+        match &event {
+            BackendEvent::ApprovalRequested { raw, .. } => {
+                assert_eq!(
+                    raw.get("scope").and_then(Value::as_str),
+                    Some("something-new")
+                );
+            }
+            other => panic!("expected an approval request, got {other:?}"),
+        }
+        let mut backend = CodexBackend::new("codex");
+        backend.track_pending_permissions(&event);
+        assert_eq!(
+            backend.approval_result(&decision(true)),
+            json!({"permissions":{"network":{"enabled":true}}, "scope":"turn"})
+        );
+    }
+
+    #[test]
     fn malformed_permission_profile_is_never_granted() {
         assert_eq!(
-            permissions_approval_result(&Value::Null, true),
+            permissions_approval_result(&Value::Null, true, None),
             json!({"permissions":{}, "scope":"turn"})
         );
     }

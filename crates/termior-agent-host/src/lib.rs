@@ -24,7 +24,10 @@ pub use backend::{
     CapabilityProfile, CapabilitySupport, TaskLaunch, TurnLaunch,
 };
 pub use cli::{find_program, AgentBackendKind, CliAgentFeatures, CliAgentProfile, CLI_AGENTS};
-pub use codex::{map_codex_message, CodexBackend, CodexProtocol, CODEX_COMPATIBLE_MINOR};
+pub use codex::{
+    map_codex_message, permission_entries, permissions_approval_result, CodexBackend,
+    CodexProtocol, PermissionEntry, CODEX_COMPATIBLE_MINOR, PERMISSIONS_APPROVAL_METHOD,
+};
 pub use environment::{
     ensure_confined, EnvironmentKind, ExecutionEnvironment, PlatformSandbox, SandboxBackend,
     SandboxCapability, SandboxCommand, SandboxError, SandboxRequest, TrustLevel,

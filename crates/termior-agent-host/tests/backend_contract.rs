@@ -454,7 +454,7 @@ fn managed_session_preserves_process_binding_across_approval_and_completion() {
     ));
 
     let completed = session
-        .respond(true, &mut |_| {}, Duration::from_secs(1))
+        .respond(true, None, &mut |_| {}, Duration::from_secs(1))
         .unwrap();
     assert!(matches!(
         completed,
