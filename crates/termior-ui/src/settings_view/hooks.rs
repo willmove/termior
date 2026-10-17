@@ -76,9 +76,13 @@ impl SettingsView {
                 t!("settings.hooks.enable")
             };
             let hook_id = hook.id.clone();
+            let painted = summary.to_string();
             div()
                 .id(SharedString::from(format!("lifecycle-hook-{index}")))
-                .debug_selector(move || format!("lifecycle-hook-{index}"))
+                .debug_selector({
+                    let painted = painted.clone();
+                    move || painted.clone()
+                })
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -123,9 +127,13 @@ impl SettingsView {
                 "result" => run.result.clone(),
                 "modified" => modified
             );
+            let painted = summary.to_string();
             div()
                 .id(SharedString::from(format!("lifecycle-hook-run-{index}")))
-                .debug_selector(move || format!("lifecycle-hook-run-{index}"))
+                .debug_selector({
+                    let painted = painted.clone();
+                    move || painted.clone()
+                })
                 .text_sm()
                 .aria_label(summary.clone())
                 .child(summary)

@@ -185,9 +185,9 @@ mod tests {
     fn catalog_roundtrip_keeps_enabled_flag() {
         let dir = tempfile::tempdir().unwrap();
         let path = lifecycle_hooks_path(dir.path());
-        let mut catalog = HookCatalog {
-            hooks: vec![sample(true)],
-        };
+        let mut hook = sample(true);
+        hook.args = vec!["lint".into()];
+        let mut catalog = HookCatalog { hooks: vec![hook] };
         assert!(catalog.set_enabled("lint", false));
         catalog.save(&path).unwrap();
         let loaded = HookCatalog::load(&path).unwrap();

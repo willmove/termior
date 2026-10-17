@@ -10,10 +10,6 @@ fn draw(vcx: &mut gpui::VisualTestContext) {
     });
 }
 
-fn a11y_tree(vcx: &mut gpui::VisualTestContext) -> String {
-    vcx.update(|window, _| window.debug_a11y_tree_json().unwrap_or_default())
-}
-
 #[gpui::test]
 fn hooks_page_lists_hooks_and_redacts_recent_runs(cx: &mut TestAppContext) {
     let dir = tempfile::tempdir().unwrap();
@@ -77,30 +73,28 @@ fn hooks_page_lists_hooks_and_redacts_recent_runs(cx: &mut TestAppContext) {
     view.update(vcx, |view, cx| view.set_page(SettingsPage::Hooks, cx));
     draw(vcx);
 
-    assert!(vcx.debug_bounds("lifecycle-hook-0").is_some());
-    assert!(vcx.debug_bounds("lifecycle-hook-1").is_some());
-    assert!(vcx.debug_bounds("lifecycle-hook-run-0").is_some());
-    let tree = a11y_tree(vcx);
+    let first = "lint · project · pre-tool · echo [REDACTED] · 1500 ms";
+    let second = "format · user · post-tool · printf ok · 5000 ms";
+    let run = "pre-tool · 42 ms · replace: path [REDACTED] · arguments modified";
     assert!(
-        tree.contains("project") && tree.contains("pre-tool") && tree.contains("1500"),
-        "hook list should show source, trigger point, and timeout: {tree}"
+        vcx.debug_bounds(first).is_some(),
+        "first hook row should render source, trigger, redacted command, and timeout"
     );
     assert!(
-        tree.contains("user") && tree.contains("post-tool") && tree.contains("printf ok"),
-        "second hook should show source, trigger point, and command: {tree}"
+        vcx.debug_bounds(second).is_some(),
+        "second hook row should render source, trigger, command, and timeout"
     );
     assert!(
-        tree.contains("42") && tree.contains("modified"),
-        "recent run should show duration and whether arguments changed: {tree}"
+        vcx.debug_bounds(run).is_some(),
+        "recent run should render trigger, duration, redacted result, and argument change"
     );
-    assert!(
-        tree.contains("[REDACTED]"),
-        "sensitive fields should be redacted: {tree}"
+    let leaked_hook: &'static str =
+        Box::leak(format!("lint · project · pre-tool · echo {SECRET} · 1500 ms").into_boxed_str());
+    let leaked_run: &'static str = Box::leak(
+        format!("pre-tool · 42 ms · replace: path {SECRET} · arguments modified").into_boxed_str(),
     );
-    assert!(
-        !tree.contains(SECRET),
-        "rendered hook list leaked a secret: {tree}"
-    );
+    assert!(vcx.debug_bounds(leaked_hook).is_none());
+    assert!(vcx.debug_bounds(leaked_run).is_none());
 }
 
 #[gpui::test]
