@@ -19,6 +19,7 @@
 //! 文件 IO 由上层用 termior-store 的原子写完成。
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -182,17 +183,20 @@ pub fn merge_install(existing: &str) -> Result<InstallResult, HooksError> {
         return Err(HooksError::NotAnObject);
     }
 
-    let hooks = root.get_mut("hooks").and_then(|h| h.as_object_mut());
-    // 确保 hooks 是对象
-    if hooks.is_none() {
+    // 缺失或类型不是对象时，先写成空对象再合并三条 hook。
+    if root.get("hooks").and_then(Value::as_object).is_none() {
         root["hooks"] = Value::Object(Map::new());
     }
-    let hooks = root.get_mut("hooks").unwrap().as_object_mut().unwrap();
+    let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return Err(HooksError::NotAnObject);
+    };
 
     let mut added = 0;
     let mut already = 0;
     for ev in HOOK_EVENTS {
-        let termior_event = event_for(ev).unwrap();
+        // 不变量：HOOK_EVENTS 的每一项都由 event_for 映射到 AgentEvent。
+        #[allow(clippy::expect_used)]
+        let termior_event = event_for(ev).expect("hook event has a Termior mapping");
         let cmd = build_command(termior_event);
         // Claude Code hooks 形如 { "hooks": { "Stop": [ { "hooks": [ { "type":"command","command":"..." } ] } ] } }
         let group_list = hooks
@@ -201,7 +205,9 @@ pub fn merge_install(existing: &str) -> Result<InstallResult, HooksError> {
         if !group_list.is_array() {
             *group_list = Value::Array(vec![]);
         }
-        let arr = group_list.as_array_mut().unwrap();
+        let Value::Array(arr) = group_list else {
+            return Err(HooksError::NotAnObject);
+        };
 
         // 检查是否已存在我们的命令（幂等）
         let already_present = arr.iter().any(|g| {

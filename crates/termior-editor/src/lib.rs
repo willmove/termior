@@ -4,6 +4,7 @@
 //! while the application crate only renders the visible viewport.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod buffer;
 pub mod completion;

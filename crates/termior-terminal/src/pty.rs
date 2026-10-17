@@ -418,6 +418,12 @@ fn build_command(
             if batch_dir.is_none() {
                 batch_dir = Some(tempfile::tempdir()?);
             }
+            let Some(askpass_dir) = batch_dir.as_ref() else {
+                return Err(SpawnError::Spawn(
+                    "ssh askpass temp directory missing after creation".into(),
+                ));
+            };
+            let askpass_path = askpass_dir.path();
             let helper = std::env::var_os("TERMIOR_SSH_ASKPASS_EXE")
                 .map(std::path::PathBuf::from)
                 .unwrap_or(std::env::current_exe()?);
@@ -429,16 +435,10 @@ fn build_command(
                 serde_json::to_string(&remote.profile)
                     .map_err(|e| SpawnError::Spawn(e.to_string()))?,
             );
-            cmd.env(
-                "TERMIOR_SSH_ASKPASS_STATE",
-                batch_dir.as_ref().unwrap().path(),
-            );
-            cmd.env(
-                "TERMIOR_SSH_ASKPASS_CANCEL_DIR",
-                batch_dir.as_ref().unwrap().path(),
-            );
+            cmd.env("TERMIOR_SSH_ASKPASS_STATE", askpass_path);
+            cmd.env("TERMIOR_SSH_ASKPASS_CANCEL_DIR", askpass_path);
             if let Some(session) = &config.auth_session {
-                let endpoint = session.register(batch_dir.as_ref().unwrap().path())?;
+                let endpoint = session.register(askpass_path)?;
                 cmd.env(
                     "TERMIOR_SSH_AUTH_ENDPOINT",
                     serde_json::to_string(&endpoint)

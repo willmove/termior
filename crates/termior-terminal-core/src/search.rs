@@ -72,7 +72,11 @@ pub fn find_hyperlinks(text: &str) -> Vec<Range<usize>> {
     // 终端每帧 render 都会调用：正则只编译一次。
     static REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     REGEX
-        .get_or_init(|| Regex::new(r#"https?://[^\s<>\"'`]+"#).expect("static hyperlink regex"))
+        .get_or_init(|| {
+            // 不变量：模式是源码字面量，编译失败说明模式写错了。
+            #[allow(clippy::expect_used)]
+            Regex::new(r#"https?://[^\s<>\"'`]+"#).expect("static hyperlink regex")
+        })
         .find_iter(text)
         .map(|matched| {
             let trimmed = matched

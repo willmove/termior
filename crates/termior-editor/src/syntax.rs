@@ -128,6 +128,8 @@ impl SyntaxDocument {
     pub fn new(language: SyntaxLanguage, source: &str) -> Self {
         let mut parser = language.tree_sitter_language().map(|lang| {
             let mut parser = Parser::new();
+            // 不变量：语法随本 crate 的 tree-sitter 版本一起打包，ABI 不匹配是构建错误。
+            #[allow(clippy::expect_used)]
             parser
                 .set_language(&lang)
                 .expect("bundled grammar must match tree-sitter ABI");

@@ -254,11 +254,12 @@ impl TerminalService for LocalTerminalService {
         }
         let process = self.process(id)?;
         let mut stdin = process.stdin.lock().map_err(|_| lock_error())?;
+        let Some(stdin) = stdin.as_mut() else {
+            return Err(TerminalServiceError::Unsupported("stdin"));
+        };
         stdin
-            .as_mut()
-            .ok_or(TerminalServiceError::Unsupported("stdin"))?
             .write_all(bytes)
-            .and_then(|()| stdin.as_mut().expect("stdin checked above").flush())
+            .and_then(|()| stdin.flush())
             .map_err(|error| TerminalServiceError::Io(error.to_string()))
     }
 
