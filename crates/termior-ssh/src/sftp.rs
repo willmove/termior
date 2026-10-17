@@ -296,7 +296,9 @@ fn connection<'a>(
         control.phase(1);
         *transport = Some(Transport::connect(profile, auth, control, stopped)?);
     }
-    Ok(transport.as_mut().expect("connected transport"))
+    transport
+        .as_mut()
+        .ok_or_else(|| Error::Failed("SFTP transport missing after connect".into()))
 }
 
 fn discard_transport(error: &Error) -> bool {
@@ -328,12 +330,14 @@ impl DirectoryCache {
                     + listing.entries.len()
                     > CACHE_ENTRIES)
         {
-            let oldest = self
+            let Some(oldest) = self
                 .0
                 .iter()
                 .min_by_key(|(_, (time, _))| *time)
                 .map(|(key, _)| key.clone())
-                .unwrap();
+            else {
+                break;
+            };
             self.0.remove(&oldest);
         }
         self.0.insert(path, (Instant::now(), listing));

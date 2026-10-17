@@ -610,7 +610,11 @@ impl ToolExecutor {
                 kind,
             });
         }
-        let shell = guard.as_mut().expect("initialized above");
+        let Some(shell) = guard.as_mut() else {
+            return Err(ToolError::Io(
+                "agent shell session missing after initialization".into(),
+            ));
+        };
         let token = self.proposal_counter.fetch_add(1, Ordering::Relaxed);
         let marker = format!("__TERMIOR_DONE_{token}__");
         let script = persistent_script(shell.kind, command, &marker);

@@ -8,8 +8,10 @@ pub enum Kind {
     Passphrase,
 }
 
-fn account(profile: &Profile, kind: Kind) -> String {
+fn account(profile: &Profile, kind: Kind) -> Result<String, String> {
     // Bind credentials to the destination, not its editable display name.
+    // The scope is only strings and an optional port, so encoding failure is
+    // reported instead of assumed impossible.
     let scope = serde_json::to_vec(&(
         &profile.host,
         &profile.user,
@@ -18,12 +20,15 @@ fn account(profile: &Profile, kind: Kind) -> String {
         &profile.identity_file,
         &profile.known_hosts_file,
     ))
-    .expect("serializable credential scope");
-    format!("{:x}-{kind:?}", Sha256::digest(scope))
+    .map_err(|_| "无法计算凭据作用域".to_string())?;
+    Ok(format!("{:x}-{kind:?}", Sha256::digest(scope)))
 }
 
 pub fn same_target(a: &Profile, b: &Profile) -> bool {
-    account(a, Kind::Password) == account(b, Kind::Password)
+    matches!(
+        (account(a, Kind::Password), account(b, Kind::Password)),
+        (Ok(left), Ok(right)) if left == right
+    )
 }
 
 pub fn delete_all(profile: &Profile) -> Result<(), String> {
@@ -32,7 +37,7 @@ pub fn delete_all(profile: &Profile) -> Result<(), String> {
 }
 
 fn entry(profile: &Profile, kind: Kind) -> Result<keyring::Entry, String> {
-    keyring::Entry::new("Termior-ssh", &account(profile, kind))
+    keyring::Entry::new("Termior-ssh", &account(profile, kind)?)
         .map_err(|_| "系统凭据库不可用；未写入任何明文凭据".into())
 }
 
@@ -107,10 +112,19 @@ mod tests {
         };
         let mut q = p.clone();
         q.name = "two".into();
-        assert_eq!(account(&p, Kind::Password), account(&q, Kind::Password));
+        assert_eq!(
+            account(&p, Kind::Password).unwrap(),
+            account(&q, Kind::Password).unwrap()
+        );
         q.port = Some(2222);
-        assert_ne!(account(&p, Kind::Password), account(&q, Kind::Password));
-        assert_ne!(account(&p, Kind::Password), account(&p, Kind::Passphrase));
+        assert_ne!(
+            account(&p, Kind::Password).unwrap(),
+            account(&q, Kind::Password).unwrap()
+        );
+        assert_ne!(
+            account(&p, Kind::Password).unwrap(),
+            account(&p, Kind::Passphrase).unwrap()
+        );
     }
     #[test]
     fn never_fill_jump_host_otp_or_generic_prompts() {

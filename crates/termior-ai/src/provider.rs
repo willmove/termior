@@ -54,7 +54,11 @@ impl MockProvider {
 impl Provider for MockProvider {
     fn stream_chat<'a>(&'a self, _req: &'a ProviderRequest) -> BoxStream<'a, ChatEvent> {
         let events = {
-            let mut guard = self.scripts.lock().unwrap();
+            let Ok(mut guard) = self.scripts.lock() else {
+                return Box::pin(futures::stream::iter([ChatEvent::Error(
+                    "mock provider script lock poisoned".into(),
+                )]));
+            };
             if guard.is_empty() {
                 vec![ChatEvent::Done(Message::assistant(""))]
             } else {

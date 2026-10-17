@@ -153,7 +153,17 @@ impl TaskJournal {
             state,
         };
         let text = serde_json::to_string_pretty(&snapshot)?;
-        atomic_write(&self.path.parent().unwrap().join("snapshot.json"), &text)?;
+        let snapshot_path = self
+            .path
+            .parent()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "journal path has no parent directory",
+                )
+            })?
+            .join("snapshot.json");
+        atomic_write(&snapshot_path, &text)?;
         Ok(snapshot)
     }
 
