@@ -22,7 +22,7 @@
 
 ## 已知差距
 
-- 官方新增了 `item/permissions/requestApproval`（权限审批，scope 为 `session` / `turn`）。适配器已把它映射为 `ApprovalRequested`（保留原始 request ID），不再静默挂起。Composer 审批卡列出每项请求的权限（默认勾选）并显示服务端提议的 scope。批准时只回传勾选子集 `{permissions: <子集>, scope: "turn"}`，拒绝时回传 `{permissions: {}, scope: "turn"}`；无论服务端提议 `turn`、`session` 还是未知 scope，授权都只限当前 turn。响应形状来自对协议的理解，本机没有 `codex`，尚未用 `generate-json-schema` 与真实 CLI 核验；脱敏录制样本仍未收录。
+- 官方新增了 `item/permissions/requestApproval`（权限审批，响应 scope 为 `session` / `turn`）。适配器已把它映射为 `ApprovalRequested`（保留原始 request ID），不再静默挂起。Composer 审批卡列出每项请求的权限（默认勾选）；请求参数里若带 `scope` 会原样显示。批准时只回传勾选子集 `{permissions: <子集>, scope: "turn"}`，拒绝时回传 `{permissions: {}, scope: "turn"}`；无论服务端提议 `turn`、`session` 还是未知 scope，授权都只限当前 turn。`rust-v0.137.0` 与 `rust-v0.153.0` 的生成 schema 里，scope 在响应上，不在请求参数上。脱敏样本在 `crates/termior-agent-host/tests/fixtures/codex-permissions-request-approval/`：按这两个 tag 的 schema 与 `permissions.rs` 序列化规则重建，并用 `StreamingRedactor` 脱敏。构建该样本时环境里没有 `codex`，没有重新跑 `generate-json-schema`。
 - 官方已标记弃用 `thread/rollback`、`thread/compacted`、`item/fileChange/outputDelta`；适配器都没有使用。
 
 ## 锁定策略

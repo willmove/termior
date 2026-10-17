@@ -20,3 +20,4 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+termior-store = { workspace = true }
