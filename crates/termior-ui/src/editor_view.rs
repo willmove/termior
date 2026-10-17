@@ -1149,7 +1149,24 @@ fn default_editor_theme() -> EditorTheme {
     builtin_editor_themes()
         .into_iter()
         .find(|theme| theme.id == "nord")
-        .expect("bundled nord editor theme")
+        .unwrap_or_else(|| {
+            // 内置目录应包含 nord。目录缺失时仍用同一套颜色，避免编辑器无法构造。
+            log::warn!("bundled editor themes are missing nord; using the built-in fallback");
+            EditorTheme {
+                id: "nord".into(),
+                name: "Nord".into(),
+                background: "#2e3440".into(),
+                foreground: "#d8dee9".into(),
+                comment: "#616e88".into(),
+                keyword: "#81a1c1".into(),
+                string: "#a3be8c".into(),
+                number: "#b48ead".into(),
+                function: "#88c0d0".into(),
+                type_name: "#ebcb8b".into(),
+                selection: "#434c5e".into(),
+                cursor: "#88c0d0".into(),
+            }
+        })
 }
 
 fn line_ranges(source: &str) -> Vec<Range<usize>> {

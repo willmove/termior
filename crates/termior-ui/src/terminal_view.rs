@@ -27,8 +27,8 @@ use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Arc};
 use termior_store::{TerminalSettings, UserKeymap};
 use termior_terminal::{
     shared_terminal_service, CommandCreate, CommandOwner, CommandSessionId, Controller,
-    LocalTerminalService, PtySessionConfig, TerminalBridge, TerminalEventProxy, TerminalService,
-    TerminalServiceError,
+    LocalTerminalService, PtySessionConfig, SpawnError, TerminalBridge, TerminalEventProxy,
+    TerminalService, TerminalServiceError,
 };
 use termior_terminal_core::{
     find_hyperlinks,
@@ -158,16 +158,16 @@ pub struct TerminalView {
 impl TerminalView {
     /// 创建终端视图：内部 spawn PTY、启动字节消费循环。
     /// 生产路径用 `from_bridge`（在 GPUI borrow 周期外 spawn，避免 RefCell 重入）；
-    /// 本构造函数保留给测试/未来单测场景。
+    /// 本构造函数保留给测试/未来单测场景。PTY 启动失败时把错误交回调用方。
     #[allow(dead_code)]
     pub fn new(
         palette: ResolvedPalette,
         settings: TerminalSettings,
         keymap: UserKeymap,
         cx: &mut Context<Self>,
-    ) -> Self {
-        let bridge = TerminalBridge::spawn(&PtySessionConfig::default()).expect("PTY spawn failed");
-        Self::from_bridge(bridge, palette, settings, keymap, cx)
+    ) -> Result<Self, SpawnError> {
+        let bridge = TerminalBridge::spawn(&PtySessionConfig::default())?;
+        Ok(Self::from_bridge(bridge, palette, settings, keymap, cx))
     }
 
     /// 用已 spawn 的 bridge 创建视图。

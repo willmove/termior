@@ -688,6 +688,22 @@ impl SshView {
             let Some(selected) = selected else {
                 return;
             };
+            let local_path = selected.path().to_string_lossy().into_owned();
+            let status = tf!(
+                "ssh.transfer.pending",
+                "action" => if upload { t!("ssh.transfer.upload") } else { t!("ssh.transfer.download") },
+                "name" => profile.name,
+                "host" => profile.host,
+                "local" => local_path,
+                "arrow" => if upload { "→" } else { "←" },
+                "remote" => remote_path,
+                "warning" => if resume {
+                    t!("ssh.transfer.resume_warning")
+                } else {
+                    t!("ssh.transfer.overwrite_warning")
+                }
+            )
+            .to_string();
             let connection = Connection {
                 profile,
                 kind: SessionKind::Sftp,
@@ -696,26 +712,11 @@ impl SshView {
                     recursive,
                     resume,
                     remote_path,
-                    local_path: selected.path().to_string_lossy().into_owned(),
+                    local_path,
                 }),
             };
             let _ = this.update(cx, |this, cx| {
-                let transfer = connection.transfer.as_ref().unwrap();
-                this.status = tf!(
-                    "ssh.transfer.pending",
-                    "action" => if upload { t!("ssh.transfer.upload") } else { t!("ssh.transfer.download") },
-                    "name" => connection.profile.name,
-                    "host" => connection.profile.host,
-                    "local" => transfer.local_path,
-                    "arrow" => if upload { "→" } else { "←" },
-                    "remote" => transfer.remote_path,
-                    "warning" => if resume {
-                        t!("ssh.transfer.resume_warning")
-                    } else {
-                        t!("ssh.transfer.overwrite_warning")
-                    }
-                )
-                .to_string();
+                this.status = status;
                 this.pending_transfer = Some(connection);
                 cx.notify();
             });
