@@ -15,7 +15,7 @@
 //! 崩溃报告仅本地留存。本断言由 `NO_TELEMETRY` 常量固化，供上层展示与审计。
 
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod deny_list;
 pub mod gating;

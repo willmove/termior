@@ -4,7 +4,7 @@
 //! Markdown parsing. GPUI rendering lives in the desktop application crate.
 
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};

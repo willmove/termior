@@ -8,6 +8,8 @@
 //! 有回归则以非零码退出（CI 据此 fail）。这是把「感觉流畅」转成「可对比达标证据」
 //! 的最后一环（ticket 目标）。
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 

@@ -16,6 +16,8 @@
 //! 冷启动绝对值依赖硬件，故 CI 门禁用「相对基线回归」，而非 spec 绝对目标
 //! （spec 绝对目标作为发布验收参考，记录在 docs/nfr-baselines.md）。
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -99,14 +101,11 @@ fn main() {
         }
     };
 
-    match run(&args) {
-        Ok(payload) => {
-            let nfr = NfrPayload::Run(payload);
-            println!(
-                "{}",
-                serde_json::to_string(&nfr).expect("serialize run payload")
-            );
-        }
+    match run(&args).and_then(|payload| {
+        serde_json::to_string(&NfrPayload::Run(payload))
+            .map_err(|err| format!("serialize run payload: {err}"))
+    }) {
+        Ok(json) => println!("{json}"),
         Err(e) => {
             eprintln!("nfr-run: {e}");
             std::process::exit(3);

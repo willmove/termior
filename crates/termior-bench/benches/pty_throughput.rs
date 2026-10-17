@@ -6,6 +6,8 @@
 //! GPU/显示噪声。该 bench 在 headless CI（ubuntu）即可跑，是 NFR 回归门禁主干项。
 //! 一次性取值（喂基线）由 `src/bin/nfr-pty.rs` 完成，复用同一 `vte_harness`。
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use std::hint::black_box;
 
 use alacritty_terminal::vte::ansi::{Processor as VteProcessor, StdSyncHandler};

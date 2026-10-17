@@ -10,7 +10,7 @@
 //! 切换时上层（GPUI Entity）广播重绘；本模块只提供主题数据与解析，不依赖 GPUI。
 
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use serde::{Deserialize, Serialize};
 

@@ -1,7 +1,7 @@
 //! Git source-control subsystem (FR-VCS).
 
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod graph;
 mod repository;

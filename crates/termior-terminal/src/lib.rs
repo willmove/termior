@@ -6,7 +6,7 @@
 //! 本 crate 不含 GPUI 渲染，保持可独立测试；渲染层在 `termior` 消费。
 //! 对齐 spec §5.2 的 `Termior-terminal` crate 与 §6.2 FR-TERM。
 
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod bridge;
 pub mod pty;

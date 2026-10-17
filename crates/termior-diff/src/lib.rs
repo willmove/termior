@@ -7,7 +7,7 @@
 //! 验收对齐 Spec §6.3：「AI 提议 5 个 hunk、接受 4 拒 1，落盘结果精确等于接受集」。
 
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};

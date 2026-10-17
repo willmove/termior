@@ -8,7 +8,7 @@
 //! [`osc`] 模块的状态机保证：无显式 OSC 777/133;C 序列时，不产出任何状态事件。
 
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod command;
 pub mod command_context;
