@@ -27,7 +27,7 @@
 
 `PermissionGrantScope` 在响应上，取值 `turn` | `session`。请求参数没有 `scope`。`strictAutoReview` 可选；Termior 的响应不带这个字段，服务端把缺省当成 `false`。
 
-夹具字节是 `serde_json` 紧凑编码（对象键排序）经过脱敏后的结果。字段集合与 schema 一致。
+夹具是 `serde_json` 紧凑编码经过脱敏后的结果。字段集合与 schema 一致。工作区里其它 crate 会打开 `serde_json` 的 `preserve_order`，整仓测试时对象键顺序和单独编译本 crate 不同。契约测试比较解析后的 JSON 值。
 
 ## 三条请求
 

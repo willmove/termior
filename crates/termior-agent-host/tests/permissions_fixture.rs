@@ -83,9 +83,21 @@ fn recorded_permission_fixtures_match_the_redacted_schema_and_the_approval_mappi
     let requests = redacted_requests_jsonl();
     let responses = response_jsonl(&requests);
     assert_redacted(&requests);
-    assert_eq!(requests, REQUESTS, "redacted request fixture drifted");
+    assert_redacted(REQUESTS);
     assert_redacted(&responses);
-    assert_eq!(responses, RESPONSES, "permission response fixture drifted");
+    assert_redacted(RESPONSES);
+    // `serde_json` key order follows feature unification (`preserve_order` vs `BTreeMap`).
+    // The committed JSONL is the redacted document; the contract is the parsed value.
+    assert_eq!(
+        parse_jsonl(&requests),
+        parse_jsonl(REQUESTS),
+        "redacted request fixture drifted"
+    );
+    assert_eq!(
+        parse_jsonl(&responses),
+        parse_jsonl(RESPONSES),
+        "permission response fixture drifted"
+    );
 }
 
 #[test]
