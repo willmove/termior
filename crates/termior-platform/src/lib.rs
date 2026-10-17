@@ -1,7 +1,7 @@
 //! Small platform boundary: notification routing, native notification commands and external URLs.
 
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod notification;
 mod open;

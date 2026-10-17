@@ -4,7 +4,7 @@
 //! 视图层不直接书写间距、圆角、字号与颜色字面量——那些只从这里取。
 
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod layout;
 mod search;

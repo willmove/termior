@@ -4,7 +4,7 @@
 //! it has been normalized by a backend adapter.
 
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod acp;
 mod acp_host;

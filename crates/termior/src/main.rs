@@ -3,7 +3,7 @@
 // Windows: GUI subsystem — no console window; closing a terminal won't kill the app.
 // Smoke/NFR scripts that redirect stdout still receive println! via inherited pipes.
 #![windows_subsystem = "windows"]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 // 视图层已实现于 `termior-ui` crate（spec §5.2）；入口只保留进程装配、
 // smoke/NFR 探针与崩溃日志。

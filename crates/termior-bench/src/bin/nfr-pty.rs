@@ -5,6 +5,8 @@
 //! 设计取舍：门禁要的是「单值 vs 基线」，不需要 criterion 的多次采样与预热；
 //! 单值采样噪声由阈值（百分比带宽）吸收。
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -18,6 +20,13 @@ const MEASURE_MIB: usize = 5;
 const MEASURE_BYTES: usize = MEASURE_MIB * 1024 * 1024;
 
 fn main() {
+    if let Err(err) = emit_payload() {
+        eprintln!("nfr-pty: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn emit_payload() -> Result<(), String> {
     // 预热一次：走通热路径、稳定分配器后再计时。
     let warmup = synthetic_pty_output(MEASURE_BYTES);
     feed_once(&warmup);
@@ -31,11 +40,10 @@ fn main() {
         bytes: bytes.len() as u64,
         elapsed_secs: elapsed,
     };
-    let nfr = NfrPayload::PtyThroughput(payload);
-    println!(
-        "{}",
-        serde_json::to_string(&nfr).expect("serialize payload")
-    );
+    let json = serde_json::to_string(&NfrPayload::PtyThroughput(payload))
+        .map_err(|err| format!("serialize payload: {err}"))?;
+    println!("{json}");
+    Ok(())
 }
 
 fn feed_once(bytes: &[u8]) {

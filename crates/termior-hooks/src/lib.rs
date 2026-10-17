@@ -19,7 +19,7 @@
 //! 文件 IO 由上层用 termior-store 的原子写完成。
 
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

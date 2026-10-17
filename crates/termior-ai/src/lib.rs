@@ -17,7 +17,7 @@
 //! `HttpProvider` 承担真实网络调用；`MockProvider` 用于确定性跑通 Agent 循环测试。
 
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod agent;
 pub mod approval;

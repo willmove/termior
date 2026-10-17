@@ -1,6 +1,6 @@
 //! OpenSSH profiles and OS credential-vault integration. Profiles never contain secrets.
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod auth;
 pub mod credentials;

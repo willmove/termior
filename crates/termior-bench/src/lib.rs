@@ -13,6 +13,7 @@
 //! 阈值语义见 [`Baseline::threshold_percent`]。
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod baselines;
 mod compare;

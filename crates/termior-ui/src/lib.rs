@@ -1,7 +1,7 @@
 //! Persistent business state for tabs, panes, sidebar, settings and Composer mounting (FR-WS).
 
 #![forbid(unsafe_code)]
-#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 // 本地化宏必须最先声明（`#[macro_use]` 的文本作用域），
 // 其余模块的 `t!` / `tf!` / `tn!` 调用才能不限定路径直接使用。
