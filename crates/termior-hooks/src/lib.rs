@@ -24,11 +24,18 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub mod catalog;
 pub mod runner;
 
+pub use catalog::{
+    hook_list_entries, hook_runs_path, lifecycle_hooks_path, load_run_log, recent_run_entries,
+    HookCatalog, HookListEntry, HookRunEntry, HOOK_RUNS_FILE, LIFECYCLE_HOOKS_FILE,
+    RECENT_RUN_LIMIT,
+};
 pub use runner::{
     FailurePolicy, HookConfig, HookDecision, HookError, HookEvent, HookPipeline,
-    HookPipelineResult, HookPoint, HookRun, HookRunRecord, HookRunner, HOOK_SCHEMA_VERSION,
+    HookPipelineResult, HookPoint, HookRun, HookRunRecord, HookRunner, DEFAULT_HOOK_TIMEOUT_MS,
+    HOOK_SCHEMA_VERSION,
 };
 
 /// 我们写入的 hook 事件名（Claude Code 的 hook key）。

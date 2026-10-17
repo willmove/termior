@@ -143,6 +143,7 @@ pub enum SettingsPage {
     Themes,
     Shortcuts,
     Agents,
+    Hooks,
     About,
 }
 

@@ -3,13 +3,28 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use wait_timeout::ChildExt;
 
 pub const HOOK_SCHEMA_VERSION: u32 = 1;
+/// Default per-hook timeout. A stored `timeout_ms` of 0 means this default.
+pub const DEFAULT_HOOK_TIMEOUT_MS: u64 = 5_000;
+
+fn default_timeout_ms() -> u64 {
+    DEFAULT_HOOK_TIMEOUT_MS
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_source() -> String {
+    "user".into()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -21,6 +36,20 @@ pub enum HookPoint {
     PostChangeApply,
     PreVerification,
     PostVerification,
+}
+
+impl HookPoint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreTask => "pre-task",
+            Self::PostTask => "post-task",
+            Self::PreTool => "pre-tool",
+            Self::PostTool => "post-tool",
+            Self::PostChangeApply => "post-change-apply",
+            Self::PreVerification => "pre-verification",
+            Self::PostVerification => "post-verification",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,8 +82,35 @@ pub struct HookConfig {
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
+    #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_enabled")]
     pub fail_closed: bool,
+    /// Where the hook was declared (`user`, a project path, or another origin).
+    #[serde(default = "default_source")]
+    pub source: String,
+    /// Per-hook timeout in milliseconds. `0` uses [`DEFAULT_HOOK_TIMEOUT_MS`].
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl HookConfig {
+    pub fn command_line(&self) -> String {
+        if self.args.is_empty() {
+            self.program.clone()
+        } else {
+            format!("{} {}", self.program, self.args.join(" "))
+        }
+    }
+
+    pub fn effective_timeout(&self) -> Duration {
+        let ms = if self.timeout_ms == 0 {
+            DEFAULT_HOOK_TIMEOUT_MS
+        } else {
+            self.timeout_ms
+        };
+        Duration::from_millis(ms)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +120,10 @@ pub struct HookRunRecord {
     pub point: HookPoint,
     pub decision: String,
     pub diagnostic: String,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub modified_arguments: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,17 +134,79 @@ pub struct HookPipelineResult {
 }
 
 pub struct HookPipeline {
-    hooks: Vec<HookConfig>,
+    hooks: Mutex<Vec<HookConfig>>,
     recent: Mutex<Vec<HookRunRecord>>,
     known_secrets: Vec<String>,
+    catalog_path: Option<PathBuf>,
+    runs_path: Option<PathBuf>,
 }
 
 impl HookPipeline {
     pub fn new(hooks: Vec<HookConfig>) -> Self {
         Self {
-            hooks,
+            hooks: Mutex::new(hooks),
             recent: Mutex::new(vec![]),
             known_secrets: Vec::new(),
+            catalog_path: None,
+            runs_path: None,
+        }
+    }
+
+    /// Reload enablement from this catalog before each run, and persist toggles here.
+    pub fn with_catalog_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.catalog_path = Some(path.into());
+        self
+    }
+
+    /// Append redacted run records to this file after each invocation.
+    pub fn with_runs_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.runs_path = Some(path.into());
+        self
+    }
+
+    pub fn configs(&self) -> Vec<HookConfig> {
+        self.hooks
+            .lock()
+            .map(|hooks| hooks.clone())
+            .unwrap_or_default()
+    }
+
+    /// Enable or disable one hook. When a catalog path is set, the change is written
+    /// before the method returns so the next run — including another pipeline — skips it.
+    pub fn set_enabled(&self, id: &str, enabled: bool) -> bool {
+        let Some(hooks) = self.hooks.lock().ok().and_then(|mut hooks| {
+            let hook = hooks.iter_mut().find(|hook| hook.id == id)?;
+            hook.enabled = enabled;
+            Some(hooks.clone())
+        }) else {
+            return false;
+        };
+        let Some(path) = &self.catalog_path else {
+            return true;
+        };
+        if (crate::catalog::HookCatalog { hooks }).save(path).is_err() {
+            if let Ok(mut hooks) = self.hooks.lock() {
+                if let Some(hook) = hooks.iter_mut().find(|hook| hook.id == id) {
+                    hook.enabled = !enabled;
+                }
+            }
+            return false;
+        }
+        true
+    }
+
+    fn sync_from_catalog(&self) {
+        let Some(path) = &self.catalog_path else {
+            return;
+        };
+        if !path.exists() {
+            return;
+        }
+        let Ok(catalog) = crate::catalog::HookCatalog::load(path) else {
+            return;
+        };
+        if let Ok(mut hooks) = self.hooks.lock() {
+            *hooks = catalog.hooks;
         }
     }
 
@@ -108,18 +230,21 @@ impl HookPipeline {
     where
         F: FnMut(&Value) -> Result<(), String>,
     {
+        self.sync_from_catalog();
+        let hooks = self.configs();
         let mut arguments = event
             .arguments
             .clone()
             .unwrap_or(Value::Object(Default::default()));
         let original = arguments.clone();
         let mut records = Vec::new();
-        for hook in self
-            .hooks
-            .iter()
+        for hook in hooks
+            .into_iter()
             .filter(|hook| hook.enabled && hook.point == HookPoint::PreTool)
         {
+            let started = Instant::now();
             let runner = HookRunner {
+                timeout: hook.effective_timeout(),
                 failure_policy: if hook.fail_closed {
                     FailurePolicy::FailClosed
                 } else {
@@ -133,43 +258,100 @@ impl HookPipeline {
             let run = match runner.run(&hook.program, &hook.args, &hook_event) {
                 Ok(run) => run,
                 Err(HookError::Warning(message)) => {
-                    records.push(HookRunRecord {
-                        hook_id: hook.id.clone(),
-                        task_id: event.task_id.clone(),
-                        point: event.point,
-                        decision: "warning".into(),
-                        diagnostic: redact_diagnostic(&message, &self.known_secrets),
-                    });
+                    records.push(self.record(&hook, event, "warning", &message, started, false));
                     continue;
                 }
-                Err(error) => return Err(error),
-            };
-            arguments = runner.apply_pre_tool(&arguments, run.decision.clone(), &mut revalidate)?;
-            records.push(HookRunRecord {
-                hook_id: hook.id.clone(),
-                task_id: event.task_id.clone(),
-                point: event.point,
-                decision: match run.decision {
-                    HookDecision::Allow => "allow",
-                    HookDecision::Deny { .. } => "deny",
-                    HookDecision::Replace { .. } => "replace",
+                Err(error) => {
+                    records.push(self.record(
+                        &hook,
+                        event,
+                        "failed",
+                        &error.to_string(),
+                        started,
+                        false,
+                    ));
+                    self.remember(&records);
+                    return Err(error);
                 }
-                .into(),
-                diagnostic: redact_diagnostic(&run.diagnostics.join("\n"), &self.known_secrets),
-            });
-        }
-        if let Ok(mut recent) = self.recent.lock() {
-            recent.extend(records.clone());
-            if recent.len() > 100 {
-                let remove = recent.len() - 100;
-                recent.drain(..remove);
+            };
+            let before = arguments.clone();
+            match runner.apply_pre_tool(&before, run.decision.clone(), &mut revalidate) {
+                Ok(next) => {
+                    let modified = next != before;
+                    arguments = next;
+                    let decision = match &run.decision {
+                        HookDecision::Allow => "allow",
+                        HookDecision::Deny { .. } => "deny",
+                        HookDecision::Replace { .. } => "replace",
+                    };
+                    records.push(self.record(
+                        &hook,
+                        event,
+                        decision,
+                        &run.diagnostics.join("\n"),
+                        started,
+                        modified,
+                    ));
+                }
+                Err(error) => {
+                    let (decision, detail) = match &error {
+                        HookError::Denied(reason) => ("deny", reason.clone()),
+                        HookError::Revalidation(reason) => ("revalidation", reason.clone()),
+                        other => ("failed", other.to_string()),
+                    };
+                    let diagnostic = if run.diagnostics.is_empty() {
+                        detail
+                    } else {
+                        format!("{detail}\n{}", run.diagnostics.join("\n"))
+                    };
+                    records.push(self.record(&hook, event, decision, &diagnostic, started, false));
+                    self.remember(&records);
+                    return Err(error);
+                }
             }
         }
+        self.remember(&records);
         Ok(HookPipelineResult {
             replaced: arguments != original,
             arguments,
             records,
         })
+    }
+
+    fn record(
+        &self,
+        hook: &HookConfig,
+        event: &HookEvent,
+        decision: &str,
+        diagnostic: &str,
+        started: Instant,
+        modified_arguments: bool,
+    ) -> HookRunRecord {
+        HookRunRecord {
+            hook_id: hook.id.clone(),
+            task_id: event.task_id.clone(),
+            point: hook.point,
+            decision: decision.to_owned(),
+            diagnostic: redact_diagnostic(diagnostic, &self.known_secrets),
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            modified_arguments,
+        }
+    }
+
+    fn remember(&self, records: &[HookRunRecord]) {
+        if records.is_empty() {
+            return;
+        }
+        if let Ok(mut recent) = self.recent.lock() {
+            recent.extend(records.iter().cloned());
+            if recent.len() > 100 {
+                let remove = recent.len() - 100;
+                recent.drain(..remove);
+            }
+        }
+        if let Some(path) = &self.runs_path {
+            let _ = self.persist_audit(path);
+        }
     }
 
     /// Persist hook audit records. The serialized log is redacted again at the disk boundary.

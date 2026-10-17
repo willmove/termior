@@ -495,6 +495,8 @@ fn pre_tool_hook_replacement_is_revalidated_and_shown_in_the_new_approval() {
             args,
             enabled: true,
             fail_closed: true,
+            source: "user".into(),
+            timeout_ms: termior_hooks::DEFAULT_HOOK_TIMEOUT_MS,
         },
     ]));
     let registry = ToolRegistry::new(WorkspaceAuthRegistry::with_roots([dir
@@ -530,7 +532,9 @@ fn pre_tool_hook_replacement_is_revalidated_and_shown_in_the_new_approval() {
     let approval = runtime.pending_approval().unwrap();
     assert!(approval.arguments.contains("b.txt"));
     assert!(!approval.arguments.contains("a.txt"));
-    assert_eq!(pipeline.recent()[0].decision, "replace");
+    let record = &pipeline.recent()[0];
+    assert_eq!(record.decision, "replace");
+    assert!(record.modified_arguments);
 }
 
 #[test]

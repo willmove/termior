@@ -104,6 +104,8 @@ fn hook_audit_file_redacts_known_secrets_on_disk() {
         args,
         enabled: true,
         fail_closed: true,
+        source: "user".into(),
+        timeout_ms: 5_000,
     }])
     .with_known_secrets(["private-value".into()]);
     let event = HookEvent {
@@ -119,6 +121,10 @@ fn hook_audit_file_redacts_known_secrets_on_disk() {
     let text = std::fs::read_to_string(path).unwrap();
     assert!(!text.contains("private-value"), "{text}");
     assert!(text.contains("[REDACTED]"), "{text}");
+    let record = &pipeline.recent()[0];
+    assert_eq!(record.decision, "allow");
+    assert!(!record.modified_arguments);
+    assert!(record.duration_ms < 5_000, "{}", record.duration_ms);
 }
 
 #[test]
@@ -149,4 +155,86 @@ fn subprocess_timeout_follows_fail_closed_policy() {
     assert!(
         matches!(runner.run(program, &args, &event), Err(HookError::FailedClosed(message)) if message.contains("timed out"))
     );
+}
+
+fn missing_program() -> HookConfig {
+    HookConfig {
+        id: "skip".into(),
+        point: HookPoint::PreTool,
+        program: "definitely-not-a-real-hook-binary".into(),
+        args: Vec::new(),
+        enabled: true,
+        fail_closed: true,
+        source: "user".into(),
+        timeout_ms: 5_000,
+    }
+}
+
+fn pre_tool_event() -> HookEvent {
+    HookEvent {
+        schema_version: HOOK_SCHEMA_VERSION,
+        point: HookPoint::PreTool,
+        task_id: "task".into(),
+        tool: Some("read_file".into()),
+        arguments: Some(json!({"path": "a.txt"})),
+    }
+}
+
+#[test]
+fn disabled_hook_does_not_run() {
+    let mut config = missing_program();
+    config.enabled = false;
+    let pipeline = HookPipeline::new(vec![config]);
+    let outcome = pipeline
+        .apply_pre_tool(&pre_tool_event(), |_| {
+            panic!("a disabled hook must not revalidate")
+        })
+        .unwrap();
+    assert!(!outcome.replaced);
+    assert!(outcome.records.is_empty());
+    assert!(pipeline.recent().is_empty());
+}
+
+#[test]
+fn disabling_a_hook_persists_and_the_next_pipeline_skips_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = termior_hooks::lifecycle_hooks_path(dir.path());
+    let pipeline = HookPipeline::new(vec![missing_program()]).with_catalog_path(&path);
+    assert!(pipeline.set_enabled("skip", false));
+    let loaded = termior_hooks::HookCatalog::load(&path).unwrap();
+    assert!(!loaded.hooks[0].enabled);
+
+    let outcome = pipeline
+        .apply_pre_tool(&pre_tool_event(), |_| panic!("disabled hook must not run"))
+        .unwrap();
+    assert!(outcome.records.is_empty());
+
+    let again = HookPipeline::new(loaded.hooks);
+    let outcome = again
+        .apply_pre_tool(&pre_tool_event(), |_| {
+            panic!("reloaded disabled hook must not run")
+        })
+        .unwrap();
+    assert!(outcome.records.is_empty());
+}
+
+#[test]
+fn catalog_on_disk_stops_a_live_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = termior_hooks::lifecycle_hooks_path(dir.path());
+    let config = missing_program();
+    let mut catalog = termior_hooks::HookCatalog {
+        hooks: vec![config.clone()],
+    };
+    catalog.save(&path).unwrap();
+    let pipeline = HookPipeline::new(vec![config]).with_catalog_path(&path);
+    catalog.set_enabled("skip", false);
+    catalog.save(&path).unwrap();
+    let outcome = pipeline
+        .apply_pre_tool(&pre_tool_event(), |_| {
+            panic!("disk disable must stop the live pipeline")
+        })
+        .unwrap();
+    assert!(outcome.records.is_empty());
+    assert_eq!(outcome.arguments, json!({"path": "a.txt"}));
 }
