@@ -213,9 +213,11 @@ impl WorkspaceView {
                 .explorer_tree
                 .select(entries[(selected + 1).min(entries.len() - 1)].path.clone()),
             "home" => self.explorer_tree.select(entries[0].path.clone()),
-            "end" => self
-                .explorer_tree
-                .select(entries.last().expect("entries is non-empty").path.clone()),
+            "end" => {
+                if let Some(entry) = entries.last() {
+                    self.explorer_tree.select(entry.path.clone());
+                }
+            }
             "right" => {
                 let entry = &entries[selected];
                 if entry.is_dir && !self.explorer_tree.is_expanded(&entry.path) {

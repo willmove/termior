@@ -1,6 +1,7 @@
 //! Filesystem-backed explorer, index and content search (FR-EXPL).
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 mod directory;
 mod index;

@@ -3,7 +3,7 @@ use gpui::{
     div, prelude::*, px, Context, MouseButton, MouseDownEvent, Render, SharedString, Window,
 };
 use termior_platform::open_external;
-use termior_preview::{normalize_preview_url, PreviewTab};
+use termior_preview::{normalize_preview_url, PreviewBackend, PreviewTab};
 
 /// Web preview view.
 ///
@@ -18,10 +18,9 @@ pub struct PreviewView {
 impl PreviewView {
     pub fn new(url: String) -> Self {
         let state = match normalize_preview_url(&url) {
-            Ok(url) => PreviewTab::new(url).expect("normalized preview URL"),
+            Ok(url) => preview_tab(url),
             Err(error) => {
-                let mut state =
-                    PreviewTab::new("http://localhost:3000").expect("static preview fallback URL");
+                let mut state = preview_tab("http://localhost:3000");
                 state
                     .fallback(tf!("preview.invalid_url", "error" => error.to_string()).to_string());
                 state
@@ -38,6 +37,23 @@ impl PreviewView {
     ) {
         if let Err(error) = open_external(&self.state.url) {
             log::warn!("open browser failed: {error}");
+        }
+    }
+}
+
+/// `PreviewTab::new` 拒绝无法解析的地址时保留原文，并记入错误，而不是 panic。
+fn preview_tab(url: impl Into<String>) -> PreviewTab {
+    let url = url.into();
+    match PreviewTab::new(&url) {
+        Ok(tab) => tab,
+        Err(error) => {
+            log::warn!("preview URL rejected: {error}");
+            PreviewTab {
+                url,
+                backend: PreviewBackend::ExternalBrowser,
+                last_error: Some(error.to_string()),
+                navigation_generation: 0,
+            }
         }
     }
 }
