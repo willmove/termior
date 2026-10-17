@@ -1,7 +1,7 @@
 # ui-design-system Specification
 
 ## Purpose
-TBD - created by archiving change ui-design-system-overhaul. Update Purpose after archive.
+用共享的尺寸 token、图标和控件契约替换各视图里散落的魔法数字与 Unicode 字形，让界面遵循同一套设计系统。
 
 ## Requirements
 
