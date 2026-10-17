@@ -1,12 +1,12 @@
 # Termior AI Agent 演进路线
 
-本文是 `docs/termior-spec.md` 中 M6–M10 的实施索引。详细需求、设计和任务分别放在五个 OpenSpec change 中,后续编码代理应按依赖顺序逐个实现、验证和归档,不要把五个阶段合并为一次大改。
+本文是 `docs/user/termior-spec.md` 中 M6–M10 的实施索引。详细需求、设计和任务分别放在五个 OpenSpec change 中,后续编码代理应按依赖顺序逐个实现、验证和归档,不要把五个阶段合并为一次大改。
 
 ## 产品方向
 
 Termior 的目标是成为以终端现场为核心、可验证、可恢复、可扩展的 Agent 工作台。内置 Agent 保留 BYOK 和本地模型路径;结构化外部 Agent 用于复用成熟执行能力;普通 CLI/TUI Agent 继续获得 Termior 的终端、附件、通知与审阅增强。
 
-架构依据见 [ADR 0005](./adr/0005-hybrid-agent-host-architecture.md)。调研参考包括 [Claude Code 的执行循环](https://code.claude.com/docs/en/how-claude-code-works)、[Codex app-server](https://learn.chatgpt.com/docs/app-server)、[ACP 架构](https://agentclientprotocol.com/get-started/architecture)、[Warp Full Terminal Use](https://docs.warp.dev/agents/capabilities/full-terminal-use/)、[Agent Skills 规范](https://agentskills.io/specification) 与 [MCP 架构](https://modelcontextprotocol.io/docs/2026-07-28/learn/architecture)。这些外部能力随版本变化,实现时须重新核验协议版本和稳定性标记。
+架构依据见 [ADR 0005](../adr/0005-hybrid-agent-host-architecture.md)。调研参考包括 [Claude Code 的执行循环](https://code.claude.com/docs/en/how-claude-code-works)、[Codex app-server](https://learn.chatgpt.com/docs/app-server)、[ACP 架构](https://agentclientprotocol.com/get-started/architecture)、[Warp Full Terminal Use](https://docs.warp.dev/agents/capabilities/full-terminal-use/)、[Agent Skills 规范](https://agentskills.io/specification) 与 [MCP 架构](https://modelcontextprotocol.io/docs/2026-07-28/learn/architecture)。这些外部能力随版本变化,实现时须重新核验协议版本和稳定性标记。
 
 ## 依赖顺序
 
@@ -20,11 +20,11 @@ M6 可靠单代理
 
 | 里程碑 | OpenSpec change | 核心退出条件 |
 |---|---|---|
-| M6 | [`agent-stage-a-reliable-runtime`](../openspec/changes/archive/2026-10-11-agent-stage-a-reliable-runtime/)（已归档） | 单代理完整完成“读取→修改→审阅→验证→失败后修正”,工具调用不丢失、不重复执行 |
-| M7 | [`agent-stage-b-terminal-workbench`](../openspec/changes/agent-stage-b-terminal-workbench/) | 长命令可流式观察、等待、输入、停止和接管;一个结构化外部后端端到端可用 |
-| M8 | [`agent-stage-c-context-ecosystem`](../openspec/changes/agent-stage-c-context-ecosystem/) | 长会话能压缩并保留目标;Skills/MCP 可控可诊断;第二后端证明能力协商有效 |
-| M9 | [`agent-stage-d-recovery-isolation`](../openspec/changes/agent-stage-d-recovery-isolation/) | 崩溃后能安全恢复;检查点范围准确;需要隔离的任务不会静默直接执行 |
-| M10 | [`agent-stage-e-parallel-automation`](../openspec/changes/agent-stage-e-parallel-automation/) | 多任务在预算和并发限制内运行;写任务隔离;自动化每次运行可审计、可取消 |
+| M6 | [`agent-stage-a-reliable-runtime`](../../openspec/changes/archive/2026-10-11-agent-stage-a-reliable-runtime/)（已归档） | 单代理完整完成“读取→修改→审阅→验证→失败后修正”,工具调用不丢失、不重复执行 |
+| M7 | [`agent-stage-b-terminal-workbench`](../../openspec/changes/agent-stage-b-terminal-workbench/) | 长命令可流式观察、等待、输入、停止和接管;一个结构化外部后端端到端可用 |
+| M8 | [`agent-stage-c-context-ecosystem`](../../openspec/changes/agent-stage-c-context-ecosystem/) | 长会话能压缩并保留目标;Skills/MCP 可控可诊断;第二后端证明能力协商有效 |
+| M9 | [`agent-stage-d-recovery-isolation`](../../openspec/changes/agent-stage-d-recovery-isolation/) | 崩溃后能安全恢复;检查点范围准确;需要隔离的任务不会静默直接执行 |
+| M10 | [`agent-stage-e-parallel-automation`](../../openspec/changes/agent-stage-e-parallel-automation/) | 多任务在预算和并发限制内运行;写任务隔离;自动化每次运行可审计、可取消 |
 
 ## 跨阶段不变量
 
@@ -39,7 +39,7 @@ M6 可靠单代理
 ## 编码代理执行约定
 
 1. 只领取当前 change 中未完成且所有前置任务已完成的一项或一组紧邻任务。
-2. 开始前读取 `AGENTS.md`、`CONTEXT.md`、`docs/termior-spec.md`、本路线、ADR 0005 和该 change 的 proposal/design/spec/tasks。
+2. 开始前读取 `AGENTS.md`、`CONTEXT.md`、`docs/user/termior-spec.md`、本路线、ADR 0005 和该 change 的 proposal/design/spec/tasks。
 3. 先实现不依赖 GPUI 的领域模型和纯逻辑测试,再连接进程、存储和 UI。
 4. 不得用字符串启发式绕过稳定 ID、状态机或协议能力协商。
 5. 完成任务后更新对应 `tasks.md` 的复选框,记录实际测试命令;如偏离设计,先更新 design/spec 再改代码。

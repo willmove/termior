@@ -21,7 +21,7 @@ M6 先建立可靠单代理基线，使一次任务的每个动作都能被识�
 
 ### Modified Capabilities
 
-- 无；`openspec/specs/` 尚无已归档 Agent capability。本 change 细化 `docs/termior-spec.md` 的 FR-ARUN、FR-ACHG-01/02/03 与 FR-AORCH-07。
+- 无；`openspec/specs/` 尚无已归档 Agent capability。本 change 细化 `docs/user/termior-spec.md` 的 FR-ARUN、FR-ACHG-01/02/03 与 FR-AORCH-07。
 
 ## Impact
 

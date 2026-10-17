@@ -1,7 +1,7 @@
 # reliable-agent-runtime Specification
 
 ## Purpose
-TBD - created by archiving change agent-stage-a-reliable-runtime. Update Purpose after archive.
+单次 Agent 任务的每个动作都可识别、排队、批准、执行、验证和终止：完整工具队列、严格工具契约、取消与预算，以及变更审阅后的验收闭环。
 
 ## Requirements
 

@@ -12,7 +12,7 @@
 
 > 오픈소스, 크로스 플랫폼, 터미널 우선 AI 네이티브 개발 환경(ADE). BYOK, 로컬 우선, 계정 불필요, 텔레메트리 없음.
 
-Termior는 실제 PTY 터미널, 가벼운 코드 에디터, 파일 탐색기, Git, 웹 미리보기, 그리고 도구 호출·승인·변경 검토·복구 기능을 갖춘 내장/외부 에이전트를 하나의 네이티브 창에 통합합니다. 제품 및 엔지니어링 사양은 [docs/termior-spec.md](docs/termior-spec.md)를 참고하세요.
+Termior는 실제 PTY 터미널, 가벼운 코드 에디터, 파일 탐색기, Git, 웹 미리보기, 그리고 도구 호출·승인·변경 검토·복구 기능을 갖춘 내장/외부 에이전트를 하나의 네이티브 창에 통합합니다. 제품 및 엔지니어링 사양은 [docs/user/termior-spec.md](docs/user/termior-spec.md)를 참고하세요.
 
 ### 설치
 
@@ -39,7 +39,7 @@ xattr -cr /Applications/Termior.app
 
 - 영속 워크스페이스, 8종 탭, 분할 창, Explorer / Source Control / History 사이드바, 상태 표시줄, 별도 설정 창;
 - portable-pty + alacritty_terminal 기반 실제 터미널: 셸 통합(bash/zsh/fish/PowerShell), OSC 7/133/777, IME, 검색, 스크롤백, URL/localhost 감지, Windows Job Objects. 설정에서 기본 셸 선택(시스템 기본 / 감지된 셸(Git Bash, WSL 배포판 포함) / 수동 경로)과 새 터미널 생성 시 셸 선택 메뉴(선택 사항). 복사/붙여넣기/모두 선택 컨텍스트 메뉴;
-- [SSH 세션과 SFTP](docs/ssh.md): 연결 프로필과 사이드바 빠른 연결, OS 자격 증명 저장소, 비밀번호/MFA/키/에이전트 인증, 점프 호스트, 호스트 키 검증, 재개 가능한 파일/디렉터리 전송. 듀얼 패인 SFTP 브라우저와 활성 원격 탭을 따라가는 파일 탐색기;
+- [SSH 세션과 SFTP](docs/user/ssh.md): 연결 프로필과 사이드바 빠른 연결, OS 자격 증명 저장소, 비밀번호/MFA/키/에이전트 인증, 점프 호스트, 호스트 키 검증, 재개 가능한 파일/디렉터리 전송. 듀얼 패인 SFTP 브라우저와 활성 원격 탭을 따라가는 파일 탐색기;
 - Rope 편집 버퍼, 가상화 뷰포트, tree-sitter 증분 하이라이팅, 검색, 실행 취소/다시 실행, 인라인 완성 고스트 텍스트, 10종 에디터 테마, Vim 상호작용 레이어;
 - 파일 인덱싱(얕은 인덱싱과 디바운스 감시), gitignore 인식, 퍼지 검색, 스트리밍 백그라운드 grep, 키보드 트리 탐색과 완전한 컨텍스트 메뉴. 탭별 프로젝트 폴더와 `cd` 주입, 사이드바 추종;
 - Git 전용 diff / history / commit-file 탭, 파일 및 hunk 단위 stage/unstage, 확인 거부(discard), commit, branch, fetch/pull/push, 커밋 그래프. 상태 갱신은 UI 스레드에서 분리;
@@ -56,7 +56,7 @@ xattr -cr /Applications/Termior.app
 - 내장/터미널 에이전트의 통합 알림 라우팅: 대상이 보일 때는 억제, 숨겨졌을 때는 테마 toast, 창이 포커스를 잃으면 시스템 알림, 헤더 벨에 현재 상태 표시;
 - Claude Code OSC hooks의 안전하고 멱등적인 설치와 제거.
 
-이는 여전히 단계적 마일스톤이며, 사양 전체의 최종 승인은 아닙니다. 기본 데스크톱 범위는 [docs/desktop-milestone.md](docs/desktop-milestone.md), Agent 스테이지 A–E의 구현 증거와 플랫폼 샌드박싱, 원격 MCP OAuth, 실제 ACP 클라이언트, 백그라운드 자동화 실행 경계는 [docs/ai-agent-implementation-status.md](docs/ai-agent-implementation-status.md)에 문서화되어 있습니다.
+이는 여전히 단계적 마일스톤이며, 사양 전체의 최종 승인은 아닙니다. 기본 데스크톱 범위는 [docs/process/desktop-milestone.md](docs/process/desktop-milestone.md), Agent 스테이지 A–E의 구현 증거와 플랫폼 샌드박싱, 원격 MCP OAuth, 실제 ACP 클라이언트, 백그라운드 자동화 실행 경계는 [docs/process/ai-agent-implementation-status.md](docs/process/ai-agent-implementation-status.md)에 문서화되어 있습니다.
 
 최신 릴리스 태그는 `v0.2.1`이며, 워크스페이스 버전은 [Cargo.toml](Cargo.toml)에 정의됩니다.
 
@@ -134,7 +134,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-CI는 같은 분할을 구현합니다: `ci.yml`은 아이콘 생성 검사, 3 플랫폼 core 잡, desktop 잡(check, clippy, 테스트, 릴리스 빌드, 바이너리 크기 게이트, Windows 스모크 프레임, 분할 창 스모크, NFR 프로세스 게이트), 줄 커버리지 80%의 coverage 잡, PTY 처리량 게이트가 있는 benchmark 잡으로 구성됩니다. `audit.yml`은 push마다와 매주 `cargo-deny`를 실행해 라이선스와 CVE 드리프트를 잡아냅니다. `nightly.yml`은 Ubuntu에서 매일 및 `workflow_dispatch`로 실행됩니다. OpenSSH와 paramiko를 설치한 뒤, 호스팅 러너에서 돌릴 수 있는 ignored 테스트(`ssh_roundtrip`, `live_release_download`)를 실행합니다. Codex smoke와 keyring 테스트는 수동이며 `docs/nightly-integration.md`를 참고하세요.
+CI는 같은 분할을 구현합니다: `ci.yml`은 아이콘 생성 검사, 3 플랫폼 core 잡, desktop 잡(check, clippy, 테스트, 릴리스 빌드, 바이너리 크기 게이트, Windows 스모크 프레임, 분할 창 스모크, NFR 프로세스 게이트), 줄 커버리지 80%의 coverage 잡, PTY 처리량 게이트가 있는 benchmark 잡으로 구성됩니다. `audit.yml`은 push마다와 매주 `cargo-deny`를 실행해 라이선스와 CVE 드리프트를 잡아냅니다. `nightly.yml`은 Ubuntu에서 매일 및 `workflow_dispatch`로 실행됩니다. OpenSSH와 paramiko를 설치한 뒤, 호스팅 러너에서 돌릴 수 있는 ignored 테스트(`ssh_roundtrip`, `live_release_download`)를 실행합니다. Codex smoke와 keyring 테스트는 수동이며 `docs/process/nightly-integration.md`를 참고하세요.
 
 #### 앱 아이콘
 

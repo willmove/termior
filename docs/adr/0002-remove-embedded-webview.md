@@ -4,11 +4,11 @@
 - 日期：2026-07-22
 - 决策者：Termior 维护者（经 `/grill-with-docs` 决策票 `.scratch/m5-completion/issues/07-webview-strategy-decision.md` 落地）
 - 取代：`termior-spec.md` v0.1 中 §3（Web 预览 = `gpui-wry`/`wry` 子 WebView）、§6.6 FR-PREV-03、风险 R2 的“保留 wry”前提
-- 相关：`docs/zed-embedded-webview-research.md`
+- 相关：`docs/process/archive/zed-embedded-webview-research.md`
 
 ## 背景
 
-`termior-spec.md` v0.1 把 Web 预览设计为“在预览 tab 存活期间创建 `wry` 子 WebView”（§6.6 FR-PREV-03），Windows 用 WebView2、macOS 用 WKWebView，Linux 仅走系统浏览器降级。`docs/zed-embedded-webview-research.md` 随后确认：上游 Zed/GPUI **不使用** 任何内嵌 WebView，`gpui-wry`/`wry` 纯粹是 Termior 自加的产品能力，并带来一组已知缺陷——子 WebView 与 GPUI 合成存在 z-order/焦点限制、Windows 上 WebView2 同步构造会重入 Win32 消息泵导致 panic、增加三平台编译与发行成本、Linux 发行策略一直悬而未决。
+`termior-spec.md` v0.1 把 Web 预览设计为“在预览 tab 存活期间创建 `wry` 子 WebView”（§6.6 FR-PREV-03），Windows 用 WebView2、macOS 用 WKWebView，Linux 仅走系统浏览器降级。`docs/process/archive/zed-embedded-webview-research.md` 随后确认：上游 Zed/GPUI **不使用** 任何内嵌 WebView，`gpui-wry`/`wry` 纯粹是 Termior 自加的产品能力，并带来一组已知缺陷——子 WebView 与 GPUI 合成存在 z-order/焦点限制、Windows 上 WebView2 同步构造会重入 Win32 消息泵导致 panic、增加三平台编译与发行成本、Linux 发行策略一直悬而未决。
 
 围绕“继续维护内嵌 WebView 还是退回系统浏览器降级”，决策票 `07` 标记为 `needs-triage` 并阻塞了 Linux 发行票 `10`。
 

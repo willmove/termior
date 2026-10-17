@@ -25,4 +25,4 @@
 
 - [x] 4.1 侧栏测试：分组渲染顺序（含空分组）、折叠/展开、移动到分组持久化、分组重命名/删除、命令栏新建空分组
 - [x] 4.2 管理窗口测试：分组字段往返 + upsert + 清空归未分组而分组保留
-- [x] 4.3 `docs/termior-spec.md` FR-SSH-01 与 §7 文件表回写；`docs/ssh.md` 新增「连接分组」章节与 schema v2 说明
+- [x] 4.3 `docs/user/termior-spec.md` FR-SSH-01 与 §7 文件表回写；`docs/user/ssh.md` 新增「连接分组」章节与 schema v2 说明

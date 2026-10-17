@@ -14,7 +14,7 @@
 
 > An open-source, cross-platform, terminal-first AI-native development environment (ADE). BYOK, local-first, no account, no telemetry.
 
-Termior brings a real PTY terminal, a lightweight code editor, a file explorer, Git, web preview, and a built-in/external agent with tool calling, approvals, change review, and recovery into a single native window. The authoritative product and engineering specification is [docs/termior-spec.md](docs/termior-spec.md).
+Termior brings a real PTY terminal, a lightweight code editor, a file explorer, Git, web preview, and a built-in/external agent with tool calling, approvals, change review, and recovery into a single native window. The authoritative product and engineering specification is [docs/user/termior-spec.md](docs/user/termior-spec.md).
 
 ### Installation
 
@@ -41,7 +41,7 @@ The workspace has moved from a pure-logic prototype to a buildable GPUI desktop 
 
 - Persistent workspaces, 8 tab kinds, splits, Explorer / Source Control / History sidebars, a status bar, and a separate settings window;
 - A real terminal built on portable-pty and alacritty_terminal: shell integration (bash/zsh/fish/PowerShell), OSC 7/133/777, IME, search, scrollback, URL and localhost detection, and Windows Job Objects; a Settings default-shell picker (system default / detected shells incl. Git Bash and WSL distros / manual path) plus an optional ask-on-new-terminal shell menu; a copy/paste/select-all context menu;
-- [SSH sessions and SFTP](docs/ssh.md): connection profiles with sidebar quick-connect, OS credential store, password/MFA/key/agent authentication, jump hosts, host key verification, and file/directory transfer with resume; a dual-pane SFTP browser plus a File Explorer that follows the active remote tab;
+- [SSH sessions and SFTP](docs/user/ssh.md): connection profiles with sidebar quick-connect, OS credential store, password/MFA/key/agent authentication, jump hosts, host key verification, and file/directory transfer with resume; a dual-pane SFTP browser plus a File Explorer that follows the active remote tab;
 - Rope edit buffers, a virtualized viewport, incremental tree-sitter highlighting, search, undo/redo, inline completion ghost text, 10 editor themes, and a Vim interaction layer;
 - File indexing with shallow indexing and debounced watching, gitignore awareness, fuzzy find, streaming background grep, keyboard tree navigation, and full context menus; per-tab project folders with `cd` injection and sidebar follow;
 - Dedicated Git diff / history / commit-file tabs, file- and hunk-level stage/unstage, confirmed discard, commit, branch, fetch/pull/push, and a commit graph, with status refresh moved off the UI thread;
@@ -58,7 +58,7 @@ The workspace has moved from a pure-logic prototype to a buildable GPUI desktop 
 - Unified notification routing for built-in and terminal agents: suppressed while the target is visible, themed toast when hidden, system notification when the window is unfocused, with a header bell listing current states;
 - Safe, idempotent installation and removal of Claude Code OSC hooks.
 
-This is still a staged milestone, not final acceptance of the whole spec. The baseline desktop scope is documented in [docs/desktop-milestone.md](docs/desktop-milestone.md); implementation evidence for Agent stages A–E, along with platform sandboxing, remote MCP OAuth, a real ACP client, and background automation execution boundaries, is documented in [docs/ai-agent-implementation-status.md](docs/ai-agent-implementation-status.md).
+This is still a staged milestone, not final acceptance of the whole spec. The baseline desktop scope is documented in [docs/process/desktop-milestone.md](docs/process/desktop-milestone.md); implementation evidence for Agent stages A–E, along with platform sandboxing, remote MCP OAuth, a real ACP client, and background automation execution boundaries, is documented in [docs/process/ai-agent-implementation-status.md](docs/process/ai-agent-implementation-status.md).
 
 The latest tagged release is `v0.2.1`; the workspace version lives in [Cargo.toml](Cargo.toml).
 
@@ -136,7 +136,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-CI implements the same split: `ci.yml` runs an icon-generation check, the core job on all three platforms, the desktop job (check, clippy, tests, release build, binary-size gate, Windows smoke frames, split-pane smoke, NFR process gate), a coverage job with an 80% line threshold, and a benchmark job with PTY throughput gating. `audit.yml` runs `cargo-deny` on every push and weekly to catch licence and CVE drift. `nightly.yml` runs daily and on `workflow_dispatch` on Ubuntu: it installs OpenSSH and paramiko, then runs the ignored tests a hosted runner can support (`ssh_roundtrip` and `live_release_download`). Codex smoke and keyring tests stay manual; see `docs/nightly-integration.md`.
+CI implements the same split: `ci.yml` runs an icon-generation check, the core job on all three platforms, the desktop job (check, clippy, tests, release build, binary-size gate, Windows smoke frames, split-pane smoke, NFR process gate), a coverage job with an 80% line threshold, and a benchmark job with PTY throughput gating. `audit.yml` runs `cargo-deny` on every push and weekly to catch licence and CVE drift. `nightly.yml` runs daily and on `workflow_dispatch` on Ubuntu: it installs OpenSSH and paramiko, then runs the ignored tests a hosted runner can support (`ssh_roundtrip` and `live_release_download`). Codex smoke and keyring tests stay manual; see `docs/process/nightly-integration.md`.
 
 #### Application icons
 
@@ -192,7 +192,7 @@ The project itself is under the [MIT License](LICENSE). Third-party dependency l
 
 > 开源、跨平台、终端优先的 AI 原生开发工作台（ADE）。BYOK、本地优先、无账号、无遥测。
 
-Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、文件浏览器、Git、Web 预览，以及具有工具调用、审批、变更审阅与恢复能力的内置/外部 Agent。产品与工程规格见 [docs/termior-spec.md](docs/termior-spec.md)。
+Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、文件浏览器、Git、Web 预览，以及具有工具调用、审批、变更审阅与恢复能力的内置/外部 Agent。产品与工程规格见 [docs/user/termior-spec.md](docs/user/termior-spec.md)。
 
 ### 安装
 
@@ -219,7 +219,7 @@ xattr -cr /Applications/Termior.app
 
 - 持久化工作区、8 类 tab、分栏、Explorer/Source Control/History 侧栏、状态栏、独立设置窗口；
 - portable-pty + alacritty_terminal 真终端，shell integration（bash/zsh/fish/PowerShell）、OSC 7/133/777、IME、搜索、回滚滚动、URL/localhost 检测和 Windows Job Object；设置页可选默认 Shell（系统默认 / 探测到的 shell，含 Git Bash 与 WSL 发行版 / 手动路径），并可开启「新建终端时选择 Shell」；提供复制/粘贴/全选的上下文菜单；
-- [SSH 会话与 SFTP](docs/ssh.md)：连接配置与侧栏快捷连接、系统凭据库、密码/MFA/密钥/agent 认证、跳板机、主机指纹校验、文件/目录上传下载与续传，并提供双栏 SFTP 浏览器与跟随活动远程 tab 的 File Explorer；
+- [SSH 会话与 SFTP](docs/user/ssh.md)：连接配置与侧栏快捷连接、系统凭据库、密码/MFA/密钥/agent 认证、跳板机、主机指纹校验、文件/目录上传下载与续传，并提供双栏 SFTP 浏览器与跟随活动远程 tab 的 File Explorer；
 - Rope 编辑缓冲、虚拟可视区、tree-sitter 增量高亮、搜索、撤销重做、行内补全 ghost text、10 套编辑器主题和 Vim 交互层；
 - 文件索引（浅层索引与防抖监听）、gitignore、模糊查找、后台流式 grep、键盘树导航与完整上下文菜单；按 tab 记忆项目文件夹并注入 `cd`，侧栏跟随该锚点；
 - Git 专用 diff/history/commit-file 页签、文件/hunk stage/unstage、确认 discard、commit、branch、fetch/pull/push 与 commit graph，状态刷新已移出 UI 线程；
@@ -236,7 +236,7 @@ xattr -cr /Applications/Termior.app
 - 内置/终端 Agent 统一通知路由：可见时抑制、隐藏时主题 toast、窗口失焦时系统通知，并在 header 铃铛列出当前状态；
 - Claude Code OSC hooks 的安全、幂等安装与卸载。
 
-这仍是阶段性里程碑，不等于整份 spec 已最终验收。基础桌面范围见 [docs/desktop-milestone.md](docs/desktop-milestone.md)；Agent A–E 的实现证据与平台 sandbox、远端 MCP OAuth、真实 ACP 客户端和自动化后台执行等边界见 [docs/ai-agent-implementation-status.md](docs/ai-agent-implementation-status.md)。
+这仍是阶段性里程碑，不等于整份 spec 已最终验收。基础桌面范围见 [docs/process/desktop-milestone.md](docs/process/desktop-milestone.md)；Agent A–E 的实现证据与平台 sandbox、远端 MCP OAuth、真实 ACP 客户端和自动化后台执行等边界见 [docs/process/ai-agent-implementation-status.md](docs/process/ai-agent-implementation-status.md)。
 
 最新发布 tag 为 `v0.2.1`，工作区版本号定义在 [Cargo.toml](Cargo.toml)。
 
@@ -317,7 +317,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-CI 按同一划分执行：`ci.yml` 包含图标生成校验、三平台 core job、desktop job（check、clippy、测试、release 构建、二进制体积门禁、Windows 渲染烟测、分栏烟测、NFR 进程门禁）、80% 行覆盖率的 coverage job，以及带 PTY 吞吐门禁的 benchmark job；`audit.yml` 在每次 push 与每周定时运行 `cargo-deny`，捕捉许可与 CVE 漂移。`nightly.yml` 在 Ubuntu 上每日以及通过 `workflow_dispatch` 运行：安装 OpenSSH 与 paramiko 后，执行托管 runner 能跑的 ignored 测试（`ssh_roundtrip` 与 `live_release_download`）。Codex smoke 与 keyring 测试仍为手动，步骤见 `docs/nightly-integration.md`。
+CI 按同一划分执行：`ci.yml` 包含图标生成校验、三平台 core job、desktop job（check、clippy、测试、release 构建、二进制体积门禁、Windows 渲染烟测、分栏烟测、NFR 进程门禁）、80% 行覆盖率的 coverage job，以及带 PTY 吞吐门禁的 benchmark job；`audit.yml` 在每次 push 与每周定时运行 `cargo-deny`，捕捉许可与 CVE 漂移。`nightly.yml` 在 Ubuntu 上每日以及通过 `workflow_dispatch` 运行：安装 OpenSSH 与 paramiko 后，执行托管 runner 能跑的 ignored 测试（`ssh_roundtrip` 与 `live_release_download`）。Codex smoke 与 keyring 测试仍为手动，步骤见 `docs/process/nightly-integration.md`。
 
 #### 应用图标
 

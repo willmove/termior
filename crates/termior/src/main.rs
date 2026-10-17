@@ -171,7 +171,7 @@ fn main() {
 ///   键入回显探针（NFR-02），由 workspace 打印结果并退出；否则直接 `cx.quit()`。
 ///
 /// RSS 由 harness 用 sysinfo 旁路采集（NFR-04）。绝对值依赖硬件，门禁只看相对基线
-/// 回归（见 docs/nfr-baselines.md）。
+/// 回归（见 docs/process/nfr-baselines.md）。
 ///
 /// `on_next_frame` 只在注册的下一帧触发一次；要持续采样就用共享状态自重注册。
 fn schedule_nfr_measurement(

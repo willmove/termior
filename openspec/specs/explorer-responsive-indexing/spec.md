@@ -1,7 +1,7 @@
 # explorer-responsive-indexing Specification
 
 ## Purpose
-TBD - created by archiving change fix-file-explorer-indexing. Update Purpose after archive.
+文件浏览器在大体量目录下也要尽快给出可浏览的首屏，后台索引可取消、可世代作废，watch 重建需防抖，loading 状态不得卡死。
 
 ## Requirements
 

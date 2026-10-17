@@ -1,7 +1,7 @@
 # workspace-chrome Specification
 
 ## Purpose
-TBD - created by archiving change ui-design-system-overhaul. Update Purpose after archive.
+主窗口把 tab 与窗口控件收成一行自绘标题栏，收敛 header 操作，并用随活动 pane 变化的状态栏与分栏焦点指示表达当前上下文。
 
 ## Requirements
 

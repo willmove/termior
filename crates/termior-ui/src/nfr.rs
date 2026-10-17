@@ -1,6 +1,6 @@
 //! NFR 测量模式（`TERMIOR_NFR_MEASURE=1`，由 `termior-bench` 的 `nfr-run` 驱动）的共享小工具。
 //!
-//! 协议行统一以 `TERMIOR_NFR_` 开头打印到 stdout，harness 逐行解析；见 docs/nfr-baselines.md。
+//! 协议行统一以 `TERMIOR_NFR_` 开头打印到 stdout，harness 逐行解析；见 docs/process/nfr-baselines.md。
 
 use std::io::Write as _;
 

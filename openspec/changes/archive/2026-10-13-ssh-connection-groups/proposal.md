@@ -59,5 +59,5 @@
 
 **文档**
 
-- `docs/termior-spec.md`：FR-SSH-01 与 §7 文件表已回写
-- `docs/ssh.md`：新增「连接分组」章节与 schema v2 说明
+- `docs/user/termior-spec.md`：FR-SSH-01 与 §7 文件表已回写
+- `docs/user/ssh.md`：新增「连接分组」章节与 schema v2 说明
