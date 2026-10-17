@@ -62,7 +62,7 @@ impl ComposerView {
         bottom: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let selected_builtin = (self.backend_choice == AgentBackendChoice::BuiltIn)
+        let selected_builtin = (self.orchestrator.backend_choice == AgentBackendChoice::BuiltIn)
             .then_some(self.active_custom_agent);
         let mut builtin = vec![(
             AgentMenuChoice::BuiltIn(None),
@@ -107,7 +107,9 @@ impl ComposerView {
             .collect::<Vec<_>>();
         let is_selected = |choice: AgentMenuChoice| match choice {
             AgentMenuChoice::BuiltIn(custom) => selected_builtin == Some(custom),
-            AgentMenuChoice::Codex => self.backend_choice == AgentBackendChoice::CodexAppServer,
+            AgentMenuChoice::Codex => {
+                self.orchestrator.backend_choice == AgentBackendChoice::CodexAppServer
+            }
             AgentMenuChoice::Cli(_) => false,
         };
         let sections = [

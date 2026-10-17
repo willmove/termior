@@ -17,18 +17,9 @@ impl ComposerView {
             mode_menu_open: false,
             plan_confirmed: false,
             awaiting_plan_confirmation: false,
-            busy: false,
             status: t!("composer.status.choose_model").to_string(),
             needs_model_setup: true,
-            runtime: None,
-            active_task: None,
-            active_cancellation: None,
-            active_plan_request: false,
-            pending_approval: None,
-            external_pending_approval: None,
-            #[cfg(test)]
-            last_external_approval: None,
-            pending_edit: None,
+            orchestrator: ComposerOrchestrator::new(),
             sessions: SessionStore::default(),
             snippets: SnippetStore::default(),
             custom_agents: Vec::new(),
@@ -66,9 +57,6 @@ impl ComposerView {
             skill_scan_error: None,
             active_skills: Vec::new(),
             memory: MemoryStore::default(),
-            backend_choice: AgentBackendChoice::BuiltIn,
-            backend_capability_summary: None,
-            external_session: None,
             agent_menu_open: false,
             cli_agent_available: Vec::new(),
             model_settings: ModelSettings::default(),
@@ -80,8 +68,6 @@ impl ComposerView {
             text_selection: None,
             selecting_text: false,
             last_task: None,
-            active_runtime: None,
-            task_project_override: None,
             command_watch: notify::CommandWatch::default(),
             command_watch_running: false,
             expanded_tools: HashSet::new(),
@@ -91,7 +77,7 @@ impl ComposerView {
 
     /// 活动任务固定的运行时；没有活动任务时为全局配置的运行时。
     pub(super) fn task_runtime(&self) -> Option<&AgentRuntime> {
-        self.active_runtime.as_ref().or(self.runtime.as_ref())
+        self.orchestrator.task_runtime()
     }
 
     /// 覆盖状态行文案；非「模型未配置」引导类状态统一走这里，
@@ -215,8 +201,8 @@ impl ComposerView {
         }
         let profile = self.effective_profile();
         let Some(profile) = profile else {
-            self.runtime = None;
-            if self.backend_choice == AgentBackendChoice::CodexAppServer {
+            self.orchestrator.runtime = None;
+            if self.orchestrator.backend_choice == AgentBackendChoice::CodexAppServer {
                 self.set_status(t!("composer.status.codex_ready"));
             } else {
                 self.set_model_setup_status(t!("composer.status.pick_provider"));
@@ -227,8 +213,8 @@ impl ComposerView {
         let key_name = format!("provider:{}", profile.id);
         let api_key = KeyringSecretStore::new().get(&key_name).ok().flatten();
         if !profile.local && api_key.is_none() {
-            self.runtime = None;
-            if self.backend_choice == AgentBackendChoice::CodexAppServer {
+            self.orchestrator.runtime = None;
+            if self.orchestrator.backend_choice == AgentBackendChoice::CodexAppServer {
                 self.set_status(t!("composer.status.codex_ready"));
             } else {
                 self.set_model_setup_status(tf!(
@@ -242,7 +228,7 @@ impl ComposerView {
         let config = match ProviderConfig::from_settings(&profile, api_key) {
             Ok(config) => config,
             Err(error) => {
-                self.runtime = None;
+                self.orchestrator.runtime = None;
                 self.set_status(error.to_string());
                 cx.notify();
                 return;
@@ -251,7 +237,7 @@ impl ComposerView {
         let executor = match self.build_executor(&root, &full_tools) {
             Ok(executor) => executor,
             Err(error) => {
-                self.runtime = None;
+                self.orchestrator.runtime = None;
                 self.set_status(error.to_string());
                 cx.notify();
                 return;
@@ -269,7 +255,7 @@ impl ComposerView {
             match self.selected_agent_runtime(&full_tools, &base_system_prompt) {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    self.runtime = None;
+                    self.orchestrator.runtime = None;
                     self.set_status(error);
                     cx.notify();
                     return;
@@ -277,7 +263,7 @@ impl ComposerView {
             };
         self.full_tools = Some(full_tools);
         self.base_system_prompt = base_system_prompt;
-        self.runtime = Some(AgentRuntime {
+        self.orchestrator.runtime = Some(AgentRuntime {
             config,
             tools,
             executor,
@@ -335,7 +321,7 @@ impl ComposerView {
     }
 
     pub(super) fn active_agent_name(&self) -> SharedString {
-        if self.backend_choice == AgentBackendChoice::CodexAppServer {
+        if self.orchestrator.backend_choice == AgentBackendChoice::CodexAppServer {
             return SharedString::from("Codex app-server");
         }
         self.active_custom_agent
@@ -346,11 +332,7 @@ impl ComposerView {
 
     /// 开始一个新的命名会话；当前会话已镜像落盘，忙碌或有挂起审批时拒绝。
     pub(super) fn new_session(&mut self, cx: &mut Context<Self>) {
-        if self.busy
-            || self.pending_approval.is_some()
-            || self.external_pending_approval.is_some()
-            || self.pending_edit.is_some()
-        {
+        if self.orchestrator.submission_blocked() {
             self.set_status(t!("composer.status.session_busy"));
             return;
         }
@@ -359,11 +341,10 @@ impl ComposerView {
         self.history.clear();
         self.expanded_tools.clear();
         self.text_selection = None;
-        self.active_task = None;
+        self.orchestrator.clear_for_new_session();
         self.last_context_plan = None;
         self.awaiting_plan_confirmation = false;
         self.plan_confirmed = false;
-        self.external_session = None;
         self.draft = ComposerDraft::default();
         self.mode = Mode::Auto;
         if self.model_choice.take().is_some() {
@@ -402,15 +383,12 @@ impl ComposerView {
     /// 切换提交模式。运行中不允许切换；挂起审批期间只允许切到 Yolo（随即自动放行），
     /// 避免计划流状态错乱。首次切到 Yolo 弹一次确认（本次应用运行内不再重复）。
     pub(super) fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
-        if self.backend_choice == AgentBackendChoice::CodexAppServer {
+        if self.orchestrator.backend_choice == AgentBackendChoice::CodexAppServer {
             self.set_status(t!("composer.status.codex_owns_approvals"));
             cx.notify();
             return;
         }
-        let pending = self.pending_approval.is_some()
-            || self.external_pending_approval.is_some()
-            || self.pending_edit.is_some();
-        if self.busy || (pending && mode != Mode::Yolo) {
+        if self.orchestrator.blocks_mode_switch(mode) {
             return;
         }
         if mode == Mode::Yolo && !self.yolo_confirmed {
@@ -458,9 +436,7 @@ impl ComposerView {
                 .history
                 .iter()
                 .all(|message| !matches!(message.role, Role::User | Role::Assistant))
-            && self.pending_approval.is_none()
-            && self.external_pending_approval.is_none()
-            && self.pending_edit.is_none()
+            && !self.orchestrator.has_pending()
             && !self.awaiting_plan_confirmation
             && self.draft.attachments.is_empty()
             && self.path_suggestions.is_empty()
@@ -487,10 +463,10 @@ impl ComposerView {
     }
 
     pub(super) fn model_setup_placeholder(&self) -> Option<&str> {
-        if self.backend_choice == AgentBackendChoice::CodexAppServer {
+        if self.orchestrator.backend_choice == AgentBackendChoice::CodexAppServer {
             return None;
         }
-        if self.runtime.is_some() {
+        if self.orchestrator.runtime.is_some() {
             return None;
         }
         self.needs_model_setup.then_some(self.status.as_str())

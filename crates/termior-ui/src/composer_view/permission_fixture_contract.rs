@@ -1,4 +1,4 @@
-use super::ExternalPendingApproval;
+use super::orchestrator::ExternalPendingApproval;
 use termior_agent_host::{
     map_codex_message, permissions_approval_result, BackendEvent, PERMISSIONS_APPROVAL_METHOD,
 };

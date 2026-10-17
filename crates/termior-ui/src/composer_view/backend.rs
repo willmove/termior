@@ -5,14 +5,10 @@ use super::*;
 
 impl ComposerView {
     pub(super) fn cycle_custom_agent(&mut self, cx: &mut Context<Self>) {
-        if self.busy
-            || self.pending_approval.is_some()
-            || self.external_pending_approval.is_some()
-            || self.pending_edit.is_some()
-        {
+        if self.orchestrator.submission_blocked() {
             return;
         }
-        let (choice, custom) = match (self.backend_choice, self.active_custom_agent) {
+        let (choice, custom) = match (self.orchestrator.backend_choice, self.active_custom_agent) {
             (AgentBackendChoice::CodexAppServer, _) => (AgentBackendChoice::BuiltIn, None),
             (AgentBackendChoice::BuiltIn, None) if !self.custom_agents.is_empty() => {
                 (AgentBackendChoice::BuiltIn, Some(0))
@@ -32,20 +28,9 @@ impl ComposerView {
         custom: Option<usize>,
         cx: &mut Context<Self>,
     ) {
-        if self.busy
-            || self.pending_approval.is_some()
-            || self.external_pending_approval.is_some()
-            || self.pending_edit.is_some()
-        {
+        if !self.orchestrator.try_select_backend(choice) {
             return;
         }
-        if self.backend_choice == AgentBackendChoice::CodexAppServer
-            && choice != AgentBackendChoice::CodexAppServer
-        {
-            self.external_session = None;
-            self.backend_capability_summary = None;
-        }
-        self.backend_choice = choice;
         self.active_custom_agent = match choice {
             AgentBackendChoice::BuiltIn => custom.filter(|index| *index < self.custom_agents.len()),
             AgentBackendChoice::CodexAppServer => None,
@@ -53,11 +38,11 @@ impl ComposerView {
         if let Some(full_tools) = self.full_tools.clone() {
             match self.selected_agent_runtime(&full_tools, &self.base_system_prompt) {
                 Ok((tools, prompt)) => {
-                    if let Some(runtime) = self.runtime.as_mut() {
+                    if let Some(runtime) = self.orchestrator.runtime.as_mut() {
                         runtime.tools = tools;
                         runtime.system_prompt = prompt;
                     }
-                    if self.backend_choice == AgentBackendChoice::CodexAppServer {
+                    if self.orchestrator.backend_choice == AgentBackendChoice::CodexAppServer {
                         self.set_status(t!("composer.status.active_agent_codex"));
                     } else {
                         self.set_status(tf!(
@@ -78,18 +63,14 @@ impl ComposerView {
             self.invoke_slash_command(command, &args, cx);
             return;
         }
-        if self.backend_choice == AgentBackendChoice::CodexAppServer {
+        if self.orchestrator.backend_choice == AgentBackendChoice::CodexAppServer {
             self.submit_external(cx);
             return;
         }
-        if self.busy
-            || self.pending_approval.is_some()
-            || self.external_pending_approval.is_some()
-            || self.pending_edit.is_some()
-        {
+        if self.orchestrator.submission_blocked() {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(runtime) = self.orchestrator.runtime.clone() else {
             self.set_model_setup_status(t!("composer.status.configure_first"));
             cx.notify();
             return;
@@ -306,7 +287,7 @@ impl ComposerView {
         let policy = self.approval_policy();
         // 终端快捷入口把任务固定到命令所在项目：执行器以该目录为根，任务的 project_dir 随之固定。
         let mut runtime = runtime;
-        let project_dir = match self.task_project_override.take() {
+        let project_dir = match self.orchestrator.take_project_override() {
             Some(dir) if dir != self.workspace_root => {
                 let tools = self
                     .full_tools
@@ -365,10 +346,8 @@ impl ComposerView {
         runtime.executor.set_task_owner(task.task().id.0.clone());
         self.last_task = Some(TaskRef::from_task(task.task()));
         self.command_watch = notify::CommandWatch::default();
-        self.active_runtime = Some(runtime);
-        self.active_cancellation = Some(task.cancellation_token());
-        self.active_task = Some(task);
-        self.active_plan_request = plan_request;
+        self.orchestrator
+            .install_builtin_task(task, runtime, plan_request);
         self.dispatch_task_command(
             TaskCommand::Start { user_input },
             t!("composer.status.agent_working"),
@@ -404,8 +383,9 @@ impl ComposerView {
                         cx.notify();
                     }
                     // 运行中的 Turn 会暂时取走 active_task（busy 期间为 None），不能据此停止。
-                    let keep_going =
-                        view.busy || view.active_task.is_some() || view.command_watch.has_running();
+                    let keep_going = view
+                        .orchestrator
+                        .watch_should_continue(view.command_watch.has_running());
                     if !keep_going {
                         view.command_watch_running = false;
                     }
@@ -429,7 +409,7 @@ impl ComposerView {
         project_dir: PathBuf,
         cx: &mut Context<Self>,
     ) {
-        if self.busy || self.active_task.is_some() {
+        if self.orchestrator.terminal_action_busy() {
             // 不打断进行中的任务：只附加，交给用户决定何时提交。
             self.draft.attach_terminal_output(label, text, command);
             self.set_status(t!("composer.status.terminal_action_attached"));
@@ -456,21 +436,17 @@ impl ComposerView {
         };
         self.draft.input = prompt.to_string();
         self.cursor = self.draft.input.len();
-        if self.backend_choice == AgentBackendChoice::BuiltIn {
-            self.task_project_override = Some(project_dir);
+        if self.orchestrator.backend_choice == AgentBackendChoice::BuiltIn {
+            self.orchestrator.pin_project(project_dir);
         }
         self.submit(cx);
         // submit 提前返回（如未配置模型）时不让固定目录泄漏到之后的手动提交。
-        self.task_project_override = None;
+        self.orchestrator.clear_project_pin();
         cx.notify();
     }
 
     pub(super) fn submit_external(&mut self, cx: &mut Context<Self>) {
-        if self.busy
-            || self.pending_approval.is_some()
-            || self.external_pending_approval.is_some()
-            || self.pending_edit.is_some()
-        {
+        if self.orchestrator.submission_blocked() {
             return;
         }
         let Some(tools) = self.full_tools.as_ref() else {
@@ -519,15 +495,15 @@ impl ComposerView {
         status: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        if self.busy {
+        let Some(ExternalDispatch {
+            session,
+            cancellation,
+        }) = self.orchestrator.begin_external()
+        else {
             return;
-        }
-        let session = self.external_session.clone();
+        };
         let project_dir = self.workspace_root.clone();
         let data_dir = self.data_dir.clone();
-        let cancellation = CancellationToken::default();
-        self.active_cancellation = Some(cancellation.clone());
-        self.busy = true;
         self.set_status(status);
         cx.emit(AgentStatus::Working);
         cx.spawn(async move |view, cx| {
@@ -572,76 +548,24 @@ impl ComposerView {
         result: ExternalRunResult,
         cx: &mut Context<Self>,
     ) {
-        self.busy = false;
-        self.active_cancellation = None;
-        if let Some(session) = result.session.as_ref() {
-            if let Ok(session) = session.lock() {
-                let capabilities = &session.info().capabilities;
-                self.backend_capability_summary = Some(format!(
-                    "{} {} · auth={} · model={} · resume={:?} · fork={:?} · steer={:?} · cancel={:?} · approvals={:?} · terminal={:?}",
-                    session.info().display_name,
-                    session.info().version,
-                    session.info().authentication_source,
-                    session.info().model_source,
-                    capabilities.session_resume,
-                    capabilities.session_fork,
-                    capabilities.mid_turn_steer,
-                    capabilities.cancel,
-                    capabilities.approval_requests,
-                    capabilities.host_terminal,
-                ));
+        let outcome = self.orchestrator.apply_external_result(result);
+        match &outcome {
+            ExternalOutcome::Error { error } => {
+                self.set_status(tf!("composer.status.codex_error", "error" => error.clone()));
             }
+            ExternalOutcome::Approval { call } => {
+                self.set_status(tf!("composer.status.codex_approval", "call" => call.clone()));
+            }
+            ExternalOutcome::Completed { status, .. } => {
+                self.set_status(tf!("composer.status.codex_turn", "status" => status.clone()));
+            }
+            ExternalOutcome::Unknown { reason } => {
+                self.set_status(tf!("composer.status.codex_unknown", "reason" => reason.clone()));
+            }
+            ExternalOutcome::Running => self.set_status(t!("composer.status.codex_running")),
+            ExternalOutcome::NoOutcome => self.set_status(t!("composer.status.codex_no_outcome")),
         }
-        if let Some(session) = result.session {
-            self.external_session = Some(session);
-        }
-        if let Some(error) = result.error {
-            self.set_status(tf!("composer.status.codex_error", "error" => error));
-            cx.emit(AgentStatus::Error);
-            return;
-        }
-        match result.outcome {
-            Some(PumpOutcome::WaitingApproval {
-                backend_request_id,
-                tool_call_id,
-                request_kind,
-                raw,
-            }) => {
-                self.external_pending_approval = Some(ExternalPendingApproval::from_codex(
-                    backend_request_id,
-                    tool_call_id.clone(),
-                    request_kind,
-                    &raw,
-                ));
-                self.set_status(tf!(
-                    "composer.status.codex_approval",
-                    "call" => tool_call_id
-                ));
-                cx.emit(AgentStatus::Attention);
-            }
-            Some(PumpOutcome::Completed { success, status }) => {
-                self.external_pending_approval = None;
-                self.set_status(tf!("composer.status.codex_turn", "status" => status));
-                cx.emit(if success {
-                    AgentStatus::Finished
-                } else {
-                    AgentStatus::Error
-                });
-            }
-            Some(PumpOutcome::Unknown { reason }) => {
-                self.external_pending_approval = None;
-                self.set_status(tf!("composer.status.codex_unknown", "reason" => reason));
-                cx.emit(AgentStatus::Attention);
-            }
-            Some(PumpOutcome::Pending) => {
-                self.set_status(t!("composer.status.codex_running"));
-                cx.emit(AgentStatus::Attention);
-            }
-            None => {
-                self.set_status(t!("composer.status.codex_no_outcome"));
-                cx.emit(AgentStatus::Error);
-            }
-        }
+        cx.emit(outcome.notify());
     }
 
     pub(super) fn dispatch_task_command(
@@ -650,26 +574,23 @@ impl ComposerView {
         status: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
-        if self.busy {
-            return;
-        }
-        let Some(mut task_runtime) = self.active_task.take() else {
-            self.set_status(t!("composer.status.no_task"));
-            cx.emit(AgentStatus::Error);
-            cx.notify();
-            return;
-        };
-        let Some(runtime) = self.task_runtime().cloned() else {
-            self.active_task = Some(task_runtime);
-            self.set_status(t!("composer.status.no_runtime"));
-            cx.emit(AgentStatus::Error);
-            cx.notify();
-            return;
-        };
-        // 续跑时按当前模式同步审批策略：任务挂起期间切到 Yolo，后续调用即不再询问。
-        task_runtime.set_approval_policy(self.approval_policy());
-        self.active_cancellation = Some(task_runtime.cancellation_token());
-        self.busy = true;
+        let (runtime, task_runtime) =
+            match self.orchestrator.begin_task_command(self.approval_policy()) {
+                Ok(dispatch) => (dispatch.runtime, dispatch.task),
+                Err(TaskDispatchReject::Busy) => return,
+                Err(TaskDispatchReject::NoTask) => {
+                    self.set_status(t!("composer.status.no_task"));
+                    cx.emit(AgentStatus::Error);
+                    cx.notify();
+                    return;
+                }
+                Err(TaskDispatchReject::NoRuntime) => {
+                    self.set_status(t!("composer.status.no_runtime"));
+                    cx.emit(AgentStatus::Error);
+                    cx.notify();
+                    return;
+                }
+            };
         self.set_status(status);
         cx.emit(AgentStatus::Working);
         cx.spawn(async move |view, cx| {
@@ -703,16 +624,12 @@ impl ComposerView {
     }
 
     pub(super) fn apply_task_result(&mut self, result: TaskRunResult, cx: &mut Context<Self>) {
-        self.busy = false;
-        self.active_cancellation = None;
-        self.pending_approval = None;
-        self.pending_edit = None;
-        self.history = result.task.history().to_vec();
+        self.history = self.orchestrator.begin_task_result(&result.task);
         self.persist_task_summary(&result.task);
         if let Some(dir) = self.data_dir.as_deref() {
             if let Err(error) = result.task.persist_journal(dir) {
                 self.set_status(tf!("composer.status.journal_error", "error" => error));
-                self.active_task = Some(result.task);
+                self.orchestrator.keep_task(result.task);
                 cx.emit(AgentStatus::Error);
                 return;
             }
@@ -720,154 +637,91 @@ impl ComposerView {
 
         if let Some(error) = result.error {
             self.set_status(tf!("composer.status.agent_error", "error" => error));
-            self.active_runtime = None;
+            self.orchestrator.fail_task();
             cx.emit(AgentStatus::Error);
             return;
         }
 
-        // 通知级别只由结构化 TaskState 决定（Stage B 6.4），不解析状态文案。
-        let status = notify::status_for_task(result.task.task().state, self.active_plan_request);
-        match result.task.task().state {
-            TaskState::WaitingApproval => {
-                let Some(request) = result.task.pending_approval() else {
-                    self.set_status(t!("composer.status.lost_approval"));
-                    cx.emit(AgentStatus::Error);
-                    return;
-                };
-                let Some(contract) = result.task.pending_contract() else {
-                    self.set_status(t!("composer.status.lost_contract"));
-                    cx.emit(AgentStatus::Error);
-                    return;
-                };
-                self.set_status(tf!(
-                    "composer.status.approval_required",
-                    "summary" => request.summary
-                ));
-                self.pending_approval = Some(PendingApproval { request, contract });
-                self.active_task = Some(result.task);
-                cx.emit(status);
+        let commit = self
+            .orchestrator
+            .commit_task_result(result.task, self.mode == Mode::Yolo);
+        self.present_task_commit(commit, cx);
+    }
+
+    fn present_task_commit(&mut self, commit: TaskCommit, cx: &mut Context<Self>) {
+        match commit.hint {
+            TaskUiHint::OpenTaskDetails => {
+                self.open_center = Some(ComposerCenter::TaskDetails);
             }
-            TaskState::WaitingChangeReview => {
-                let summary = result
-                    .task
-                    .pending_change_summary()
-                    .and_then(|summary| serde_json::from_str::<EditProposalSummary>(summary).ok());
-                let Some(summary) = summary else {
-                    self.set_status(t!("composer.status.invalid_summary"));
-                    cx.emit(AgentStatus::Error);
-                    return;
-                };
-                let review_request = EditReviewRequested(summary.clone());
-                self.pending_edit = Some(PendingEdit {
-                    summary,
-                    decisions: HashMap::new(),
-                });
-                self.set_status(t!("composer.status.review_hunks"));
-                self.active_task = Some(result.task);
-                cx.emit(status);
-                // Yolo 下随后自动接受全部 hunk，不再弹审阅面板。
-                if self.mode != Mode::Yolo {
-                    cx.emit(review_request);
-                }
-            }
-            TaskState::WaitingUser => {
-                match result.task.task().waiting_reason.as_ref() {
-                    Some(WaitingReason::BudgetExhausted {
-                        dimension,
-                        used,
-                        limit,
-                    }) => self.set_status(tf!(
-                        "composer.status.budget_exhausted",
-                        "dimension" => format!("{dimension:?}"),
-                        "used" => used,
-                        "limit" => limit
-                    )),
-                    Some(WaitingReason::TerminalControl { session_id, cursor }) => {
-                        self.open_center = Some(ComposerCenter::TaskDetails);
-                        self.set_status(tf!(
-                            "composer.status.terminal_taken_over",
-                            "session" => session_id,
-                            "cursor" => cursor
-                        ))
-                    }
-                    Some(reason) => self.set_status(tf!(
-                        "composer.status.needs_input_reason",
-                        "reason" => format!("{reason:?}")
-                    )),
-                    None => self.set_status(t!("composer.status.needs_input")),
-                }
-                self.active_task = Some(result.task);
-                cx.emit(status);
-            }
-            TaskState::CompletedVerified => {
-                if self.active_plan_request {
-                    self.awaiting_plan_confirmation = true;
-                    self.set_status(t!("composer.plan.ready"));
-                    cx.emit(status);
-                } else {
-                    self.set_status(t!("composer.status.finished_verified"));
-                    cx.emit(status);
-                }
-                self.active_task = None;
-            }
-            TaskState::CompletedUnverified => {
-                if self.active_plan_request {
-                    self.awaiting_plan_confirmation = true;
-                    self.set_status(t!("composer.plan.ready"));
-                    cx.emit(status);
-                } else {
-                    self.set_status(t!("composer.status.finished_unverified"));
-                    cx.emit(status);
-                }
-                self.active_task = None;
-            }
-            TaskState::Cancelled => {
-                self.set_status(t!("composer.status.cancelled"));
-                self.active_task = None;
-                cx.emit(status);
-            }
-            TaskState::Unknown => {
-                self.set_status(t!("composer.status.unknown_result"));
-                self.active_task = None;
-                cx.emit(status);
-            }
-            TaskState::Failed => {
-                self.set_status(t!("composer.status.task_failed"));
-                self.active_task = None;
-                cx.emit(status);
-            }
-            state => {
-                self.set_status(tf!(
-                    "composer.status.task_state",
-                    "state" => format!("{state:?}")
-                ));
-                self.active_task = Some(result.task);
-                cx.emit(status);
-            }
+            TaskUiHint::AwaitPlanConfirmation => self.awaiting_plan_confirmation = true,
+            TaskUiHint::None => {}
         }
-        if !self.active_plan_request && self.active_task.is_none() {
+        match &commit.status {
+            TaskStatusLine::LostApproval => self.set_status(t!("composer.status.lost_approval")),
+            TaskStatusLine::LostContract => self.set_status(t!("composer.status.lost_contract")),
+            TaskStatusLine::InvalidSummary => {
+                self.set_status(t!("composer.status.invalid_summary"));
+            }
+            TaskStatusLine::ApprovalRequired { summary } => self.set_status(tf!(
+                "composer.status.approval_required",
+                "summary" => summary.clone()
+            )),
+            TaskStatusLine::ReviewHunks => self.set_status(t!("composer.status.review_hunks")),
+            TaskStatusLine::BudgetExhausted {
+                dimension,
+                used,
+                limit,
+            } => self.set_status(tf!(
+                "composer.status.budget_exhausted",
+                "dimension" => dimension.clone(),
+                "used" => *used,
+                "limit" => *limit
+            )),
+            TaskStatusLine::TerminalTakenOver { session, cursor } => self.set_status(tf!(
+                "composer.status.terminal_taken_over",
+                "session" => session.clone(),
+                "cursor" => *cursor
+            )),
+            TaskStatusLine::NeedsInputReason { reason } => self.set_status(tf!(
+                "composer.status.needs_input_reason",
+                "reason" => reason.clone()
+            )),
+            TaskStatusLine::NeedsInput => self.set_status(t!("composer.status.needs_input")),
+            TaskStatusLine::PlanReady => self.set_status(t!("composer.plan.ready")),
+            TaskStatusLine::FinishedVerified => {
+                self.set_status(t!("composer.status.finished_verified"));
+            }
+            TaskStatusLine::FinishedUnverified => {
+                self.set_status(t!("composer.status.finished_unverified"));
+            }
+            TaskStatusLine::Cancelled => self.set_status(t!("composer.status.cancelled")),
+            TaskStatusLine::UnknownResult => {
+                self.set_status(t!("composer.status.unknown_result"));
+            }
+            TaskStatusLine::TaskFailed => self.set_status(t!("composer.status.task_failed")),
+            TaskStatusLine::Other { state } => self.set_status(tf!(
+                "composer.status.task_state",
+                "state" => state.clone()
+            )),
+        }
+        cx.emit(commit.notify);
+        if let Some(summary) = commit.review.clone() {
+            cx.emit(EditReviewRequested(summary));
+        }
+        self.orchestrator.finish_task_commit(&commit);
+        if commit.clear_plan {
             self.plan_confirmed = false;
             self.awaiting_plan_confirmation = false;
         }
-        if self.active_task.is_none() {
-            self.active_runtime = None;
+        if commit.auto_resolve {
+            self.auto_resolve_in_yolo(cx);
         }
-        self.auto_resolve_in_yolo(cx);
     }
 
     pub(super) fn continue_with_more_budget(&mut self, cx: &mut Context<Self>) {
-        let Some(runtime) = self.active_task.as_ref() else {
+        let Some(budgets) = self.orchestrator.increased_budgets() else {
             return;
         };
-        if runtime.task().state != TaskState::WaitingUser {
-            return;
-        }
-        let mut budgets = runtime.task().budgets.clone();
-        budgets.max_model_steps = budgets.max_model_steps.saturating_add(100);
-        budgets.max_wall_clock_ms = budgets.max_wall_clock_ms.saturating_add(30 * 60 * 1_000);
-        budgets.max_tool_output_bytes = budgets
-            .max_tool_output_bytes
-            .saturating_add(16 * 1024 * 1024);
         self.dispatch_task_command(
             TaskCommand::IncreaseBudgets { budgets },
             t!("composer.budget.continuing"),
