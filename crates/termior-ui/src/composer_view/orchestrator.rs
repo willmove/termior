@@ -1307,6 +1307,7 @@ mod tests {
             base.max_tool_output_bytes + 16 * 1024 * 1024
         );
 
+        orch.busy = true;
         assert!(orch.blocks_mode_switch(Mode::Plan));
         orch.busy = false;
         orch.pending_approval = Some(PendingApproval {
