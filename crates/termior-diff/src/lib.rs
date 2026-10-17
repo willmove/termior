@@ -7,6 +7,7 @@
 //! 验收对齐 Spec §6.3：「AI 提议 5 个 hunk、接受 4 拒 1，落盘结果精确等于接受集」。
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
@@ -56,11 +57,9 @@ pub fn diff_hunks(old: &str, new: &str, context: usize) -> Vec<Hunk> {
 
     let mut hunks = Vec::new();
     for (id, ops) in grouped.iter().enumerate() {
-        if ops.is_empty() {
+        let (Some(first), Some(last)) = (ops.first(), ops.last()) else {
             continue;
-        }
-        let first = ops.first().unwrap();
-        let last = ops.last().unwrap();
+        };
 
         let old_start = first.old_range().start;
         let old_end = last.old_range().end;

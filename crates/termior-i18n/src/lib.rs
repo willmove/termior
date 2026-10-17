@@ -19,6 +19,7 @@
 //! 重渲染让新文案生效。
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::HashMap;
 use std::fmt::Write as _;

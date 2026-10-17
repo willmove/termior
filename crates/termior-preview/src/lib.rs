@@ -4,6 +4,7 @@
 //! Markdown parsing. GPUI rendering lives in the desktop application crate.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -55,13 +56,17 @@ pub struct LocalhostDetector {
     seen: HashSet<String>,
 }
 
+fn localhost_regex() -> Regex {
+    // 不变量：模式是源码字面量，编译失败说明模式写错了。
+    #[allow(clippy::expect_used)]
+    Regex::new(r#"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?(?:/[^\s<>\"']*)?"#)
+        .expect("static preview regex")
+}
+
 impl Default for LocalhostDetector {
     fn default() -> Self {
         Self {
-            regex: Regex::new(
-                r#"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?(?:/[^\s<>\"']*)?"#,
-            )
-            .expect("static preview regex"),
+            regex: localhost_regex(),
             tail: String::new(),
             seen: HashSet::new(),
         }

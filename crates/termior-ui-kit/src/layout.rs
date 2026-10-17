@@ -143,11 +143,11 @@ impl PaneLayout {
         if !self.root.contains(pane) {
             return Err(LayoutError::PaneNotFound(pane));
         }
-        self.root = self
-            .root
-            .clone()
-            .remove(pane)
-            .expect("more than one pane leaves a root");
+        // 已确认窗格多于一块且目标存在。remove 返回 None 表示树被拆空。
+        let Some(root) = self.root.clone().remove(pane) else {
+            return Err(LayoutError::FinalPane);
+        };
+        self.root = root;
         if self.focused == pane {
             self.focused = self.panes()[0];
         }

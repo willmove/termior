@@ -7,6 +7,7 @@
 //! 查询/glob/ignore 规则」的纯函数，供上层（GPUI 视图 + 后台索引线程）调用。
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod fuzzy;
 pub mod search;
