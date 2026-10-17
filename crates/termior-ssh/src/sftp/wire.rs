@@ -111,9 +111,9 @@ impl Transport {
             );
         }
         let mut child = command.spawn()?;
-        let mut input = child.stdin.take().expect("piped stdin");
-        let mut output = child.stdout.take().expect("piped stdout");
-        let mut errors = child.stderr.take().expect("piped stderr");
+        let mut input = spawned_pipe(child.stdin.take(), "stdin")?;
+        let mut output = spawned_pipe(child.stdout.take(), "stdout")?;
+        let mut errors = spawned_pipe(child.stderr.take(), "stderr")?;
         let (outgoing, writes) = mpsc::channel::<Vec<u8>>();
         let (packets, incoming) = mpsc::sync_channel(1);
         let stderr = Arc::new(Mutex::new(Vec::new()));
@@ -477,6 +477,12 @@ impl Drop for Transport {
 fn invalid(message: &str) -> Error {
     Error::InvalidOutput(message.into())
 }
+fn spawned_pipe<T>(pipe: Option<T>, name: &str) -> Result<T, Error> {
+    pipe.ok_or_else(|| Error::Failed(format!("OpenSSH {name} pipe missing after spawn")))
+}
+fn exact_bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N], Error> {
+    bytes.try_into().map_err(|_| invalid("truncated packet"))
+}
 fn put_u32(buffer: &mut Vec<u8>, value: u32) {
     buffer.extend(value.to_be_bytes());
 }
@@ -511,7 +517,7 @@ impl<'a> Decoder<'a> {
         Ok(self.take(1)?[0])
     }
     fn u32(&mut self) -> Result<u32, Error> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_be_bytes(exact_bytes(self.take(4)?)?))
     }
     fn bytes(&mut self) -> Result<&'a [u8], Error> {
         let size = self.u32()? as usize;
@@ -527,7 +533,7 @@ impl<'a> Decoder<'a> {
             return Err(invalid("unknown attribute flags"));
         }
         let size = if flags & 1 != 0 {
-            Some(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+            Some(u64::from_be_bytes(exact_bytes(self.take(8)?)?))
         } else {
             None
         };

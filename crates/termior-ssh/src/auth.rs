@@ -118,10 +118,12 @@ impl Session {
             std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
         }
         #[cfg(windows)]
-        let name = format!(
-            "termior-auth-{}",
-            directory.path().file_name().unwrap().to_string_lossy()
-        );
+        let name = {
+            let file_name = directory.path().file_name().ok_or_else(|| {
+                io::Error::other("authentication temp directory has no file name")
+            })?;
+            format!("termior-auth-{}", file_name.to_string_lossy())
+        };
         #[cfg(unix)]
         let name = directory.path().join("s").to_string_lossy().into_owned();
         let options = ListenerOptions::new()
@@ -577,7 +579,12 @@ pub fn resolve_destination(profile: &Profile) -> Destination {
     let Ok(mut child) = command.spawn() else {
         return result;
     };
-    let output = child.stdout.take().unwrap();
+    // Stdout is piped above. A missing pipe cannot be parsed, so fail closed.
+    let Some(output) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return result;
+    };
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut text = String::new();

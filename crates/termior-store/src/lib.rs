@@ -10,6 +10,7 @@
 //! 写盘前可选经 [`assert_no_persistent_secret`] 扫描（默认在写 [`settings`] 时启用）。
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod atomic;
 pub mod blob;
