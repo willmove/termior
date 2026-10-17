@@ -17,8 +17,10 @@ impl gpui::Render for ComposerView {
         let handler = ComposerInputHandler {
             view: cx.entity().downgrade(),
         };
-        let external_backend = self.backend_choice == AgentBackendChoice::CodexAppServer;
+        let external_backend =
+            self.orchestrator.backend_choice == AgentBackendChoice::CodexAppServer;
         let environment_id = self
+            .orchestrator
             .active_task
             .as_ref()
             .map(|runtime| runtime.task().environment_id.clone())

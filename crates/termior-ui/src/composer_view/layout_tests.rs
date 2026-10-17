@@ -1,7 +1,9 @@
 use super::helpers::requested_skill_names;
 use super::input::ComposerInputHandler;
+use super::orchestrator::ExternalPendingApproval;
 use super::*;
 use gpui::TestAppContext;
+use termior_agent_host::PERMISSIONS_APPROVAL_METHOD;
 
 fn draw(vcx: &mut gpui::VisualTestContext) {
     vcx.update(|window, cx| {
@@ -516,7 +518,7 @@ fn new_session_command_starts_an_empty_active_session() {
         assert_ne!(view.sessions.active_id.as_deref(), Some("old"));
         assert_eq!(view.sessions.get("old").unwrap().messages.len(), 1);
 
-        view.busy = true;
+        view.orchestrator.busy = true;
         view.new_session(cx);
         assert_eq!(
             view.sessions.sessions.len(),
@@ -618,13 +620,22 @@ fn agent_menu_separates_backend_kinds_and_launches_cli_agents_in_a_terminal() {
     });
     composer.update(vcx, |view, cx| {
         view.choose_agent(agent_menu::AgentMenuChoice::Codex, cx);
-        assert_eq!(view.backend_choice, AgentBackendChoice::CodexAppServer);
+        assert_eq!(
+            view.orchestrator.backend_choice,
+            AgentBackendChoice::CodexAppServer
+        );
         assert!(!view.agent_menu_open);
         view.choose_agent(agent_menu::AgentMenuChoice::BuiltIn(None), cx);
-        assert_eq!(view.backend_choice, AgentBackendChoice::BuiltIn);
+        assert_eq!(
+            view.orchestrator.backend_choice,
+            AgentBackendChoice::BuiltIn
+        );
         // 普通 CLI Agent 不改变 Composer 后端，只请求在终端里启动。
         view.choose_agent(agent_menu::AgentMenuChoice::Cli(0), cx);
-        assert_eq!(view.backend_choice, AgentBackendChoice::BuiltIn);
+        assert_eq!(
+            view.orchestrator.backend_choice,
+            AgentBackendChoice::BuiltIn
+        );
     });
     assert_eq!(*launched.lock().unwrap(), vec!["claude"]);
 }
@@ -650,8 +661,8 @@ fn terminal_action_without_a_model_keeps_the_attachment_and_drops_the_project_pi
         assert_eq!(view.draft.attachments.len(), 1);
         assert!(view.draft.input.contains("cargo test"));
         assert!(view.needs_model_setup);
-        assert_eq!(view.task_project_override, None);
-        assert!(view.active_task.is_none());
+        assert_eq!(view.orchestrator.task_project_override, None);
+        assert!(view.orchestrator.active_task.is_none());
     });
 }
 
@@ -704,7 +715,7 @@ fn show_permission_approval(
             "permissions": sample_permission_profile(),
         });
         view.panel_height = 600.0;
-        view.external_pending_approval = Some(ExternalPendingApproval::from_codex(
+        view.orchestrator.external_pending_approval = Some(ExternalPendingApproval::from_codex(
             "7".into(),
             "item-1".into(),
             PERMISSIONS_APPROVAL_METHOD.into(),
@@ -745,7 +756,11 @@ fn permission_card_approve_all_sends_every_checked_permission() {
         .map(|entry| entry.id)
         .collect::<Vec<_>>();
     composer.update(vcx, |view, _| {
-        let pending = view.external_pending_approval.as_ref().unwrap();
+        let pending = view
+            .orchestrator
+            .external_pending_approval
+            .as_ref()
+            .unwrap();
         assert!(pending.permissions.iter().all(|choice| choice.checked));
         assert_eq!(
             pending
@@ -770,7 +785,7 @@ fn permission_card_approve_all_sends_every_checked_permission() {
     });
     click_id(vcx, "approve-tool");
     composer.update(vcx, |view, _| {
-        let reply = view.last_external_approval.as_ref().unwrap();
+        let reply = view.orchestrator.last_external_approval.as_ref().unwrap();
         assert!(reply.approved);
         assert_eq!(
             reply.granted_permission_ids.as_deref(),
@@ -798,7 +813,8 @@ fn permission_card_partial_approve_sends_only_checked_permissions() {
     show_permission_approval(&composer, vcx, "session");
     assert!(vcx.debug_bounds("permission-scope-session").is_some());
     let shared_index = composer.update(vcx, |view, _| {
-        view.external_pending_approval
+        view.orchestrator
+            .external_pending_approval
             .as_ref()
             .unwrap()
             .permissions
@@ -808,7 +824,11 @@ fn permission_card_partial_approve_sends_only_checked_permissions() {
     });
     click_permission(vcx, shared_index);
     composer.update(vcx, |view, _| {
-        let pending = view.external_pending_approval.as_ref().unwrap();
+        let pending = view
+            .orchestrator
+            .external_pending_approval
+            .as_ref()
+            .unwrap();
         assert!(!pending.permissions[shared_index].checked);
         assert_eq!(
             pending
@@ -823,7 +843,7 @@ fn permission_card_partial_approve_sends_only_checked_permissions() {
     draw(vcx);
     click_id(vcx, "approve-tool");
     composer.update(vcx, |view, _| {
-        let reply = view.last_external_approval.as_ref().unwrap();
+        let reply = view.orchestrator.last_external_approval.as_ref().unwrap();
         assert!(reply.approved);
         assert_eq!(
             reply.granted_permission_ids.as_deref(),
@@ -854,7 +874,7 @@ fn permission_card_deny_sends_an_empty_permission_set() {
     show_permission_approval(&composer, vcx, "session");
     click_id(vcx, "reject-tool");
     composer.update(vcx, |view, _| {
-        let reply = view.last_external_approval.as_ref().unwrap();
+        let reply = view.orchestrator.last_external_approval.as_ref().unwrap();
         assert!(!reply.approved);
         assert_eq!(reply.granted_permission_ids.as_deref(), Some([].as_slice()));
         assert_eq!(
@@ -877,14 +897,18 @@ fn permission_card_shows_unknown_scope_and_grants_for_the_turn() {
     assert!(vcx.debug_bounds("permission-scope-something-new").is_some());
     composer.update(vcx, |view, _| {
         assert_eq!(
-            view.external_pending_approval.as_ref().unwrap().scope,
+            view.orchestrator
+                .external_pending_approval
+                .as_ref()
+                .unwrap()
+                .scope,
             "something-new"
         );
     });
     click_id(vcx, "approve-tool");
     composer.update(vcx, |view, _| {
-        assert!(view.external_pending_approval.is_none());
-        let reply = view.last_external_approval.as_ref().unwrap();
+        assert!(view.orchestrator.external_pending_approval.is_none());
+        let reply = view.orchestrator.last_external_approval.as_ref().unwrap();
         assert!(reply.approved);
         let result = termior_agent_host::permissions_approval_result(
             &sample_permission_profile(),

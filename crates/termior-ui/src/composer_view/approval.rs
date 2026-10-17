@@ -9,14 +9,9 @@ impl ComposerView {
         accepted: &[usize],
         cx: &mut Context<Self>,
     ) -> Result<String, String> {
-        if self
-            .pending_edit
-            .as_ref()
-            .is_none_or(|edit| edit.summary.id != proposal_id)
-        {
+        if !self.orchestrator.take_matching_edit(proposal_id) {
             return Err(t!("composer.edit.no_longer_pending").to_string());
         }
-        self.pending_edit = None;
         self.dispatch_task_command(
             TaskCommand::ReviewChange {
                 change_set_id: ChangeSetId(proposal_id.to_owned()),
@@ -33,14 +28,9 @@ impl ComposerView {
         proposal_id: &str,
         cx: &mut Context<Self>,
     ) -> Result<String, String> {
-        if self
-            .pending_edit
-            .as_ref()
-            .is_none_or(|edit| edit.summary.id != proposal_id)
-        {
+        if !self.orchestrator.take_matching_edit(proposal_id) {
             return Err(t!("composer.edit.no_longer_pending").to_string());
         }
-        self.pending_edit = None;
         self.dispatch_task_command(
             TaskCommand::ReviewChange {
                 change_set_id: ChangeSetId(proposal_id.to_owned()),
@@ -55,15 +45,15 @@ impl ComposerView {
     /// Yolo 即 Agent 完全自主：挂起中的工具审批直接批准、变更审阅直接接受全部 hunk。
     /// 正常 Yolo 任务在运行时内部就已自动放行；这里兜底任务在 Auto 下挂起后才切到 Yolo 的情形。
     pub(super) fn auto_resolve_in_yolo(&mut self, cx: &mut Context<Self>) {
-        if self.mode != Mode::Yolo || self.busy {
+        if self.mode != Mode::Yolo {
             return;
         }
-        if self.pending_approval.is_some() {
-            self.approve_tool(cx);
-        } else if let Some(edit) = self.pending_edit.as_ref() {
-            let id = edit.summary.id.clone();
-            let hunks = edit.summary.hunk_ids.clone();
-            let _ = self.apply_reviewed_edit(&id, &hunks, cx);
+        match self.orchestrator.auto_resolve() {
+            AutoResolve::None => {}
+            AutoResolve::Tool => self.approve_tool(cx),
+            AutoResolve::Edit { id, hunks } => {
+                let _ = self.apply_reviewed_edit(&id, &hunks, cx);
+            }
         }
     }
 
@@ -87,133 +77,85 @@ impl ComposerView {
         }
     }
 
-    pub(super) fn dispatch_external_approval(
-        &mut self,
-        approved: bool,
-        pending: ExternalPendingApproval,
-        status: SharedString,
-        cx: &mut Context<Self>,
-    ) {
-        let granted_permission_ids = pending.granted_permission_ids(approved);
-        #[cfg(test)]
-        {
-            self.last_external_approval = Some(ExternalApprovalReply {
-                approved,
-                granted_permission_ids: granted_permission_ids.clone(),
-            });
-        }
-        self.dispatch_external_command(
-            ExternalCommand::Respond {
-                approved,
-                granted_permission_ids,
-            },
-            status,
-            cx,
-        );
-    }
-
     pub(super) fn toggle_permission(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(pending) = self.external_pending_approval.as_mut() else {
-            return;
-        };
-        let Some(choice) = pending.permissions.get_mut(index) else {
-            return;
-        };
-        choice.checked = !choice.checked;
-        cx.notify();
+        if self.orchestrator.toggle_permission(index) {
+            cx.notify();
+        }
     }
 
     pub(super) fn approve_tool(&mut self, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
-        if let Some(pending) = self.external_pending_approval.take() {
-            self.dispatch_external_approval(
-                true,
-                pending,
+        match self.orchestrator.take_approval(true, true) {
+            ApprovalAction::None => {}
+            ApprovalAction::External(command) => self.dispatch_external_command(
+                command,
                 t!("composer.status.returning_approval_codex"),
                 cx,
-            );
-            return;
+            ),
+            ApprovalAction::Builtin {
+                call_id,
+                tool_name,
+                approved,
+            } => {
+                let label = tf!("composer.status.running_tool", "tool" => tool_name);
+                self.dispatch_task_command(
+                    TaskCommand::ResolveApproval { call_id, approved },
+                    label,
+                    cx,
+                );
+            }
         }
-        let Some(pending) = self.pending_approval.take() else {
-            return;
-        };
-        let label = tf!(
-            "composer.status.running_tool",
-            "tool" => pending.request.tool_name
-        );
-        self.dispatch_task_command(
-            TaskCommand::ResolveApproval {
-                call_id: pending.request.call_id,
-                approved: true,
-            },
-            label,
-            cx,
-        );
     }
 
     pub(super) fn reject_tool(&mut self, cx: &mut Context<Self>) {
-        if let Some(pending) = self.external_pending_approval.take() {
-            self.dispatch_external_approval(
-                false,
-                pending,
+        match self.orchestrator.take_approval(false, false) {
+            ApprovalAction::None => {}
+            ApprovalAction::External(command) => self.dispatch_external_command(
+                command,
                 t!("composer.status.returning_rejection_codex"),
                 cx,
-            );
-            return;
-        }
-        if let Some(pending) = self.pending_approval.take() {
-            self.dispatch_task_command(
-                TaskCommand::ResolveApproval {
-                    call_id: pending.request.call_id,
-                    approved: false,
-                },
-                t!("composer.status.returning_rejection"),
-                cx,
-            );
+            ),
+            ApprovalAction::Builtin {
+                call_id, approved, ..
+            } => {
+                self.dispatch_task_command(
+                    TaskCommand::ResolveApproval { call_id, approved },
+                    t!("composer.status.returning_rejection"),
+                    cx,
+                );
+            }
         }
     }
 
     pub(super) fn decide_hunk(&mut self, id: usize, accept: bool, cx: &mut Context<Self>) {
-        if let Some(edit) = self.pending_edit.as_mut() {
-            edit.decisions.insert(id, accept);
+        if self.orchestrator.decide_hunk(id, accept) {
             cx.notify();
         }
     }
 
     pub(super) fn apply_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(edit) = self.pending_edit.as_ref() else {
-            return;
-        };
-        if edit.decisions.len() != edit.summary.hunk_ids.len() {
-            self.set_status(t!("composer.status.decide_hunks"));
-            cx.notify();
-            return;
+        match self.orchestrator.prepared_edit() {
+            PreparedEdit::Missing => {}
+            PreparedEdit::Incomplete => {
+                self.set_status(t!("composer.status.decide_hunks"));
+                cx.notify();
+            }
+            PreparedEdit::Ready {
+                proposal_id,
+                accepted,
+            } => {
+                let _ = self.apply_reviewed_edit(&proposal_id, &accepted, cx);
+            }
         }
-        let accepted = edit
-            .summary
-            .hunk_ids
-            .iter()
-            .filter(|id| edit.decisions.get(id) == Some(&true))
-            .copied()
-            .collect::<Vec<_>>();
-        let proposal_id = edit.summary.id.clone();
-        let _ = self.apply_reviewed_edit(&proposal_id, &accepted, cx);
     }
 
     pub(super) fn reject_edit(&mut self, cx: &mut Context<Self>) {
-        if let Some(proposal_id) = self
-            .pending_edit
-            .as_ref()
-            .map(|edit| edit.summary.id.clone())
-        {
+        if let Some(proposal_id) = self.orchestrator.pending_edit_id() {
             let _ = self.reject_reviewed_edit(&proposal_id, cx);
         }
     }
 
     pub(super) fn confirm_plan(&mut self, cx: &mut Context<Self>) {
-        if !self.awaiting_plan_confirmation || self.busy {
+        if !self.awaiting_plan_confirmation || self.orchestrator.busy {
             return;
         }
         self.awaiting_plan_confirmation = false;
@@ -240,7 +182,7 @@ impl ComposerView {
         p: &ResolvedPalette,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let approval_model = if let Some(pending) = self.pending_approval.as_ref() {
+        let approval_model = if let Some(pending) = self.orchestrator.pending_approval.as_ref() {
             Some(ApprovalCardModel {
                 headline: tf!(
                     "composer.approval.headline",
@@ -254,26 +196,29 @@ impl ComposerView {
                 choices: Vec::new(),
             })
         } else {
-            self.external_pending_approval.as_ref().map(|pending| {
-                let permissions_request = pending.is_permissions();
-                ApprovalCardModel {
-                    headline: tf!(
-                        "composer.approval.codex_headline",
-                        "kind" => pending.request_kind,
-                        "request" => pending.backend_request_id,
-                        "call" => pending.tool_call_id
-                    ),
-                    show_arguments: !permissions_request || pending.permissions.is_empty(),
-                    arguments: pending.arguments.clone(),
-                    scope: permissions_request.then(|| pending.scope.clone()),
-                    choices: pending
-                        .permissions
-                        .iter()
-                        .enumerate()
-                        .map(|(index, choice)| (index, choice.label.clone(), choice.checked))
-                        .collect(),
-                }
-            })
+            self.orchestrator
+                .external_pending_approval
+                .as_ref()
+                .map(|pending| {
+                    let permissions_request = pending.is_permissions();
+                    ApprovalCardModel {
+                        headline: tf!(
+                            "composer.approval.codex_headline",
+                            "kind" => pending.request_kind,
+                            "request" => pending.backend_request_id,
+                            "call" => pending.tool_call_id
+                        ),
+                        show_arguments: !permissions_request || pending.permissions.is_empty(),
+                        arguments: pending.arguments.clone(),
+                        scope: permissions_request.then(|| pending.scope.clone()),
+                        choices: pending
+                            .permissions
+                            .iter()
+                            .enumerate()
+                            .map(|(index, choice)| (index, choice.label.clone(), choice.checked))
+                            .collect(),
+                    }
+                })
         };
         let approval = approval_model.map(|model| {
             let scope_row = model.scope.as_ref().map(|scope| {
@@ -382,7 +327,7 @@ impl ComposerView {
         p: &ResolvedPalette,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let edit_review = self.pending_edit.as_ref().map(|edit| {
+        let edit_review = self.orchestrator.pending_edit.as_ref().map(|edit| {
             let hunk_buttons = edit.summary.hunk_ids.iter().flat_map(|id| {
                 let accept_id = *id;
                 let reject_id = *id;
@@ -499,6 +444,7 @@ impl ComposerView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let budget_resume = self
+            .orchestrator
             .active_task
             .as_ref()
             .is_some_and(|runtime| runtime.task().state == TaskState::WaitingUser)

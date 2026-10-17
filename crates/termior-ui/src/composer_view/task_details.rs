@@ -48,7 +48,7 @@ impl ComposerView {
 
     /// 当前活动任务正因用户接管该会话而等待。
     fn waiting_for_hand_back(&self, id: &CommandSessionId) -> bool {
-        self.active_task.as_ref().is_some_and(|task| {
+        self.orchestrator.active_task.as_ref().is_some_and(|task| {
             matches!(
                 &task.task().waiting_reason,
                 Some(WaitingReason::TerminalControl { session_id, .. }) if *session_id == id.0
@@ -87,7 +87,7 @@ impl ComposerView {
                 return;
             }
         };
-        if self.waiting_for_hand_back(id) && !self.busy {
+        if self.waiting_for_hand_back(id) && !self.orchestrator.busy {
             self.dispatch_task_command(
                 TaskCommand::HandBack {
                     session_id: id.0.clone(),
@@ -124,6 +124,7 @@ impl ComposerView {
             );
         };
         let state = self
+            .orchestrator
             .active_task
             .as_ref()
             .filter(|runtime| runtime.task().id.0 == task.task_id)

@@ -14,8 +14,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use termior_agent_host::{
-    permission_entries, BackendEvent, CodexBackend, ManagedAgentSession, PumpOutcome, TaskLaunch,
-    PERMISSIONS_APPROVAL_METHOD,
+    BackendEvent, CodexBackend, ManagedAgentSession, PumpOutcome, TaskLaunch,
 };
 use termior_ai::automation::{next_run_after, AutomationManager, AutomationStore};
 use termior_ai::context_engine::{
@@ -24,12 +23,12 @@ use termior_ai::context_engine::{
 };
 use termior_ai::slash::{self, ComposerCommand, SlashAction, SlashCommand};
 use termior_ai::{
-    AgentDefinition, AgentDefinitionStore, ApprovalPolicy, ApprovalRequest, Attachment,
-    AttachmentSource, CancellationToken, ChangeSetId, ComposerDraft, EditProposalSummary,
-    HttpProvider, KeyringSecretStore, Message, Mode, ProviderConfig, Role, RuntimeBudgets,
-    SecretStore, SessionModel, SessionStore, Snippet, SnippetError, SnippetStore, TaskCommand,
-    TaskConfig, TaskRuntime, TaskState, TaskSummary, TaskSummaryStore, TerminalContext,
-    TerminalContextProvider, TodoStore, ToolContract, ToolExecutor, ToolRegistry, WaitingReason,
+    AgentDefinition, AgentDefinitionStore, ApprovalPolicy, Attachment, AttachmentSource,
+    CancellationToken, ChangeSetId, ComposerDraft, EditProposalSummary, HttpProvider,
+    KeyringSecretStore, Message, Mode, ProviderConfig, Role, RuntimeBudgets, SecretStore,
+    SessionModel, SessionStore, Snippet, SnippetError, SnippetStore, TaskCommand, TaskConfig,
+    TaskRuntime, TaskState, TaskSummary, TaskSummaryStore, TerminalContext,
+    TerminalContextProvider, TodoStore, ToolExecutor, ToolRegistry, WaitingReason,
 };
 use termior_explorer_core::fuzzy::fuzzy_match;
 use termior_platform::AgentStatus;
@@ -42,8 +41,9 @@ use termior_store::{
 use termior_theme::ResolvedPalette;
 use termior_ui_kit::{menu_panel, tokens::icon_size, Icon, Tooltip};
 
-// 拆分结构：本文件保留核心类型与 `ComposerView` 字段；
-// 行为按职责放在子模块（session、backend、messages、approval、input、centers、render）。
+// 拆分结构：本文件保留核心类型与 `ComposerView` 字段。
+// 任务 / 审批 / 外部后端状态在 `orchestrator`（不依赖 GPUI）。
+// 其余行为按职责放在子模块（session、backend、messages、approval、input、centers、render）。
 mod agent_menu;
 mod approval;
 mod backend;
@@ -53,10 +53,17 @@ mod input;
 mod messages;
 mod model_menu;
 mod notify;
+mod orchestrator;
 mod render;
 mod session;
 mod task_details;
 mod tool_blocks;
+
+use orchestrator::{
+    AgentBackendChoice, AgentRuntime, ApprovalAction, AutoResolve, ComposerOrchestrator,
+    ExternalCommand, ExternalDispatch, ExternalOutcome, ExternalRunResult, PreparedEdit,
+    StopAction, TaskCommit, TaskDispatchReject, TaskRunResult, TaskStatusLine, TaskUiHint,
+};
 
 pub use agent_menu::ComposerLaunchCliAgent;
 use task_details::TaskRef;
@@ -65,29 +72,6 @@ use task_details::TaskRef;
 mod layout_tests;
 #[cfg(test)]
 mod permission_fixture_contract;
-
-#[derive(Clone)]
-struct AgentRuntime {
-    config: ProviderConfig,
-    tools: ToolRegistry,
-    executor: Arc<ToolExecutor>,
-    system_prompt: String,
-}
-
-struct PendingApproval {
-    request: ApprovalRequest,
-    contract: ToolContract,
-}
-
-struct PendingEdit {
-    summary: EditProposalSummary,
-    decisions: HashMap<usize, bool>,
-}
-
-struct TaskRunResult {
-    task: TaskRuntime,
-    error: Option<String>,
-}
 
 /// Composer 的检查面板（任务详情、上下文检查器、恢复中心等），互斥展开。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,19 +85,6 @@ enum ComposerCenter {
     Memory,
     Snippets,
     Todos,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentBackendChoice {
-    BuiltIn,
-    CodexAppServer,
-}
-
-/// Codex `item/permissions/requestApproval` 在审批卡上的一项可勾选权限。
-struct PermissionChoice {
-    id: String,
-    label: String,
-    checked: bool,
 }
 
 struct ApprovalCardModel {
@@ -144,106 +115,12 @@ fn scope_element_id(scope: &str) -> String {
     format!("permission-scope-{token}")
 }
 
-struct ExternalPendingApproval {
-    backend_request_id: String,
-    tool_call_id: String,
-    request_kind: String,
-    arguments: String,
-    /// 服务端提议的 scope（`turn` / `session` / 未知值）。缺省为空串。
-    /// 真正回给 Codex 的授权范围始终是当前 turn。
-    scope: String,
-    permissions: Vec<PermissionChoice>,
-}
-
-impl ExternalPendingApproval {
-    fn from_codex(
-        backend_request_id: String,
-        tool_call_id: String,
-        request_kind: String,
-        raw: &serde_json::Value,
-    ) -> Self {
-        let redactor = termior_store::StreamingRedactor::new(Vec::<String>::new());
-        let arguments = redactor.redact(&raw.to_string()).text;
-        let scope = raw
-            .get("scope")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let permissions = if request_kind == PERMISSIONS_APPROVAL_METHOD {
-            let profile = raw.get("permissions").unwrap_or(&serde_json::Value::Null);
-            permission_entries(profile)
-                .into_iter()
-                .map(|entry| PermissionChoice {
-                    label: redactor.redact(&entry.label).text,
-                    id: entry.id,
-                    checked: true,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        Self {
-            backend_request_id,
-            tool_call_id,
-            request_kind,
-            arguments,
-            scope,
-            permissions,
-        }
-    }
-
-    fn is_permissions(&self) -> bool {
-        self.request_kind == PERMISSIONS_APPROVAL_METHOD
-    }
-
-    /// 权限审批：批准回传勾选子集，拒绝回传空集。其它审批不携带权限 id。
-    fn granted_permission_ids(&self, approved: bool) -> Option<Vec<String>> {
-        if !self.is_permissions() {
-            return None;
-        }
-        if !approved {
-            return Some(Vec::new());
-        }
-        Some(
-            self.permissions
-                .iter()
-                .filter(|choice| choice.checked)
-                .map(|choice| choice.id.clone())
-                .collect(),
-        )
-    }
-}
-
-enum ExternalCommand {
-    Start {
-        task_id: String,
-        text: String,
-    },
-    Respond {
-        approved: bool,
-        granted_permission_ids: Option<Vec<String>>,
-    },
-}
-
-/// 审批按钮交给 Codex 会话的决议，供 GPUI 测试断言勾选子集。
-#[cfg(test)]
-struct ExternalApprovalReply {
-    approved: bool,
-    granted_permission_ids: Option<Vec<String>>,
-}
-
 #[derive(Debug, Clone, Copy)]
 enum MemoryAction {
     Accept,
     Reject,
     TogglePause,
     Delete,
-}
-
-struct ExternalRunResult {
-    session: Option<Arc<Mutex<ManagedAgentSession>>>,
-    outcome: Option<PumpOutcome>,
-    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -308,22 +185,14 @@ pub struct ComposerView {
     mode_menu_open: bool,
     plan_confirmed: bool,
     awaiting_plan_confirmation: bool,
-    busy: bool,
     status: String,
     /// 当前 status 是否为「先到 Settings → Models 配置模型」引导文案；
     /// 是则空闲时在输入行内作为占位符复用（见 `model_setup_placeholder`）。
     /// 原先用 `status.contains("Settings → Models")` 之类的文本嗅探，i18n 化后
     /// 文案会随语言变化，改为在写入状态时显式维护该标记。
     needs_model_setup: bool,
-    runtime: Option<AgentRuntime>,
-    active_task: Option<TaskRuntime>,
-    active_cancellation: Option<CancellationToken>,
-    active_plan_request: bool,
-    pending_approval: Option<PendingApproval>,
-    external_pending_approval: Option<ExternalPendingApproval>,
-    #[cfg(test)]
-    last_external_approval: Option<ExternalApprovalReply>,
-    pending_edit: Option<PendingEdit>,
+    /// 任务、审批和外部后端会话。渲染只读这里，事件转发给它。
+    orchestrator: ComposerOrchestrator,
     sessions: SessionStore,
     snippets: SnippetStore,
     custom_agents: Vec<AgentDefinition>,
@@ -360,9 +229,6 @@ pub struct ComposerView {
     skill_scan_error: Option<String>,
     active_skills: Vec<String>,
     memory: MemoryStore,
-    backend_choice: AgentBackendChoice,
-    backend_capability_summary: Option<String>,
-    external_session: Option<Arc<Mutex<ManagedAgentSession>>>,
     /// Agent 选择器下拉（Stage B 6.1）与打开时探测的 CLI Agent 可用性。
     agent_menu_open: bool,
     cli_agent_available: Vec<bool>,
@@ -380,10 +246,6 @@ pub struct ComposerView {
     selecting_text: bool,
     /// 任务详情面板（Stage B 6.3）所指的任务；任务结束后仍可查看命令结果。
     last_task: Option<TaskRef>,
-    /// 活动任务固定使用的运行时：执行器的根即任务的 project_dir，审批/续跑不随全局切换漂移。
-    active_runtime: Option<AgentRuntime>,
-    /// 下一次提交要固定到的项目目录（终端快捷入口设置，Stage B 3.3）。
-    task_project_override: Option<PathBuf>,
     /// 任务命令会话的状态边沿检测（Stage B 6.4）。
     command_watch: notify::CommandWatch,
     command_watch_running: bool,

@@ -64,7 +64,9 @@ impl ComposerView {
                 },
             ),
             (Some(_), _) => (t!("composer.tool.failed").to_string(), p.status[3]),
-            (None, _) if self.busy => (t!("composer.tool.running").to_string(), p.status[0]),
+            (None, _) if self.orchestrator.busy => {
+                (t!("composer.tool.running").to_string(), p.status[0])
+            }
             (None, _) => (t!("composer.tool.pending").to_string(), p.status[2]),
         };
         let line_count = output

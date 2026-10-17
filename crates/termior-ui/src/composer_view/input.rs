@@ -342,7 +342,7 @@ impl ComposerView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.busy {
+        if self.orchestrator.busy {
             self.stop_active_task(cx);
         } else {
             self.submit(cx);
@@ -350,15 +350,21 @@ impl ComposerView {
     }
 
     pub(super) fn stop_active_task(&mut self, cx: &mut Context<Self>) {
-        if let Some(cancellation) = &self.active_cancellation {
-            cancellation.cancel();
-            self.set_status(t!("composer.status.cancelling"));
-            cx.emit(AgentStatus::Attention);
-            cx.notify();
-            return;
-        }
-        if self.active_task.is_some() {
-            self.dispatch_task_command(TaskCommand::Cancel, t!("composer.status.cancelling"), cx);
+        match self.orchestrator.stop_action() {
+            StopAction::CancelToken(cancellation) => {
+                cancellation.cancel();
+                self.set_status(t!("composer.status.cancelling"));
+                cx.emit(AgentStatus::Attention);
+                cx.notify();
+            }
+            StopAction::DispatchCancel => {
+                self.dispatch_task_command(
+                    TaskCommand::Cancel,
+                    t!("composer.status.cancelling"),
+                    cx,
+                );
+            }
+            StopAction::Idle => {}
         }
     }
 
@@ -741,7 +747,8 @@ impl ComposerView {
         p: &ResolvedPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let external_backend = self.backend_choice == AgentBackendChoice::CodexAppServer;
+        let external_backend =
+            self.orchestrator.backend_choice == AgentBackendChoice::CodexAppServer;
         let mode_label = if external_backend {
             t!("composer.backend_approval")
         } else {
@@ -749,6 +756,7 @@ impl ComposerView {
         };
         let agent_name = self.active_agent_name();
         let agent_tooltip = self
+            .orchestrator
             .backend_capability_summary
             .clone()
             .map(SharedString::from)
@@ -957,8 +965,12 @@ impl ComposerView {
             .child(
                 crate::ui::icon_button(
                     "composer-send",
-                    if self.busy { Icon::Stop } else { Icon::Send },
-                    if self.busy {
+                    if self.orchestrator.busy {
+                        Icon::Stop
+                    } else {
+                        Icon::Send
+                    },
+                    if self.orchestrator.busy {
                         t!("composer.stop_task")
                     } else {
                         t!("composer.send_hint")
