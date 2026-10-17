@@ -52,7 +52,7 @@ Termior 的功能骨架已经完整，但界面观感停留在"内部工具"水�
 
 ### Modified Capabilities
 
-（无。`openspec/specs/` 目前为空，本仓库此前未使用 OpenSpec 管理规格；上述能力均为首次建档。与既有 `docs/termior-spec.md` 的冲突处理见 Impact。）
+（无。`openspec/specs/` 目前为空，本仓库此前未使用 OpenSpec 管理规格；上述能力均为首次建档。与既有 `docs/user/termior-spec.md` 的冲突处理见 Impact。）
 
 ## Impact
 
@@ -71,12 +71,12 @@ Termior 的功能骨架已经完整，但界面观感停留在"内部工具"水�
 **依赖**
 
 - 新增：Lucide SVG 资源（ISC，需按 spec §0 保留许可声明）、资源内嵌方案（`rust-embed` 或 `include_dir`）
-- 不引入 `gpui-component`：它把 gpui 钉在 zed `1d217ee`，而本仓库钉 `3565c49` 且 vendor 了打过补丁的 `gpui_windows`；对齐与长期维护成本超过收益。此决策关闭 `docs/termior-spec.md` §3.1 的开放问题 Q2
+- 不引入 `gpui-component`：它把 gpui 钉在 zed `1d217ee`，而本仓库钉 `3565c49` 且 vendor 了打过补丁的 `gpui_windows`；对齐与长期维护成本超过收益。此决策关闭 `docs/user/termior-spec.md` §3.1 的开放问题 Q2
 
 **文档**
 
 - 新增 ADR：不采用 gpui-component 的决策与理由
-- 修订 `docs/termior-spec.md`：FR-THEME 的主题/明暗模型、FR-WS-06 的 header 描述。FR-WS-05 的状态栏面包屑属于补齐原有要求，不算偏离
+- 修订 `docs/user/termior-spec.md`：FR-THEME 的主题/明暗模型、FR-WS-06 的 header 描述。FR-WS-05 的状态栏面包屑属于补齐原有要求，不算偏离
 - 附录 A 的默认键位表不变（本次不引入命令面板）
 
 **平台风险**

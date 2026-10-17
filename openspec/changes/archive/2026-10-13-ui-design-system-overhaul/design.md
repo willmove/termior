@@ -41,7 +41,7 @@ Termior 是 Rust + GPUI 单进程桌面应用，17 个业务 crate + 1 个 GPUI 
 
 **考虑过的替代方案**：(a) 迁 rev 后引入 gpui-component——被上述维护成本否决；(b) 按需 vendor 其单个组件源码——需要连带搬运其主题系统与内部工具函数，反而更脏；(c) 先做 spec 原计划的 M0 三组基线实验——rev 冲突已经足以定论，基线实验不会改变结论。
 
-此决策关闭 `docs/termior-spec.md` §3.1 的开放问题 Q2，需落一份 ADR。
+此决策关闭 `docs/user/termior-spec.md` §3.1 的开放问题 Q2，需落一份 ADR。
 
 ### D2 — 控件层落在 `termior-ui-kit`，用 feature gate 隔离 GPUI
 

@@ -1,6 +1,6 @@
 # AI Agent A–E 实现状态
 
-本文记录当前工作树中 A–E 五个阶段的实际实现、自动验证结果和平台边界。各阶段的手工验收步骤见同目录的 `ai-agent-stage-*-validation.md`。
+本文记录当前工作树中 A–E 五个阶段的实际实现、自动验证结果和平台边界。勾选清单以各 OpenSpec change 的 `tasks.md` 为准，本文只保留实现证据和平台边界，不另维护一份任务列表。Stage A 的手工验收见 [`archive/ai-agent-stage-a-validation.md`](archive/ai-agent-stage-a-validation.md)；Stage B–E 见同目录的 `ai-agent-stage-b-validation.md` 至 `ai-agent-stage-e-validation.md`。
 
 ## 已实现
 

@@ -164,11 +164,11 @@
       → oneshot `with_animation` 160ms fade-in（sidebar / toast / bell / 菜单）；禁止 `.repeat()`。
 - [x] 7.4 验证空闲一分钟内零重绘
       → `TERMIOR_IDLE_REDRAW_PROBE` + `scripts/idle-redraw-smoke.ps1`；10s 探针 `FRAMES=0`（可 `-Seconds 60`）。
-- [x] 7.5 新增 ADR 记录不采用 gpui-component 的决策与理由，并在 `docs/termior-spec.md` §3.1 关闭开放问题 Q2
+- [x] 7.5 新增 ADR 记录不采用 gpui-component 的决策与理由，并在 `docs/user/termior-spec.md` §3.1 关闭开放问题 Q2
       → `docs/adr/0003-no-gpui-component.md`；§3.1 / NFR-11 / R4/R6 / Q2 已同步。
-- [x] 7.6 修订 `docs/termior-spec.md` 的 FR-THEME 主题/明暗模型描述
+- [x] 7.6 修订 `docs/user/termior-spec.md` 的 FR-THEME 主题/明暗模型描述
       → FR-THEME-02：原生外观 + FollowSystem 配对；去掉算法浅色变体与 gpui-component 映射。
-- [x] 7.7 修订 `docs/termior-spec.md` 的 FR-WS-06 header 描述（自绘标题栏与操作区收敛）
+- [x] 7.7 修订 `docs/user/termior-spec.md` 的 FR-WS-06 header 描述（自绘标题栏与操作区收敛）
       → FR-WS-05/06/07 对齐当前 chrome（自绘标题栏、状态栏上下文、设置左侧导航）。
 - [x] 7.8 全主题、全界面截图复核，产出最终前后对比
       → `target/ui-shots/phase7-{default,default-light,tokyo,nord-light}-{main,settings}.png`。

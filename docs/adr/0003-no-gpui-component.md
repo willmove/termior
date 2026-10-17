@@ -4,7 +4,7 @@
 - 日期：2026-07-25
 - 决策者：Termior 维护者（经 OpenSpec change `ui-design-system-overhaul` / design D1）
 - 取代：`termior-spec.md` v0.1 §3.1「有限采用 gpui-component」与开放问题 Q2
-- 相关：`openspec/changes/ui-design-system-overhaul/design.md`（D1）、`crates/termior-ui-kit`
+- 相关：`openspec/changes/archive/2026-10-13-ui-design-system-overhaul/design.md`（D1）、`crates/termior-ui-kit`
 
 ## 背景
 
@@ -16,7 +16,7 @@
 
 **不引入 gpui-component。** 通用桌面控件（Icon、IconButton、Tooltip、Input chrome、ListRow、Menu、EmptyState、尺寸 token 等）在 `termior-ui-kit` 内自建，可选 `gpui-kit` feature 隔离 GPUI 依赖；业务 crate 只消费 ui-kit 与 GPUI，不得直接依赖 gpui-component。
 
-此决策关闭 `docs/termior-spec.md` 开放问题 Q2，并废止 §3.1 中「有限采用 + M0 三组基线」的路径。
+此决策关闭 `docs/user/termior-spec.md` 开放问题 Q2，并废止 §3.1 中「有限采用 + M0 三组基线」的路径。
 
 ## 理由
 
@@ -34,7 +34,7 @@
 ## 一致性变更
 
 - `termior-ui-kit`：自建 Icon / Tooltip / IconButton / Input / ListRow / Menu / EmptyState 与尺寸 token（见 OpenSpec `ui-design-system`）。
-- `docs/termior-spec.md`：§3 技术选型、§3.1、NFR-11、风险 R4/R6、开放问题 Q2 同步修订为「不采用 gpui-component」。
+- `docs/user/termior-spec.md`：§3 技术选型、§3.1、NFR-11、风险 R4/R6、开放问题 Q2 同步修订为「不采用 gpui-component」。
 - 业务 crate（`termior` 等）禁止新增对 gpui-component 的依赖。
 
 ## 未来工作

@@ -35,4 +35,4 @@
 
 **文档**
 
-- 不强制修订 `docs/termior-spec.md`；若实现引入明确的浅层优先策略，可在实现后于 tasks 中补一句 FR-EXPL-03 说明
+- 不强制修订 `docs/user/termior-spec.md`；若实现引入明确的浅层优先策略，可在实现后于 tasks 中补一句 FR-EXPL-03 说明

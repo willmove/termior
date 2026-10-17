@@ -1,7 +1,7 @@
 # settings-window Specification
 
 ## Purpose
-TBD - created by archiving change ui-design-system-overhaul. Update Purpose after archive.
+设置窗口用左侧导航和限宽居中的内容区组织选项，常规项自动保存并去掉 Save 按钮，只有 API key 等需要确认的操作保留显式动作。
 
 ## Requirements
 

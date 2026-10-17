@@ -14,7 +14,7 @@
 //! **平台范围**：需真实显示环境（GPUI 窗口）。CI 仅在 windows/macos（带显示）
 //! 的 desktop job 启用；ubuntu（headless）只跑 `nfr-pty` + criterion bench。
 //! 冷启动绝对值依赖硬件，故 CI 门禁用「相对基线回归」，而非 spec 绝对目标
-//! （spec 绝对目标作为发布验收参考，记录在 docs/nfr-baselines.md）。
+//! （spec 绝对目标作为发布验收参考，记录在 docs/process/nfr-baselines.md）。
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 

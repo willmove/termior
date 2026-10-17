@@ -1,7 +1,7 @@
 # theme-appearance-model Specification
 
 ## Purpose
-TBD - created by archiving change ui-design-system-overhaul. Update Purpose after archive.
+主题用语义色板声明原生明暗归属；选择主题即采用该外观，Follow system 配一对浅色/深色主题，已导出的自定义主题保持可迁移。
 
 ## Requirements
 

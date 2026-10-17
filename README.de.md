@@ -12,7 +12,7 @@
 
 > Eine Open-Source-, plattformübergreifende, terminal-first KI-native Entwicklungsumgebung (ADE). BYOK, lokal zuerst, ohne Konto, ohne Telemetrie.
 
-Termior bündelt ein echtes PTY-Terminal, einen schlanken Code-Editor, einen Datei-Explorer, Git, eine Web-Vorschau sowie einen eingebauten/externen Agenten mit Werkzeugaufrufen, Freigaben, Änderungsprüfung und Wiederherstellung in einem einzigen nativen Fenster. Die maßgebliche Produkt- und Engineering-Spezifikation liegt unter [docs/termior-spec.md](docs/termior-spec.md) (englisch).
+Termior bündelt ein echtes PTY-Terminal, einen schlanken Code-Editor, einen Datei-Explorer, Git, eine Web-Vorschau sowie einen eingebauten/externen Agenten mit Werkzeugaufrufen, Freigaben, Änderungsprüfung und Wiederherstellung in einem einzigen nativen Fenster. Die maßgebliche Produkt- und Engineering-Spezifikation liegt unter [docs/user/termior-spec.md](docs/user/termior-spec.md) (englisch).
 
 ### Installation
 
@@ -39,7 +39,7 @@ Der Workspace hat sich von einem reinen Logik-Prototyp zu einer baubaren GPUI-De
 
 - Persistente Workspaces, 8 Tab-Arten, Splits, Explorer-/Source-Control-/History-Seitenleisten, eine Statusleiste und ein separates Einstellungsfenster;
 - Ein echtes Terminal auf Basis von portable-pty und alacritty_terminal: Shell-Integration (bash/zsh/fish/PowerShell), OSC 7/133/777, IME, Suche, Scrollback, URL- und localhost-Erkennung sowie Windows Job Objects; Auswahl der Standard-Shell in den Einstellungen (Systemstandard / erkannte Shells inkl. Git Bash und WSL-Distributionen / manueller Pfad) plus ein optionales Shell-Menü beim Anlegen eines Terminals; ein Kontextmenü für Kopieren/Einfügen/Alles auswählen;
-- [SSH-Sitzungen und SFTP](docs/ssh.md) (englisch): Verbindungsprofile mit Schnellzugriff aus der Seitenleiste, OS-Credential-Store, Passwort-/MFA-/Schlüssel-/Agent-Authentifizierung, Sprunghosts, Host-Key-Verifikation sowie Datei-/Verzeichnisübertragung mit Fortsetzung; ein zweispaltiger SFTP-Browser und ein Datei-Explorer, der dem aktiven Remote-Tab folgt;
+- [SSH-Sitzungen und SFTP](docs/user/ssh.md) (englisch): Verbindungsprofile mit Schnellzugriff aus der Seitenleiste, OS-Credential-Store, Passwort-/MFA-/Schlüssel-/Agent-Authentifizierung, Sprunghosts, Host-Key-Verifikation sowie Datei-/Verzeichnisübertragung mit Fortsetzung; ein zweispaltiger SFTP-Browser und ein Datei-Explorer, der dem aktiven Remote-Tab folgt;
 - Rope-Editierpuffer, virtualisierter Viewport, inkrementelles tree-sitter-Highlighting, Suche, Undo/Redo, Inline-Completion-Ghost-Text, 10 Editor-Themes und eine Vim-Interaktionsschicht;
 - Datei-Indizierung mit flacher Indizierung und entprellter Überwachung, gitignore-Bewusstsein, Fuzzy-Suche, gestreamtes Background-grep, Tastatur-Navigation im Baum und vollständige Kontextmenüs; projektabhängige Ordner pro Tab mit `cd`-Injektion und folgender Seitenleiste;
 - Dedizierte Git-Diff-/History-/Commit-Datei-Tabs, Staging/Unstaging auf Datei- und Hunk-Ebene, bestätigtes Verwerfen, Commit, Branch, Fetch/Pull/Push und ein Commit-Graph, mit Statusaktualisierung außerhalb des UI-Threads;
@@ -56,7 +56,7 @@ Der Workspace hat sich von einem reinen Logik-Prototyp zu einer baubaren GPUI-De
 - Vereinheitlichtes Notification-Routing für eingebaute und Terminal-Agenten: unterdrückt, solange das Ziel sichtbar ist, thematisches Toast bei Verdeckung, Systembenachrichtigung bei unfokussiertem Fenster, mit Statusglocke im Header;
 - Sichere, idempotente Installation und Entfernung der Claude-Code-OSC-Hooks.
 
-Dies bleibt ein gestufter Meilenstein, nicht die Endabnahme der gesamten Spezifikation. Der Basis-Umfang des Desktops ist in [docs/desktop-milestone.md](docs/desktop-milestone.md) (englisch) dokumentiert; Implementierungsnachweise für die Agent-Stufen A–E sowie Plattform-Sandboxing, Remote-MCP-OAuth, ein echter ACP-Client und die Grenzen der Hintergrundautomatisierung stehen in [docs/ai-agent-implementation-status.md](docs/ai-agent-implementation-status.md) (englisch).
+Dies bleibt ein gestufter Meilenstein, nicht die Endabnahme der gesamten Spezifikation. Der Basis-Umfang des Desktops ist in [docs/process/desktop-milestone.md](docs/process/desktop-milestone.md) (englisch) dokumentiert; Implementierungsnachweise für die Agent-Stufen A–E sowie Plattform-Sandboxing, Remote-MCP-OAuth, ein echter ACP-Client und die Grenzen der Hintergrundautomatisierung stehen in [docs/process/ai-agent-implementation-status.md](docs/process/ai-agent-implementation-status.md) (englisch).
 
 Das neueste getaggte Release ist `v0.2.1`; die Workspace-Version steht in [Cargo.toml](Cargo.toml).
 
@@ -134,7 +134,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-Die CI setzt dieselbe Aufteilung um: `ci.yml` enthält eine Icon-Generierungsprüfung, den Core-Job auf allen drei Plattformen, den Desktop-Job (Check, Clippy, Tests, Release-Build, Binärgrößen-Gate, Windows-Smoke-Frames, Split-Pane-Smoke, NFR-Prozess-Gate), einen Coverage-Job mit 80-%-Zeilenschwelle sowie einen Benchmark-Job mit PTY-Durchsatz-Gate. `audit.yml` führt bei jedem Push und wöchentlich `cargo-deny` aus, um Lizenz- und CVE-Drift zu erkennen. `nightly.yml` läuft täglich und per `workflow_dispatch` auf Ubuntu, installiert OpenSSH und paramiko und führt die ignorierten Tests aus, die ein gehosteter Runner tragen kann (`ssh_roundtrip` und `live_release_download`). Codex-Smoke und Keyring-Tests bleiben manuell; siehe `docs/nightly-integration.md`.
+Die CI setzt dieselbe Aufteilung um: `ci.yml` enthält eine Icon-Generierungsprüfung, den Core-Job auf allen drei Plattformen, den Desktop-Job (Check, Clippy, Tests, Release-Build, Binärgrößen-Gate, Windows-Smoke-Frames, Split-Pane-Smoke, NFR-Prozess-Gate), einen Coverage-Job mit 80-%-Zeilenschwelle sowie einen Benchmark-Job mit PTY-Durchsatz-Gate. `audit.yml` führt bei jedem Push und wöchentlich `cargo-deny` aus, um Lizenz- und CVE-Drift zu erkennen. `nightly.yml` läuft täglich und per `workflow_dispatch` auf Ubuntu, installiert OpenSSH und paramiko und führt die ignorierten Tests aus, die ein gehosteter Runner tragen kann (`ssh_roundtrip` und `live_release_download`). Codex-Smoke und Keyring-Tests bleiben manuell; siehe `docs/process/nightly-integration.md`.
 
 #### App-Icons
 

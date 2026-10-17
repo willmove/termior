@@ -1,6 +1,6 @@
 # NFR 基准 harness、基线与回归门禁
 
-> 对应工单 `01-nfr-benchmarks-harness`；对齐 `termior-spec.md` §8 非功能需求（NFR-01~04）。
+> 对应工单 `01-nfr-benchmarks-harness`；对齐 [`termior-spec.md`](../user/termior-spec.md) §8 非功能需求（NFR-01~04）。
 
 ## 目标
 
@@ -94,7 +94,7 @@ RSS 更有参考价值；数字稳定后再固化为 `linux` 平台基线。
 
 ## 基线与门禁语义
 
-基线固化在 [`baselines/nfr-baselines.json`](baselines/nfr-baselines.json)。
+基线固化在 [`baselines/nfr-baselines.json`](../baselines/nfr-baselines.json)。
 
 - **门禁只看相对回归**：冷启动/RSS/FPS 的绝对值高度依赖 CI runner 硬件（同型号 runner
   也存在代际差异），所以门禁判据是「当前相对基线退化是否超 `threshold_percent`」，

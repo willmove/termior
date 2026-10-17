@@ -2,7 +2,7 @@
 #
 # Codex smoke and the keyring vault test stay manual: a hosted Ubuntu runner has
 # neither a compatible logged-in Codex CLI nor an unlocked Secret Service.
-# Steps: docs/nightly-integration.md
+# Steps: docs/process/nightly-integration.md
 #
 # Schedule fires only from the default branch. workflow_dispatch can target a
 # branch once this file is on that branch and GitHub accepts the dispatch.

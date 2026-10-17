@@ -1,7 +1,7 @@
 # explorer-resilience Specification
 
 ## Purpose
-TBD - created by archiving change ui-design-system-overhaul. Update Purpose after archive.
+文件索引遇到不可读条目时跳过该条目并走完全程，面板底部用一行提示汇总被跳过的项，而不是中止整棵树或把原始错误铺满面板。
 
 ## Requirements
 

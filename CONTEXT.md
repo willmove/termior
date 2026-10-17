@@ -1,6 +1,6 @@
 # Termior
 
-一体化开发工作台(终端 + 编辑器 + 文件浏览 + 源码管理 + Web 预览 + AI Agent)的领域词汇表。产品规格见 `docs/termior-spec.md`,架构决策见 `docs/adr/`。
+一体化开发工作台(终端 + 编辑器 + 文件浏览 + 源码管理 + Web 预览 + AI Agent)的领域词汇表。产品规格见 `docs/user/termior-spec.md`,架构决策见 `docs/adr/`。
 
 ## Language
 

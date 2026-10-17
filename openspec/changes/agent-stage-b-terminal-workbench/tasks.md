@@ -73,7 +73,7 @@
 本轮补齐的项目与证据：
 
 - 0.1 `agent-stage-a-reliable-runtime` 已用 `openspec archive` 归档（`openspec/changes/archive/2026-10-11-agent-stage-a-reliable-runtime`，主规格 `openspec/specs/reliable-agent-runtime`）；M6 离线 scenario harness 与 `runtime_reliability` 全绿。
-- 0.2 Codex app-server 官方方法、实验面与锁定策略记录在 `docs/codex-app-server-compat.md`。本机未安装 `codex`，真实 smoke 未重跑。
+- 0.2 Codex app-server 官方方法、实验面与锁定策略记录在 `docs/process/codex-app-server-compat.md`。本机未安装 `codex`，真实 smoke 未重跑。
 - 3.3 终端右键菜单新增“解释最近失败的命令 / 修复并重跑最近失败的命令”。附件带命令元数据；内置后端的任务以当前 Tab 项目目录为执行器根，`TaskConfig.project_dir` 随之固定；审批和续跑使用同一个任务运行时（`ComposerView::active_runtime`），不随全局配置漂移。
 - 3.4 `ToolExecutor` 记录经 `command_claim` 取得的会话。用户接管后，`RuntimeToolExecutor::user_control_interrupt` 在下一个调度步骤报告一次，任务进入 `WaitingUser { TerminalControl }`。终端 pane 显示控制权横幅（接管 / 交还 Agent / 保留控制权），任务详情里也有同样的按钮。交还时调用 `TaskCommand::HandBack`，Agent 拿到接管期间的输出游标后从原进程继续。不交还也可以直接 `ContinueAfterUser`。
 - 6.1 Agent 选择器改为下拉菜单，分“内置后端 / 结构化外部后端 / 终端 CLI Agent”三组。CLI Agent（`termior_agent_host::CLI_AGENTS`）的结构化能力全部报告为 unsupported，选中后在当前项目的新终端里启动。

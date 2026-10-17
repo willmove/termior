@@ -153,6 +153,13 @@ final description. Draft the curated notes in a file outside version control (co
 gh release edit vX.Y.Z --title "Termior vX.Y.Z" --notes-file dist/release-notes-vX.Y.Z.md
 ```
 
+The published archive is the GitHub Release body, not a file in this repository. `dist/` is
+gitignored packaging output, so `dist/release-notes-vX.Y.Z.md` exists only on the machine that
+drafts that release. A local `dist/` that stops at v0.1.9 does not mean later notes are missing:
+v0.2.x notes belong on the GitHub Release for that tag. Confirm with `gh release view vX.Y.Z`
+before writing anything new. Do not copy those bodies back into `dist/` or `docs/`, and do not
+invent notes for a version that has no Release.
+
 Use this structure unless the release content calls for a small adjustment:
 
 ```markdown

@@ -12,7 +12,7 @@
 
 > オープンソース・クロスプラットフォーム・ターミナルファーストの AI ネイティブ開発環境（ADE）。BYOK・ローカルファースト・アカウント不要・テレメトリなし。
 
-Termior は、本物の PTY ターミナル、軽量コードエディター、ファイルエクスプローラー、Git、Web プレビュー、そしてツール呼び出し・承認・変更レビュー・復旧に対応した内蔵/外部エージェントを、単一のネイティブウィンドウに統合します。製品およびエンジニアリング仕様は [docs/termior-spec.md](docs/termior-spec.md) を参照してください。
+Termior は、本物の PTY ターミナル、軽量コードエディター、ファイルエクスプローラー、Git、Web プレビュー、そしてツール呼び出し・承認・変更レビュー・復旧に対応した内蔵/外部エージェントを、単一のネイティブウィンドウに統合します。製品およびエンジニアリング仕様は [docs/user/termior-spec.md](docs/user/termior-spec.md) を参照してください。
 
 ### インストール
 
@@ -39,7 +39,7 @@ xattr -cr /Applications/Termior.app
 
 - 永続ワークスペース、8 種類のタブ、分割ペイン、Explorer / Source Control / History サイドバー、ステータスバー、独立した設定ウィンドウ；
 - portable-pty + alacritty_terminal による本物のターミナル：シェル統合（bash/zsh/fish/PowerShell）、OSC 7/133/777、IME、検索、スクロールバック、URL/localhost 検出、Windows Job Objects。設定でのデフォルトシェル選択（システム既定 / 検出されたシェル（Git Bash や WSL ディストリビューションを含む） / 手動パス）と、新規ターミナル作成時のシェル選択メニュー（オプション）。コピー/貼り付け/すべて選択のコンテキストメニュー；
-- [SSH セッションと SFTP](docs/ssh.md)：接続プロファイルとサイドバーからのクイック接続、OS 認証情報ストア、パスワード/MFA/鍵/エージェント認証、ジャンプホスト、ホスト鍵検証、再開対応のファイル/ディレクトリ転送。双 pane の SFTP ブラウザーと、アクティブなリモートタブに追従するファイルエクスプローラー；
+- [SSH セッションと SFTP](docs/user/ssh.md)：接続プロファイルとサイドバーからのクイック接続、OS 認証情報ストア、パスワード/MFA/鍵/エージェント認証、ジャンプホスト、ホスト鍵検証、再開対応のファイル/ディレクトリ転送。双 pane の SFTP ブラウザーと、アクティブなリモートタブに追従するファイルエクスプローラー；
 - Rope 編集バッファ、仮想化ビューポート、tree-sitter のインクリメンタルハイライト、検索、アンドゥ/リドゥ、インライン補完のゴーストテキスト、10 種類のエディターテーマ、Vim 操作レイヤー；
 - ファイルインデックス（浅いインデックスとデバウンス付き監視）、gitignore 対応、ファジー検索、ストリーミング バックグラウンド grep、キーボードによるツリーナビゲーションと完全なコンテキストメニュー。タブごとのプロジェクトフォルダーと `cd` インジェクション、サイドバーの追従；
 - Git 専用の diff / history / commit-file タブ、ファイルおよび hunk 単位の stage/unstage、確認付き discard、commit、branch、fetch/pull/push、コミットグラフ。ステータス更新は UI スレッドから分離；
@@ -56,7 +56,7 @@ xattr -cr /Applications/Termior.app
 - 内蔵/ターミナルエージェントの統一通知ルーティング：対象が可視の間は抑制、非表示時はテーマ対応 toast、ウィンドウ非フォーカス時はシステム通知、ヘッダーのベルに現在の状態を列挙；
 - Claude Code OSC hooks の安全で冪等なインストールとアンインストール。
 
-これはまだ段階的なマイルストーンであり、仕様全体の最終受領ではありません。ベースラインとなるデスクトップ範囲は [docs/desktop-milestone.md](docs/desktop-milestone.md)、Agent ステージ A–E の実装証拠とプラットフォームサンドボックス、リモート MCP OAuth、実際の ACP クライアント、バックグラウンド自動実行の境界は [docs/ai-agent-implementation-status.md](docs/ai-agent-implementation-status.md) に記録されています。
+これはまだ段階的なマイルストーンであり、仕様全体の最終受領ではありません。ベースラインとなるデスクトップ範囲は [docs/process/desktop-milestone.md](docs/process/desktop-milestone.md)、Agent ステージ A–E の実装証拠とプラットフォームサンドボックス、リモート MCP OAuth、実際の ACP クライアント、バックグラウンド自動実行の境界は [docs/process/ai-agent-implementation-status.md](docs/process/ai-agent-implementation-status.md) に記録されています。
 
 最新のリリースタグは `v0.2.1`、ワークスペースのバージョンは [Cargo.toml](Cargo.toml) で定義されます。
 
@@ -134,7 +134,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-CI は同じ分割を実装します：`ci.yml` はアイコン生成チェック、3 プラットフォームの core ジョブ、desktop ジョブ（check、clippy、テスト、リリースビルド、バイナリサイズゲート、Windows スモークフレーム、分割ペインスモーク、NFR プロセスゲート）、行カバレッジ 80% の coverage ジョブ、PTY スループットゲート付き benchmark ジョブで構成されます。`audit.yml` は push ごとと毎週 `cargo-deny` を実行し、ライセンスと CVE のドリフトを検出します。`nightly.yml` は Ubuntu 上で毎日および `workflow_dispatch` により実行され、OpenSSH と paramiko を入れたあと、ホストランナーで実行できる ignored テスト（`ssh_roundtrip` と `live_release_download`）を走らせます。Codex smoke と keyring のテストは手動です。手順は `docs/nightly-integration.md` を参照してください。
+CI は同じ分割を実装します：`ci.yml` はアイコン生成チェック、3 プラットフォームの core ジョブ、desktop ジョブ（check、clippy、テスト、リリースビルド、バイナリサイズゲート、Windows スモークフレーム、分割ペインスモーク、NFR プロセスゲート）、行カバレッジ 80% の coverage ジョブ、PTY スループットゲート付き benchmark ジョブで構成されます。`audit.yml` は push ごとと毎週 `cargo-deny` を実行し、ライセンスと CVE のドリフトを検出します。`nightly.yml` は Ubuntu 上で毎日および `workflow_dispatch` により実行され、OpenSSH と paramiko を入れたあと、ホストランナーで実行できる ignored テスト（`ssh_roundtrip` と `live_release_download`）を走らせます。Codex smoke と keyring のテストは手動です。手順は `docs/process/nightly-integration.md` を参照してください。
 
 #### アプリアイコン
 

@@ -1,7 +1,7 @@
 # ssh-connection-groups Specification
 
 ## Purpose
-TBD - created by archiving change ssh-connection-groups. Update Purpose after archive.
+SSH/SFTP 连接分组是持久化的一等实体：schema v2 保存分组顺序与连接归属，侧栏与管理窗口按分组组织连接，并校验名称、引用与 v1 迁移。
 
 ## Requirements
 
