@@ -1,6 +1,6 @@
 # Termior 桌面里程碑说明
 
-本文记录从 P0 纯逻辑原型推进到原生桌面应用后的阶段性交付边界。权威产品要求仍为 [`termior-spec.md`](termior-spec.md)。
+本文记录从 P0 纯逻辑原型推进到原生桌面应用后的阶段性交付边界。权威产品要求仍为 [`termior-spec.md`](../user/termior-spec.md)。
 
 ## 本阶段已贯通的端到端链路
 
@@ -40,7 +40,7 @@ GitHub Actions 另在 Windows/macOS/Linux 构建 release 桌面二进制、记�
 ## 后续仍需完成的 spec 项
 
 > 2026-09-30 按代码核对刷新。WSL 发行版切换、背景图渲染、行内补全停顿调度与 ghost text、
-> 自动更新（`termior-platform::update`）和 NFR 基准 harness（`docs/nfr-baselines.md`）已落地，不再列入。
+> 自动更新（`termior-platform::update`）和 NFR 基准 harness（`docs/process/nfr-baselines.md`）已落地，不再列入。
 
 - FR-AGENT-06 语音输入（P2）；
 - 多窗口工作区切换与跨窗口 tab 管理；

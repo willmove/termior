@@ -11,7 +11,7 @@ cargo test -p termior-agent-host --test backend_contract
 cargo test -p termior-agent-host --test codex_smoke -- --ignored --nocapture
 ```
 
-前三条完全离线。它们验证输出游标与截断、超时不杀进程、PTY 控制权、窗格注册、进程树终止、JSON-RPC 分帧、乱序/未知事件、稳定协议映射和审批 ID。最后一条要求本机 PATH 中存在已登录的兼容 Codex CLI（`codex-cli 0.137.x` 或 `0.153.x`），只作为真实集成 smoke。托管 runner 不提供这份 CLI，nightly 不运行它；手动步骤见 `docs/nightly-integration.md`。
+前三条完全离线。它们验证输出游标与截断、超时不杀进程、PTY 控制权、窗格注册、进程树终止、JSON-RPC 分帧、乱序/未知事件、稳定协议映射和审批 ID。最后一条要求本机 PATH 中存在已登录的兼容 Codex CLI（`codex-cli 0.137.x` 或 `0.153.x`），只作为真实集成 smoke。托管 runner 不提供这份 CLI，nightly 不运行它；手动步骤见 `docs/process/nightly-integration.md`。
 
 ## 手工验证
 

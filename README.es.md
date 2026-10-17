@@ -12,7 +12,7 @@
 
 > Un entorno de desarrollo nativo de IA (ADE), de código abierto, multiplataforma y con el terminal como prioridad. BYOK, prioridad por lo local, sin cuenta y sin telemetría.
 
-Termior reúne en una sola ventana nativa un terminal PTY real, un editor de código ligero, un explorador de archivos, Git, una vista previa web y un agente integrado/externo con llamadas a herramientas, aprobaciones, revisión de cambios y recuperación. La especificación autoritativa de producto e ingeniería está en [docs/termior-spec.md](docs/termior-spec.md) (en inglés).
+Termior reúne en una sola ventana nativa un terminal PTY real, un editor de código ligero, un explorador de archivos, Git, una vista previa web y un agente integrado/externo con llamadas a herramientas, aprobaciones, revisión de cambios y recuperación. La especificación autoritativa de producto e ingeniería está en [docs/user/termior-spec.md](docs/user/termior-spec.md) (en inglés).
 
 ### Instalación
 
@@ -39,7 +39,7 @@ El workspace ha pasado de un prototipo de lógica pura a un banco de trabajo de 
 
 - Workspaces persistentes, 8 tipos de pestañas, paneles divididos, barras laterales Explorer / Source Control / History, barra de estado y una ventana de ajustes independiente;
 - Un terminal real sobre portable-pty y alacritty_terminal: integración de shell (bash/zsh/fish/PowerShell), OSC 7/133/777, IME, búsqueda, historial de desplazamiento, detección de URL y localhost, y Job Objects de Windows; selector de shell predeterminado en ajustes (predeterminado del sistema / shells detectados, incluidos Git Bash y distribuciones WSL / ruta manual) más un menú opcional de elección de shell al crear un terminal; menú contextual de copiar/pegar/seleccionar todo;
-- [Sesiones SSH y SFTP](docs/ssh.md) (en inglés): perfiles de conexión con conexión rápida desde la barra lateral, almacén de credenciales del sistema, autenticación por contraseña/MFA/clave/agente, hosts de salto, verificación de huellas de host y transferencia de archivos/directorios con reanudación; un navegador SFTP de dos paneles y un explorador de archivos que sigue la pestaña remota activa;
+- [Sesiones SSH y SFTP](docs/user/ssh.md) (en inglés): perfiles de conexión con conexión rápida desde la barra lateral, almacén de credenciales del sistema, autenticación por contraseña/MFA/clave/agente, hosts de salto, verificación de huellas de host y transferencia de archivos/directorios con reanudación; un navegador SFTP de dos paneles y un explorador de archivos que sigue la pestaña remota activa;
 - Búferes de edición con Rope, viewport virtualizado, resaltado incremental con tree-sitter, búsqueda, deshacer/rehacer, texto fantasma de autocompletado en línea, 10 temas del editor y una capa de interacción Vim;
 - Indexación de archivos con indexación superficial y vigilancia con debounce, conciencia de gitignore, búsqueda difusa, grep en segundo plano por streaming, navegación de árbol por teclado y menús contextuales completos; carpetas de proyecto por pestaña con inyección de `cd` y seguimiento de la barra lateral;
 - Pestañas dedicadas de diff / historial / archivo de commit de Git, stage/unstage a nivel de archivo y hunk, descarte confirmado, commit, branch, fetch/pull/push y un grafo de commits, con la actualización de estado fuera del hilo de UI;
@@ -56,7 +56,7 @@ El workspace ha pasado de un prototipo de lógica pura a un banco de trabajo de 
 - Enrutado unificado de notificaciones para agentes integrados y de terminal: suprimidas cuando el destino es visible, toast temático cuando está oculto, notificación del sistema cuando la ventana pierde el foco, con la campana del encabezado listando los estados actuales;
 - Instalación y desinstalación seguras e idempotentes de los hooks OSC de Claude Code.
 
-Sigue siendo un hito por etapas, no la aceptación final de toda la especificación. El alcance base de escritorio está documentado en [docs/desktop-milestone.md](docs/desktop-milestone.md) (en inglés); la evidencia de implementación de las etapas A–E del agente, junto con el sandboxing por plataforma, OAuth para MCP remoto, un cliente ACP real y los límites de ejecución de automatización en segundo plano, está en [docs/ai-agent-implementation-status.md](docs/ai-agent-implementation-status.md) (en inglés).
+Sigue siendo un hito por etapas, no la aceptación final de toda la especificación. El alcance base de escritorio está documentado en [docs/process/desktop-milestone.md](docs/process/desktop-milestone.md) (en inglés); la evidencia de implementación de las etapas A–E del agente, junto con el sandboxing por plataforma, OAuth para MCP remoto, un cliente ACP real y los límites de ejecución de automatización en segundo plano, está en [docs/process/ai-agent-implementation-status.md](docs/process/ai-agent-implementation-status.md) (en inglés).
 
 La última versión etiquetada es `v0.2.1`; la versión del workspace vive en [Cargo.toml](Cargo.toml).
 
@@ -134,7 +134,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-CI implementa la misma división: `ci.yml` ejecuta una comprobación de generación de iconos, el job core en las tres plataformas, el job desktop (check, clippy, tests, build de release, puerta de tamaño del binario, frames de humo en Windows, humo de panel dividido, puerta de proceso NFR), un job de cobertura con umbral del 80% de líneas y un job de benchmarks con puerta de rendimiento PTY. `audit.yml` ejecuta `cargo-deny` en cada push y semanalmente para detectar derivas de licencias y CVEs. `nightly.yml` se ejecuta a diario y con `workflow_dispatch` en Ubuntu: instala OpenSSH y paramiko, y ejecuta las pruebas ignoradas que un runner alojado puede cubrir (`ssh_roundtrip` y `live_release_download`). El smoke de Codex y las pruebas de keyring siguen siendo manuales; véase `docs/nightly-integration.md`.
+CI implementa la misma división: `ci.yml` ejecuta una comprobación de generación de iconos, el job core en las tres plataformas, el job desktop (check, clippy, tests, build de release, puerta de tamaño del binario, frames de humo en Windows, humo de panel dividido, puerta de proceso NFR), un job de cobertura con umbral del 80% de líneas y un job de benchmarks con puerta de rendimiento PTY. `audit.yml` ejecuta `cargo-deny` en cada push y semanalmente para detectar derivas de licencias y CVEs. `nightly.yml` se ejecuta a diario y con `workflow_dispatch` en Ubuntu: instala OpenSSH y paramiko, y ejecuta las pruebas ignoradas que un runner alojado puede cubrir (`ssh_roundtrip` y `live_release_download`). El smoke de Codex y las pruebas de keyring siguen siendo manuales; véase `docs/process/nightly-integration.md`.
 
 #### Iconos de la aplicación
 

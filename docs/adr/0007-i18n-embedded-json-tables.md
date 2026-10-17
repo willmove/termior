@@ -3,7 +3,7 @@
 - 状态：已采纳（Accepted）
 - 日期：2026-09-22
 - 决策者：Termior 维护者
-- 相关：`docs/termior-spec.md` §3.1（版本与依赖纪律）、NFR-05（体积门禁）、CONTEXT.md（领域词汇表）
+- 相关：`docs/user/termior-spec.md` §3.1（版本与依赖纪律）、NFR-05（体积门禁）、CONTEXT.md（领域词汇表）
 
 ## 背景
 

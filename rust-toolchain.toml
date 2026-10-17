@@ -1,7 +1,7 @@
 # 固化工具链：贡献者与 CI 使用同一个确切的 stable 版本，确保格式/lint 行为一致。
 # 浮动的 "stable" 会在新版本发布当天引入新 clippy lint，配合 CI 的 -D warnings 直接变红；
 # 升级工具链应是一次显式提交（同时更新 clippy.toml 的 msrv）。
-# 纯逻辑核心 crate 无 nightly 特性依赖（见 docs/termior-spec.md §3.1 版本与依赖纪律）。
+# 纯逻辑核心 crate 无 nightly 特性依赖（见 docs/user/termior-spec.md §3.1 版本与依赖纪律）。
 [toolchain]
 channel = "1.98.1"
 components = ["rustfmt", "clippy"]

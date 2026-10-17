@@ -12,7 +12,7 @@
 
 > 開源、跨平台、終端機優先的 AI 原生開發工作台（ADE）。BYOK、本地優先、無帳號、無遙測。
 
-Termior 在單一原生視窗中組合真 PTY 終端機、輕量程式碼編輯器、檔案瀏覽器、Git、Web 預覽，以及具有工具呼叫、審批、變更審閱與復原能力的內建/外部 Agent。產品與工程規格見 [docs/termior-spec.md](docs/termior-spec.md)。
+Termior 在單一原生視窗中組合真 PTY 終端機、輕量程式碼編輯器、檔案瀏覽器、Git、Web 預覽，以及具有工具呼叫、審批、變更審閱與復原能力的內建/外部 Agent。產品與工程規格見 [docs/user/termior-spec.md](docs/user/termior-spec.md)。
 
 ### 安裝
 
@@ -39,7 +39,7 @@ xattr -cr /Applications/Termior.app
 
 - 持久化工作區、8 類 tab、分割窗格、Explorer/Source Control/History 側欄、狀態列、獨立設定視窗；
 - portable-pty + alacritty_terminal 真終端機，shell integration（bash/zsh/fish/PowerShell）、OSC 7/133/777、IME、搜尋、回捲瀏覽、URL/localhost 偵測與 Windows Job Object；設定頁可選預設 Shell（系統預設 / 偵測到的 shell，含 Git Bash 與 WSL 發行版 / 手動路徑），並可開啟「新建終端機時選擇 Shell」；提供複製/貼上/全選的內容選單；
-- [SSH 連線與 SFTP](docs/ssh.md)：連線設定與側欄快速連線、系統憑證庫、密碼/MFA/金鑰/agent 認證、跳板機、主機指紋校驗、檔案/目錄上傳下載與續傳，並提供雙欄 SFTP 瀏覽器與跟隨活動遠端 tab 的 File Explorer；
+- [SSH 連線與 SFTP](docs/user/ssh.md)：連線設定與側欄快速連線、系統憑證庫、密碼/MFA/金鑰/agent 認證、跳板機、主機指紋校驗、檔案/目錄上傳下載與續傳，並提供雙欄 SFTP 瀏覽器與跟隨活動遠端 tab 的 File Explorer；
 - Rope 編輯緩衝、虛擬可視區、tree-sitter 增量語法高亮、搜尋、復原/重做、行內補全 ghost text、10 套編輯器主題與 Vim 互動層；
 - 檔案索引（淺層索引與防抖監聽）、gitignore、模糊尋找、背景串流 grep、鍵盤樹狀導覽與完整內容選單；按 tab 記憶專案資料夾並注入 `cd`，側欄跟隨該錨點；
 - Git 專用 diff/history/commit-file 分頁、檔案/hunk stage/unstage、確認後 discard、commit、branch、fetch/pull/push 與 commit graph，狀態刷新已移出 UI 執行緒；
@@ -56,7 +56,7 @@ xattr -cr /Applications/Termior.app
 - 內建/終端機 Agent 統一通知路由：可見時抑制、隱藏時主題 toast、視窗失焦時系統通知，並在 header 鈴鐺列出目前狀態；
 - Claude Code OSC hooks 的安全、冪等安裝與解除安裝。
 
-這仍是階段性里程碑，不等於整份 spec 已最終驗收。基礎桌面範圍見 [docs/desktop-milestone.md](docs/desktop-milestone.md)；Agent A–E 的實作證據與平台 sandbox、遠端 MCP OAuth、真實 ACP 用戶端和自動化背景執行等邊界見 [docs/ai-agent-implementation-status.md](docs/ai-agent-implementation-status.md)。
+這仍是階段性里程碑，不等於整份 spec 已最終驗收。基礎桌面範圍見 [docs/process/desktop-milestone.md](docs/process/desktop-milestone.md)；Agent A–E 的實作證據與平台 sandbox、遠端 MCP OAuth、真實 ACP 用戶端和自動化背景執行等邊界見 [docs/process/ai-agent-implementation-status.md](docs/process/ai-agent-implementation-status.md)。
 
 最新發布 tag 為 `v0.2.1`，工作區版本號定義在 [Cargo.toml](Cargo.toml)。
 
@@ -137,7 +137,7 @@ cargo bench -p termior-editor --bench large_file -- --quick
 cargo bench -p termior-bench --bench pty_throughput -- --quick
 ```
 
-CI 按同一劃分執行：`ci.yml` 包含圖示產生校驗、三平台 core job、desktop job（check、clippy、測試、release 建置、二進位體積門禁、Windows 渲染煙測、分割窗格煙測、NFR 處理程序門禁）、80% 行覆蓋率的 coverage job，以及帶 PTY 吞吐門禁的 benchmark job；`audit.yml` 在每次 push 與每週定時執行 `cargo-deny`，捕捉授權與 CVE 漂移。`nightly.yml` 在 Ubuntu 上每日以及透過 `workflow_dispatch` 執行：安裝 OpenSSH 與 paramiko 後，執行託管 runner 能跑的 ignored 測試（`ssh_roundtrip` 與 `live_release_download`）。Codex smoke 與 keyring 測試仍為手動，步驟見 `docs/nightly-integration.md`。
+CI 按同一劃分執行：`ci.yml` 包含圖示產生校驗、三平台 core job、desktop job（check、clippy、測試、release 建置、二進位體積門禁、Windows 渲染煙測、分割窗格煙測、NFR 處理程序門禁）、80% 行覆蓋率的 coverage job，以及帶 PTY 吞吐門禁的 benchmark job；`audit.yml` 在每次 push 與每週定時執行 `cargo-deny`，捕捉授權與 CVE 漂移。`nightly.yml` 在 Ubuntu 上每日以及透過 `workflow_dispatch` 執行：安裝 OpenSSH 與 paramiko 後，執行託管 runner 能跑的 ignored 測試（`ssh_roundtrip` 與 `live_release_download`）。Codex smoke 與 keyring 測試仍為手動，步驟見 `docs/process/nightly-integration.md`。
 
 #### 應用圖示
 

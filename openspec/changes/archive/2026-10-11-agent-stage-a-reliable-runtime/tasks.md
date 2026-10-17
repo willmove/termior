@@ -1,6 +1,6 @@
 ## 0. 前置确认
 
-- [x] 0.1 阅读 `docs/termior-spec.md` FR-ARUN / FR-ACHG / FR-AORCH-07、`CONTEXT.md`、ADR 0004/0005 和本 change 全部文档
+- [x] 0.1 阅读 `docs/user/termior-spec.md` FR-ARUN / FR-ACHG / FR-AORCH-07、`CONTEXT.md`、ADR 0004/0005 和本 change 全部文档
 - [x] 0.2 记录当前 `termior-ai` 单测、`agent_e2e`、`security_redteam` 与工作树基线；后续实现不得覆盖任务范围外的未提交改动
 
 ## 1. 任务与事件领域模型
