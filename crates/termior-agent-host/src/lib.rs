@@ -15,6 +15,7 @@ mod environment;
 mod in_process;
 mod mcp;
 mod projection;
+mod restore;
 mod session;
 mod transport;
 
@@ -22,7 +23,7 @@ pub use acp::{map_acp_message, AcpBackend, AcpClientHandler, ACP_PROTOCOL_VERSIO
 pub use acp_host::{AcpHostPolicy, TermiorAcpClientHandler};
 pub use backend::{
     AgentBackend, BackendBinding, BackendDecision, BackendError, BackendEvent, BackendInfo,
-    CapabilityProfile, CapabilitySupport, TaskLaunch, TurnLaunch,
+    BackendSessionReport, CapabilityProfile, CapabilitySupport, TaskLaunch, TurnLaunch,
 };
 pub use cli::{find_program, AgentBackendKind, CliAgentFeatures, CliAgentProfile, CLI_AGENTS};
 pub use codex::{
@@ -40,6 +41,10 @@ pub use mcp::{
     MCP_PROTOCOL_VERSION,
 };
 pub use projection::BackendTaskProjector;
+pub use restore::{
+    checkpoint_session, reconcile_persisted_backend_bindings, restore_external_session,
+    ExternalRecoveryTarget, ExternalRestoreReport, ExternalSessionCheckpoint,
+};
 pub use session::{ManagedAgentSession, ManagedSessionState, PumpOutcome};
 pub use transport::{
     JsonRpcLineCodec, StdioCapture, StdioTransport, TransportCommand, TransportMessage,

@@ -836,6 +836,13 @@ fn run_external_command(
                 }
             }
         };
+        if let Some(dir) = data_dir {
+            guard.enable_recovery(ExternalRecoveryTarget {
+                tasks_root: dir.join("agent-tasks"),
+                program: std::env::var("TERMIOR_CODEX_PATH").unwrap_or_else(|_| "codex".into()),
+                args: Vec::new(),
+            });
+        }
         match command {
             ExternalCommand::Start { text, .. } => {
                 guard.start_turn(text).map(|()| PumpOutcome::Pending)

@@ -137,6 +137,41 @@ impl AgentBackend for AcpBackend {
         )?;
         Ok(binding)
     }
+
+    fn query_session(
+        &mut self,
+        binding: &BackendBinding,
+    ) -> Result<BackendSessionReport, BackendError> {
+        if !self.capabilities.can_resume() {
+            return Err(BackendError::Unsupported("session query"));
+        }
+        let cwd =
+            std::env::current_dir().map_err(|error| BackendError::Transport(error.to_string()))?;
+        // session/load replays history. Permission requests are observed and not answered.
+        let result = self.transport()?.request(
+            "session/load",
+            json!({
+                "sessionId": binding.backend_session_id,
+                "cwd": cwd,
+                "mcpServers": []
+            }),
+            Duration::from_secs(5),
+        )?;
+        let mut queued = Vec::new();
+        for _ in 0..32 {
+            let Some(raw) = self.transport()?.next_event(Duration::ZERO)? else {
+                break;
+            };
+            queued.push(raw);
+        }
+        let status = crate::restore::observe_queued_status(
+            crate::restore::reported_status_from_value(&result),
+            queued,
+            map_acp_message,
+        )
+        .unwrap_or_else(|| "unknown".into());
+        Ok(BackendSessionReport { status })
+    }
     fn start_turn(&mut self, launch: TurnLaunch) -> Result<BackendBinding, BackendError> {
         let turn_id = format!("acp-prompt-{}", self.pending_prompts.len() + 1);
         let request_id = self.transport()?.begin_request(

@@ -115,8 +115,10 @@ impl ComposerView {
                 .load()
                 .unwrap_or_default()
                 .agents;
-            self.recovery_tasks =
-                RecoveryCenter::scan(&dir.join("agent-tasks")).unwrap_or_default();
+            let tasks_root = dir.join("agent-tasks");
+            // Query persisted Codex/ACP sessions before listing them. Failures stay unknown.
+            let _ = reconcile_persisted_backend_bindings(&tasks_root);
+            self.recovery_tasks = RecoveryCenter::scan(&tasks_root).unwrap_or_default();
             self.automations = AutomationStore::load(dir).unwrap_or_default();
             self.checkpoints = CheckpointStore::new(dir.join("agent-checkpoints"))
                 .list_manifests()

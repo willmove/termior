@@ -236,6 +236,35 @@ impl AgentBackend for CodexBackend {
         Ok(binding)
     }
 
+    fn query_session(
+        &mut self,
+        binding: &crate::BackendBinding,
+    ) -> Result<crate::BackendSessionReport, BackendError> {
+        if !self.capabilities().can_resume() {
+            return Err(BackendError::Unsupported("session query"));
+        }
+        // thread/resume loads the thread. It does not start a turn or answer approvals.
+        let result = self.transport()?.request(
+            "thread/resume",
+            json!({"threadId": binding.backend_session_id}),
+            Duration::from_secs(5),
+        )?;
+        let mut queued = Vec::new();
+        for _ in 0..32 {
+            let Some(raw) = self.transport()?.next_event(Duration::ZERO)? else {
+                break;
+            };
+            queued.push(raw);
+        }
+        let status = crate::restore::observe_queued_status(
+            crate::restore::reported_status_from_value(&result),
+            queued,
+            map_codex_message,
+        )
+        .unwrap_or_else(|| "unknown".into());
+        Ok(crate::BackendSessionReport { status })
+    }
+
     fn start_turn(&mut self, launch: TurnLaunch) -> Result<BackendBinding, BackendError> {
         let result = self.transport()?.request(
             "turn/start",

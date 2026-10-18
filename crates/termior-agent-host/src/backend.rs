@@ -170,4 +170,20 @@ pub trait AgentBackend: Send {
     fn respond(&mut self, decision: BackendDecision) -> Result<(), BackendError>;
     fn cancel(&mut self, binding: &BackendBinding) -> Result<(), BackendError>;
     fn shutdown(&mut self, timeout: Duration) -> Result<(), BackendError>;
+
+    /// Read-only session status. Implementations must not start a turn, approve a tool,
+    /// or otherwise re-issue a side-effecting call.
+    fn query_session(
+        &mut self,
+        binding: &BackendBinding,
+    ) -> Result<BackendSessionReport, BackendError> {
+        let _ = binding;
+        Err(BackendError::Unsupported("session query"))
+    }
+}
+
+/// Status string returned by a read-only backend query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendSessionReport {
+    pub status: String,
 }
