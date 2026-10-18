@@ -1,16 +1,24 @@
 //! Stage D 2.3: query Codex/ACP on restore, then reduce. Never replay side effects.
 
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
 use termior_agent_host::{
-    checkpoint_session, reconcile_persisted_backend_bindings, restore_external_session,
-    AgentBackend, BackendBinding, BackendDecision, BackendError, BackendEvent, BackendInfo,
-    BackendSessionReport, CapabilityProfile, CapabilitySupport, ExternalSessionCheckpoint,
-    ManagedSessionState, TaskLaunch, TurnLaunch,
+    checkpoint_session, reconcile_persisted_backend_bindings, ExternalSessionCheckpoint,
+    ManagedSessionState,
 };
-use termior_store::{RecoveredOperationState, RecoveryCenter};
+use termior_agent_host::{
+    restore_external_session, AgentBackend, BackendBinding, BackendDecision, BackendError,
+    BackendEvent, BackendInfo, BackendSessionReport, CapabilityProfile, CapabilitySupport,
+    TaskLaunch, TurnLaunch,
+};
+use termior_store::RecoveredOperationState;
+#[cfg(unix)]
+use termior_store::RecoveryCenter;
 
 struct RecordingBackend {
     queryable: bool,
