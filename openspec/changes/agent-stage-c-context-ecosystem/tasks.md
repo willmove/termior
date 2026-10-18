@@ -48,7 +48,7 @@
 - [x] 6.1 定义 versioned HookEvent/HookDecision 和支持的生命周期点
 - [x] 6.2 实现无交互子进程 runner、默认 5 秒超时、输出上限、fail-closed/warn 策略与诊断
 - [x] 6.3 pre-tool 修改后重新执行 schema、授权、deny-list 和审批计算；旧决议作废
-- [ ] 6.4 添加 Hook 管理与最近运行记录 UI，隐藏敏感字段
+- [x] 6.4 添加 Hook 管理与最近运行记录 UI，隐藏敏感字段
 
 ## 7. ACP 第二后端
 
@@ -75,6 +75,5 @@
 - 5.3 MCP HTTP 仅完成 HTTPS 限制、Bearer/session 与 callback state/resource 校验；授权服务器发现、PKCE 登录、refresh token 与 keyring UI 未接入。
 - 5.5 未处理 `list_changed` 通知。
 - 5.6 恶意 fake MCP server 红队未覆盖 token 泄漏与断线重连。
-- 6.4 无 Hook 管理与最近运行记录 UI。
 - 7.5 未用 Gemini CLI / OpenCode 做真实 ACP 端到端 smoke。
 - 8.x 收尾验证未完成。

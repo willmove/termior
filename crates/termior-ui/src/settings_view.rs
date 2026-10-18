@@ -131,6 +131,9 @@ pub struct SettingsView {
     agent_usage_error: Option<String>,
     cleanup_running: bool,
     cleanup_cancel: Option<Arc<AtomicBool>>,
+    lifecycle_hooks: termior_hooks::HookCatalog,
+    hook_runs: Vec<termior_hooks::HookRunRecord>,
+    hook_load_error: Option<String>,
     _updater_subscription: gpui::Subscription,
 }
 
@@ -141,6 +144,7 @@ mod agents;
 mod edit;
 mod general;
 mod helpers;
+mod hooks;
 mod models;
 mod persist;
 mod shortcuts;
@@ -149,6 +153,8 @@ mod widgets;
 
 #[cfg(test)]
 mod edit_tests;
+#[cfg(test)]
+mod hooks_tests;
 
 use edit::SettingsInputHandler;
 use helpers::{bytes_to_mib, char_to_byte, on_off};
@@ -214,6 +220,9 @@ impl SettingsView {
             agent_usage_error: None,
             cleanup_running: false,
             cleanup_cancel: None,
+            lifecycle_hooks: termior_hooks::HookCatalog::default(),
+            hook_runs: Vec::new(),
+            hook_load_error: None,
         };
         view.refresh_credential_state();
         // shell 探测两段式：原生条目（PATH 检查，即时）先到，WSL 枚举
@@ -251,6 +260,9 @@ impl SettingsView {
             self.agent_usage_error = None;
             self.refresh_agent_usage(cx);
         }
+        if page == SettingsPage::Hooks {
+            self.reload_lifecycle_hooks();
+        }
         cx.notify();
     }
 
@@ -265,6 +277,7 @@ impl SettingsView {
             SettingsPage::Themes => t!("settings.page.themes"),
             SettingsPage::Shortcuts => t!("settings.page.shortcuts"),
             SettingsPage::Agents => t!("settings.page.agents"),
+            SettingsPage::Hooks => t!("settings.page.hooks"),
             SettingsPage::About => t!("settings.page.about"),
         }
     }
@@ -276,6 +289,7 @@ impl SettingsView {
             SettingsPage::Themes => self.themes_page(cx),
             SettingsPage::Shortcuts => self.shortcuts_page(cx),
             SettingsPage::Agents => self.agents_page(cx),
+            SettingsPage::Hooks => self.hooks_page(cx),
             SettingsPage::About => self.about_page(cx),
         }
     }
@@ -323,6 +337,7 @@ impl gpui::Render for SettingsView {
             SettingsPage::Themes,
             SettingsPage::Shortcuts,
             SettingsPage::Agents,
+            SettingsPage::Hooks,
             SettingsPage::About,
         ]
         .into_iter()

@@ -288,7 +288,16 @@ impl ComposerView {
             .with_terminal_context(self.terminal_context.clone())
             .with_todo_store(self.todos.clone(), self.data_dir.clone());
         Ok(Arc::new(match self.data_dir.as_ref() {
-            Some(data_dir) => executor.with_checkpoint_store(data_dir.join("agent-checkpoints")),
+            Some(data_dir) => {
+                let catalog_path = termior_hooks::lifecycle_hooks_path(data_dir);
+                let catalog = termior_hooks::HookCatalog::load(&catalog_path).unwrap_or_default();
+                let pipeline = termior_hooks::HookPipeline::new(catalog.hooks)
+                    .with_catalog_path(catalog_path)
+                    .with_runs_path(termior_hooks::hook_runs_path(data_dir));
+                executor
+                    .with_hook_pipeline(std::sync::Arc::new(pipeline))
+                    .with_checkpoint_store(data_dir.join("agent-checkpoints"))
+            }
             None => executor,
         }))
     }
