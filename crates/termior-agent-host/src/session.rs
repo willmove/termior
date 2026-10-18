@@ -45,8 +45,10 @@ pub struct ManagedAgentSession {
     backend: Box<dyn AgentBackend>,
     info: BackendInfo,
     binding: BackendBinding,
+    project_dir: String,
     state: ManagedSessionState,
     pending_request_id: Option<String>,
+    recovery: Option<crate::ExternalRecoveryTarget>,
 }
 
 impl ManagedAgentSession {
@@ -55,14 +57,23 @@ impl ManagedAgentSession {
         launch: TaskLaunch,
     ) -> Result<Self, BackendError> {
         let info = backend.initialize()?;
+        let project_dir = launch.project_dir.clone();
         let binding = backend.create_task(launch)?;
         Ok(Self {
             backend,
             info,
             binding,
+            project_dir,
             state: ManagedSessionState::Ready,
             pending_request_id: None,
+            recovery: None,
         })
+    }
+
+    /// Remember where a restart should look this session up. Does not start a turn.
+    pub fn enable_recovery(&mut self, target: crate::ExternalRecoveryTarget) {
+        self.recovery = Some(target);
+        self.checkpoint_recovery();
     }
 
     pub fn info(&self) -> &BackendInfo {
@@ -97,6 +108,7 @@ impl ManagedAgentSession {
         })?;
         self.pending_request_id = None;
         self.state = ManagedSessionState::Running;
+        self.checkpoint_recovery();
         Ok(())
     }
 
@@ -122,6 +134,7 @@ impl ManagedAgentSession {
                 Ok(event) => event,
                 Err(error) => {
                     self.state = ManagedSessionState::Unknown;
+                    self.checkpoint_recovery();
                     return Ok(PumpOutcome::Unknown {
                         reason: error.to_string(),
                     });
@@ -141,6 +154,7 @@ impl ManagedAgentSession {
                 } => {
                     self.pending_request_id = Some(backend_request_id.clone());
                     self.state = ManagedSessionState::WaitingApproval;
+                    self.checkpoint_recovery();
                     return Ok(PumpOutcome::WaitingApproval {
                         backend_request_id: backend_request_id.clone(),
                         tool_call_id: tool_call_id.clone(),
@@ -152,10 +166,12 @@ impl ManagedAgentSession {
                     success, status, ..
                 } => {
                     self.state = ManagedSessionState::Completed;
+                    self.checkpoint_recovery();
                     return Ok(PumpOutcome::Completed { success, status });
                 }
                 BackendEvent::Error { message, .. } => {
                     self.state = ManagedSessionState::Unknown;
+                    self.checkpoint_recovery();
                     return Ok(PumpOutcome::Unknown {
                         reason: message.clone(),
                     });
@@ -190,6 +206,7 @@ impl ManagedAgentSession {
             granted_permission_ids,
         })?;
         self.state = ManagedSessionState::Running;
+        self.checkpoint_recovery();
         self.pump_for(max_wait, on_event)
     }
 
@@ -205,11 +222,30 @@ impl ManagedAgentSession {
         }
         if let Err(error) = self.backend.cancel(&self.binding) {
             self.state = ManagedSessionState::Unknown;
+            self.checkpoint_recovery();
             return Err(error);
         }
         self.pending_request_id = None;
         self.state = ManagedSessionState::Ready;
+        self.checkpoint_recovery();
         Ok(())
+    }
+
+    fn checkpoint_recovery(&self) {
+        let Some(target) = &self.recovery else {
+            return;
+        };
+        let _ = crate::checkpoint_session(&crate::ExternalSessionCheckpoint {
+            tasks_root: target.tasks_root.clone(),
+            task_id: self.binding.task_id.clone(),
+            backend_id: self.info.id.clone(),
+            backend_session_id: self.binding.backend_session_id.clone(),
+            queryable: self.info.capabilities.can_resume(),
+            program: target.program.clone(),
+            args: target.args.clone(),
+            project_dir: self.project_dir.clone(),
+            managed_state: self.state,
+        });
     }
 
     pub fn shutdown(&mut self, timeout: Duration) -> Result<(), BackendError> {

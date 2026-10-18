@@ -33,6 +33,12 @@ pub enum RecoveryCommand {
     Resume {
         verified_state: RecoveredOperationState,
     },
+    /// Record a read-only backend query. Non-queryable sessions stay `unknown`.
+    ApplyBackendQuery {
+        session_id: Option<String>,
+        queryable: bool,
+        reported_status: Option<String>,
+    },
 }
 
 /// A startup-safe view of a persisted task. States that could have owned an in-flight
@@ -119,28 +125,35 @@ impl RecoveryCenter {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown")
                 .to_owned();
-            let recovered_state = recovered_state(&state);
-            let persisted_recovery = load_recovered_operation(tasks_root, &task_id)?;
-            let recovered_state = persisted_recovery
+            let task = snapshot
                 .as_ref()
-                .map_or(recovered_state, |operation| operation.state);
+                .and_then(|snapshot| snapshot.state.get("task"));
+            let backend_id = task
+                .and_then(|task| task.get("backend_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let persisted_recovery = load_recovered_operation(tasks_root, &task_id)?;
+            // External sessions are not trusted from the local snapshot until a query is recorded.
+            // Built-in waiting states stay waiting; running work stays unknown.
+            let recovered_state = if let Some(operation) = persisted_recovery.as_ref() {
+                operation.state
+            } else if is_external_backend(backend_id.as_deref())
+                && snapshot_needs_backend_query(&state)
+            {
+                RecoveredOperationState::Unknown
+            } else {
+                recovered_state(&state)
+            };
             if matches!(
                 recovered_state,
                 RecoveredOperationState::Succeeded | RecoveredOperationState::Abandoned
             ) {
                 continue;
             }
-            let task = snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.state.get("task"));
             let project_dir = task
                 .and_then(|task| task.get("project_dir"))
                 .and_then(serde_json::Value::as_str)
                 .map(PathBuf::from);
-            let backend_id = task
-                .and_then(|task| task.get("backend_id"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
             let waiting_reason = task
                 .and_then(|task| task.get("waiting_reason"))
                 .filter(|value| !value.is_null())
@@ -269,8 +282,79 @@ impl RecoveredOperation {
                 }
                 None
             }
+            RecoveryCommand::ApplyBackendQuery {
+                session_id,
+                queryable,
+                reported_status,
+            } => {
+                let session_id = session_id.filter(|id| !id.is_empty());
+                let queryable = queryable && session_id.is_some();
+                self.state = reduce_queried_backend_status(queryable, reported_status.as_deref());
+                self.queryable_backend_session = if queryable { session_id } else { None };
+                None
+            }
         }
     }
+}
+
+/// Map a read-only Codex/ACP status onto a recovery state.
+///
+/// A session that cannot be queried stays `unknown` even when the caller passes a status.
+/// In-flight or unrecognized statuses also stay `unknown`: restore must not guess that a
+/// side effect finished.
+pub fn reduce_queried_backend_status(
+    queryable: bool,
+    reported_status: Option<&str>,
+) -> RecoveredOperationState {
+    if !queryable {
+        return RecoveredOperationState::Unknown;
+    }
+    let normalized = reported_status
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    match normalized.as_str() {
+        "waiting-approval" | "awaiting-approval" | "approval" | "needs-approval" => {
+            RecoveredOperationState::Waiting
+        }
+        "waiting-change-review" | "awaiting-change-review" | "change-review" => {
+            RecoveredOperationState::Waiting
+        }
+        "waiting" | "waiting-user" | "waiting-plan" => RecoveredOperationState::Waiting,
+        "completed"
+        | "succeeded"
+        | "success"
+        | "completed-verified"
+        | "completed-unverified"
+        | "end-turn" => RecoveredOperationState::Succeeded,
+        "failed" | "error" | "refusal" => RecoveredOperationState::Failed,
+        "cancelled" | "canceled" | "interrupted" | "abandoned" => {
+            RecoveredOperationState::Abandoned
+        }
+        _ => RecoveredOperationState::Unknown,
+    }
+}
+
+fn is_external_backend(backend_id: Option<&str>) -> bool {
+    backend_id.is_some_and(|backend| {
+        let backend = backend.to_ascii_lowercase();
+        backend.contains("codex") || backend.contains("acp")
+    })
+}
+
+fn snapshot_needs_backend_query(state: &str) -> bool {
+    matches!(
+        state,
+        "running"
+            | "cancelling"
+            | "idle"
+            | "unknown"
+            | "waiting-approval"
+            | "waiting-plan"
+            | "waiting-change-review"
+            | "waiting-user"
+    )
 }
 
 #[cfg(test)]

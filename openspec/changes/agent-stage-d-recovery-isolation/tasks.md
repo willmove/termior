@@ -17,9 +17,9 @@
 
 - [x] 2.1 启动扫描 task index/journal，running model/tool/command 统一恢复为 unknown
 - [x] 2.2 定义 inspect/abandon/retry/resume commands；retry 必须创建新 attempt ID
-- [ ] 2.3 对可查询的 Codex/ACP session 先拉取远端/后端状态，再归约为已知或 unknown
+- [x] 2.3 对可查询的 Codex/ACP session 先拉取远端/后端状态，再归约为已知或 unknown
 - [x] 2.4 增加恢复中心 UI：按项目列出 waiting/unknown/failed，显示最后可信事件和可用动作
-- [ ] 2.5 测试等待审批、等待 change review、命令运行中三类重启场景
+- [x] 2.5 测试等待审批、等待 change review、命令运行中三类重启场景
 
 ## 3. Checkpoint
 
@@ -75,8 +75,6 @@
 
 - 0.x 阶段门禁与三平台 sandbox prototype 记录未完成。
 - 1.6 仅覆盖尾部半记录/中段篡改，未对每个关键事件做写入前/中/后 fault injection。
-- 2.3 未对 Codex/ACP 会话先查询后端状态再归约。
-- 2.5 三类重启场景的手工验收未完成。
 - 4.3 TerminalService、文件工具、规则与 repo map 尚未整体切换到 worktree 根；4.5 自动/手工合入分流未接入 Git 审阅流程。
 - 5.2 环境 ID 固定/变更 profile 新建环境未见专门实现与测试；5.3 能力仅在环境 chip 悬浮提示显示，审批卡未显示。
 - 6.2 Windows 仅进程树控制，文件/网络/凭据隔离报告 unsupported；6.6 三平台黑盒 escape suite 未运行。

@@ -1705,6 +1705,46 @@ impl RuntimeToolExecutor for RecordingExecutor {
     }
 }
 
+struct CrashBoundaryExecutor {
+    data_root: std::path::PathBuf,
+    crash_root: std::path::PathBuf,
+    task_id: String,
+    calls: Arc<AtomicUsize>,
+    marker: std::path::PathBuf,
+}
+
+impl RuntimeToolExecutor for CrashBoundaryExecutor {
+    fn execute(
+        &self,
+        _call_id: &str,
+        tool: &str,
+        _normalized_arguments: &str,
+        _cancellation: &CancellationToken,
+    ) -> Result<ToolExecution, String> {
+        assert_eq!(tool, "run_command");
+        copy_dir(
+            &self.data_root.join("agent-tasks").join(&self.task_id),
+            &self.crash_root.join("agent-tasks").join(&self.task_id),
+        );
+        std::fs::write(&self.marker, "ran").map_err(|error| error.to_string())?;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolExecution::Completed("exit=0".into()))
+    }
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
 fn assistant_with_calls(calls: Vec<ToolCall>) -> Message {
     Message {
         role: termior_ai::Role::Assistant,
@@ -1790,5 +1830,239 @@ fn approval_resume_preserves_the_full_queue_and_executes_each_call_once() {
     assert_eq!(
         *calls.lock().unwrap(),
         vec!["read_file", "write_file", "run_command"]
+    );
+}
+
+#[test]
+fn restart_while_waiting_for_approval_does_not_rerun_the_command() {
+    let data = tempfile::tempdir().unwrap();
+    let executor = RecordingExecutor::default();
+    let calls = executor.calls.clone();
+    let mut runtime = TaskRuntime::new(
+        TaskConfig::new("approve-restart", data.path(), "native", "direct"),
+        RuntimeBudgets::default(),
+        ApprovalPolicy::Prompt,
+    )
+    .try_with_journal(data.path())
+    .unwrap();
+    let task_id = runtime.task().id.0.clone();
+    let provider = MockProvider::new(vec![vec![ChatEvent::Done(assistant_with_calls(vec![
+        ToolCall {
+            id: "cmd-approve".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command":"echo side-effect"}"#.into(),
+        },
+    ]))]]);
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::Start {
+            user_input: "run".into(),
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+    assert_eq!(runtime.task().state, TaskState::WaitingApproval);
+    assert!(calls.lock().unwrap().is_empty());
+    drop(runtime);
+
+    let mut recovered = TaskRuntime::recover_journal(
+        data.path(),
+        &task_id,
+        ApprovalPolicy::Prompt,
+        ToolRegistry::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.task().state, TaskState::WaitingApproval);
+    assert_eq!(
+        recovered.invocations()[0].state,
+        ToolState::AwaitingApproval
+    );
+    let fresh = RecordingExecutor::default();
+    let fresh_calls = fresh.calls.clone();
+    assert!(futures::executor::block_on(recovered.handle(
+        TaskCommand::Start {
+            user_input: "again".into(),
+        },
+        &provider,
+        &fresh,
+        &mut |_| {},
+    ))
+    .is_err());
+    assert!(fresh_calls.lock().unwrap().is_empty());
+    assert!(calls.lock().unwrap().is_empty());
+    let task = termior_store::RecoveryCenter::scan(&data.path().join("agent-tasks"))
+        .unwrap()
+        .into_iter()
+        .find(|task| task.task_id == task_id)
+        .unwrap();
+    assert_eq!(
+        task.recovered_state,
+        termior_store::RecoveredOperationState::Waiting
+    );
+}
+
+#[test]
+fn restart_while_waiting_for_change_review_does_not_apply_the_edit() {
+    let data = tempfile::tempdir().unwrap();
+    let file = data.path().join("a.txt");
+    std::fs::write(&file, "old\n").unwrap();
+    let registry = ToolRegistry::new(WorkspaceAuthRegistry::with_roots([data
+        .path()
+        .display()
+        .to_string()]));
+    let executor = ToolExecutor::new(data.path(), registry.clone()).unwrap();
+    let provider = MockProvider::new(vec![vec![ChatEvent::Done(assistant_with_calls(vec![
+        ToolCall {
+            id: "write-restart".into(),
+            name: "write_file".into(),
+            arguments: r#"{"path":"a.txt","content":"new\n"}"#.into(),
+        },
+    ]))]]);
+    let mut runtime = TaskRuntime::new(
+        TaskConfig::new("review-restart", data.path(), "native", "direct"),
+        RuntimeBudgets::default(),
+        ApprovalPolicy::Prompt,
+    )
+    .with_tools(registry)
+    .try_with_journal(data.path())
+    .unwrap();
+    let task_id = runtime.task().id.0.clone();
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::Start {
+            user_input: "edit".into(),
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::ResolveApproval {
+            call_id: "write-restart".into(),
+            approved: true,
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+    assert_eq!(runtime.task().state, TaskState::WaitingChangeReview);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    drop(runtime);
+
+    let mut recovered = TaskRuntime::recover_journal(
+        data.path(),
+        &task_id,
+        ApprovalPolicy::Prompt,
+        ToolRegistry::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.task().state, TaskState::WaitingChangeReview);
+    assert_eq!(
+        recovered.invocations()[0].state,
+        ToolState::AwaitingChangeReview
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    assert!(futures::executor::block_on(recovered.handle(
+        TaskCommand::Start {
+            user_input: "apply again".into(),
+        },
+        &MockProvider::single(vec![]),
+        &executor,
+        &mut |_| {},
+    ))
+    .is_err());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
+    let task = termior_store::RecoveryCenter::scan(&data.path().join("agent-tasks"))
+        .unwrap()
+        .into_iter()
+        .find(|task| task.task_id == task_id)
+        .unwrap();
+    assert_eq!(
+        task.recovered_state,
+        termior_store::RecoveredOperationState::Waiting
+    );
+}
+
+#[test]
+fn restart_while_a_command_is_running_is_unknown_and_does_not_rerun_it() {
+    let data = tempfile::tempdir().unwrap();
+    let crash = tempfile::tempdir().unwrap();
+    let marker = data.path().join("side-effect.txt");
+    let mut runtime = TaskRuntime::new(
+        TaskConfig::new("command-restart", data.path(), "native", "direct"),
+        RuntimeBudgets::default(),
+        ApprovalPolicy::Yolo,
+    )
+    .try_with_journal(data.path())
+    .unwrap();
+    let task_id = runtime.task().id.0.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = CrashBoundaryExecutor {
+        data_root: data.path().to_path_buf(),
+        crash_root: crash.path().to_path_buf(),
+        task_id: task_id.clone(),
+        calls: calls.clone(),
+        marker: marker.clone(),
+    };
+    let provider = MockProvider::new(vec![
+        vec![ChatEvent::Done(assistant_with_calls(vec![ToolCall {
+            id: "cmd-running".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command":"echo side-effect"}"#.into(),
+        }]))],
+        vec![ChatEvent::Done(Message::assistant("done"))],
+    ]);
+    futures::executor::block_on(runtime.handle(
+        TaskCommand::Start {
+            user_input: "run".into(),
+        },
+        &provider,
+        &executor,
+        &mut |_| {},
+    ))
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran");
+    drop(runtime);
+
+    let mut recovered = TaskRuntime::recover_journal(
+        crash.path(),
+        &task_id,
+        ApprovalPolicy::Yolo,
+        ToolRegistry::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.task().state, TaskState::Unknown);
+    assert_eq!(recovered.invocations()[0].state, ToolState::Unknown);
+    let fresh_calls = Arc::new(AtomicUsize::new(0));
+    let fresh = CrashBoundaryExecutor {
+        data_root: data.path().to_path_buf(),
+        crash_root: crash.path().join("ignored"),
+        task_id: task_id.clone(),
+        calls: fresh_calls.clone(),
+        marker: data.path().join("side-effect-again.txt"),
+    };
+    assert!(futures::executor::block_on(recovered.handle(
+        TaskCommand::Start {
+            user_input: "resume the command".into(),
+        },
+        &provider,
+        &fresh,
+        &mut |_| {},
+    ))
+    .is_err());
+    assert_eq!(fresh_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(!data.path().join("side-effect-again.txt").exists());
+    let task = termior_store::RecoveryCenter::scan(&crash.path().join("agent-tasks"))
+        .unwrap()
+        .into_iter()
+        .find(|task| task.task_id == task_id)
+        .unwrap();
+    assert_eq!(
+        task.recovered_state,
+        termior_store::RecoveredOperationState::Unknown
     );
 }

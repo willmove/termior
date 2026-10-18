@@ -14,7 +14,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 use termior_agent_host::{
-    BackendEvent, CodexBackend, ManagedAgentSession, PumpOutcome, TaskLaunch,
+    reconcile_persisted_backend_bindings, BackendEvent, CodexBackend, ExternalRecoveryTarget,
+    ManagedAgentSession, PumpOutcome, TaskLaunch,
 };
 use termior_ai::automation::{next_run_after, AutomationManager, AutomationStore};
 use termior_ai::context_engine::{

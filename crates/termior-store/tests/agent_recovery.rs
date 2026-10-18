@@ -226,6 +226,111 @@ fn incomplete_work_recovers_unknown_and_retry_gets_a_new_attempt() {
 }
 
 #[test]
+fn external_session_without_a_query_stays_unknown_in_the_recovery_center() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut codex = TaskJournal::create(dir.path(), "codex-waiting").unwrap();
+    codex
+        .append("state_changed", json!({"to":"waiting-approval"}), true)
+        .unwrap();
+    codex
+        .write_snapshot(json!({
+            "task": {
+                "state": "waiting-approval",
+                "backend_id": "codex-app-server",
+                "backend_session_id": "thread-1"
+            }
+        }))
+        .unwrap();
+    let mut native = TaskJournal::create(dir.path(), "native-waiting").unwrap();
+    native
+        .append("state_changed", json!({"to":"waiting-approval"}), true)
+        .unwrap();
+    native
+        .write_snapshot(json!({"task":{"state":"waiting-approval","backend_id":"native"}}))
+        .unwrap();
+
+    let tasks = RecoveryCenter::scan(dir.path()).unwrap();
+    let codex = tasks
+        .iter()
+        .find(|task| task.task_id == "codex-waiting")
+        .unwrap();
+    assert_eq!(codex.recovered_state, RecoveredOperationState::Unknown);
+    assert_eq!(
+        tasks
+            .iter()
+            .find(|task| task.task_id == "native-waiting")
+            .unwrap()
+            .recovered_state,
+        RecoveredOperationState::Waiting
+    );
+}
+
+#[test]
+fn queried_backend_status_reduces_to_known_or_unknown_and_stays_visible() {
+    assert_eq!(
+        reduce_queried_backend_status(false, Some("succeeded")),
+        RecoveredOperationState::Unknown
+    );
+    assert_eq!(
+        reduce_queried_backend_status(true, Some("waiting-approval")),
+        RecoveredOperationState::Waiting
+    );
+    assert_eq!(
+        reduce_queried_backend_status(true, Some("running")),
+        RecoveredOperationState::Unknown
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    for (id, queryable, status, expected) in [
+        (
+            "known",
+            true,
+            Some("waiting-change-review".into()),
+            RecoveredOperationState::Waiting,
+        ),
+        (
+            "inflight",
+            true,
+            Some("in-progress".into()),
+            RecoveredOperationState::Unknown,
+        ),
+        (
+            "blind",
+            false,
+            Some("succeeded".into()),
+            RecoveredOperationState::Unknown,
+        ),
+    ] {
+        let mut journal = TaskJournal::create(dir.path(), id).unwrap();
+        journal
+            .append("diagnostic", json!({"message":"checkpoint"}), true)
+            .unwrap();
+        journal
+            .write_snapshot(json!({"task":{"state":"running","backend_id":"acp"}}))
+            .unwrap();
+        let operation = RecoveryCenter::apply(
+            dir.path(),
+            id,
+            RecoveryCommand::ApplyBackendQuery {
+                session_id: Some(format!("{id}-session")),
+                queryable,
+                reported_status: status,
+            },
+        )
+        .unwrap();
+        assert_eq!(operation.state, expected, "{id}");
+    }
+    let visible: Vec<_> = RecoveryCenter::scan(dir.path())
+        .unwrap()
+        .into_iter()
+        .map(|task| (task.task_id, task.recovered_state))
+        .collect();
+    assert!(visible.contains(&("inflight".into(), RecoveredOperationState::Unknown)));
+    assert!(visible.contains(&("blind".into(), RecoveredOperationState::Unknown)));
+    assert!(visible.contains(&("known".into(), RecoveredOperationState::Waiting)));
+}
+
+#[test]
 fn backend_resume_only_changes_state_when_the_session_is_queryable() {
     let mut local = RecoveredOperation::from_incomplete("call", "tool", 1, None);
     local.apply(RecoveryCommand::Resume {

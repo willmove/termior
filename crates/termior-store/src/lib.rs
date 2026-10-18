@@ -40,8 +40,8 @@ pub use keymap::{
 pub use migrate::{migrate, MigrationError, SCHEMA_VERSION};
 pub use paths::{app_data_dir, AppDataError};
 pub use recovery::{
-    RecoveredOperation, RecoveredOperationState, RecoveryCenter, RecoveryCommand,
-    RecoveryTaskSummary,
+    reduce_queried_backend_status, RecoveredOperation, RecoveredOperationState, RecoveryCenter,
+    RecoveryCommand, RecoveryTaskSummary,
 };
 pub use redaction::{RedactionReport, StreamingRedactor};
 pub use retention::{
