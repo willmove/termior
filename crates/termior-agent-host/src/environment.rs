@@ -460,7 +460,6 @@ fn macos_profile(root: &Path, program: &Path, allow_network: bool) -> String {
         "(allow file-ioctl)".to_owned(),
         "(allow file-read-metadata)".to_owned(),
         "(allow file-map-executable)".to_owned(),
-        "(allow file-mprotect)".to_owned(),
     ];
     for subpath in [
         "/usr",
