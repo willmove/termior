@@ -52,6 +52,11 @@ pub use settings::{
     default_settings, recommended_models, BackgroundSettings, ModelProviderSettings, ModelSettings,
     Settings, ShellDetection, TerminalSettings,
 };
+#[cfg(any(test, feature = "fault-injection"))]
+pub use task_journal::{
+    arm_journal_fault, disarm_journal_fault, JournalFault, JournalFaultPhase,
+    JOURNAL_FAULT_EXIT_CODE,
+};
 pub use task_journal::{JournalError, JournalEvent, JournalRecovery, TaskJournal, TaskSnapshot};
 
 /// FR-SEC-06 / INV-5：扫描待落盘文本是否含形似密钥的明文。命中返回错误。
