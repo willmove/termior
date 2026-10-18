@@ -442,16 +442,25 @@ fn macos_sandbox_command(
 
 fn macos_profile(root: &Path, program: &Path, allow_network: bool) -> String {
     let root = scheme_escape(&root.display().to_string());
+    // `(deny default)` also blocks the mach and mmap operations dyld and libsystem
+    // use before main. Without this baseline, sandbox-exec SIGKILLs the child during
+    // image load and the parent only sees an empty, unsuccessful exit.
     let mut rules = vec![
         "(version 1)".to_owned(),
         "(deny default)".to_owned(),
-        "(allow process*)".to_owned(),
-        "(allow signal)".to_owned(),
+        "(allow process-fork process-exec)".to_owned(),
+        "(allow process-info* (target self))".to_owned(),
+        "(allow signal (target self))".to_owned(),
+        "(allow mach-lookup)".to_owned(),
+        "(allow mach-priv-host-port)".to_owned(),
+        "(allow mach-register)".to_owned(),
         "(allow sysctl-read)".to_owned(),
+        "(allow ipc-posix-shm)".to_owned(),
+        "(allow ipc-posix-sem)".to_owned(),
         "(allow file-ioctl)".to_owned(),
         "(allow file-read-metadata)".to_owned(),
-        "(allow ipc-posix-shm)".to_owned(),
-        "(allow mach-lookup)".to_owned(),
+        "(allow file-map-executable)".to_owned(),
+        "(allow file-mprotect)".to_owned(),
     ];
     for subpath in [
         "/usr",
@@ -463,6 +472,7 @@ fn macos_profile(root: &Path, program: &Path, allow_network: bool) -> String {
         "/dev",
         "/private/etc",
         "/private/var/db",
+        "/private/preboot",
         "/Applications",
     ] {
         rules.push(format!(
@@ -482,7 +492,7 @@ fn macos_profile(root: &Path, program: &Path, allow_network: bool) -> String {
     } else {
         rules.push("(deny network*)".to_owned());
     }
-    rules.join("")
+    rules.join("\n")
 }
 
 fn scheme_subpath(path: &Path) -> Option<String> {

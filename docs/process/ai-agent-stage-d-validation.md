@@ -16,7 +16,7 @@ cargo test -p termior-agent-host --test escape_suite
 
 测试覆盖 journal 尾部半记录修复、中段篡改隔离、未知事件保留、SHA-256 hash chain、每个关键事件在写入前/中/后的 fault injection（含一次真实进程退出）、secret 写盘脱敏、snapshot+replay、unknown 恢复、新 attempt ID、内容寻址 checkpoint、用户后改冲突、路径逃逸/符号链接/硬链接拒绝、worktree 创建与安全清理、sandbox required capability fail-closed、三平台 black-box escape suite 和 retention 清理顺序。
 
-Escape suite 在 Core 矩阵的 Ubuntu、macOS、Windows 上随 `cargo test` 运行。Linux 需要 `bwrap`（CI 安装 `bubblewrap`），macOS 使用 `sandbox-exec`。任一逃逸成功都会让该作业失败。当前 Windows 没有经黑盒验证的文件/网络/凭据隔离，套件断言 `prepare` fail closed，并且不会启动 payload。
+Escape suite 在 Core 矩阵的 Ubuntu、macOS、Windows 上随 `cargo test` 运行。Linux 需要 `bwrap`（CI 安装 `bubblewrap`，并关闭 `kernel.apparmor_restrict_unprivileged_userns`，否则 `--unshare-net` 在配置 loopback 时会因缺少 `CAP_NET_ADMIN` 失败）。macOS 使用 `sandbox-exec`，profile 带上 dyld 启动所需的 `file-map-executable` 与 mach 基线允许项。任一逃逸成功都会让该作业失败。当前 Windows 没有经黑盒验证的文件/网络/凭据隔离，套件断言 `prepare` fail closed，并且不会启动 payload。
 
 ## 手工验证
 
@@ -35,7 +35,7 @@ Escape suite 在 Core 矩阵的 Ubuntu、macOS、Windows 上随 `cargo test` 运
 | 平台 | 文件/凭据/网络 | 进程树 | 行为 |
 |---|---|---|---|
 | Linux + `bwrap` | verified | verified | 系统库目录只读，工作区绑定到 `/workspace`，不挂载宿主根；清空环境；默认 unshare network/PID，沙箱退出后不留子进程 |
-| macOS + `sandbox-exec` | verified | verified | profile 只允许工作区写入和系统目录读取，默认拒绝网络，清空环境，退出时结束进程组 |
+| macOS + `sandbox-exec` | verified | verified | profile 默认拒绝；允许 dyld/libsystem 启动，只允许工作区写入和系统目录读取，默认拒绝网络，清空环境，退出时结束进程组 |
 | Windows | unsupported | verified | 当前没有经黑盒验证的文件/网络/凭据隔离；required 请求拒绝执行，escape suite 断言 fail closed |
 
 Windows 不会把普通进程或 Job Object 描述成完整 sandbox。选择 sandboxed 且要求上述能力时会 fail closed。direct/worktree 也不会被显示为 sandboxed。

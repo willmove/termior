@@ -9,7 +9,7 @@ use std::fs;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use termior_agent_host::{
@@ -249,8 +249,9 @@ fn launch_harness() {
         .expect("harness was launched even though the sandbox fails closed");
     let (status, stdout, stderr) = spawn_payload(&environment, &work);
     assert!(
-        status,
-        "sandboxed env probe failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        status.success(),
+        "sandboxed env probe failed ({})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        exit_summary(&status)
     );
 }
 
@@ -301,15 +302,16 @@ fn run_mode_unchecked(work: &Path, mode: &str, outside: &Path, pwned: &Path, tar
         });
     let (status, stdout, stderr) = spawn_payload(&environment, work);
     assert!(
-        status,
-        "{mode} payload failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        status.success(),
+        "{mode} payload failed ({})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        exit_summary(&status)
     );
 }
 
 fn spawn_payload(
     environment: &termior_agent_host::ExecutionEnvironment,
     _work: &Path,
-) -> (bool, String, String) {
+) -> (ExitStatus, String, String) {
     let exe = std::env::current_exe().unwrap();
     let command = PlatformSandbox
         .wrap_command(
@@ -344,7 +346,19 @@ fn spawn_payload(
     };
     let stdout = stdout_thread.join().unwrap_or_default();
     let stderr = stderr_thread.join().unwrap_or_default();
-    (status.success(), stdout, stderr)
+    (status, stdout, stderr)
+}
+
+fn exit_summary(status: &ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        format!("code={:?} signal={:?}", status.code(), status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        format!("code={:?}", status.code())
+    }
 }
 
 fn run_payload(task: &EscapeTask) {
@@ -392,13 +406,13 @@ fn create_and_read_symlink(outside: &Path) -> Option<String> {
         if std::os::unix::fs::symlink(outside, link).is_err() {
             return None;
         }
+        fs::read_to_string(link).ok()
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
-        let _ = outside;
-        return None;
+        let _ = (outside, link);
+        None
     }
-    fs::read_to_string(link).ok()
 }
 
 fn payload_network(task: &EscapeTask) {

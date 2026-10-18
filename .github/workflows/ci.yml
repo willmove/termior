@@ -48,6 +48,10 @@ jobs:
           # libraries as the Desktop job. fontconfig alone is not enough to link.
           # bubblewrap is the Linux sandbox used by the Core escape suite.
           sudo apt-get install -y bubblewrap libdbus-1-dev libfontconfig-dev libfreetype-dev libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev
+          # Ubuntu 24.04's AppArmor userns restriction strips CAP_NET_ADMIN from
+          # bwrap, so --unshare-net dies with "loopback: Failed RTM_NEWADDR".
+          # This relaxes the runner only; the sandbox under test is unchanged.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -243,6 +247,8 @@ jobs:
           # Same X11/xcb/xkb link dependencies as the Core Linux job and Desktop.
           # bubblewrap keeps the escape-suite lines in this coverage run.
           sudo apt-get install -y bubblewrap libdbus-1-dev libfontconfig-dev libfreetype-dev libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev
+          # Same AppArmor relaxation as the Core Linux job so --unshare-net can configure loopback.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
