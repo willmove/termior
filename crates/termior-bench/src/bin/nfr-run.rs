@@ -11,8 +11,9 @@
 //!
 //! 输出一行 `NfrPayload::Run` JSON。
 //!
-//! **平台范围**：需真实显示环境（GPUI 窗口）。CI 仅在 windows/macos（带显示）
-//! 的 desktop job 启用；ubuntu（headless）只跑 `nfr-pty` + criterion bench。
+//! **平台范围**：需真实显示环境（GPUI 窗口）。CI 的 desktop job 三平台都跑并过
+//! `nfr-gate`：windows/macos 直接启动，linux 在 xvfb + openbox + lavapipe 下启动。
+//! ubuntu 的 headless benchmark job 只跑 `nfr-pty` + criterion bench。
 //! 冷启动绝对值依赖硬件，故 CI 门禁用「相对基线回归」，而非 spec 绝对目标
 //! （spec 绝对目标作为发布验收参考，记录在 docs/process/nfr-baselines.md）。
 
