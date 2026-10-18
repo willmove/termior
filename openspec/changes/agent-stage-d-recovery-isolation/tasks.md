@@ -11,7 +11,7 @@
 - [x] 1.3 把 M6 TaskRuntime 状态变更全部归约为 TaskEvent；禁止绕过 reducer 直接改持久状态
 - [x] 1.4 实现原子 TaskSnapshot 和从 snapshot sequence 继续重放
 - [x] 1.5 实现尾部半记录修复、中段损坏隔离、未知 event 保留和诊断导出
-- [ ] 1.6 建立 fault-injection tests：每个关键事件写入前/中/后模拟退出并比较恢复状态
+- [x] 1.6 建立 fault-injection tests：每个关键事件写入前/中/后模拟退出并比较恢复状态
 
 ## 2. Unknown 恢复与会话入口
 
@@ -52,7 +52,7 @@
 - [x] 6.3 实现 macOS backend：经 prototype 选定的原生机制、目录/network/credential/process 限制和 cleanup
 - [x] 6.4 实现 Linux backend：经 prototype 选定的 namespace/seccomp/文件/network/process 组合和 capability probe
 - [x] 6.5 所有 backend 在 prepare 后运行 capability probe；required 不满足则 fail closed
-- [ ] 6.6 建立三平台 black-box escape suite：父目录、symlink、hardlink、loopback/private/public network、env secret、child escape、orphan process
+- [x] 6.6 建立三平台 black-box escape suite：父目录、symlink、hardlink、loopback/private/public network、env secret、child escape、orphan process
 
 ## 7. 脱敏、保留与清理
 
@@ -69,14 +69,14 @@
 - [ ] 8.4 更新安全文档，准确说明审批、worktree、sandbox、checkpoint 与远程副作用边界
 - [ ] 8.5 全部退出场景通过后记录偏差并严格验证本 change
 
-## 实施核对（2026-09-30）
+## 实施核对（2026-09-30，1.6 / 6.6 于 2026-10-18 补齐）
 
-代码已随 `8d294f0` 落地，但当时未回写本文件。以上勾选以仓库内实现与测试为证据；以下未勾项仍未完成，本 change 暂不归档：
+代码已随 `8d294f0` 落地，但当时未回写本文件。以上勾选以仓库内实现与测试为证据。1.6 与 6.6 已补齐；其余未勾项仍未完成，本 change 暂不归档：
 
 - 0.x 阶段门禁与三平台 sandbox prototype 记录未完成。
-- 1.6 仅覆盖尾部半记录/中段篡改，未对每个关键事件做写入前/中/后 fault injection。
+- 1.6 已覆盖每个关键事件的写入前/中/后 fault injection（进程内钩子 + running 边界的真实进程退出），恢复状态与预期一致。
 - 4.3 TerminalService、文件工具、规则与 repo map 尚未整体切换到 worktree 根；4.5 自动/手工合入分流未接入 Git 审阅流程。
 - 5.2 环境 ID 固定/变更 profile 新建环境未见专门实现与测试；5.3 能力仅在环境 chip 悬浮提示显示，审批卡未显示。
-- 6.2 Windows 仅进程树控制，文件/网络/凭据隔离报告 unsupported；6.6 三平台黑盒 escape suite 未运行。
+- 6.2 Windows 仅进程树控制，文件/网络/凭据隔离报告 unsupported。6.6 逃逸套件已进入 Core 三平台：Linux `bwrap` 与 macOS `sandbox-exec` 执行黑盒探测；Windows 对未支持能力断言 fail closed，不静默跳过。
 - 7.2 已在 journal、output blob、context、hook audit、MCP diagnostic、backend stderr 与 crash log 写盘前调用 StreamingRedactor，各路径有注入已知 secret 的落盘测试。7.4 无保留设置与磁盘使用 UI。
-- 8.x 收尾验证未完成。
+- 8.x 收尾验证未完成。8.1 里的 journal fault injection 与三平台 escape suite 已由 Core `cargo test` 覆盖；checkpoint 冲突与 worktree 用例仍是既有测试，阶段门禁记录本身未归档。
