@@ -179,7 +179,7 @@ jobs:
           name: smoke-logs-${{ matrix.platform }}
           path: smoke-logs/
           if-no-files-found: ignore
-      - name: NFR process-level gate (cold start / RSS / FPS)
+      - name: NFR process-level gate (cold start / RSS / FPS / key echo)
         if: matrix.platform == 'windows' || matrix.platform == 'macos'
         shell: bash
         run: |
@@ -190,29 +190,35 @@ jobs:
           fi
           cargo build -p termior-bench --features run-harness --release --bins
           # The app exits on its own after FPS + key-echo sampling; dwell is only the upper bound
-          # per launch. Three launches, gated on the per-metric median: hosted runners (Windows
-          # renders through WARP on shared vCPUs) occasionally stall one launch, while a real
-          # regression slows all of them.
+          # per launch. Three launches, gated on the per-metric median: one stalled launch on a
+          # shared runner does not fail the job, while a real regression slows all of them.
           ./target/release/nfr-run --binary "$BIN" --dwell-secs 20 --echo-samples 40 --runs 3 > nfr-run-payload.json
           cat nfr-run-payload.json
+          for key in cold_start_ms rss_mib fps echo_p99_ms; do
+            grep -q "\"${key}\":" nfr-run-payload.json || { echo "nfr payload missing ${key}"; exit 1; }
+          done
           ./target/release/nfr-gate --platform ${{ matrix.platform }} \
             --payload nfr-run-payload.json \
             --baselines docs/baselines/nfr-baselines.json
-      - name: NFR process-level measurement on Linux (xvfb, record-only)
-        # GPUI needs a display: run under xvfb with Mesa's software Vulkan (lavapipe).
-        # No linux baseline is pinned yet, so nfr-gate only records these samples.
-        # Software rendering makes FPS/frame-time pessimistic; cold start and RSS are
-        # the useful numbers here. Kept non-blocking until the numbers are stable.
+      - name: NFR process-level gate on Linux (xvfb)
+        # GPUI needs a display: xvfb + openbox + Mesa lavapipe. A bare Xvfb never
+        # presents a frame (same as the launch smoke). Linux baselines are pinned;
+        # this step fails the job on regression.
         if: matrix.platform == 'linux'
-        continue-on-error: true
         shell: bash
         run: |
           sudo apt-get install -y xvfb mesa-vulkan-drivers openbox
           cargo build -p termior-bench --features run-harness --release --bins
-          # Without a window manager no frame is ever presented (same as the launch smoke).
+          # xvfb-run folds the child stderr into its stdout, so the capture mixes
+          # GPUI logs with the one-line Run JSON. Gate on that JSON line only.
           xvfb-run -a -s "-screen 0 1920x1080x24" \
-            bash -c 'openbox >/dev/null 2>&1 & sleep 1; exec ./target/release/nfr-run --binary ./target/release/termior --dwell-secs 20 --echo-samples 40 --runs 3' > nfr-run-payload.json
-          cat nfr-run-payload.json
+            bash -c 'openbox >/dev/null 2>&1 & sleep 1; exec ./target/release/nfr-run --binary ./target/release/termior --dwell-secs 20 --echo-samples 40 --runs 3' \
+            > nfr-run.log
+          cat nfr-run.log
+          awk '/^\{"kind":"Run"/{line=$0} END{if (line=="") exit 1; print line}' nfr-run.log > nfr-run-payload.json
+          for key in cold_start_ms rss_mib fps echo_p99_ms; do
+            grep -q "\"${key}\":" nfr-run-payload.json || { echo "nfr payload missing ${key}"; exit 1; }
+          done
           ./target/release/nfr-gate --platform linux \
             --payload nfr-run-payload.json \
             --baselines docs/baselines/nfr-baselines.json

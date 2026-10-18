@@ -5,8 +5,9 @@
 ## 目标
 
 把「终端/编辑器感觉流畅」这种主观判断，换成**可测量、可对比、可回归**的硬指标，
-并接到 CI 上自动把关：冷启动耗时、常驻 RSS、稳态帧率、PTY 吞吐四组基准各落一组
-基线数字，CI 每次把当前测量与基线对比，退化超阈值即 fail。
+并接到 CI 上自动把关：冷启动耗时、常驻 RSS、稳态帧率、键入回显、PTY 吞吐各落一组
+基线数字，CI 每次把当前测量与基线对比，退化超阈值即 fail。键入回显目前在 Linux 与
+macOS 上设了基线；Windows 的回显方差太大，先只记录。
 
 ## 组件
 
@@ -47,11 +48,12 @@
 
 GPUI 的 next-frame 回调在每个显示刷新 tick 都会执行，**与这一 tick 是否真的 draw 无关**；
 Termior 又要求空闲零重绘。旧口径只数回调次数，量到的是显示器刷新节拍，而不是渲染开销
-（旧口径在 CI 上 macOS 40fps、Windows 58fps 即如此，58 也因此残留成了 Windows 的
-过时锚点）。新口径按强制整窗重绘的实测重锚：macOS 40（实测 50-56）、Windows 27
-（GitHub-hosted runner 走 WARP 软件光栅化，实测 20-27；真机 GPU 下远高于此）。
+（旧口径在 CI 上 macOS 40fps、Windows 58fps 即如此）。新口径按强制整窗重绘实测。
+2026-10-18 的 hosted runner 水位是：macOS 稳定 60fps，Linux xvfb 为 31 或 63
+（30Hz / 60Hz 的 present 上限），Windows WARP 为 16–36fps。真机 GPU 会高于 Windows 这档。
 此外 GPUI 对**非前台窗口**把帧间隔限到 ~33ms：CI 窗口拿不到前台时帧率上限约 30fps，
-`window_active=false` 时判读帧率要打折扣。
+`window_active=false` 时判读帧率要打折扣。Linux 上 31fps 那一档的 `window_active` 仍是
+true，帧间隔 p99 锁在 32ms，所以它是刷新上限，不是这条约 30fps 的后台限制。
 
 ### 为什么要预热、分窗取中位数、多次启动
 
@@ -69,7 +71,10 @@ Termior 又要求空闲零重绘。旧口径只数回调次数，量到的是显
 3. **多次启动中位数**：CI 用 `nfr-run --runs 3`，每次全新数据目录，冷启动/RSS/帧率等
    各取 3 次的中位数；原始测量写进 payload 的 `runs`，日志里逐次打印。
 
-门禁本身（基线、阈值、方向）不变；`nfr-gate` 读到的仍是一份 `Run` payload。
+那次只改了测量，基线先留在 27 / 40%。`nfr-gate` 读到的仍是一份 `Run` payload。
+随后的 25 次新口径样本里，Windows 仍有整次作业三次启动都是 16–17fps，失败线
+16.2fps 还是会误伤与渲染无关的提交。2026-10-18 把 Windows FPS 重锚到实测地板，
+见下面的基线表。
 
 ### 为什么 PTY 吞吐是 headless 主干项
 
@@ -77,14 +82,18 @@ NFR-02 的可量化内核是「VTE 解析 + 网格写入速率」，与 GPU/显�
 ubuntu CI runner 上确定性复现，是回归门禁最稳的项。`cat` 大文件期间「UI 不掉帧」
 由 NFR-03（帧率）覆盖；两者正交。
 
-### 为什么进程级指标（冷启动/RSS/FPS）只在 windows/macos CI 跑
+### 为什么进程级指标在三个 desktop job 上都过门禁
 
-GPUI 需要真实显示环境才能开窗。ubuntu CI runner（headless）只跑 PTY 吞吐 + criterion
-bench；windows/macos 的 desktop job 启用 `nfr-run` 并过门禁。Linux desktop job 在
-`xvfb-run` + openbox + Mesa lavapipe（软件 Vulkan）下运行 `nfr-run`（裸 Xvfb 没有窗口管理器时
-窗口一帧都不会上屏，payload 只剩 RSS），**只记录不判回归**
-（`continue-on-error`，且尚无 `linux` 基线条目）。软件渲染会让帧率/帧耗时偏悲观，冷启动与
-RSS 更有参考价值；数字稳定后再固化为 `linux` 平台基线。
+GPUI 需要真实显示环境才能开窗。ubuntu 的 headless benchmark job 只跑 PTY 吞吐 +
+criterion bench。三个 desktop job 都跑 `nfr-run --runs 3` 并过 `nfr-gate`：
+
+- windows / macOS：直接启动 release 二进制。
+- Linux：`xvfb-run -s "-screen 0 1920x1080x24"` + openbox + Mesa lavapipe（软件 Vulkan）。
+  裸 Xvfb 没有窗口管理器时窗口一帧都不会上屏，payload 只剩 RSS。`xvfb-run` 会把子进程
+  stderr 折进 stdout，CI 从日志里抽出那一行 `Run` JSON 再交给门禁。
+
+软件渲染让 Linux 的帧率 / 帧耗时偏悲观，所以 Linux FPS 基线锚在 30Hz 那一档，而不是
+60Hz 那一档。冷启动和 RSS 在这套环境里同样稳定，一并进门禁。
 
 ### RSS 取 dwell 窗口峰值
 
@@ -100,8 +109,35 @@ RSS 更有参考价值；数字稳定后再固化为 `linux` 平台基线。
   也存在代际差异），所以门禁判据是「当前相对基线退化是否超 `threshold_percent`」，
   而非 spec 绝对目标。退化方向已按「越小越好 / 越大越好」归一化。
 - **无基线的采样不判回归**：新平台/新场景首次采集只记录，供下次固化基线（避免
-  「没有基线就 fail」的死锁）。
+  「没有基线就 fail」的死锁）。`frame_p99_ms` 三平台仍是这种：Linux 锁在 16ms 或 32ms
+  （跟 30Hz / 60Hz 两档刷新走），Windows 是 42–198ms，macOS 是 19–39ms。Windows 键入回显的
+  三次中位数是 25–78ms，单次启动到过 929ms，也先不设基线。
 - **spec 绝对目标是发布验收参考**（见下表），不进 CI 硬门禁，但在发版前人工核对。
+- **方差大的指标锚在健康样本的差的那一端**，阈值只覆盖「比这批样本更差」的一段。
+  锚在中位数上、再用阈值去罩住整段噪声，失败线会正好落在健康样本里（Windows FPS
+  旧锚 27 / 40% 的失败线是 16.2fps，而这就是实测地板）。
+
+### 当前 CI 基线（2026-10-18）
+
+样本是 2026-10-16 至 2026-10-18 的 25 次 Desktop CI（main 与未改渲染的 PR），每次
+`nfr-run --runs 3` 的中位数。失败线按 `current` 相对基线的退化百分比**严格大于**
+阈值计算（等于阈值仍算通过）。
+
+| 平台 | 指标 | 25 次范围 | 基线 | 阈值 | 失败线 | 为什么是这个数 |
+|---|---|---|---|---|---|---|
+| linux | 冷启动 | 152–233ms（两档，约 160 与约 230） | 233ms | 25% | > 291ms | 最差中位数 232.8ms。慢档本身很齐（216–233），25% 是慢档之外的退化 |
+| linux | RSS | 183–187MiB | 188MiB | 15% | > 216MiB | 最差 187.0。lavapipe 下高于 spec 的 150MB，门禁看的是这台 runner 上的回归 |
+| linux | FPS | 31 或 62–63 | 31fps | 20% | < 24.8fps | 低档每次都是 31。门禁抓住「连 30Hz 都守不住」；60Hz runner 掉到 31 与健康的 30Hz runner 无法区分 |
+| linux | 回显 p99 | 12.0–16.1ms | 16.1ms | 25% | > 20.1ms | 多数在 12–13ms，两次到 15.5 / 16.1。锚在最差那次 |
+| macos | 冷启动 | 190–632ms（中位 340） | 632ms | 35% | > 853ms | 旧锚 1700ms 要超过 2380ms 才失败。单次启动最慢 761ms，三次中位数最慢 632ms |
+| macos | RSS | 67.9–68.7MiB | 69MiB | 20% | > 82.8MiB | 旧锚 250MiB。这 25 次的波动不到 1MiB |
+| macos | FPS | 中位数 59–60（单次最低 50） | 60fps | 15% | < 51fps | 旧锚 40 / 30% 要掉到 28fps 才失败。一次启动到 50 时，另外两次仍是 59–60，中位数滤得掉 |
+| macos | 回显 p99 | 18.6–24.4ms | 25ms | 30% | > 32.5ms | 75 次启动里有一次 175ms，中位数把它滤掉了 |
+| windows | 冷启动 | 120–213ms | 220ms | 30% | > 286ms | 旧锚 800ms（spec 目标）在这批 CI 上要退化大约 4 倍才报。本地开发机更慢，那不是这条门禁的锚 |
+| windows | RSS | 54–59MiB | 60MiB | 20% | > 72MiB | 旧锚 300MiB。慢帧率那几台 runner 的 RSS 反而略低（约 54） |
+| windows | FPS | 16–36（中位 23；5 次整作业 16–17） | 16fps | 25% | < 12fps | 旧锚 27 / 40% 在 16.2fps 失败，而 16fps 是健康样本的地板（#45、#48、#52 同提交重跑即到 28–36）。75 次启动最低 14fps |
+
+PTY 吞吐仍是 `any` / `vte_parse` / 100MiB/s / 40%，不在这批进程级样本里。
 
 ### spec 绝对目标（NFR-01~04，发布验收参考）
 
@@ -125,6 +161,7 @@ cargo run -p termior-bench --features run-harness --release --bin nfr-run -- \
   --binary ./target/release/termior --dwell-secs 20 --echo-samples 40 --runs 3 > run.json
 cargo run -p termior-bench --release --bin nfr-gate -- \
   --platform windows --payload run.json --baselines docs/baselines/nfr-baselines.json
+# Linux 把 platform 换成 linux，二进制在 xvfb-run + openbox 里启动。
 ```
 
 门禁退出码：`0` = 通过，`1` = 有回归（CI 应 fail），`2` = 输入/参数错误。
