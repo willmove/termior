@@ -119,7 +119,32 @@ impl ToolRegistry {
 
     /// Register a policy-normalized external tool such as an MCP server-qualified tool.
     pub fn register_external(&mut self, contract: ToolContract) -> Result<(), ToolError> {
-        if contract.name.trim().is_empty() || self.external_contracts.contains_key(&contract.name) {
+        self.validate_external_contract(&contract)?;
+        if self.external_contracts.contains_key(&contract.name) {
+            return Err(ToolError::InvalidArguments(
+                "external tool name is empty or already registered".into(),
+            ));
+        }
+        self.external_contracts
+            .insert(contract.name.clone(), contract);
+        Ok(())
+    }
+
+    /// Insert or replace an external contract. Used when an MCP server rediscovers tools.
+    pub fn upsert_external(&mut self, contract: ToolContract) -> Result<(), ToolError> {
+        self.validate_external_contract(&contract)?;
+        self.external_contracts
+            .insert(contract.name.clone(), contract);
+        Ok(())
+    }
+
+    /// Drop external contracts whose names fail `keep`.
+    pub fn retain_external(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.external_contracts.retain(|name, _| keep(name));
+    }
+
+    fn validate_external_contract(&self, contract: &ToolContract) -> Result<(), ToolError> {
+        if contract.name.trim().is_empty() {
             return Err(ToolError::InvalidArguments(
                 "external tool name is empty or already registered".into(),
             ));
@@ -134,8 +159,6 @@ impl ToolRegistry {
                 "external tool schema must be a closed object schema".into(),
             ));
         }
-        self.external_contracts
-            .insert(contract.name.clone(), contract);
         Ok(())
     }
 
