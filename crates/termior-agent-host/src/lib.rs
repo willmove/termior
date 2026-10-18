@@ -36,9 +36,11 @@ pub use environment::{
 };
 pub use in_process::InProcessBackend;
 pub use mcp::{
-    McpCatalog, McpDiscovery, McpHttpClient, McpHttpToolHandler, McpStdioClient,
-    McpStdioToolHandler, McpToolDeclaration, McpTransport, OAuthPkceRequest, QualifiedMcpTool,
-    MCP_PROTOCOL_VERSION,
+    confine_workspace_path, ingest_tool_declarations, sanitize_untrusted_description, McpCatalog,
+    McpDiscovery, McpHttpClient, McpHttpToolHandler, McpIngest, McpServerPool, McpStdioClient,
+    McpStdioSpec, McpStdioToolHandler, McpToolDeclaration, McpTransport, OAuthPkceRequest,
+    QualifiedMcpTool, ServerLink, ServerLinkState, MCP_DESCRIPTION_MAX_CHARS, MCP_MAX_OUTPUT_BYTES,
+    MCP_PROTOCOL_VERSION, TOOLS_LIST_CHANGED,
 };
 pub use projection::BackendTaskProjector;
 pub use restore::{
