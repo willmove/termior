@@ -854,125 +854,6 @@ impl MemoryStore {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RepoMapEntry {
-    pub path: PathBuf,
-    pub digest: String,
-    pub symbols: Vec<String>,
-    pub references: Vec<String>,
-    pub stale: bool,
-}
-
-#[derive(Debug, Default)]
-pub struct RepoMap {
-    entries: BTreeMap<PathBuf, RepoMapEntry>,
-}
-
-impl RepoMap {
-    pub fn index_workspace(&mut self, root: &Path) -> Result<usize, ContextError> {
-        let root = std::fs::canonicalize(root)?;
-        let mut indexed = 0;
-        for entry in ignore::WalkBuilder::new(&root)
-            .hidden(false)
-            .git_ignore(true)
-            .git_exclude(true)
-            .build()
-        {
-            let entry = entry.map_err(|error| ContextError::Walk(error.to_string()))?;
-            if entry.file_type().is_some_and(|kind| kind.is_file())
-                && std::fs::metadata(entry.path())
-                    .is_ok_and(|metadata| metadata.len() <= 2 * 1024 * 1024)
-                && self.index_file(&root, entry.path()).is_ok()
-            {
-                indexed += 1;
-            }
-        }
-        Ok(indexed)
-    }
-
-    pub fn index_file(&mut self, root: &Path, path: &Path) -> Result<(), ContextError> {
-        let root = std::fs::canonicalize(root)?;
-        let path = std::fs::canonicalize(path)?;
-        if !path.starts_with(&root) {
-            return Err(ContextError::OutsideWorkspace(path));
-        }
-        if std::fs::symlink_metadata(&path)
-            .is_ok_and(|metadata| metadata.is_file() && metadata_link_count(&path, &metadata) > 1)
-        {
-            return Err(ContextError::OutsideWorkspace(path));
-        }
-        let content = std::fs::read_to_string(&path)?;
-        let symbols = lexical_symbols(&content);
-        let references = lexical_references(&content, &symbols);
-        self.entries.insert(
-            path.clone(),
-            RepoMapEntry {
-                path,
-                digest: stable_digest(content.as_bytes()),
-                symbols,
-                references,
-                stale: false,
-            },
-        );
-        Ok(())
-    }
-
-    pub fn invalidate_changed(&mut self) {
-        for entry in self.entries.values_mut() {
-            let current = std::fs::read(&entry.path)
-                .ok()
-                .map(|bytes| stable_digest(&bytes));
-            entry.stale = current.as_deref() != Some(&entry.digest);
-        }
-    }
-
-    pub fn relevant(&self, query: &str, token_budget: u64) -> Vec<RepoMapEntry> {
-        let needles = query
-            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-            .filter(|part| !part.is_empty())
-            .map(str::to_ascii_lowercase)
-            .collect::<Vec<_>>();
-        let mut candidates = self
-            .entries
-            .values()
-            .filter(|entry| !entry.stale)
-            .cloned()
-            .collect::<Vec<_>>();
-        candidates.sort_by_key(|entry| {
-            let haystack = format!(
-                "{} {} {}",
-                entry.path.display(),
-                entry.symbols.join(" "),
-                entry.references.join(" ")
-            )
-            .to_ascii_lowercase();
-            let score = needles
-                .iter()
-                .filter(|word| haystack.contains(word.as_str()))
-                .count();
-            (std::cmp::Reverse(score), entry.path.clone())
-        });
-        let mut used = 0;
-        candidates
-            .into_iter()
-            .take_while(|entry| {
-                let cost = HeuristicTokenEstimator
-                    .estimate(&format!(
-                        "{} {}",
-                        entry.path.display(),
-                        entry.symbols.join(" ")
-                    ))
-                    .tokens;
-                if used + cost > token_budget {
-                    false
-                } else {
-                    used += cost;
-                    true
-                }
-            })
-            .collect()
-    }
-}
 impl MemoryCandidate {
     pub fn accept(self) -> Result<MemoryEntry, ContextError> {
         if self.evidence.is_empty() {
@@ -1022,6 +903,8 @@ pub enum ContextError {
     Decode(String),
     #[error("workspace walk failed: {0}")]
     Walk(String),
+    #[error("repo map indexing was cancelled")]
+    Cancelled,
     #[error("I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -1046,72 +929,6 @@ fn stable_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// Same probe as checkpoint hardlink rejection. Windows `MetadataExt::number_of_links` is unstable.
-#[cfg(unix)]
-fn metadata_link_count(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    metadata.nlink()
-}
-
-#[cfg(windows)]
-fn metadata_link_count(path: &Path, _metadata: &std::fs::Metadata) -> u64 {
-    use std::os::windows::process::CommandExt;
-    std::process::Command::new("fsutil")
-        .args(["hardlink", "list"])
-        .arg(path)
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count() as u64
-        })
-        .unwrap_or(1)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn metadata_link_count(_path: &Path, _metadata: &std::fs::Metadata) -> u64 {
-    1
-}
-
-fn lexical_symbols(content: &str) -> Vec<String> {
-    let words = content
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    let mut result = Vec::new();
-    for pair in words.windows(2) {
-        if matches!(
-            pair[0],
-            "fn" | "struct" | "enum" | "trait" | "class" | "def" | "function"
-        ) {
-            result.push(pair[1].to_owned());
-        }
-    }
-    result.sort();
-    result.dedup();
-    result
-}
-
-fn lexical_references(content: &str, definitions: &[String]) -> Vec<String> {
-    let definitions = definitions
-        .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let mut references = content
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .filter(|word| word.len() > 2 && !definitions.contains(*word))
-        .filter(|word| word.chars().next().is_some_and(|ch| ch.is_alphabetic()))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    references.sort();
-    references.dedup();
-    references.truncate(512);
-    references
-}
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

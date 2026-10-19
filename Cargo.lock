@@ -6582,6 +6582,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "termior-diff",
+ "termior-editor",
  "termior-explorer",
  "termior-hooks",
  "termior-security",
@@ -6590,6 +6591,7 @@ dependencies = [
  "thiserror 1.0.69",
  "url",
  "wait-timeout",
+ "winapi-util",
 ]
 
 [[package]]
@@ -6601,6 +6603,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
+ "termior-ai",
+ "termior-security",
 ]
 
 [[package]]

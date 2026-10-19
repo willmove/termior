@@ -73,6 +73,7 @@ impl ComposerView {
         self.update_path_suggestions();
         self.update_slash_suggestions();
         self.update_snippet_suggestions();
+        self.warm_repo_map();
     }
 
     pub(super) fn update_snippet_suggestions(&mut self) {

@@ -13,6 +13,7 @@
 //! - [`agent`]：Agent 循环状态机（FR-AGENT-08）。
 //! - [`context`]：实时上下文桥契约（FR-AGENT-07）。
 //! - [`session`]：会话与项目记忆（FR-SESS-01/02）。
+//! - [`repo_map`]：增量 symbol/reference 仓库地图与按任务相关性切片（FR-ACTX-05）。
 //!
 //! `HttpProvider` 承担真实网络调用；`MockProvider` 用于确定性跑通 Agent 循环测试。
 
@@ -38,6 +39,7 @@ pub mod model_registry;
 pub mod orchestration;
 pub mod plan;
 pub mod provider;
+pub mod repo_map;
 pub mod runtime;
 pub mod secret_store;
 pub mod session;

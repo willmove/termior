@@ -10,13 +10,14 @@ use std::sync::{Arc, Mutex};
 use termior_agent_host::{
     permission_entries, ManagedAgentSession, PumpOutcome, PERMISSIONS_APPROVAL_METHOD,
 };
-use termior_ai::context_engine::RepoMap;
+use termior_ai::repo_map::{RepoMapConfig, RepoMapService};
 use termior_ai::{
     ApprovalPolicy, ApprovalRequest, CancellationToken, EditProposalSummary, Mode,
     PinnedEnvironment, ProviderConfig, RuntimeBudgets, TaskRuntime, TaskState, ToolContract,
     ToolExecutor, ToolRegistry, WaitingReason,
 };
 use termior_platform::AgentStatus;
+use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_vcs::{MergeBack, WorktreeEnvironment, WorktreeError, WorktreeManager};
 
 use super::notify::status_for_task;
@@ -339,7 +340,8 @@ pub(super) struct ComposerOrchestrator {
     pub(super) pinned_environment: Option<PinnedEnvironment>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) pending_git_review: Option<PendingGitReview>,
-    repo_map: Option<RepoMap>,
+    /// Background index for `repo_map_root`. The UI thread only reads applied snapshots.
+    repo_map: Option<RepoMapService>,
     repo_map_root: Option<PathBuf>,
     pub(super) busy: bool,
 }
@@ -424,36 +426,56 @@ impl ComposerOrchestrator {
         workspace_root.to_path_buf()
     }
 
-    /// Symbols from the worktree checkout only. Paths outside that root are dropped.
-    pub(super) fn worktree_repo_excerpt(
+    /// Start indexing `root` in the background if no service covers it yet. Never blocks on the
+    /// index. Returns `true` when this call started a new service.
+    pub(super) fn ensure_repo_map(
+        &mut self,
+        root: &Path,
+        authorization: &WorkspaceAuthRegistry,
+    ) -> Result<bool, String> {
+        if self.repo_map.is_some() && self.repo_map_root.as_deref() == Some(root) {
+            return Ok(false);
+        }
+        self.repo_map = None;
+        self.repo_map_root = None;
+        let service = RepoMapService::spawn(
+            root,
+            RepoMapConfig {
+                authorization: Some(authorization.clone()),
+                ..RepoMapConfig::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        self.repo_map = Some(service);
+        self.repo_map_root = Some(root.to_path_buf());
+        Ok(true)
+    }
+
+    /// Symbols relevant to `query` from the last applied index of `root`, within
+    /// `token_budget`. Queues a refresh so edits since the previous turn land for the next one.
+    /// Empty while the first sweep is still running.
+    pub(super) fn repo_map_excerpt(
         &mut self,
         root: &Path,
         query: &str,
+        authorization: &WorkspaceAuthRegistry,
+        token_budget: u64,
     ) -> Result<String, String> {
-        let root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
-        if self.repo_map_root.as_ref() != Some(&root) {
-            let mut map = RepoMap::default();
-            map.index_workspace(&root)
-                .map_err(|error| error.to_string())?;
-            self.repo_map = Some(map);
-            self.repo_map_root = Some(root.clone());
-        }
-        let Some(map) = self.repo_map.as_ref() else {
-            return Ok(String::new());
-        };
-        let mut lines = Vec::new();
-        for entry in map.relevant(query, 1_200) {
-            if entry.path != root && !entry.path.starts_with(&root) {
-                continue;
+        if !self.ensure_repo_map(root, authorization)? {
+            if let Some(service) = &self.repo_map {
+                service.request_refresh();
             }
-            let relative = entry.path.strip_prefix(&root).unwrap_or(&entry.path);
-            lines.push(format!(
-                "{} {}",
-                relative.display(),
-                entry.symbols.join(",")
-            ));
         }
-        Ok(lines.join("\n"))
+        Ok(self
+            .repo_map
+            .as_ref()
+            .map(|service| service.slice(query, token_budget).render())
+            .unwrap_or_default())
+    }
+
+    #[cfg(test)]
+    pub(super) fn repo_map_service(&self) -> Option<&RepoMapService> {
+        self.repo_map.as_ref()
     }
 
     /// Fast-forward or cherry-pick when that cannot touch user edits. Otherwise record a Git review.
@@ -1627,6 +1649,42 @@ mod tests {
             std::fs::read_to_string(repository.join("notes.txt")).unwrap(),
             "user scratch\n"
         );
+    }
+
+    #[test]
+    fn repo_map_indexes_in_the_background_and_follows_the_task_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("ledger.rs"),
+            "pub fn settle_ledger(total: u64) -> u64 { total }\n",
+        )
+        .unwrap();
+        let authorization =
+            WorkspaceAuthRegistry::with_roots([workspace.path().to_string_lossy().into_owned()]);
+        let mut orch = ComposerOrchestrator::new();
+
+        assert!(orch
+            .ensure_repo_map(workspace.path(), &authorization)
+            .unwrap());
+        assert!(!orch
+            .ensure_repo_map(workspace.path(), &authorization)
+            .unwrap());
+        let service = orch.repo_map_service().expect("service started");
+        assert!(service.wait_for_sweeps(1, std::time::Duration::from_secs(30)));
+        let excerpt = orch
+            .repo_map_excerpt(workspace.path(), "settle_ledger", &authorization, 1_200)
+            .unwrap();
+        assert!(excerpt.contains("ledger.rs"), "{excerpt}");
+        assert!(
+            excerpt.contains("pub fn settle_ledger(total: u64) -> u64"),
+            "{excerpt}"
+        );
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(orch
+            .ensure_repo_map(elsewhere.path(), &authorization)
+            .is_err());
+        assert!(orch.repo_map_service().is_none());
     }
 
     fn git(path: &std::path::Path, args: &[&str]) {

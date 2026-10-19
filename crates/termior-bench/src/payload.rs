@@ -119,12 +119,89 @@ impl RunPayload {
     }
 }
 
-/// harness 二进制最终打印的顶层 JSON。CI 脚本据此分流到 PTY bench 或进程级 run。
+/// `nfr-context` 的载荷：仓库地图在合成仓库上的上下文延迟。
+///
+/// 只有 `slice_p99_ms` 与 `incremental_ms` 进门禁，其余字段供判读。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContextLatencyPayload {
+    /// 合成仓库的文件数。
+    pub files: u64,
+    /// 增量阶段改动、改名、删除、新增的文件总数。
+    #[serde(default)]
+    pub changed_files: u64,
+    /// 后台建索引/刷新期间，调用线程取切片的 p99（ms）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_p99_ms: Option<f64>,
+    /// 增量 sweep 从请求到落定的墙钟时间（ms）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_p50_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_max_ms: Option<f64>,
+    /// 首次全量建索引的墙钟时间（ms）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_index_ms: Option<f64>,
+    /// 在调用线程上启动服务（校验根、起线程）的耗时（ms）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_ms: Option<f64>,
+    /// 计入分位数的切片次数。
+    #[serde(default)]
+    pub slices: u64,
+    /// 多轮测量的原始值；顶层各指标是它们的中位数。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<ContextLatencyPayload>,
+}
+
+impl ContextLatencyPayload {
+    /// 每个指标取各轮中位数，原始轮次放进 `runs`。
+    pub fn median_of(runs: Vec<ContextLatencyPayload>) -> ContextLatencyPayload {
+        let pick = |field: fn(&ContextLatencyPayload) -> Option<f64>| {
+            median(runs.iter().filter_map(field))
+        };
+        ContextLatencyPayload {
+            files: runs.iter().map(|r| r.files).max().unwrap_or(0),
+            changed_files: runs.iter().map(|r| r.changed_files).max().unwrap_or(0),
+            slice_p99_ms: pick(|r| r.slice_p99_ms),
+            incremental_ms: pick(|r| r.incremental_ms),
+            slice_p50_ms: pick(|r| r.slice_p50_ms),
+            slice_max_ms: pick(|r| r.slice_max_ms),
+            full_index_ms: pick(|r| r.full_index_ms),
+            spawn_ms: pick(|r| r.spawn_ms),
+            slices: runs.iter().map(|r| r.slices).sum(),
+            runs,
+        }
+    }
+
+    pub fn to_samples(&self, platform: &str) -> Vec<Sample> {
+        let mut out = Vec::new();
+        if let Some(v) = self.slice_p99_ms {
+            out.push(Sample::new(
+                MetricKind::ContextLatencyP99Ms,
+                platform,
+                "repo_map_slice",
+                v,
+            ));
+        }
+        if let Some(v) = self.incremental_ms {
+            out.push(Sample::new(
+                MetricKind::RepoMapIncrementalMs,
+                platform,
+                "repo_map_refresh",
+                v,
+            ));
+        }
+        out
+    }
+}
+
+/// harness 二进制最终打印的顶层 JSON。CI 脚本据此分流到 PTY bench、进程级 run 或上下文延迟。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum NfrPayload {
     PtyThroughput(PtyThroughputPayload),
     Run(RunPayload),
+    ContextLatency(ContextLatencyPayload),
 }
 
 /// 完整 harness 报告：标注平台后，CI 可直接喂给 [`crate::compare`]。
@@ -142,6 +219,7 @@ impl HarnessReport {
             match payload {
                 NfrPayload::PtyThroughput(p) => out.push(p.to_sample(&self.platform)),
                 NfrPayload::Run(r) => out.extend(r.to_samples(&self.platform, "typical")),
+                NfrPayload::ContextLatency(c) => out.extend(c.to_samples(&self.platform)),
             }
         }
         out

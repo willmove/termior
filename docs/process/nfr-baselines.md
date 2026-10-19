@@ -19,6 +19,7 @@ macOS 上设了基线；Windows 的回显方差太大，先只记录。
 | `benches/pty_throughput.rs` | criterion 统计稳态的 PTY/VTE 吞吐 bench（NFR-02） |
 | `src/bin/nfr-pty.rs` | 一次性 PTY 吞吐取值，打印 `NfrPayload::PtyThroughput` JSON |
 | `src/bin/nfr-run.rs`（feature `run-harness`） | 启动 release 应用，采集冷启动/RSS/FPS，打印 `NfrPayload::Run` JSON |
+| `src/bin/nfr-context.rs` + `src/context_harness.rs` | 合成仓库上测仓库地图的 Agent 上下文延迟，打印 `NfrPayload::ContextLatency` JSON |
 | `src/bin/nfr-gate.rs` | 读 payload + 基线，调用 `compare`，打印摘要，有回归则退出码非 0 |
 
 应用侧插桩在 `crates/termior/src/main.rs` 的 `schedule_nfr_measurement`（`TERMIOR_NFR_MEASURE=1`）：
@@ -43,6 +44,8 @@ macOS 上设了基线；Windows 的回显方差太大，先只记录。
 | NFR-02 | 键入回显 p99 | ms | `x`/Backspace 交替写入 PTY → shell 回显进入网格 → 包含它的那一帧 `render`；不含该帧剩余 paint/present（由帧间隔 p99 覆盖） | 越小越好 |
 | NFR-03 | 空闲零重绘 | frames | `scripts/idle-redraw-smoke.ps1`：`TERMIOR_IDLE_REDRAW_PROBE` 在 settle 后统计 `WorkspaceView::render` 次数，期望 `TERMIOR_IDLE_REDRAW_FRAMES=0` | 必须为 0 |
 | NFR-02 | PTY/VTE 吞吐 | MiB/s | `nfr-pty`/bench：5 MiB 合成 `cat` 输出 → `vte::Processor::advance` 喂 alacritty `Term` 网格 | 越大越好 |
+| Agent 上下文 | 切片延迟 p99（`context_latency_p99_ms`） | ms | `nfr-context`：调用线程（相当于 UI 线程）向 `RepoMapService` 取 1,200 token 相关切片，后台全量建索引与增量刷新期间持续采样 | 越小越好 |
+| Agent 上下文 | 增量刷新（`repo_map_incremental_ms`） | ms | `nfr-context`：约 1% 文件改动加约 0.2% 改名/删除/新增后，一次后台 sweep 从请求到落定 | 越小越好 |
 
 ### 为什么帧率必须强制重绘
 
@@ -94,6 +97,23 @@ criterion bench。三个 desktop job 都跑 `nfr-run --runs 3` 并过 `nfr-gate`
 
 软件渲染让 Linux 的帧率 / 帧耗时偏悲观，所以 Linux FPS 基线锚在 30Hz 那一档，而不是
 60Hz 那一档。冷启动和 RSS 在这套环境里同样稳定，一并进门禁。
+
+### Agent 上下文延迟怎么测
+
+`nfr-context` 每轮在临时目录生成 20,000 个文件的合成仓库（仓库地图的文件上限；Rust、
+Python、TypeScript、Go、C 与 Markdown 轮换，另有被 `.gitignore` 排除的 `target/`），
+mtime 回拨一小时，相当于已有的 checkout。随后：
+
+1. 在调用线程上启动 `RepoMapService`，后台全量建索引期间每 2ms 取一次切片并计时；
+2. 改动约 1% 的文件，外加约 0.2% 的改名、删除、新增，请求一次刷新，刷新期间继续取切片；
+3. 空闲后再取 50 次；
+4. 校验：文件数与改动后一致，增量 sweep 没有重读未改动文件，改名后的符号指向新路径，
+   删除的文件不在索引里。校验失败时退出码非 0，CI 直接失败，不进入门禁比较。
+
+切片延迟取全部采样的 p99：它度量 UI 线程拿上下文会不会被后台写路径挡住。增量刷新在
+后台线程上，只要求有界。CI 跑 3 轮，各指标取中位数，原始轮次写进 payload 的 `runs`；
+全量建索引耗时、启动耗时和 p50/max 只记录，不进门禁。三个平台各在
+`Context latency (<platform>)` job 里过门禁，与 Desktop job 的帧率噪声互不影响。
 
 ### RSS 取 dwell 窗口峰值
 
@@ -162,6 +182,11 @@ cargo run -p termior-bench --features run-harness --release --bin nfr-run -- \
 cargo run -p termior-bench --release --bin nfr-gate -- \
   --platform windows --payload run.json --baselines docs/baselines/nfr-baselines.json
 # Linux 把 platform 换成 linux，二进制在 xvfb-run + openbox 里启动。
+
+# 3) Agent 上下文延迟（headless 可跑；--files / --rounds 可调）
+cargo run -p termior-bench --release --bin nfr-context -- --rounds 3 > context.json
+cargo run -p termior-bench --release --bin nfr-gate -- \
+  --platform linux --payload context.json --baselines docs/baselines/nfr-baselines.json
 ```
 
 门禁退出码：`0` = 通过，`1` = 有回归（CI 应 fail），`2` = 输入/参数错误。

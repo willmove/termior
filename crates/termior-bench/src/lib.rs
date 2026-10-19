@@ -26,8 +26,11 @@ pub use baselines::{Baseline, BaselineSet};
 pub use compare::{compare, Regression, RegressionReport, Verdict};
 pub use metric::{MetricKind, Sample};
 pub use payload::{
-    parse_harness_report, HarnessReport, NfrPayload, PtyThroughputPayload, RunPayload,
+    parse_harness_report, ContextLatencyPayload, HarnessReport, NfrPayload, PtyThroughputPayload,
+    RunPayload,
 };
+/// `nfr-context` 的合成仓库与分位数（与测试共用）。
+pub mod context_harness;
 pub use vte_harness::{new_term, synthetic_pty_output};
 
 #[cfg(test)]

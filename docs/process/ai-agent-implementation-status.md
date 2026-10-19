@@ -24,7 +24,8 @@
 ### Stage C：上下文与扩展生态
 
 - ContextItem/ContextPlan、类别预算、精确发送清单、可重取引用和结构化压缩
-- 根与嵌套 AGENTS 规则、词法/symbol 仓库地图、Skills 渐进激活、可审阅 Memory
+- 根与嵌套 AGENTS 规则、Skills 渐进激活、可审阅 Memory
+- 增量仓库地图：tree-sitter 定义/引用索引（Rust/Python/JS/TS/TSX/Go/C/C++/Java，其余语言词法降级），按内容 hash 增量更新并复用改名文件的大纲，遵守 ignore、deny-list 与授权根；后台线程建索引，Composer 每次内置任务取 token 有界的相关切片，查询时排除已过期文件
 - MCP stdio 与 Streamable HTTP discovery/call、server-qualified ToolContract 和故障隔离
 - MCP Streamable HTTP 的 Protected Resource / Authorization Server 元数据发现、本机回环 PKCE、state 与 resource 绑定、钥匙串中的 access/refresh token、过期刷新，以及刷新失败后的重新登录状态。Settings 展示登录状态并提供注销
 - 有界 Hook runner；pre-tool 修改后重新执行 schema、授权、deny-list 和审批判断
@@ -68,5 +69,6 @@
 - Linux `bwrap` 与 macOS `sandbox-exec` 由 Core 矩阵里的 black-box escape suite 覆盖（父目录、symlink、hardlink、loopback/private/public 网络、环境 secret、子进程、孤儿进程）。没有对应工具或能力时，套件断言 fail closed，不静默跳过。UI 仍按 capability probe 显示，required capability 不满足时拒绝运行。
 - Windows 当前仅验证进程树控制，不宣称完整的文件、网络或凭据 sandbox；这些能力报告为 unsupported，sandboxed 任务和 escape suite 都 fail closed。
 - MCP HTTP 授权生命周期由 fake 授权服务器覆盖：发现、PKCE 登录、调用、过期刷新、撤销，以及刷新失败后的重新登录。访问令牌和刷新令牌只进入 `Termior-ai` 钥匙串，不写入 server catalog、日志或 journal。CI 不打开真实浏览器，也不对公开 IdP 做人工登录验收。
+- 仓库地图没有文件系统 watcher：两轮之间的改动由提交时的后台刷新和查询时的过期检查处理，首次提交可能在首轮索引完成前拿到空切片。上下文延迟只在 20,000 文件的合成仓库上测量（CI `Context latency` 三平台），未用真实大型仓库验证；D4 中的测试邻近关系未实现。
 - ACP 自动测试使用恶意/双向 fake server。当前主机没有安装并验证 Gemini CLI 或 OpenCode 的真实 ACP 端到端流程；未握手声明的 optional capability 始终保持 unsupported。
 - 本地 Automation 的 schedule/catch-up/repo-event 引擎、持久 run factory 和宿主调度循环已实现。应用关闭期间不会运行；应用运行时循环领取 queued run，并受并发与磁盘预算限制。等待审批时按通知策略提醒，不弹出模态框，也不自动批准。
