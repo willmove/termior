@@ -21,9 +21,21 @@ impl gpui::Render for ComposerView {
             self.orchestrator.backend_choice == AgentBackendChoice::CodexAppServer;
         let environment_id = self
             .orchestrator
-            .active_task
+            .pinned_environment
             .as_ref()
-            .map(|runtime| runtime.task().environment_id.clone())
+            .map(|pin| pin.id.clone())
+            .or_else(|| {
+                self.orchestrator
+                    .active_task
+                    .as_ref()
+                    .map(|runtime| runtime.task().environment_id.clone())
+            })
+            .or_else(|| {
+                self.orchestrator
+                    .bound_worktree
+                    .as_ref()
+                    .map(|worktree| worktree.id.clone())
+            })
             .unwrap_or_else(|| {
                 if external_backend {
                     "codex-workspace-write".into()
@@ -31,20 +43,7 @@ impl gpui::Render for ComposerView {
                     "direct-workspace".into()
                 }
             });
-        let environment_root = self.orchestrator.displayed_root(&self.workspace_root);
-        let environment_tooltip = if external_backend {
-            tf!(
-                "composer.environment_external",
-                "host" => std::env::consts::OS,
-                "root" => environment_root.display()
-            )
-        } else {
-            tf!(
-                "composer.environment_builtin",
-                "host" => std::env::consts::OS,
-                "root" => environment_root.display()
-            )
-        };
+        let environment_tooltip = self.environment_capability_line();
         let compact = self.is_compact();
         let placeholder = self.model_setup_placeholder();
         let show_status_row = placeholder.is_none() && !self.status.is_empty();
@@ -205,233 +204,253 @@ impl gpui::Render for ComposerView {
             .child(
                 div()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .h(px(COMPOSER_HEADER_HEIGHT))
-                    .px_2()
+                    .flex_col()
                     .flex_none()
+                    .px_2()
+                    .pb_1()
+                    .gap(px(2.0))
                     .border_b_1()
                     .border_color(crate::ui::border(&p))
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .px_1()
-                                    .text_xs()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(t!("composer.header")),
-                            )
-                            .when(self.last_task.is_some(), |header| {
-                                header.child(
-                                    div()
-                                        .id("composer-task-details-badge")
-                                        .px_2()
-                                        .py(px(2.0))
-                                        .rounded_md()
-                                        .bg(crate::ui::alpha(p.status[0], 0.12))
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .child(t!("composer.task.badge"))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.toggle_center(ComposerCenter::TaskDetails);
-                                                if this.center_open(ComposerCenter::TaskDetails) {
-                                                    this.ensure_command_watch(cx);
-                                                }
-                                                cx.notify();
-                                            }),
-                                        ),
-                                )
-                            })
-                            .when(!self.recovery_tasks.is_empty(), |header| {
-                                header.child(
-                                    div()
-                                        .id("composer-recovery-center")
-                                        .px_2()
-                                        .py(px(2.0))
-                                        .rounded_md()
-                                        .bg(crate::ui::alpha(p.status[2], 0.14))
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .child(tf!(
-                                            "composer.recovery.badge",
-                                            "count" => self.recovery_tasks.len()
-                                        ))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.toggle_center(ComposerCenter::Recovery);
-                                                cx.notify();
-                                            }),
-                                        ),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .id("composer-automation-center")
-                                    .px_2()
-                                    .py(px(2.0))
-                                    .rounded_md()
-                                    .bg(crate::ui::alpha(p.accent, 0.10))
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .child(tf!(
-                                        "composer.automation.badge",
-                                        "count" => self.automations.automations.len()
-                                    ))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.toggle_center(ComposerCenter::Automations);
-                                            cx.notify();
-                                        }),
-                                    ),
-                            )
-                            .when(!self.checkpoints.is_empty(), |header| {
-                                header.child(
-                                    div()
-                                        .id("composer-checkpoint-center")
-                                        .px_2()
-                                        .py(px(2.0))
-                                        .rounded_md()
-                                        .bg(crate::ui::alpha(p.status[1], 0.12))
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .child(tf!(
-                                            "composer.checkpoint.badge",
-                                            "count" => self.checkpoints.len()
-                                        ))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.toggle_center(ComposerCenter::Checkpoints);
-                                                cx.notify();
-                                            }),
-                                        ),
-                                )
-                            })
-                            .when(
-                                !self.skills.is_empty() || self.skill_scan_error.is_some(),
-                                |header| {
-                                    header.child(
-                                        div()
-                                            .id("composer-skill-center")
-                                            .px_2()
-                                            .py(px(2.0))
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(crate::ui::border(&p))
-                                            .text_xs()
-                                            .cursor_pointer()
-                                            .child(tf!(
-                                                "composer.skills.badge",
-                                                "count" => self.skills.len()
-                                            ))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.toggle_center(ComposerCenter::Skills);
-                                                    cx.notify();
-                                                }),
-                                            ),
-                                    )
-                                },
-                            )
-                            .when(
-                                !self.memory.candidates.is_empty()
-                                    || !self.memory.entries.is_empty(),
-                                |header| {
-                                    header.child(
-                                        div()
-                                            .id("composer-memory-center")
-                                            .px_2()
-                                            .py(px(2.0))
-                                            .rounded_md()
-                                            .border_1()
-                                            .border_color(crate::ui::border(&p))
-                                            .text_xs()
-                                            .cursor_pointer()
-                                            .child(tf!(
-                                                "composer.memory.badge",
-                                                "count" => self.memory.candidates.len()
-                                                    + self.memory.entries.len()
-                                            ))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.toggle_center(ComposerCenter::Memory);
-                                                    cx.notify();
-                                                }),
-                                            ),
-                                    )
-                                },
-                            )
-                            .child({
-                                let environment_palette = p.clone();
-                                div()
-                                    .id("composer-environment")
-                                    .px_2()
-                                    .py(px(2.0))
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(crate::ui::border(&p))
-                                    .text_xs()
-                                    .child(SharedString::from(environment_id))
-                                    .tooltip(move |_window, cx| {
-                                        Tooltip::view(
-                                            environment_tooltip.clone(),
-                                            &environment_palette,
-                                            cx,
-                                        )
-                                    })
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
                             .flex_row()
                             .items_center()
-                            .gap_1()
+                            .justify_between()
+                            .h(px(COMPOSER_HEADER_HEIGHT))
                             .child(
-                                crate::ui::icon_button(
-                                    "composer-dock",
-                                    self.dock.toggle_icon(),
-                                    t!(self.dock.toggle_label_key()),
-                                    &p,
-                                )
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|_, _, _, cx| {
-                                        cx.emit(ComposerDockToggle);
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .px_1()
+                                            .text_xs()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(t!("composer.header")),
+                                    )
+                                    .when(self.last_task.is_some(), |header| {
+                                        header.child(
+                                            div()
+                                                .id("composer-task-details-badge")
+                                                .px_2()
+                                                .py(px(2.0))
+                                                .rounded_md()
+                                                .bg(crate::ui::alpha(p.status[0], 0.12))
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .child(t!("composer.task.badge"))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.toggle_center(
+                                                            ComposerCenter::TaskDetails,
+                                                        );
+                                                        if this.center_open(
+                                                            ComposerCenter::TaskDetails,
+                                                        ) {
+                                                            this.ensure_command_watch(cx);
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
+                                    })
+                                    .when(!self.recovery_tasks.is_empty(), |header| {
+                                        header.child(
+                                            div()
+                                                .id("composer-recovery-center")
+                                                .px_2()
+                                                .py(px(2.0))
+                                                .rounded_md()
+                                                .bg(crate::ui::alpha(p.status[2], 0.14))
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .child(tf!(
+                                                    "composer.recovery.badge",
+                                                    "count" => self.recovery_tasks.len()
+                                                ))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.toggle_center(
+                                                            ComposerCenter::Recovery,
+                                                        );
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .id("composer-automation-center")
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .rounded_md()
+                                            .bg(crate::ui::alpha(p.accent, 0.10))
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .child(tf!(
+                                                "composer.automation.badge",
+                                                "count" => self.automations.automations.len()
+                                            ))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.toggle_center(ComposerCenter::Automations);
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
+                                    .when(!self.checkpoints.is_empty(), |header| {
+                                        header.child(
+                                            div()
+                                                .id("composer-checkpoint-center")
+                                                .px_2()
+                                                .py(px(2.0))
+                                                .rounded_md()
+                                                .bg(crate::ui::alpha(p.status[1], 0.12))
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .child(tf!(
+                                                    "composer.checkpoint.badge",
+                                                    "count" => self.checkpoints.len()
+                                                ))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.toggle_center(
+                                                            ComposerCenter::Checkpoints,
+                                                        );
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
+                                    })
+                                    .when(
+                                        !self.skills.is_empty() || self.skill_scan_error.is_some(),
+                                        |header| {
+                                            header.child(
+                                                div()
+                                                    .id("composer-skill-center")
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(crate::ui::border(&p))
+                                                    .text_xs()
+                                                    .cursor_pointer()
+                                                    .child(tf!(
+                                                        "composer.skills.badge",
+                                                        "count" => self.skills.len()
+                                                    ))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.toggle_center(
+                                                                ComposerCenter::Skills,
+                                                            );
+                                                            cx.notify();
+                                                        }),
+                                                    ),
+                                            )
+                                        },
+                                    )
+                                    .when(
+                                        !self.memory.candidates.is_empty()
+                                            || !self.memory.entries.is_empty(),
+                                        |header| {
+                                            header.child(
+                                                div()
+                                                    .id("composer-memory-center")
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(crate::ui::border(&p))
+                                                    .text_xs()
+                                                    .cursor_pointer()
+                                                    .child(tf!(
+                                                        "composer.memory.badge",
+                                                        "count" => self.memory.candidates.len()
+                                                            + self.memory.entries.len()
+                                                    ))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.toggle_center(
+                                                                ComposerCenter::Memory,
+                                                            );
+                                                            cx.notify();
+                                                        }),
+                                                    ),
+                                            )
+                                        },
+                                    )
+                                    .child({
+                                        let environment_palette = p.clone();
+                                        div()
+                                            .id("composer-environment")
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(crate::ui::border(&p))
+                                            .text_xs()
+                                            .child(SharedString::from(environment_id))
+                                            .tooltip(move |_window, cx| {
+                                                Tooltip::view(
+                                                    environment_tooltip.clone(),
+                                                    &environment_palette,
+                                                    cx,
+                                                )
+                                            })
                                     }),
-                                ),
                             )
                             .child(
-                                crate::ui::icon_button(
-                                    "composer-collapse",
-                                    Icon::ChevronDown,
-                                    t!("composer.hide_panel"),
-                                    &p,
-                                )
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|_, _, _, cx| {
-                                        cx.emit(ComposerCollapse);
-                                    }),
-                                ),
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        crate::ui::icon_button(
+                                            "composer-dock",
+                                            self.dock.toggle_icon(),
+                                            t!(self.dock.toggle_label_key()),
+                                            &p,
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _, _, cx| {
+                                                cx.emit(ComposerDockToggle);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        crate::ui::icon_button(
+                                            "composer-collapse",
+                                            Icon::ChevronDown,
+                                            t!("composer.hide_panel"),
+                                            &p,
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _, _, cx| {
+                                                cx.emit(ComposerCollapse);
+                                            }),
+                                        ),
+                                    ),
                             ),
-                    ),
+                    )
+                    .child(self.capability_row("composer-environment-capabilities", &p)),
             )
             .child(
                 canvas(

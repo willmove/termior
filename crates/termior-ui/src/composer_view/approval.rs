@@ -276,6 +276,7 @@ impl ComposerView {
                 .border_color(crate::ui::color(p.status[2]))
                 .bg(crate::ui::alpha(p.status[2], 0.08))
                 .child(model.headline)
+                .child(self.capability_row("composer-approval-capabilities", p))
                 .children(scope_row)
                 .children(choice_rows)
                 .when(model.show_arguments, |card| {

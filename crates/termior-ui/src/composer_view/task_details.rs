@@ -33,6 +33,44 @@ impl TaskRef {
 }
 
 impl ComposerView {
+    /// Pinned environment when a task has one; otherwise a display-only profile for the header.
+    pub(super) fn displayed_environment(&self) -> PinnedEnvironment {
+        if let Some(pin) = &self.orchestrator.pinned_environment {
+            return pin.clone();
+        }
+        let root = self.orchestrator.displayed_root(&self.workspace_root);
+        let profile = if self.orchestrator.bound_worktree.is_some() {
+            EnvironmentProfile::Worktree
+        } else if self.orchestrator.backend_choice == AgentBackendChoice::CodexAppServer {
+            EnvironmentProfile::external("codex")
+        } else {
+            EnvironmentProfile::Direct
+        };
+        PinnedEnvironment::display_only(profile, root)
+    }
+
+    pub(super) fn environment_capability_line(&self) -> SharedString {
+        let pin = self.displayed_environment();
+        tf!(
+            "composer.environment.capabilities",
+            "host" => pin.host.clone(),
+            "root" => pin.root.display().to_string(),
+            "file" => pin.file.clone(),
+            "network" => pin.network.clone(),
+            "credentials" => pin.credentials.clone(),
+            "process" => pin.process.clone()
+        )
+    }
+
+    pub(super) fn capability_row(&self, id: &'static str, p: &ResolvedPalette) -> AnyElement {
+        div()
+            .id(id)
+            .text_xs()
+            .text_color(crate::ui::muted(p))
+            .child(self.environment_capability_line())
+            .into_any_element()
+    }
+
     pub(super) fn task_digests(&self) -> Vec<CommandDigest> {
         self.task_digests_with_tail(true)
     }
@@ -149,7 +187,8 @@ impl ComposerView {
                 "project" => task.project_dir.display(),
                 "backend" => task.backend_id.clone(),
                 "environment" => task.environment_id.clone()
-            )));
+            )))
+            .child(self.capability_row("composer-task-capabilities", p));
         let empty = digests.is_empty().then(|| {
             div()
                 .text_xs()

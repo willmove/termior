@@ -400,6 +400,58 @@ impl SettingsView {
         )
     }
 
+    fn capability_matrix_section(&self) -> AnyElement {
+        let rows = termior_agent_host::capability_matrix()
+            .into_iter()
+            .map(|row| {
+                let label = match row.backend {
+                    "direct" => t!("settings.agents.matrix_direct"),
+                    "worktree" => t!("settings.agents.matrix_worktree"),
+                    "sandboxed" => t!("settings.agents.matrix_sandboxed"),
+                    "external" => t!("settings.agents.matrix_external"),
+                    _ => SharedString::from(row.backend.to_owned()),
+                };
+                let detail = tf!(
+                    "composer.environment.capabilities",
+                    "host" => row.host,
+                    "root" => row.root,
+                    "file" => row.file,
+                    "network" => row.network,
+                    "credentials" => row.credentials,
+                    "process" => row.process
+                );
+                div()
+                    .id(SharedString::from(format!(
+                        "settings-capability-{}",
+                        row.backend
+                    )))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(div().text_sm().child(label))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(crate::ui::muted(&self.palette))
+                            .child(detail),
+                    )
+                    .into_any_element()
+            });
+        self.section(
+            t!("settings.agents.matrix_title"),
+            t!("settings.agents.matrix_description"),
+            std::iter::once(
+                div()
+                    .id("settings-capability-matrix")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(rows)
+                    .into_any_element(),
+            ),
+        )
+    }
+
     pub(super) fn agents_page(&self, cx: &mut Context<Self>) -> AnyElement {
         let hook_status = termior_hooks::status()
             .map(|status| {
@@ -562,6 +614,7 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_6()
+            .child(self.capability_matrix_section())
             .child(self.agent_data_section(cx))
             .child(
                 self.section(

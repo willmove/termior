@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use futures::stream::BoxStream;
 use termior_ai::{
-    AcceptanceCheck, AcceptanceCriterion, AcceptanceReport, AcceptanceStatus, ApprovalPolicy,
-    CancellationToken, ChatEvent, EvaluationSuiteReport, Message, MockProvider, Role,
-    RuntimeBudgets, RuntimeToolExecutor, ScenarioReport, Task, TaskCommand, TaskConfig,
-    TaskEventKind, TaskRuntime, TaskState, ToolCall, ToolExecution, ToolExecutor, ToolRegistry,
-    ToolState, UserControlInterrupt, WaitingReason,
+    AcceptanceCheck, AcceptanceCriterion, AcceptanceReport, AcceptanceStatus, AccessGrant,
+    ApprovalPolicy, CancellationToken, ChatEvent, EnvironmentProfile, EvaluationSuiteReport,
+    Message, MockProvider, PinError, Role, RuntimeBudgets, RuntimeToolExecutor, ScenarioReport,
+    Task, TaskCommand, TaskConfig, TaskEventKind, TaskRuntime, TaskState, ToolCall, ToolExecution,
+    ToolExecutor, ToolRegistry, ToolState, UserControlInterrupt, WaitingReason,
 };
 use termior_security::workspace::WorkspaceAuthRegistry;
 
@@ -2065,4 +2065,70 @@ fn restart_while_a_command_is_running_is_unknown_and_does_not_rerun_it() {
         task.recovered_state,
         termior_store::RecoveredOperationState::Unknown
     );
+}
+
+#[test]
+fn pinned_environment_survives_restore_and_a_wider_profile_is_a_new_environment() {
+    let data = tempfile::tempdir().unwrap();
+    let pin = termior_ai::PinnedEnvironment::pin(
+        EnvironmentProfile::Sandboxed {
+            allow_network: false,
+        },
+        data.path(),
+    );
+    let original_id = pin.id.clone();
+    let original_grant = pin.grant.clone();
+    let runtime = TaskRuntime::new(
+        TaskConfig::new("pin", data.path(), "native", original_id.clone()),
+        RuntimeBudgets::default(),
+        ApprovalPolicy::Prompt,
+    )
+    .with_pinned_environment(pin)
+    .unwrap()
+    .try_with_journal(data.path())
+    .unwrap();
+    let task_id = runtime.task().id.0.clone();
+    drop(runtime);
+
+    let mut recovered = TaskRuntime::recover_journal(
+        data.path(),
+        &task_id,
+        ApprovalPolicy::Prompt,
+        ToolRegistry::default(),
+    )
+    .unwrap();
+    assert_eq!(recovered.task().environment_id, original_id);
+    assert_eq!(
+        recovered.pinned_environment().unwrap().grant,
+        original_grant
+    );
+    assert_eq!(
+        recovered.pinned_environment().unwrap().grant.network,
+        AccessGrant::None
+    );
+
+    let mut wider = original_grant.clone();
+    wider.network = AccessGrant::Host;
+    let mut ledger = termior_ai::EnvironmentPins::default();
+    ledger
+        .restore_pin(recovered.pinned_environment().unwrap().clone())
+        .unwrap();
+    assert_eq!(
+        ledger.try_apply_grant(&original_id, wider),
+        Err(PinError::WouldWiden {
+            id: original_id.clone()
+        })
+    );
+    assert_eq!(ledger.get(&original_id).unwrap().grant, original_grant);
+
+    let created = recovered
+        .rebind_environment(EnvironmentProfile::Direct, data.path())
+        .unwrap();
+    assert_ne!(created.id, original_id);
+    assert!(created.grant.widens(&original_grant));
+    assert_eq!(
+        recovered.environment_pin(&original_id).unwrap().grant,
+        original_grant
+    );
+    assert_eq!(recovered.task().environment_id, created.id);
 }

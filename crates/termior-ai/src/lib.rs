@@ -25,6 +25,7 @@ pub mod automation;
 pub mod composer;
 pub mod context;
 pub mod context_engine;
+pub mod environment_pin;
 pub mod evaluation;
 pub mod executor;
 pub mod http_provider;
@@ -52,6 +53,9 @@ pub use composer::{
     TodoStore, MAX_TODO_ITEMS,
 };
 pub use context::{TerminalContext, TerminalContextProvider};
+pub use environment_pin::{
+    AccessGrant, EnvironmentGrant, EnvironmentPins, EnvironmentProfile, PinError, PinnedEnvironment,
+};
 pub use evaluation::{
     EvaluationMetrics, EvaluationSuiteReport, ScenarioReport, EVALUATION_SCHEMA_VERSION,
 };
