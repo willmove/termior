@@ -6603,6 +6603,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
+ "termior-ai",
+ "termior-security",
 ]
 
 [[package]]

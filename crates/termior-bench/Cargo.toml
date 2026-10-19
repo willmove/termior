@@ -11,12 +11,16 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # nfr-pty 二进制与 bench 共用 VTE 解析路径（spec NFR-02）。
 alacritty_terminal = { workspace = true }
+# nfr-context 测的是真实的仓库地图服务（Agent 上下文延迟）。
+termior-ai = { workspace = true }
+termior-security = { workspace = true }
 
 # 仅 nfr-run 二进制需要：采集子进程 RSS（spec §8 NFR-01/04）。
 sysinfo = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 default = []
@@ -39,3 +43,7 @@ path = "src/bin/nfr-gate.rs"
 name = "nfr-run"
 path = "src/bin/nfr-run.rs"
 required-features = ["run-harness"]
+
+[[bin]]
+name = "nfr-context"
+path = "src/bin/nfr-context.rs"

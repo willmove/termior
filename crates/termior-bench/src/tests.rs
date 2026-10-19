@@ -3,7 +3,9 @@
 use crate::baselines::{Baseline, BaselineSet};
 use crate::compare::{compare, Verdict};
 use crate::metric::{MetricKind, Sample};
-use crate::payload::{HarnessReport, NfrPayload, PtyThroughputPayload, RunPayload};
+use crate::payload::{
+    ContextLatencyPayload, HarnessReport, NfrPayload, PtyThroughputPayload, RunPayload,
+};
 
 fn set(baselines: &[Baseline]) -> BaselineSet {
     BaselineSet {
@@ -341,6 +343,8 @@ fn metric_kind_serialization_names_are_stable() {
         (MetricKind::RssMiB, "rss_mib"),
         (MetricKind::Fps, "fps"),
         (MetricKind::PtyThroughputMiBps, "pty_throughput_mibps"),
+        (MetricKind::ContextLatencyP99Ms, "context_latency_p99_ms"),
+        (MetricKind::RepoMapIncrementalMs, "repo_map_incremental_ms"),
     ];
     for (kind, expected) in cases {
         let s = serde_json::to_string(&kind).unwrap();
@@ -351,5 +355,147 @@ fn metric_kind_serialization_names_are_stable() {
         );
         let back: MetricKind = serde_json::from_str(&s).unwrap();
         assert_eq!(back, kind, "roundtrip mismatch for {kind:?}");
+    }
+}
+
+fn context_round(slice_p99_ms: f64, incremental_ms: f64) -> ContextLatencyPayload {
+    ContextLatencyPayload {
+        files: 5_000,
+        changed_files: 80,
+        slice_p99_ms: Some(slice_p99_ms),
+        incremental_ms: Some(incremental_ms),
+        slices: 10,
+        ..ContextLatencyPayload::default()
+    }
+}
+
+#[test]
+fn context_payload_expands_to_gated_samples_only() {
+    let report = HarnessReport {
+        platform: "linux".into(),
+        payloads: vec![NfrPayload::ContextLatency(ContextLatencyPayload {
+            full_index_ms: Some(900.0),
+            spawn_ms: Some(0.2),
+            ..context_round(4.0, 120.0)
+        })],
+    };
+    let samples = report.to_samples();
+    assert_eq!(
+        samples,
+        vec![
+            Sample::new(
+                MetricKind::ContextLatencyP99Ms,
+                "linux",
+                "repo_map_slice",
+                4.0
+            ),
+            Sample::new(
+                MetricKind::RepoMapIncrementalMs,
+                "linux",
+                "repo_map_refresh",
+                120.0
+            ),
+        ]
+    );
+    assert!(MetricKind::ContextLatencyP99Ms.lower_is_better());
+    assert_eq!(MetricKind::RepoMapIncrementalMs.unit(), "ms");
+}
+
+#[test]
+fn context_median_drops_one_stalled_round_but_fails_a_real_regression() {
+    let baselines = set(&[Baseline::new(
+        MetricKind::ContextLatencyP99Ms,
+        "linux",
+        "repo_map_slice",
+        10.0,
+        50.0,
+    )]);
+    let merged = ContextLatencyPayload::median_of(vec![
+        context_round(8.0, 100.0),
+        context_round(90.0, 900.0),
+        context_round(9.0, 110.0),
+    ]);
+    assert_eq!(merged.slice_p99_ms, Some(9.0));
+    assert_eq!(merged.incremental_ms, Some(110.0));
+    assert_eq!(merged.slices, 30);
+    assert_eq!(merged.runs.len(), 3);
+    assert!(!compare(&merged.to_samples("linux"), &baselines).has_regression());
+
+    let slow = ContextLatencyPayload::median_of(vec![
+        context_round(30.0, 100.0),
+        context_round(31.0, 100.0),
+        context_round(29.0, 100.0),
+    ]);
+    assert!(compare(&slow.to_samples("linux"), &baselines).has_regression());
+}
+
+#[test]
+fn context_payload_json_roundtrips_through_the_gate_format() {
+    let payload =
+        NfrPayload::ContextLatency(ContextLatencyPayload::median_of(vec![context_round(
+            3.0, 50.0,
+        )]));
+    let json = serde_json::to_string(&payload).unwrap();
+    assert!(json.starts_with(r#"{"kind":"ContextLatency""#), "{json}");
+    assert_eq!(serde_json::from_str::<NfrPayload>(&json).unwrap(), payload);
+    let minimal = r#"{"kind":"ContextLatency","files":10}"#;
+    let NfrPayload::ContextLatency(parsed) = serde_json::from_str(minimal).unwrap() else {
+        panic!("expected a context payload");
+    };
+    assert!(parsed.to_samples("any").is_empty());
+}
+
+#[test]
+fn percentile_uses_nearest_rank() {
+    use crate::context_harness::percentile;
+    assert_eq!(percentile(&[], 0.99), None);
+    let values: Vec<f64> = (1..=100).map(f64::from).collect();
+    assert_eq!(percentile(&values, 0.99), Some(99.0));
+    assert_eq!(percentile(&values, 0.5), Some(50.0));
+    assert_eq!(percentile(&values, 1.0), Some(100.0));
+    assert_eq!(percentile(&[7.0], 0.99), Some(7.0));
+}
+
+#[test]
+fn context_round_indexes_churns_and_verifies_a_small_repo() {
+    use crate::context_harness::{measure_round, ContextHarnessConfig};
+    let scratch = tempfile::tempdir().unwrap();
+    let payload = measure_round(
+        scratch.path(),
+        ContextHarnessConfig {
+            files: 600,
+            timeout: std::time::Duration::from_secs(120),
+        },
+    )
+    .unwrap();
+    assert_eq!(payload.files, 600);
+    assert!(payload.changed_files >= 6, "{payload:?}");
+    assert!(payload.slices >= 50, "{payload:?}");
+    assert!(payload.slice_p99_ms.is_some_and(|ms| ms >= 0.0));
+    assert!(payload.incremental_ms.is_some_and(|ms| ms > 0.0));
+    assert_eq!(payload.to_samples("any").len(), 2);
+}
+
+#[test]
+fn churn_touches_every_category() {
+    use crate::context_harness::{churn, generate_repo, relative_path};
+    let scratch = tempfile::tempdir().unwrap();
+    generate_repo(scratch.path(), 1_000).unwrap();
+    assert!(scratch.path().join("target/debug/generated_0.rs").is_file());
+    let plan = churn(scratch.path(), 1_000).unwrap();
+    assert_eq!(plan.modified.len(), 10);
+    assert_eq!(plan.renamed.len(), 2);
+    assert_eq!(plan.deleted.len(), 2);
+    assert_eq!(plan.added.len(), 2);
+    assert_eq!(plan.total(), 16);
+    for (index, to) in &plan.renamed {
+        assert!(!scratch.path().join(relative_path(*index)).exists());
+        assert!(scratch.path().join(to).is_file());
+    }
+    for index in &plan.deleted {
+        assert!(!scratch.path().join(relative_path(*index)).exists());
+    }
+    for index in &plan.added {
+        assert!(scratch.path().join(relative_path(*index)).is_file());
     }
 }

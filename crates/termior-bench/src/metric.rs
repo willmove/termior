@@ -30,6 +30,13 @@ pub enum MetricKind {
     /// 键入回显延迟 p99（NFR-02）：键入写入 PTY → 回显进入的那一帧 render，单位毫秒。
     #[serde(rename = "echo_p99_ms")]
     EchoP99Ms,
+    /// Agent 上下文延迟 p99：调用线程（UI）向仓库地图取一次相关切片的耗时，单位毫秒。
+    /// 采样期间后台线程在全量建索引或增量刷新，测的是读路径会不会被写路径挡住。
+    #[serde(rename = "context_latency_p99_ms")]
+    ContextLatencyP99Ms,
+    /// 仓库地图增量刷新耗时：少量文件改动/改名/删除后，后台一次 sweep 落定的墙钟时间，单位毫秒。
+    #[serde(rename = "repo_map_incremental_ms")]
+    RepoMapIncrementalMs,
 }
 
 impl MetricKind {
@@ -39,7 +46,9 @@ impl MetricKind {
             MetricKind::ColdStartMs
             | MetricKind::RssMiB
             | MetricKind::FrameP99Ms
-            | MetricKind::EchoP99Ms => true,
+            | MetricKind::EchoP99Ms
+            | MetricKind::ContextLatencyP99Ms
+            | MetricKind::RepoMapIncrementalMs => true,
             MetricKind::Fps | MetricKind::PtyThroughputMiBps => false,
         }
     }
@@ -47,7 +56,11 @@ impl MetricKind {
     /// 展示用的单位标签。
     pub fn unit(self) -> &'static str {
         match self {
-            MetricKind::ColdStartMs | MetricKind::FrameP99Ms | MetricKind::EchoP99Ms => "ms",
+            MetricKind::ColdStartMs
+            | MetricKind::FrameP99Ms
+            | MetricKind::EchoP99Ms
+            | MetricKind::ContextLatencyP99Ms
+            | MetricKind::RepoMapIncrementalMs => "ms",
             MetricKind::RssMiB => "MiB",
             MetricKind::Fps => "fps",
             MetricKind::PtyThroughputMiBps => "MiB/s",

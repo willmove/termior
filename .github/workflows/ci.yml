@@ -275,6 +275,11 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        # termior-bench links termior-ai for nfr-context; its keyring backend needs libdbus.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -298,3 +303,51 @@ jobs:
         with:
           name: nfr-pty-payload
           path: nfr-pty-payload.json
+
+  context-latency:
+    name: Context latency (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+      - name: NFR context latency gate (repo map)
+        shell: bash
+        run: |
+          cargo build -p termior-bench --release --bin nfr-context --bin nfr-gate
+          # 20,000-file synthetic repo (the repo-map file cap), three rounds, median per metric.
+          # Gates the calling-thread slice p99 while the background index builds and refreshes,
+          # and the incremental refresh after ~1% churn plus renames, deletes, and adds.
+          ./target/release/nfr-context --rounds 3 > nfr-context-payload.json
+          cat nfr-context-payload.json
+          for key in slice_p99_ms incremental_ms; do
+            grep -q "\"${key}\":" nfr-context-payload.json || { echo "nfr payload missing ${key}"; exit 1; }
+          done
+          ./target/release/nfr-gate --platform ${{ matrix.platform }} \
+            --payload nfr-context-payload.json \
+            --baselines docs/baselines/nfr-baselines.json
+      - name: Upload context latency payload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfr-context-payload-${{ matrix.platform }}
+          path: nfr-context-payload.json
+          if-no-files-found: ignore
