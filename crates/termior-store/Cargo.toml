@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# Test-only journal crash points. Production builds leave this off so the arming API is absent.
+fault-injection = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

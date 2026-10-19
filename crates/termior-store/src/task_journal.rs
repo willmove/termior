@@ -4,10 +4,100 @@ use crate::atomic_write;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(any(test, feature = "fault-injection"))]
+use std::cell::Cell;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+const JOURNAL_FAULT_EXIT_CODE_INTERNAL: i32 = 75;
+
+/// Process exit status used when a fault is configured to abort the process.
+#[cfg(any(test, feature = "fault-injection"))]
+pub const JOURNAL_FAULT_EXIT_CODE: i32 = JOURNAL_FAULT_EXIT_CODE_INTERNAL;
+
+/// Where a simulated process exit interrupts a journal append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalFaultPhase {
+    /// Exit before any byte of this record reaches the file.
+    BeforeWrite,
+    /// Exit after a partial record is synced and before the terminating newline.
+    DuringWrite,
+    /// Exit after the full record, including its newline, is flushed and synced.
+    AfterWrite,
+}
+
+/// Deterministic crash point for one journal sequence.
+///
+/// Arm it with [`arm_journal_fault`] from tests. Production builds compile the
+/// check, but the arming API is absent unless the `fault-injection` feature is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalFault {
+    pub sequence: u64,
+    pub phase: JournalFaultPhase,
+    /// `std::process::exit` at the fault point instead of returning an error.
+    pub exit_process: bool,
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+thread_local! {
+    static JOURNAL_FAULT: Cell<Option<JournalFault>> = const { Cell::new(None) };
+}
+
+/// Install a process-exit fault for the next matching append on this thread.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn arm_journal_fault(fault: JournalFault) {
+    JOURNAL_FAULT.with(|slot| slot.set(Some(fault)));
+}
+
+/// Clear a fault installed by [`arm_journal_fault`].
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn disarm_journal_fault() {
+    JOURNAL_FAULT.with(|slot| slot.set(None));
+}
+
+fn consume_journal_fault(sequence: u64) -> Option<JournalFault> {
+    #[cfg(any(test, feature = "fault-injection"))]
+    {
+        JOURNAL_FAULT.with(|slot| {
+            let armed = slot.get();
+            if armed.is_some_and(|fault| fault.sequence == sequence) {
+                slot.set(None);
+                armed
+            } else {
+                None
+            }
+        })
+    }
+    #[cfg(not(any(test, feature = "fault-injection")))]
+    {
+        let _ = sequence;
+        None
+    }
+}
+
+fn trigger_journal_fault(fault: JournalFault) -> Result<JournalEvent, JournalError> {
+    if fault.exit_process {
+        std::process::exit(JOURNAL_FAULT_EXIT_CODE_INTERNAL);
+    }
+    Err(JournalError::SimulatedExit {
+        phase: match fault.phase {
+            JournalFaultPhase::BeforeWrite => "before",
+            JournalFaultPhase::DuringWrite => "during",
+            JournalFaultPhase::AfterWrite => "after",
+        },
+        sequence: fault.sequence,
+    })
+}
+
+fn partial_record_len(len: usize) -> usize {
+    if len <= 1 {
+        len
+    } else {
+        len / 2
+    }
+}
 
 pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
 
@@ -126,8 +216,19 @@ impl TaskJournal {
             hash: hash.clone(),
             critical,
         };
+        let encoded = serde_json::to_vec(&event)?;
+        let fault = consume_journal_fault(sequence);
+        if let Some(fault) = fault.filter(|fault| fault.phase == JournalFaultPhase::BeforeWrite) {
+            return trigger_journal_fault(fault);
+        }
         let mut file = OpenOptions::new().append(true).open(&self.path)?;
-        serde_json::to_writer(&mut file, &event)?;
+        if let Some(fault) = fault.filter(|fault| fault.phase == JournalFaultPhase::DuringWrite) {
+            file.write_all(&encoded[..partial_record_len(encoded.len())])?;
+            file.flush()?;
+            file.sync_data()?;
+            return trigger_journal_fault(fault);
+        }
+        file.write_all(&encoded)?;
         file.write_all(b"\n")?;
         self.pending_noncritical += usize::from(!critical);
         if critical || self.pending_noncritical >= 32 {
@@ -137,6 +238,11 @@ impl TaskJournal {
         }
         self.next_sequence += 1;
         self.previous_hash = hash;
+        if let Some(fault) = fault.filter(|fault| fault.phase == JournalFaultPhase::AfterWrite) {
+            file.flush()?;
+            file.sync_data()?;
+            return trigger_journal_fault(fault);
+        }
         Ok(event)
     }
 
@@ -337,4 +443,72 @@ pub enum JournalError {
     UnsupportedSchema(u32),
     #[error("journal is corrupt at sequence {sequence}: {reason}")]
     Corrupt { sequence: u64, reason: String },
+    /// Test fault: the writer simulated a process exit at `phase` of `sequence`.
+    #[error("simulated process exit {phase} writing journal sequence {sequence}")]
+    SimulatedExit { phase: &'static str, sequence: u64 },
+}
+
+#[cfg(test)]
+mod fault_tests {
+    use super::*;
+    use serde_json::json;
+
+    struct ClearFault;
+    impl Drop for ClearFault {
+        fn drop(&mut self) {
+            disarm_journal_fault();
+        }
+    }
+
+    #[test]
+    fn critical_append_fault_before_during_and_after_matches_recovered_records() {
+        for phase in [
+            JournalFaultPhase::BeforeWrite,
+            JournalFaultPhase::DuringWrite,
+            JournalFaultPhase::AfterWrite,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut journal = TaskJournal::create(dir.path(), "fault").unwrap();
+            arm_journal_fault(JournalFault {
+                sequence: 1,
+                phase,
+                exit_process: false,
+            });
+            let _guard = ClearFault;
+            let error = journal
+                .append(
+                    "state_changed",
+                    json!({"type": "state_changed", "to": "running"}),
+                    true,
+                )
+                .unwrap_err();
+            drop(journal);
+            let label = match phase {
+                JournalFaultPhase::BeforeWrite => "before",
+                JournalFaultPhase::DuringWrite => "during",
+                JournalFaultPhase::AfterWrite => "after",
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("simulated process exit {label} writing journal sequence 1")
+            );
+            let recovered = TaskJournal::recover(dir.path(), "fault", &[]).unwrap();
+            match phase {
+                JournalFaultPhase::BeforeWrite => {
+                    assert!(!recovered.repaired_tail);
+                    assert!(recovered.events.is_empty());
+                }
+                JournalFaultPhase::DuringWrite => {
+                    assert!(recovered.repaired_tail);
+                    assert!(recovered.events.is_empty());
+                }
+                JournalFaultPhase::AfterWrite => {
+                    assert!(!recovered.repaired_tail);
+                    assert_eq!(recovered.events.len(), 1);
+                    assert!(recovered.events[0].critical);
+                    assert_eq!(recovered.events[0].kind, "state_changed");
+                }
+            }
+        }
+    }
 }

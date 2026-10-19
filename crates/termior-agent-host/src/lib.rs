@@ -32,7 +32,7 @@ pub use codex::{
 };
 pub use environment::{
     ensure_confined, EnvironmentKind, ExecutionEnvironment, PlatformSandbox, SandboxBackend,
-    SandboxCapability, SandboxCommand, SandboxError, SandboxRequest, TrustLevel,
+    SandboxCapability, SandboxCommand, SandboxError, SandboxRequest, SandboxedProcess, TrustLevel,
 };
 pub use in_process::InProcessBackend;
 pub use mcp::{

@@ -3,8 +3,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::time::Duration;
 use thiserror::Error;
+use wait_timeout::ChildExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -134,7 +136,7 @@ pub struct SandboxCommand {
 }
 
 impl SandboxCommand {
-    pub fn spawn(&self) -> Result<Child, SandboxError> {
+    pub fn spawn(&self) -> Result<SandboxedProcess, SandboxError> {
         let mut command = Command::new(&self.program);
         command
             .args(&self.args)
@@ -150,9 +152,91 @@ impl SandboxCommand {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        command
+        // sandbox-exec does not call setsid. A new process group lets cleanup signal every
+        // descendant that has not left the group. bwrap calls setsid itself (--new-session),
+        // so forcing a group here would make that call fail.
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let child = command
             .spawn()
-            .map_err(|error| SandboxError::Io(error.to_string()))
+            .map_err(|error| SandboxError::Io(error.to_string()))?;
+        Ok(SandboxedProcess {
+            child,
+            reaped: false,
+        })
+    }
+}
+
+/// Child of a sandbox wrapper. Drop, wait, and kill also signal the process group.
+pub struct SandboxedProcess {
+    child: Child,
+    reaped: bool,
+}
+
+impl SandboxedProcess {
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub fn take_stderr(&mut self) -> Option<ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    pub fn wait(&mut self) -> Result<ExitStatus, SandboxError> {
+        let status = self
+            .child
+            .wait()
+            .map_err(|error| SandboxError::Io(error.to_string()))?;
+        self.finish();
+        Ok(status)
+    }
+
+    pub fn wait_timeout(&mut self, timeout: Duration) -> Result<Option<ExitStatus>, SandboxError> {
+        let status = self
+            .child
+            .wait_timeout(timeout)
+            .map_err(|error| SandboxError::Io(error.to_string()))?;
+        if status.is_some() {
+            self.finish();
+        }
+        Ok(status)
+    }
+
+    pub fn kill(&mut self) -> Result<(), SandboxError> {
+        self.child
+            .kill()
+            .map_err(|error| SandboxError::Io(error.to_string()))?;
+        reap_process_group(self.child.id());
+        let _ = self.child.wait();
+        self.reaped = true;
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        if self.reaped {
+            return;
+        }
+        self.reaped = true;
+        reap_process_group(self.child.id());
+    }
+}
+
+impl Drop for SandboxedProcess {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = self.child.kill();
+        reap_process_group(self.child.id());
+        let _ = self.child.wait();
+        self.reaped = true;
     }
 }
 
@@ -223,63 +307,243 @@ impl SandboxBackend for PlatformSandbox {
         args: &[String],
         allow_network: bool,
     ) -> Result<SandboxCommand, SandboxError> {
-        environment.validate_required(&[
+        let mut required = vec![
             SandboxCapability::Filesystem,
             SandboxCapability::Credentials,
             SandboxCapability::ProcessTree,
-        ])?;
+        ];
+        if !allow_network {
+            required.push(SandboxCapability::Network);
+        }
+        environment.validate_required(&required)?;
         if cfg!(target_os = "linux") {
-            let mut wrapped = vec![
-                "--die-with-parent".into(),
-                "--new-session".into(),
-                "--unshare-pid".into(),
-                "--ro-bind".into(),
-                "/".into(),
-                "/".into(),
-                "--bind".into(),
-                environment.root.display().to_string(),
-                environment.root.display().to_string(),
-                "--chdir".into(),
-                environment.root.display().to_string(),
-                "--clearenv".into(),
-                "--setenv".into(),
-                "PATH".into(),
-                safe_path(),
-            ];
-            if !allow_network {
-                wrapped.push("--unshare-net".into());
-            }
-            wrapped.push("--".into());
-            wrapped.push(program.into());
-            wrapped.extend_from_slice(args);
-            return Ok(SandboxCommand {
-                program: "bwrap".into(),
-                args: wrapped,
-                cwd: environment.root.clone(),
-                clear_environment: true,
-            });
+            return linux_sandbox_command(environment, program, args, allow_network);
         }
         if cfg!(target_os = "macos") {
-            let root = environment.root.display().to_string().replace('"', "\\\"");
-            let network = if allow_network {
-                "(allow network*)"
-            } else {
-                "(deny network*)"
-            };
-            let profile = format!(
-                "(version 1)(deny default)(allow process*)(allow file-read*)\
-                 (allow file-write* (subpath \"{root}\")){network}"
-            );
-            let mut wrapped = vec!["-p".into(), profile, program.into()];
-            wrapped.extend_from_slice(args);
-            return Ok(SandboxCommand {
-                program: "sandbox-exec".into(),
-                args: wrapped,
-                cwd: environment.root.clone(),
-                clear_environment: true,
-            });
+            return macos_sandbox_command(environment, program, args, allow_network);
         }
         Err(SandboxError::CommandIsolationUnsupported)
+    }
+}
+
+fn linux_sandbox_command(
+    environment: &ExecutionEnvironment,
+    program: &str,
+    args: &[String],
+    allow_network: bool,
+) -> Result<SandboxCommand, SandboxError> {
+    let host_program = resolve_host_program(program)?;
+    let mut wrapped = vec![
+        "--die-with-parent".into(),
+        "--new-session".into(),
+        "--unshare-pid".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--dev".into(),
+        "/dev".into(),
+        "--tmpfs".into(),
+        "/tmp".into(),
+    ];
+    // System locations the dynamic linker needs. The host root is intentionally not mounted.
+    for path in [
+        "/usr",
+        "/usr/local",
+        "/lib",
+        "/lib64",
+        "/bin",
+        "/sbin",
+        "/etc",
+        "/opt",
+    ] {
+        if Path::new(path).exists() {
+            wrapped.push("--ro-bind".into());
+            wrapped.push(path.into());
+            wrapped.push(path.into());
+        }
+    }
+    let inside_program = map_linux_program(&host_program, &mut wrapped)?;
+    let host_root = environment.root.display().to_string();
+    wrapped.extend([
+        "--bind".into(),
+        host_root,
+        "/workspace".into(),
+        // The bubblewrap root is a writable tmpfs until this point. Remount it
+        // read-only after the workspace bind so `../` cannot create files there.
+        "--remount-ro".into(),
+        "/".into(),
+        "--chdir".into(),
+        "/workspace".into(),
+        "--clearenv".into(),
+        "--setenv".into(),
+        "PATH".into(),
+        safe_path(),
+    ]);
+    if !allow_network {
+        wrapped.push("--unshare-net".into());
+    }
+    wrapped.push("--".into());
+    wrapped.push(inside_program);
+    wrapped.extend_from_slice(args);
+    Ok(SandboxCommand {
+        program: "bwrap".into(),
+        args: wrapped,
+        cwd: environment.root.clone(),
+        clear_environment: true,
+    })
+}
+
+fn map_linux_program(program: &Path, args: &mut Vec<String>) -> Result<String, SandboxError> {
+    let text = program.display().to_string();
+    const PREFIXES: &[&str] = &[
+        "/usr/",
+        "/lib/",
+        "/lib64/",
+        "/bin/",
+        "/sbin/",
+        "/etc/",
+        "/opt/",
+        "/usr/local/",
+    ];
+    if PREFIXES.iter().any(|prefix| text.starts_with(prefix)) {
+        return Ok(text);
+    }
+    let file_name = program
+        .file_name()
+        .ok_or_else(|| SandboxError::Io(format!("sandbox program has no file name: {text}")))?;
+    let parent = program
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            SandboxError::Io(format!("sandbox program has no parent directory: {text}"))
+        })?;
+    args.push("--ro-bind".into());
+    args.push(parent.display().to_string());
+    args.push("/termior-bin".into());
+    Ok(format!("/termior-bin/{}", file_name.to_string_lossy()))
+}
+
+fn macos_sandbox_command(
+    environment: &ExecutionEnvironment,
+    program: &str,
+    args: &[String],
+    allow_network: bool,
+) -> Result<SandboxCommand, SandboxError> {
+    let host_program = resolve_host_program(program)?;
+    let profile = macos_profile(&environment.root, &host_program, allow_network);
+    let mut wrapped = vec!["-p".into(), profile, host_program.display().to_string()];
+    wrapped.extend_from_slice(args);
+    Ok(SandboxCommand {
+        program: "sandbox-exec".into(),
+        args: wrapped,
+        cwd: environment.root.clone(),
+        clear_environment: true,
+    })
+}
+
+fn macos_profile(root: &Path, program: &Path, allow_network: bool) -> String {
+    let root = scheme_escape(&root.display().to_string());
+    // `(deny default)` also blocks the mach and mmap operations dyld and libsystem
+    // use before main. Without this baseline, sandbox-exec SIGKILLs the child during
+    // image load and the parent only sees an empty, unsuccessful exit.
+    let mut rules = vec![
+        "(version 1)".to_owned(),
+        "(deny default)".to_owned(),
+        "(allow process-fork process-exec)".to_owned(),
+        "(allow process-info* (target self))".to_owned(),
+        "(allow signal (target self))".to_owned(),
+        "(allow mach-lookup)".to_owned(),
+        "(allow mach-priv-host-port)".to_owned(),
+        "(allow mach-register)".to_owned(),
+        "(allow sysctl-read)".to_owned(),
+        "(allow ipc-posix-shm)".to_owned(),
+        "(allow ipc-posix-sem)".to_owned(),
+        "(allow file-ioctl)".to_owned(),
+        "(allow file-read-metadata)".to_owned(),
+        "(allow file-map-executable)".to_owned(),
+        // macOS 26 aborts during dyld if the root vnode itself is unreadable,
+        // even when /usr and /System are allowed. A literal is not a subpath,
+        // so this does not grant the directory tree under /.
+        "(allow file-read* (literal \"/\"))".to_owned(),
+    ];
+    for subpath in [
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/System",
+        "/Library",
+        "/opt",
+        "/dev",
+        "/private/etc",
+        "/private/var/db",
+        "/private/preboot",
+        "/Applications",
+    ] {
+        rules.push(format!(
+            "(allow file-read* (subpath \"{}\"))",
+            scheme_escape(subpath)
+        ));
+    }
+    if let Some(parent) = program.parent().and_then(scheme_subpath) {
+        rules.push(format!("(allow file-read* (subpath \"{parent}\"))"));
+    }
+    rules.push(format!("(allow file-read* (subpath \"{root}\"))"));
+    rules.push(format!("(allow file-write* (subpath \"{root}\"))"));
+    rules.push("(allow file-write* (literal \"/dev/null\"))".to_owned());
+    rules.push("(allow file-write* (literal \"/dev/dtracehelper\"))".to_owned());
+    if allow_network {
+        rules.push("(allow network*)".to_owned());
+    } else {
+        rules.push("(deny network*)".to_owned());
+    }
+    rules.join("\n")
+}
+
+fn scheme_subpath(path: &Path) -> Option<String> {
+    let text = path.display().to_string();
+    if text.is_empty() || text == "/" {
+        None
+    } else {
+        Some(scheme_escape(&text))
+    }
+}
+
+fn scheme_escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn resolve_host_program(program: &str) -> Result<PathBuf, SandboxError> {
+    let path = PathBuf::from(program);
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths).find_map(|dir| {
+                    let candidate = dir.join(program);
+                    candidate.is_file().then_some(candidate)
+                })
+            })
+            .ok_or_else(|| SandboxError::Io(format!("sandbox program not found: {program}")))?
+    };
+    candidate
+        .canonicalize()
+        .map_err(|error| SandboxError::Io(error.to_string()))
+}
+
+fn reap_process_group(pid: u32) {
+    // `--` stops procps from parsing `kill -KILL -PID` as a signal plus a short group id.
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
     }
 }
 

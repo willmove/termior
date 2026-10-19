@@ -93,6 +93,27 @@ fn platform_command_wrapper_fails_closed_or_uses_the_verified_native_boundary() 
                 .unwrap();
             assert!(wrapped.clear_environment);
             assert!(wrapped.program == "bwrap" || wrapped.program == "sandbox-exec");
+            if wrapped.program == "bwrap" {
+                assert!(wrapped.args.iter().any(|arg| arg == "--unshare-net"));
+                assert!(wrapped.args.iter().any(|arg| arg == "--remount-ro"));
+            }
+            if wrapped.program == "sandbox-exec" {
+                let profile = wrapped
+                    .args
+                    .iter()
+                    .find(|arg| arg.contains("(deny default)"))
+                    .expect("sandbox-exec profile");
+                for needle in [
+                    "(allow file-map-executable)",
+                    "(allow file-read-metadata)",
+                    "(allow file-read* (literal \"/\"))",
+                    "(allow mach-priv-host-port)",
+                    "(allow process-info* (target self))",
+                    "(deny network*)",
+                ] {
+                    assert!(profile.contains(needle), "profile missing {needle}");
+                }
+            }
         }
         Err(SandboxError::RequiredCapabilityUnavailable(_)) => {
             assert!(backend

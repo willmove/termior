@@ -2029,6 +2029,12 @@ fn optional_budget_reason(
     }
 }
 
+/// Critical task events are flushed before the runtime continues past the boundary.
+#[doc(hidden)]
+pub fn event_requires_durable_journal(kind: &TaskEventKind) -> bool {
+    task_event_is_critical(kind)
+}
+
 fn task_event_is_critical(kind: &TaskEventKind) -> bool {
     matches!(
         kind,

@@ -36,3 +36,4 @@ keyring-backend = ["dep:keyring"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+termior-store = { workspace = true, features = ["fault-injection"] }
