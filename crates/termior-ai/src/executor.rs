@@ -390,7 +390,7 @@ impl ToolExecutor {
         let paths = index
             .entries()
             .iter()
-            .filter(|entry| !entry.is_dir)
+            .filter(|entry| !entry.is_dir && self.readable_inside_root(&entry.path))
             .map(|entry| entry.path.clone())
             .collect::<Vec<_>>();
         let mut lines = Vec::new();
@@ -793,8 +793,62 @@ impl ToolExecutor {
     }
 
     fn check_path(&self, tool: &str, path: &Path, direction: Direction) -> Result<(), ToolError> {
+        // Workspace auth may still list the main checkout. A task rooted at a worktree
+        // must not follow `..`, an absolute path, or a symlink back into that checkout.
+        self.ensure_inside_root(path)?;
+        self.reject_worktree_hardlink(path)?;
         self.registry
             .check_path_access(tool, &path.to_string_lossy(), direction)
+    }
+
+    fn canonical_inside_root(&self, path: &Path) -> bool {
+        std::fs::canonicalize(path)
+            .ok()
+            .is_some_and(|canonical| canonical == self.root || canonical.starts_with(&self.root))
+    }
+
+    fn readable_inside_root(&self, path: &Path) -> bool {
+        if !self.canonical_inside_root(path) {
+            return false;
+        }
+        if !self.environment_id.starts_with("worktree") {
+            return true;
+        }
+        std::fs::symlink_metadata(path)
+            .ok()
+            .is_some_and(|metadata| !is_hardlinked_file(&metadata))
+    }
+
+    fn ensure_inside_root(&self, path: &Path) -> Result<(), ToolError> {
+        let candidate = if path.exists() {
+            std::fs::canonicalize(path).map_err(io_error)?
+        } else {
+            path.to_path_buf()
+        };
+        if candidate == self.root || candidate.starts_with(&self.root) {
+            Ok(())
+        } else {
+            Err(ToolError::NotAuthorized(candidate.display().to_string()))
+        }
+    }
+
+    /// A hardlink inside the worktree can alias a main-checkout inode without leaving the root.
+    fn reject_worktree_hardlink(&self, path: &Path) -> Result<(), ToolError> {
+        if !self.environment_id.starts_with("worktree") {
+            return Ok(());
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return Ok(());
+        };
+        // Directories report nlink > 1 because of `.` and `..`. Only regular-file
+        // hardlinks alias another inode without leaving the worktree root.
+        if is_hardlinked_file(&metadata) {
+            return Err(ToolError::NotAuthorized(format!(
+                "hardlink escapes worktree: {}",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     fn revalidate_hook_arguments(&self, tool: &str, value: &Value) -> Result<(), String> {
@@ -1036,6 +1090,28 @@ fn collect_until_marker(
             )));
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn is_hardlinked_file(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file() && link_count(metadata) > 1
+}
+
+fn link_count(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.number_of_links()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        1
     }
 }
 

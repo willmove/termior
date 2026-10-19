@@ -127,6 +127,17 @@ enum MemoryAction {
 #[derive(Debug, Clone)]
 pub struct EditReviewRequested(pub EditProposalSummary);
 
+/// Automatic worktree merge-back was not a conflict-free fast-forward or cherry-pick.
+/// The workspace opens the existing Git review flow and does not change the target checkout.
+#[derive(Debug, Clone)]
+pub struct GitReviewRequested {
+    pub repository: PathBuf,
+    pub worktree_path: PathBuf,
+    pub reason: String,
+    pub patch: String,
+    pub conflicts: Vec<String>,
+}
+
 /// 面板头图标按钮：请求在底部/右侧停靠间切换。
 #[derive(Debug, Clone)]
 pub struct ComposerDockToggle;
@@ -273,6 +284,7 @@ const CENTER_DOCK_MAX_FRACTION: f32 = 0.45;
 
 impl EventEmitter<AgentStatus> for ComposerView {}
 impl EventEmitter<EditReviewRequested> for ComposerView {}
+impl EventEmitter<GitReviewRequested> for ComposerView {}
 impl EventEmitter<ComposerDockToggle> for ComposerView {}
 impl EventEmitter<ComposerCollapse> for ComposerView {}
 impl EventEmitter<ComposerAppAction> for ComposerView {}

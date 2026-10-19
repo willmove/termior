@@ -4,18 +4,20 @@
 //! 状态转移的结果再由 View 写成文案、焦点和 `cx.emit`。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use termior_agent_host::{
     permission_entries, ManagedAgentSession, PumpOutcome, PERMISSIONS_APPROVAL_METHOD,
 };
+use termior_ai::context_engine::RepoMap;
 use termior_ai::{
     ApprovalPolicy, ApprovalRequest, CancellationToken, EditProposalSummary, Mode, ProviderConfig,
     RuntimeBudgets, TaskRuntime, TaskState, ToolContract, ToolExecutor, ToolRegistry,
     WaitingReason,
 };
 use termior_platform::AgentStatus;
+use termior_vcs::{MergeBack, WorktreeEnvironment, WorktreeError, WorktreeManager};
 
 use super::notify::status_for_task;
 
@@ -300,6 +302,22 @@ struct TaskFacts {
     mode_is_yolo: bool,
 }
 
+pub(super) struct TaskExecutionRoot {
+    pub(super) root: PathBuf,
+    pub(super) environment_id: String,
+    pub(super) worktree: Option<WorktreeEnvironment>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct PendingGitReview {
+    pub(super) repository: PathBuf,
+    pub(super) worktree_path: PathBuf,
+    pub(super) reason: String,
+    pub(super) patch: String,
+    pub(super) conflicts: Vec<String>,
+}
+
 pub(super) struct ComposerOrchestrator {
     pub(super) runtime: Option<AgentRuntime>,
     pub(super) active_task: Option<TaskRuntime>,
@@ -315,6 +333,11 @@ pub(super) struct ComposerOrchestrator {
     pub(super) external_session: Option<Arc<Mutex<ManagedAgentSession>>>,
     pub(super) active_runtime: Option<AgentRuntime>,
     pub(super) task_project_override: Option<PathBuf>,
+    pub(super) bound_worktree: Option<WorktreeEnvironment>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) pending_git_review: Option<PendingGitReview>,
+    repo_map: Option<RepoMap>,
+    repo_map_root: Option<PathBuf>,
     pub(super) busy: bool,
 }
 
@@ -335,8 +358,127 @@ impl ComposerOrchestrator {
             external_session: None,
             active_runtime: None,
             task_project_override: None,
+            bound_worktree: None,
+            pending_git_review: None,
+            repo_map: None,
+            repo_map_root: None,
             busy: false,
         }
+    }
+
+    /// Pin the next builtin task to a prepared worktree. Tool, terminal, rule, and repo-map
+    /// roots come from `environment.path`, not the main checkout.
+    ///
+    /// Called when a worktree environment is prepared for a task. No in-app control creates
+    /// that environment yet, so the entry point is part of the host contract rather than a button.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn bind_worktree(&mut self, environment: WorktreeEnvironment) {
+        if self.repo_map_root.as_ref() != Some(&environment.path) {
+            self.repo_map = None;
+            self.repo_map_root = None;
+        }
+        self.bound_worktree = Some(environment);
+    }
+
+    /// Root for the task executor, rules, and repo map.
+    ///
+    /// A bound worktree wins over a one-shot project pin and over the main workspace.
+    /// The project pin is consumed so it cannot leak onto a later task.
+    pub(super) fn take_execution_root(&mut self, workspace_root: &Path) -> TaskExecutionRoot {
+        if let Some(worktree) = self.bound_worktree.clone() {
+            self.task_project_override = None;
+            return TaskExecutionRoot {
+                environment_id: worktree.id.clone(),
+                root: worktree.path.clone(),
+                worktree: Some(worktree),
+            };
+        }
+        if let Some(root) = self.take_project_override() {
+            return TaskExecutionRoot {
+                root,
+                environment_id: "direct".into(),
+                worktree: None,
+            };
+        }
+        TaskExecutionRoot {
+            root: workspace_root.to_path_buf(),
+            environment_id: "direct".into(),
+            worktree: None,
+        }
+    }
+
+    pub(super) fn displayed_root(&self, workspace_root: &Path) -> PathBuf {
+        if let Some(worktree) = &self.bound_worktree {
+            return worktree.path.clone();
+        }
+        if let Some(task) = &self.active_task {
+            return task.task().project_dir.clone();
+        }
+        if let Some(root) = &self.task_project_override {
+            return root.clone();
+        }
+        workspace_root.to_path_buf()
+    }
+
+    /// Symbols from the worktree checkout only. Paths outside that root are dropped.
+    pub(super) fn worktree_repo_excerpt(
+        &mut self,
+        root: &Path,
+        query: &str,
+    ) -> Result<String, String> {
+        let root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
+        if self.repo_map_root.as_ref() != Some(&root) {
+            let mut map = RepoMap::default();
+            map.index_workspace(&root)
+                .map_err(|error| error.to_string())?;
+            self.repo_map = Some(map);
+            self.repo_map_root = Some(root.clone());
+        }
+        let Some(map) = self.repo_map.as_ref() else {
+            return Ok(String::new());
+        };
+        let mut lines = Vec::new();
+        for entry in map.relevant(query, 1_200) {
+            if entry.path != root && !entry.path.starts_with(&root) {
+                continue;
+            }
+            let relative = entry.path.strip_prefix(&root).unwrap_or(&entry.path);
+            lines.push(format!(
+                "{} {}",
+                relative.display(),
+                entry.symbols.join(",")
+            ));
+        }
+        Ok(lines.join("\n"))
+    }
+
+    /// Fast-forward or cherry-pick when that cannot touch user edits. Otherwise record a Git review.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn integrate_worktree(
+        &mut self,
+        target_ref: &str,
+        validation_passed: bool,
+    ) -> Result<MergeBack, WorktreeError> {
+        let Some(environment) = self.bound_worktree.clone() else {
+            return Err(WorktreeError::Git("no worktree is bound".into()));
+        };
+        let outcome = WorktreeManager::merge_back(&environment, target_ref, validation_passed)?;
+        self.pending_git_review = match &outcome {
+            MergeBack::Review { reason, preview } => Some(PendingGitReview {
+                repository: environment.repository.clone(),
+                worktree_path: environment.path.clone(),
+                reason: reason.to_string(),
+                patch: preview.patch.clone(),
+                conflicts: preview.conflicts.clone(),
+            }),
+            MergeBack::Applied { .. } => None,
+        };
+        Ok(outcome)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn take_git_review(&mut self) -> Option<PendingGitReview> {
+        self.pending_git_review.take()
     }
 
     /// 活动任务固定的运行时；没有活动任务时为全局配置的运行时。
@@ -1396,6 +1538,93 @@ mod tests {
         });
         assert!(matches!(outcome, ExternalOutcome::Unknown { .. }));
         assert_eq!(outcome.notify(), AgentStatus::Attention);
+    }
+
+    #[test]
+    fn bound_worktree_replaces_the_main_workspace_and_a_project_pin() {
+        let mut orch = ComposerOrchestrator::new();
+        orch.pin_project(PathBuf::from("/main/workspace"));
+        orch.bind_worktree(WorktreeEnvironment {
+            id: "worktree-task-17".into(),
+            repository: PathBuf::from("/main/workspace"),
+            base_commit: "abc".into(),
+            branch: "task-branch".into(),
+            path: PathBuf::from("/tmp/checkout"),
+            owner_task: "task-17".into(),
+            orphaned: false,
+        });
+        let execution = orch.take_execution_root(Path::new("/main/workspace"));
+        assert_eq!(execution.root, PathBuf::from("/tmp/checkout"));
+        assert_eq!(execution.environment_id, "worktree-task-17");
+        assert!(execution.worktree.is_some());
+        assert!(orch.task_project_override.is_none());
+        assert_eq!(
+            orch.displayed_root(Path::new("/main/workspace")),
+            PathBuf::from("/tmp/checkout")
+        );
+    }
+
+    #[test]
+    fn conflicting_merge_back_requests_git_review_and_keeps_user_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let repository = root.path().join("main");
+        std::fs::create_dir(&repository).unwrap();
+        git(&repository, &["init"]);
+        git(&repository, &["config", "user.email", "test@example.com"]);
+        git(&repository, &["config", "user.name", "Termior Test"]);
+        std::fs::write(repository.join("a.txt"), "base\n").unwrap();
+        git(&repository, &["add", "."]);
+        git(&repository, &["commit", "-m", "base"]);
+        let destination = root.path().join("checkout");
+        let environment =
+            WorktreeManager::create(&repository, &destination, "HEAD", "task-branch", "task-17")
+                .unwrap();
+        std::fs::write(repository.join("a.txt"), "user-commit\n").unwrap();
+        git(&repository, &["add", "a.txt"]);
+        git(&repository, &["commit", "-m", "user"]);
+        std::fs::write(environment.path.join("a.txt"), "task-commit\n").unwrap();
+        git(&environment.path, &["add", "a.txt"]);
+        git(&environment.path, &["commit", "-m", "task"]);
+        std::fs::write(repository.join("notes.txt"), "user scratch\n").unwrap();
+        let worktree_path = environment.path.clone();
+
+        let mut orch = ComposerOrchestrator::new();
+        orch.bind_worktree(environment);
+        let outcome = orch.integrate_worktree("HEAD", true).unwrap();
+        assert!(matches!(
+            outcome,
+            MergeBack::Review {
+                reason: termior_vcs::MergeBackReason::DirtyTarget,
+                ..
+            }
+        ));
+        let review = orch.take_git_review().expect("git review");
+        assert_eq!(review.reason, "dirty-target");
+        assert_eq!(
+            review.repository,
+            std::fs::canonicalize(&repository).unwrap()
+        );
+        assert_eq!(review.worktree_path, worktree_path);
+        assert!(review.patch.contains("a.txt"), "{}", review.patch);
+        assert!(review.conflicts.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repository.join("a.txt")).unwrap(),
+            "user-commit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join("notes.txt")).unwrap(),
+            "user scratch\n"
+        );
+    }
+
+    fn git(path: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
     }
 
     fn sample_runtime() -> AgentRuntime {

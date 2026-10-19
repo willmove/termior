@@ -31,17 +31,18 @@ impl gpui::Render for ComposerView {
                     "direct-workspace".into()
                 }
             });
+        let environment_root = self.orchestrator.displayed_root(&self.workspace_root);
         let environment_tooltip = if external_backend {
             tf!(
                 "composer.environment_external",
                 "host" => std::env::consts::OS,
-                "root" => self.workspace_root.display()
+                "root" => environment_root.display()
             )
         } else {
             tf!(
                 "composer.environment_builtin",
                 "host" => std::env::consts::OS,
-                "root" => self.workspace_root.display()
+                "root" => environment_root.display()
             )
         };
         let compact = self.is_compact();

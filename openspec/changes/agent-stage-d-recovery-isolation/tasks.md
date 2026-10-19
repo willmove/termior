@@ -33,9 +33,9 @@
 
 - [x] 4.1 在 `termior-vcs` 定义 WorktreeEnvironment 与 create/init/status/integrate/remove 契约
 - [x] 4.2 原子化“创建→初始化→绑定任务”；失败回滚或记录 orphaned
-- [ ] 4.3 将任务 TerminalService、文件工具、规则和 repo map 根切换到 worktree path
+- [x] 4.3 将任务 TerminalService、文件工具、规则和 repo map 根切换到 worktree path
 - [x] 4.4 实现合入前 base/target/dirty/diff/validation/conflict 检查与 preview
-- [ ] 4.5 只自动处理无冲突安全路径；其他情况打开现有 Git 审阅流程
+- [x] 4.5 只自动处理无冲突安全路径；其他情况打开现有 Git 审阅流程
 - [x] 4.6 清理前拒绝 dirty/运行进程环境，覆盖 Windows 文件占用和进程树场景
 
 ## 5. Execution Environment 与安全描述
@@ -75,7 +75,7 @@
 
 - 0.x 阶段门禁与三平台 sandbox prototype 记录未完成。
 - 1.6 已覆盖每个关键事件的写入前/中/后 fault injection（进程内钩子 + running 边界的真实进程退出），恢复状态与预期一致。
-- 4.3 TerminalService、文件工具、规则与 repo map 尚未整体切换到 worktree 根；4.5 自动/手工合入分流未接入 Git 审阅流程。
+- 4.3 任务绑定 worktree 后，TerminalService、文件工具、规则解析与 repo map 根切到 worktree path；路径穿越、符号链接与硬链接不得读回主工作区。4.5 仅对无冲突的 fast-forward 或 cherry-pick 自动合入，其余情况打开现有 Git 审阅且不改写用户文件。
 - 5.2 环境 ID 固定/变更 profile 新建环境未见专门实现与测试；5.3 能力仅在环境 chip 悬浮提示显示，审批卡未显示。
 - 6.2 Windows 仅进程树控制，文件/网络/凭据隔离报告 unsupported。6.6 逃逸套件已进入 Core 三平台：Linux `bwrap` 与 macOS `sandbox-exec` 执行黑盒探测；Windows 对未支持能力断言 fail closed，不静默跳过。
 - 7.2 已在 journal、output blob、context、hook audit、MCP diagnostic、backend stderr 与 crash log 写盘前调用 StreamingRedactor，各路径有注入已知 secret 的落盘测试。7.4 无保留设置与磁盘使用 UI。

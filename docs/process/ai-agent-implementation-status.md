@@ -36,6 +36,7 @@
 - Recovery Center、显式 abandon/retry 与新 attempt ID
 - 内容寻址 checkpoint、三方 restore plan、冲突默认跳过和 Composer 恢复入口
 - Git worktree 环境的创建、状态、集成预检和安全清理
+- worktree 任务把 TerminalService、文件工具、规则解析和 repo map 根切到 worktree path；合入只自动处理无冲突 fast-forward 或 cherry-pick，其余打开 Git 审阅且不覆盖用户改动
 - direct/worktree/sandboxed descriptor、能力信任级别、required capability fail-closed
 - 写盘前流式脱敏与按天数/容量的 retention 清理
 

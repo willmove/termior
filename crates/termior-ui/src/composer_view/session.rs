@@ -286,7 +286,17 @@ impl ComposerView {
         root: &Path,
         tools: &ToolRegistry,
     ) -> Result<Arc<ToolExecutor>, termior_ai::ToolError> {
-        let executor = ToolExecutor::new(root, tools.clone())?
+        self.build_executor_for(root, tools, "direct")
+    }
+
+    /// 按任务环境构建执行器。Worktree 任务的 `environment_id` 来自 worktree，终端 cwd 与文件根都是 `root`。
+    pub(super) fn build_executor_for(
+        &self,
+        root: &Path,
+        tools: &ToolRegistry,
+        environment_id: &str,
+    ) -> Result<Arc<ToolExecutor>, termior_ai::ToolError> {
+        let executor = ToolExecutor::new_in_environment(root, tools.clone(), environment_id)?
             .with_terminal_context(self.terminal_context.clone())
             .with_todo_store(self.todos.clone(), self.data_dir.clone());
         Ok(Arc::new(match self.data_dir.as_ref() {
@@ -302,6 +312,20 @@ impl ComposerView {
             }
             None => executor,
         }))
+    }
+
+    /// Authorize `root` on a private registry copy, then build an executor confined to it.
+    pub(super) fn executor_for_root(
+        &self,
+        root: &Path,
+        tools: &ToolRegistry,
+        environment_id: &str,
+    ) -> Result<Arc<ToolExecutor>, termior_ai::ToolError> {
+        let mut tools = tools.clone();
+        tools
+            .workspace_auth
+            .authorize(&root.to_string_lossy().replace('\\', "/"));
+        self.build_executor_for(root, &tools, environment_id)
     }
 
     pub(super) fn selected_agent_runtime(
