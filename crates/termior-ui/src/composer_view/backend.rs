@@ -3,6 +3,9 @@
 use super::helpers::{new_session_id, requested_skill_names, user_home_dir};
 use super::*;
 
+/// Token ceiling for the repo-map slice inside the Evidence category.
+const REPO_MAP_TOKEN_BUDGET: u64 = 1_200;
+
 impl ComposerView {
     /// Bind later builtin tasks to a worktree. The executor, terminal cwd, rules, and repo map
     /// then use the worktree path until the binding is replaced.
@@ -246,14 +249,16 @@ impl ComposerView {
             item.required = true;
             context_items.push(item);
         }
-        if execution.worktree.is_some() {
-            if let Ok(excerpt) = self
-                .orchestrator
-                .worktree_repo_excerpt(&execution.root, &user_input)
-            {
+        if let Some(authorization) = self.repo_map_authorization(&execution.root) {
+            if let Ok(excerpt) = self.orchestrator.repo_map_excerpt(
+                &execution.root,
+                &user_input,
+                &authorization,
+                REPO_MAP_TOKEN_BUDGET,
+            ) {
                 if !excerpt.is_empty() {
                     context_items.push(ContextItem::inline(
-                        "worktree-repo-map",
+                        "repo-map",
                         ContextCategory::Evidence,
                         ContextSource::Workspace(execution.root.clone()),
                         redactor.redact(&excerpt).text,

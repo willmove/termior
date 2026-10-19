@@ -13,6 +13,7 @@ termior-security = { workspace = true }
 termior-diff = { workspace = true }
 termior-store = { workspace = true }
 termior-explorer = { workspace = true }
+termior-editor = { workspace = true }
 termior-terminal = { workspace = true }
 termior-hooks = { workspace = true }
 reqwest = { workspace = true }
@@ -27,6 +28,10 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 # OS 钥匙串后端（FR-PROV-04 / FR-SEC-06）：feature gate，CI 与发行构建启用。
 keyring = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Safe hardlink count from the opened handle (std's number_of_links is unstable).
+winapi-util = { workspace = true }
 
 [features]
 default = []

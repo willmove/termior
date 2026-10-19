@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use termior_ai::context_engine::*;
+use termior_ai::repo_map::{RepoMap, RepoMapConfig};
 
 fn item(id: &str, category: ContextCategory, content: &str, priority: u16) -> ContextItem {
     ContextItem::inline(id, category, ContextSource::User, content, priority)
@@ -318,15 +319,19 @@ fn repo_map_invalidates_changed_files_and_obeys_query_budget() {
     let b = dir.path().join("other.rs");
     std::fs::write(&a, "pub struct AgentRuntime;\npub fn drive_agent() {}\n").unwrap();
     std::fs::write(&b, "pub fn unrelated() {}\n").unwrap();
-    let mut map = RepoMap::default();
-    map.index_file(dir.path(), &a).unwrap();
-    map.index_file(dir.path(), &b).unwrap();
-    let slice = map.relevant("AgentRuntime", 30);
-    assert_eq!(slice.first().unwrap().path.file_name().unwrap(), "agent.rs");
-    std::fs::write(&a, "pub struct Renamed;\n").unwrap();
-    map.invalidate_changed();
-    assert!(map
-        .relevant("AgentRuntime", 30)
+    let mut map = RepoMap::build(dir.path(), RepoMapConfig::default()).unwrap();
+    let slice = map.slice("AgentRuntime", 30);
+    assert!(slice.tokens <= 30);
+    assert_eq!(slice.entries.first().unwrap().relative, "agent.rs");
+    assert!(slice
+        .entries
         .iter()
-        .all(|entry| entry.path != std::fs::canonicalize(&a).unwrap()));
+        .all(|entry| entry.relative != "other.rs"));
+    std::fs::write(&a, "pub struct Renamed;\n").unwrap();
+    let stale = map.slice("AgentRuntime", 30);
+    assert!(stale.entries.is_empty());
+    assert_eq!(stale.stale_excluded, vec!["agent.rs".to_owned()]);
+    map.refresh().unwrap();
+    assert_eq!(map.slice("AgentRuntime", 30).candidates, 0);
+    assert_eq!(map.slice("Renamed", 30).entries[0].relative, "agent.rs");
 }

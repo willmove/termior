@@ -335,6 +335,31 @@ impl ComposerView {
         self.build_executor_for(root, &tools, environment_id)
     }
 
+    /// Registry the repo map checks `root` against. A task root other than the workspace root
+    /// is authorized on a private copy, the same rule `executor_for_root` applies to tools.
+    /// `None` until the composer is configured.
+    pub(super) fn repo_map_authorization(&self, root: &Path) -> Option<WorkspaceAuthRegistry> {
+        let mut authorization = self.full_tools.as_ref()?.workspace_auth.clone();
+        if root != self.workspace_root {
+            authorization.authorize(&root.to_string_lossy().replace('\\', "/"));
+        }
+        Some(authorization)
+    }
+
+    /// Start indexing the root the next builtin task will use, so the first submit finds a
+    /// warm map. Spawning is cheap; the sweep runs on the repo-map thread.
+    pub(super) fn warm_repo_map(&mut self) {
+        if self.orchestrator.backend_choice != AgentBackendChoice::BuiltIn
+            || self.draft.input.trim().is_empty()
+        {
+            return;
+        }
+        let root = self.orchestrator.displayed_root(&self.workspace_root);
+        if let Some(authorization) = self.repo_map_authorization(&root) {
+            let _ = self.orchestrator.ensure_repo_map(&root, &authorization);
+        }
+    }
+
     pub(super) fn selected_agent_runtime(
         &self,
         full_tools: &ToolRegistry,

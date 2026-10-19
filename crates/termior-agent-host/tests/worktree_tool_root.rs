@@ -7,7 +7,8 @@
 use std::path::Path;
 use std::process::Command;
 use termior_agent_host::ExecutionEnvironment;
-use termior_ai::context_engine::{RepoMap, RuleResolver};
+use termior_ai::context_engine::RuleResolver;
+use termior_ai::repo_map::{RepoMap, RepoMapConfig};
 use termior_ai::ToolRegistry;
 use termior_security::workspace::WorkspaceAuthRegistry;
 use termior_vcs::WorktreeManager;
@@ -208,20 +209,28 @@ fn worktree_tools_rules_and_repo_map_cannot_touch_the_main_checkout() {
         .iter()
         .all(|rule| rule.path.starts_with(&environment.path)));
 
-    let mut map = RepoMap::default();
-    map.index_workspace(&environment.path).unwrap();
+    let map = RepoMap::build(&environment.path, RepoMapConfig::default()).unwrap();
     let worktree_root = std::fs::canonicalize(&environment.path).unwrap();
-    let worktree_hits = map.relevant("only_worktree", 2_000);
-    assert!(worktree_hits.iter().any(|entry| {
+    let worktree_hits = map.slice("only_worktree", 2_000);
+    assert!(worktree_hits.entries.iter().any(|entry| {
         entry.path.starts_with(&worktree_root)
-            && entry.symbols.iter().any(|symbol| symbol == "only_worktree")
+            && entry
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == "only_worktree")
     }));
-    let main_hits = map.relevant("only_main", 2_000);
+    assert!(map
+        .entries()
+        .all(|entry| entry.path.starts_with(&worktree_root)));
+    let main_hits = map.slice("only_main", 2_000);
     assert!(
-        main_hits.iter().all(|entry| {
+        main_hits.entries.iter().all(|entry| {
             entry.path.starts_with(&worktree_root)
                 && !entry.path.ends_with("only_main.rs")
-                && entry.symbols.iter().all(|symbol| symbol != "only_main")
+                && entry
+                    .symbols
+                    .iter()
+                    .all(|symbol| symbol.name != "only_main")
         }),
         "repo map included the main checkout: {main_hits:?}"
     );
