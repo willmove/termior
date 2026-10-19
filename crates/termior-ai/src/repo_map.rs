@@ -45,6 +45,8 @@ const SEED_FILES: usize = 8;
 const MAX_DEFINITION_SITES: usize = 3;
 const LEXICAL_REFERENCE_CAP: usize = termior_editor::outline::MAX_REFERENCES_PER_FILE;
 
+/// Shorter query words (`fix`, `add`, `new`) would match a word segment in most files.
+const MIN_PARTIAL_TERM: usize = 4;
 const SYMBOL_EXACT: u32 = 12;
 const SYMBOL_PARTIAL: u32 = 4;
 const PATH_EXACT: u32 = 6;
@@ -92,6 +94,8 @@ pub struct FileSymbols {
     pub has_error: bool,
     pub symbols: Vec<OutlineSymbol>,
     symbol_keys: Vec<String>,
+    /// Deduplicated word segments of the symbol names, for partial matches.
+    segment_keys: Vec<String>,
     /// Sorted, deduplicated hashes of normalized reference names. Names are not retained, so
     /// lexical tokens from config files never sit in memory as strings.
     reference_keys: Vec<u64>,
@@ -105,6 +109,7 @@ impl FileSymbols {
             has_error: false,
             symbols: Vec::new(),
             symbol_keys: Vec::new(),
+            segment_keys: Vec::new(),
             reference_keys: Vec::new(),
         }
     }
@@ -120,6 +125,12 @@ impl FileSymbols {
             .iter()
             .map(|symbol| normalize(&symbol.name))
             .collect();
+        let segment_keys = symbols
+            .iter()
+            .flat_map(|symbol| word_segments(&symbol.name))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         let mut reference_keys = references
             .into_iter()
             .map(|name| key_hash(&normalize(&name)))
@@ -132,6 +143,7 @@ impl FileSymbols {
             has_error,
             symbols,
             symbol_keys,
+            segment_keys,
             reference_keys,
         }
     }
@@ -156,6 +168,7 @@ pub struct RepoMapEntry {
     modified: Option<SystemTime>,
     hashed_at: SystemTime,
     path_keys: Vec<String>,
+    path_segments: Vec<String>,
 }
 
 impl RepoMapEntry {
@@ -275,6 +288,8 @@ pub struct RepoMap {
     definition_index: HashMap<u64, Vec<u32>>,
     reference_index: HashMap<u64, Vec<u32>>,
     path_index: HashMap<String, Vec<u32>>,
+    symbol_segment_index: HashMap<String, Vec<u32>>,
+    path_segment_index: HashMap<String, Vec<u32>>,
     by_digest: HashMap<String, Arc<FileSymbols>>,
     generation: u64,
     swept_generation: Option<u64>,
@@ -319,6 +334,8 @@ impl RepoMap {
             definition_index: HashMap::new(),
             reference_index: HashMap::new(),
             path_index: HashMap::new(),
+            symbol_segment_index: HashMap::new(),
+            path_segment_index: HashMap::new(),
             by_digest: HashMap::new(),
             generation: 0,
             swept_generation: None,
@@ -504,16 +521,12 @@ impl RepoMap {
             if let Some(ids) = self.path_index.get(term) {
                 hit(ids, 1, PATH_EXACT);
             }
-            if term.chars().count() >= 4 {
-                for (key, ids) in &self.symbol_index {
-                    if key.len() > term.len() && key.contains(term.as_str()) {
-                        hit(ids, 0, SYMBOL_PARTIAL);
-                    }
+            if term.chars().count() >= MIN_PARTIAL_TERM {
+                if let Some(ids) = self.symbol_segment_index.get(term) {
+                    hit(ids, 0, SYMBOL_PARTIAL);
                 }
-                for (key, ids) in &self.path_index {
-                    if key.len() > term.len() && key.contains(term.as_str()) {
-                        hit(ids, 1, PATH_PARTIAL);
-                    }
+                if let Some(ids) = self.path_segment_index.get(term) {
+                    hit(ids, 1, PATH_PARTIAL);
                 }
             }
             if let Some(ids) = self.reference_index.get(&key_hash(term)) {
@@ -657,6 +670,12 @@ impl RepoMap {
         for key in keys.paths {
             self.path_index.entry(key).or_default().push(id);
         }
+        for key in keys.symbol_segments {
+            self.symbol_segment_index.entry(key).or_default().push(id);
+        }
+        for key in keys.path_segments {
+            self.path_segment_index.entry(key).or_default().push(id);
+        }
         if !entry.digest.is_empty() {
             self.by_digest
                 .insert(entry.digest.clone(), Arc::clone(&entry.outline));
@@ -685,6 +704,12 @@ impl RepoMap {
         for key in keys.paths {
             remove_posting(&mut self.path_index, key, id);
         }
+        for key in keys.symbol_segments {
+            remove_posting(&mut self.symbol_segment_index, key, id);
+        }
+        for key in keys.path_segments {
+            remove_posting(&mut self.path_segment_index, key, id);
+        }
         self.free.push(id);
         true
     }
@@ -703,6 +728,8 @@ struct EntryKeys {
     definitions: HashSet<u64>,
     references: Vec<u64>,
     paths: HashSet<String>,
+    symbol_segments: Vec<String>,
+    path_segments: Vec<String>,
 }
 
 impl EntryKeys {
@@ -720,6 +747,8 @@ impl EntryKeys {
             definitions,
             references: entry.outline.reference_keys.clone(),
             paths: entry.path_keys.iter().cloned().collect(),
+            symbol_segments: entry.outline.segment_keys.clone(),
+            path_segments: entry.path_segments.clone(),
         }
     }
 }
@@ -931,6 +960,7 @@ impl Scanner<'_> {
             modified,
             hashed_at,
             path_keys: path_keys(relative),
+            path_segments: path_segments(relative),
         }
     }
 }
@@ -1140,9 +1170,10 @@ fn ordered_symbols<'a>(entry: &'a RepoMapEntry, terms: &[String]) -> Vec<&'a Out
         .iter()
         .zip(&entry.outline.symbol_keys)
         .map(|(symbol, key)| {
-            let matched = terms
-                .iter()
-                .any(|term| key == term || (term.len() >= 4 && key.contains(term.as_str())));
+            let segments = word_segments(&symbol.name);
+            let matched = terms.iter().any(|term| {
+                key == term || (term.chars().count() >= MIN_PARTIAL_TERM && segments.contains(term))
+            });
             (!matched, symbol)
         })
         .collect::<Vec<_>>();
@@ -1216,6 +1247,46 @@ fn path_keys(relative: &str) -> Vec<String> {
         }
     }
     keys.into_iter().collect()
+}
+
+/// Lowercase words of an identifier or path component, split at separators and camelCase
+/// boundaries: `parseHTTPHeader` gives `parse`, `http`, `header`. Partial matches are whole
+/// words, so a lookup is one hash probe instead of a scan of every key.
+fn word_segments(name: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    for part in name.split(|ch: char| !ch.is_alphanumeric()) {
+        let chars = part.chars().collect::<Vec<_>>();
+        let mut start = 0;
+        for index in 1..chars.len() {
+            let (previous, current) = (chars[index - 1], chars[index]);
+            let next_is_lower = chars.get(index + 1).is_some_and(|ch| ch.is_lowercase());
+            let boundary = (previous.is_lowercase() && current.is_uppercase())
+                || (previous.is_uppercase() && current.is_uppercase() && next_is_lower)
+                || (previous.is_alphabetic() != current.is_alphabetic());
+            if boundary {
+                words.push(chars[start..index].iter().collect::<String>());
+                start = index;
+            }
+        }
+        if start < chars.len() {
+            words.push(chars[start..].iter().collect::<String>());
+        }
+    }
+    let mut seen = HashSet::new();
+    words
+        .into_iter()
+        .map(|word| word.to_lowercase())
+        .filter(|word| seen.insert(word.clone()))
+        .collect()
+}
+
+fn path_segments(relative: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    relative
+        .split('/')
+        .flat_map(word_segments)
+        .filter(|word| seen.insert(word.clone()))
+        .collect()
 }
 
 fn key_hash(key: &str) -> u64 {
@@ -1298,7 +1369,11 @@ pub struct RepoMapStatus {
     pub generation: u64,
     pub files: usize,
     pub truncated: bool,
+    /// Stats of the latest sweep or path refresh.
     pub last_refresh: RefreshStats,
+    /// Stats of the latest completed full sweep. Path refreshes do not overwrite it.
+    pub last_sweep: RefreshStats,
+    /// Wall time of the latest full sweep.
     pub last_refresh_ms: u64,
     pub last_error: Option<String>,
 }
@@ -1497,6 +1572,7 @@ fn run_sweep(shared: &Shared, extractor: &mut OutlineExtractor) {
     match result {
         Ok(stats) => {
             status.last_refresh = stats;
+            status.last_sweep = stats;
             status.last_error = None;
         }
         Err(error) => status.last_error = Some(error.to_string()),
@@ -1562,6 +1638,30 @@ mod tests {
         let mut keys = path_keys("crates/termior-ai/src/repo_map.rs");
         keys.sort();
         assert_eq!(keys, vec!["crates", "repomap", "src", "termiorai"]);
+    }
+
+    #[test]
+    fn word_segments_split_separators_camel_case_and_digits() {
+        assert_eq!(
+            word_segments("parseHTTPHeader"),
+            vec!["parse", "http", "header"]
+        );
+        assert_eq!(
+            word_segments("RepoMapService"),
+            vec!["repo", "map", "service"]
+        );
+        assert_eq!(
+            word_segments("ledger_settle_42"),
+            vec!["ledger", "settle", "42"]
+        );
+        assert_eq!(word_segments("MAX_FILES"), vec!["max", "files"]);
+        assert!(word_segments("__").is_empty());
+        let mut segments = path_segments("crates/termior-ai/src/repo_map.rs");
+        segments.sort();
+        assert_eq!(
+            segments,
+            vec!["ai", "crates", "map", "repo", "rs", "src", "termior"]
+        );
     }
 
     #[test]
