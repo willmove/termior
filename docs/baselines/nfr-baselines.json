@@ -1,5 +1,5 @@
 {
-  "notes": "NFR 回归基线（spec §8 NFR-01~04）。绝对值依赖 CI runner 硬件；门禁只看相对回归。macOS FPS 按 GitHub-hosted runner 实测约 40fps 固化；PTY 吞吐阈值放宽以吸收 ubuntu runner 噪声。v0.1.8 将 macOS 冷启动基线 1200→1700：SSH/SFTP 功能使两平台冷启动一致增加约 16-20%（Windows 149→178ms，macOS 1450→1685-1761ms，RSS/FPS 不变），且旧基线 1200 低于 v0.1.7 实测 1450，属过紧锚点；重锚到当前已知良好值以继续检测未来回归。 v0.2.0：Windows 冷启动基线 1500→800（=spec NFR-01 目标）。旧锚 1500 远高于实测（旧口径 149-178ms），退化 10 倍门禁都不报；同时首帧标记改为首帧 present 之后打印（本地开发机实测 627-683ms），故不锚到旧口径的 ~180ms。FPS 改为强制重绘口径并新增 frame_p99_ms / echo_p99_ms（首次采集只记录，稳定后再固化）；nfr-run 改用隔离的 TERMIOR_DATA_DIR，保证是 spec 的「空载 1 终端 tab」场景。v0.2.1：Windows FPS 基线 58→27。58 是旧口径（数刷新节拍）的值，换强制重绘口径后未重锚；GitHub-hosted Windows runner 走 WARP 软件光栅化，新口径实测 20-27fps（2026-09-30 三次：20/22/27，同版本 macOS 实测 50-56 正常，冷启动/RSS 优于基线），v0.2.0 tag 时旧口径实测 54。按 macOS「按 runner 实测固化」先例重锚到 27，继续以 40% 阈值检测未来回归。2026-10-15：同一口径在 hosted Windows runner 上 26 次实测 16-36fps（中位数 21），16fps 三次越线（+40.7%）且同提交重跑即过，属 1.5s 均值把 PowerShell 冷启动卡顿算进稳态。测量改为预热后 5 个 1s 窗口取中位数、CI 再取 3 次启动的中位数（见 docs/process/nfr-baselines.md）；基线 27 与 40% 阈值不动，持续退化仍会失败。2026-10-18：用 2026-10-16～18 的 25 次 Desktop CI（每次 3 次启动取中位数，渲染路径未改）重锚，并启用 Linux 与键入回显门禁。样本里 Linux xvfb 帧率只有 31 与 62–63 两档，帧间隔 p99 正好是 32ms / 16ms，且 window_active 都为 true，是 30Hz 与 60Hz 的 present 上限而不是负载噪声；冷启动同步分成约 152–204ms 与 216–233ms。基线取较差一档的实测上沿，阈值只留给再往外的退化：linux 冷启动 233ms/25%（最差 232.8）、RSS 188MiB/15%（最差 187.0）、FPS 31/20%（低档恒为 31）、回显 16.1ms/25%（最差 16.1）。macOS 冷启动 190–632（中位 340）相对旧锚 1700 已经判不出回归，重锚到最差中位数 632/35%；RSS 67.9–68.7 重锚到 69/20%；FPS 稳定在 59–60（中位数最低 59，单次启动最低 50），旧锚 40/30% 要掉到 28fps 才失败，重锚到 60/15%；回显中位数 18.6–24.4，基线 25/30%。Windows FPS 在新测量口径下仍有 5/25 次整次作业为 16–17fps（三次启动、五个 1s 窗口全部慢，frame_p99 152–198ms），同提交另一次是 28–36fps。慢的是整台 runner，预热和中位数滤不掉。旧锚 27/40% 的失败线是 16.2fps，压在健康样本地板上，所以与渲染无关的 PR 会红。重锚到地板 16/25%（失败线 12fps）：75 次启动里最低是 14fps，低于这条线才算超出已知噪声。Windows 冷启动实测 120–213、RSS 54–59，旧锚 800ms 与 300MiB 要退化数倍才报，改到 220ms/30% 与 60MiB/20%。三平台的 frame_p99，以及 Windows 回显（中位数 25–78，单次启动到过 929ms），方差大于还能分开的回归，继续只记录。",
+  "notes": "NFR 回归基线（spec §8 NFR-01~04）。绝对值依赖 CI runner 硬件；门禁只看相对回归。macOS FPS 按 GitHub-hosted runner 实测约 40fps 固化；PTY 吞吐阈值放宽以吸收 ubuntu runner 噪声。v0.1.8 将 macOS 冷启动基线 1200→1700：SSH/SFTP 功能使两平台冷启动一致增加约 16-20%（Windows 149→178ms，macOS 1450→1685-1761ms，RSS/FPS 不变），且旧基线 1200 低于 v0.1.7 实测 1450，属过紧锚点；重锚到当前已知良好值以继续检测未来回归。 v0.2.0：Windows 冷启动基线 1500→800（=spec NFR-01 目标）。旧锚 1500 远高于实测（旧口径 149-178ms），退化 10 倍门禁都不报；同时首帧标记改为首帧 present 之后打印（本地开发机实测 627-683ms），故不锚到旧口径的 ~180ms。FPS 改为强制重绘口径并新增 frame_p99_ms / echo_p99_ms（首次采集只记录，稳定后再固化）；nfr-run 改用隔离的 TERMIOR_DATA_DIR，保证是 spec 的「空载 1 终端 tab」场景。v0.2.1：Windows FPS 基线 58→27。58 是旧口径（数刷新节拍）的值，换强制重绘口径后未重锚；GitHub-hosted Windows runner 走 WARP 软件光栅化，新口径实测 20-27fps（2026-09-30 三次：20/22/27，同版本 macOS 实测 50-56 正常，冷启动/RSS 优于基线），v0.2.0 tag 时旧口径实测 54。按 macOS「按 runner 实测固化」先例重锚到 27，继续以 40% 阈值检测未来回归。2026-10-15：同一口径在 hosted Windows runner 上 26 次实测 16-36fps（中位数 21），16fps 三次越线（+40.7%）且同提交重跑即过，属 1.5s 均值把 PowerShell 冷启动卡顿算进稳态。测量改为预热后 5 个 1s 窗口取中位数、CI 再取 3 次启动的中位数（见 docs/process/nfr-baselines.md）；基线 27 与 40% 阈值不动，持续退化仍会失败。2026-10-18：用 2026-10-16～18 的 25 次 Desktop CI（每次 3 次启动取中位数，渲染路径未改）重锚，并启用 Linux 与键入回显门禁。样本里 Linux xvfb 帧率只有 31 与 62–63 两档，帧间隔 p99 正好是 32ms / 16ms，且 window_active 都为 true，是 30Hz 与 60Hz 的 present 上限而不是负载噪声；冷启动同步分成约 152–204ms 与 216–233ms。基线取较差一档的实测上沿，阈值只留给再往外的退化：linux 冷启动 233ms/25%（最差 232.8）、RSS 188MiB/15%（最差 187.0）、FPS 31/20%（低档恒为 31）、回显 16.1ms/25%（最差 16.1）。macOS 冷启动 190–632（中位 340）相对旧锚 1700 已经判不出回归，重锚到最差中位数 632/35%；RSS 67.9–68.7 重锚到 69/20%；FPS 稳定在 59–60（中位数最低 59，单次启动最低 50），旧锚 40/30% 要掉到 28fps 才失败，重锚到 60/15%；回显中位数 18.6–24.4，基线 25/30%。Windows FPS 在新测量口径下仍有 5/25 次整次作业为 16–17fps（三次启动、五个 1s 窗口全部慢，frame_p99 152–198ms），同提交另一次是 28–36fps。慢的是整台 runner，预热和中位数滤不掉。旧锚 27/40% 的失败线是 16.2fps，压在健康样本地板上，所以与渲染无关的 PR 会红。重锚到地板 16/25%（失败线 12fps）：75 次启动里最低是 14fps，低于这条线才算超出已知噪声。Windows 冷启动实测 120–213、RSS 54–59，旧锚 800ms 与 300MiB 要退化数倍才报，改到 220ms/30% 与 60MiB/20%。三平台的 frame_p99，以及 Windows 回显（中位数 25–78，单次启动到过 929ms），方差大于还能分开的回归，继续只记录。 2026-10-19：新增 Agent 上下文延迟（nfr-context，20,000 文件合成仓库，3 轮中位数）。首批只有 PR #61 一次 CI（每平台 3 轮），基线锚在各平台最慢那一轮并留宽阈值：linux 切片 p99 6.5ms/60%、增量 185ms/60%；macos 7.5ms/75%、190ms/75%；windows 16.5ms/75%、1050ms/75%。样本攒够后再收紧。",
   "baselines": [
     {
       "kind": "pty_throughput_mibps",
@@ -84,6 +84,48 @@
       "scenario": "typical",
       "value": 16.1,
       "threshold_percent": 25.0
+    },
+    {
+      "kind": "context_latency_p99_ms",
+      "platform": "linux",
+      "scenario": "repo_map_slice",
+      "value": 6.5,
+      "threshold_percent": 60.0
+    },
+    {
+      "kind": "repo_map_incremental_ms",
+      "platform": "linux",
+      "scenario": "repo_map_refresh",
+      "value": 185.0,
+      "threshold_percent": 60.0
+    },
+    {
+      "kind": "context_latency_p99_ms",
+      "platform": "macos",
+      "scenario": "repo_map_slice",
+      "value": 7.5,
+      "threshold_percent": 75.0
+    },
+    {
+      "kind": "repo_map_incremental_ms",
+      "platform": "macos",
+      "scenario": "repo_map_refresh",
+      "value": 190.0,
+      "threshold_percent": 75.0
+    },
+    {
+      "kind": "context_latency_p99_ms",
+      "platform": "windows",
+      "scenario": "repo_map_slice",
+      "value": 16.5,
+      "threshold_percent": 75.0
+    },
+    {
+      "kind": "repo_map_incremental_ms",
+      "platform": "windows",
+      "scenario": "repo_map_refresh",
+      "value": 1050.0,
+      "threshold_percent": 75.0
     }
   ]
 }
