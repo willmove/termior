@@ -391,6 +391,13 @@ fn automation_store_round_trips_without_changing_active_template_versions() {
             run_id: Some(run.run_id),
             kind: "trigger".into(),
             detail: "manual".into(),
+            trigger: Some("manual".into()),
+            template_version: Some(3),
+            dedupe_key: Some("manual".into()),
+            schedule_reason: Some("manual".into()),
+            retry_decision: None,
+            approval: None,
+            merge: None,
         }],
         engine: AutomationEngine::default(),
     };
@@ -670,4 +677,322 @@ fn orchestration_runtime_executes_ready_children_in_parallel_and_then_dependenci
     let after_index = completed.iter().position(|id| id == "after").unwrap();
     assert!(completed[..after_index].contains(&"a".to_string()));
     assert!(completed[..after_index].contains(&"b".to_string()));
+}
+
+struct ScriptedExecutor {
+    outcome: ExecutionOutcome,
+    executed: Vec<String>,
+}
+
+impl RunExecutor for ScriptedExecutor {
+    fn execute(&mut self, run: &AutomationRun) -> ExecutionOutcome {
+        self.executed.push(run.run_id.clone());
+        self.outcome.clone()
+    }
+}
+
+fn host_limits(concurrency: u16, budget: u64, used: u64) -> HostLimits {
+    HostLimits {
+        max_concurrency: concurrency,
+        disk_budget_bytes: budget,
+        disk_used_bytes: used,
+    }
+}
+
+#[test]
+fn host_tick_claims_and_executes_under_concurrency_and_disk_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = AutomationManager::load(dir.path()).unwrap();
+    let mut auto = automation(CatchUpPolicy::Skip);
+    auto.trigger = Trigger::Manual;
+    auto.template.max_concurrency = 4;
+    manager.upsert(auto).unwrap();
+    for offset in 0..3 {
+        manager.trigger_manual("daily", 100 + offset).unwrap();
+    }
+    let created = manager
+        .store
+        .audit
+        .iter()
+        .find(|event| event.kind == "manual")
+        .unwrap();
+    assert_eq!(created.trigger.as_deref(), Some("manual"));
+    assert_eq!(created.template_version, Some(3));
+    assert!(created.dedupe_key.is_some());
+    assert_eq!(created.schedule_reason.as_deref(), Some("manual"));
+
+    let mut executor = ScriptedExecutor {
+        outcome: ExecutionOutcome::Completed {
+            detail: "done".into(),
+        },
+        executed: Vec::new(),
+    };
+    let effects = manager
+        .tick(200, host_limits(1, 1_000, 10), &mut executor)
+        .unwrap();
+    assert_eq!(effects.len(), 1);
+    assert_eq!(executor.executed.len(), 1);
+    assert!(effects.iter().all(|effect| !effect.auto_approved));
+    assert_eq!(
+        manager
+            .store
+            .recent_runs
+            .iter()
+            .filter(|run| run.status == RunStatus::Queued)
+            .count(),
+        2
+    );
+
+    let mut blocked = ScriptedExecutor {
+        outcome: ExecutionOutcome::Completed {
+            detail: "should-not-run".into(),
+        },
+        executed: Vec::new(),
+    };
+    let blocked_effects = manager
+        .tick(201, host_limits(4, 100, 100), &mut blocked)
+        .unwrap();
+    assert!(blocked_effects.is_empty());
+    assert!(blocked.executed.is_empty());
+    assert!(manager.store.audit.iter().any(|event| {
+        event.kind == "deferred" && event.schedule_reason.as_deref() == Some("disk-budget")
+    }));
+
+    let mut tight = automation(CatchUpPolicy::Skip);
+    tight.id = "tight".into();
+    tight.trigger = Trigger::Manual;
+    tight.template.max_concurrency = 1;
+    manager.upsert(tight).unwrap();
+    for offset in 0..3 {
+        manager.trigger_manual("tight", 300 + offset).unwrap();
+    }
+    let mut limited = ScriptedExecutor {
+        outcome: ExecutionOutcome::Merged {
+            detail: "fast-forward".into(),
+        },
+        executed: Vec::new(),
+    };
+    let merged = manager
+        .tick(400, host_limits(8, 1_000, 10), &mut limited)
+        .unwrap();
+    assert!(merged.iter().all(|effect| !effect.auto_approved));
+    assert_eq!(
+        manager
+            .store
+            .recent_runs
+            .iter()
+            .filter(|run| run.automation_id == "tight" && run.status == RunStatus::Completed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        manager
+            .store
+            .recent_runs
+            .iter()
+            .filter(|run| run.automation_id == "tight" && run.status == RunStatus::Queued)
+            .count(),
+        2
+    );
+    assert!(manager
+        .store
+        .audit
+        .iter()
+        .any(|event| { event.kind == "merge" && event.merge.as_deref() == Some("fast-forward") }));
+    assert_eq!(
+        manager
+            .store
+            .recent_runs
+            .iter()
+            .filter(|run| run.automation_id == "daily" && run.status == RunStatus::Queued)
+            .count(),
+        0,
+        "queued runs execute once the disk budget allows them"
+    );
+}
+
+#[test]
+fn catch_up_admin_summary_counts_missed_coalesced_and_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = AutomationManager::load(dir.path()).unwrap();
+    let mut auto = automation(CatchUpPolicy::RunOnce);
+    manager.upsert(auto.clone()).unwrap();
+    let executable = manager.catch_up("daily", 0, 50).unwrap();
+    assert_eq!(executable.len(), 1);
+    let summary = admin_summary(&manager.store, "daily", 50).unwrap();
+    assert_eq!(summary.coalesced, 4);
+    assert_eq!(summary.missed, 0);
+    assert!(summary.next_run_at.is_some());
+    assert_eq!(summary.last_runs.len(), 5);
+
+    auto.id = "skip".into();
+    auto.catch_up = CatchUpPolicy::Skip;
+    manager.upsert(auto).unwrap();
+    assert!(manager.catch_up("skip", 0, 50).unwrap().is_empty());
+    let skipped = admin_summary(&manager.store, "skip", 50).unwrap();
+    assert_eq!(skipped.missed, 5);
+    assert_eq!(skipped.next_run_at, Some(60));
+
+    let mut event = automation(CatchUpPolicy::Skip);
+    event.id = "repo".into();
+    event.trigger = Trigger::RepoEvent {
+        event: "change".into(),
+        coalesce_seconds: 30,
+    };
+    manager.upsert(event).unwrap();
+    manager
+        .trigger_repo_event("repo", "repo", "one", 10)
+        .unwrap();
+    manager
+        .trigger_repo_event("repo", "repo", "one", 11)
+        .unwrap();
+    let repo = admin_summary(&manager.store, "repo", 11).unwrap();
+    assert_eq!(repo.duplicate, 1);
+    assert!(repo.next_run_at.is_none());
+}
+
+struct RefuseTools;
+
+impl termior_ai::RuntimeToolExecutor for RefuseTools {
+    fn execute(
+        &self,
+        _call_id: &str,
+        _tool: &str,
+        _arguments: &str,
+        _cancellation: &termior_ai::CancellationToken,
+    ) -> Result<termior_ai::ToolExecution, String> {
+        Err("automation executed a tool before approval".into())
+    }
+}
+
+#[test]
+fn automation_approval_waits_are_notified_and_never_auto_approved() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = AutomationManager::load(dir.path()).unwrap();
+    let mut auto = automation(CatchUpPolicy::Skip);
+    auto.trigger = Trigger::Manual;
+    auto.notification = NotificationPolicy::Actionable;
+    manager.upsert(auto.clone()).unwrap();
+    manager.trigger_manual("daily", 10).unwrap();
+    let claimed = manager.claim_queued(11, host_limits(2, 0, 0)).unwrap();
+    assert_eq!(claimed.len(), 1);
+
+    let provider =
+        termior_ai::MockProvider::single(vec![termior_ai::ChatEvent::Done(termior_ai::Message {
+            role: termior_ai::Role::Assistant,
+            content: String::new(),
+            tool_calls: vec![termior_ai::ToolCall {
+                id: "call-1".into(),
+                name: "write_file".into(),
+                arguments: r#"{"path":"notes.txt","content":"hi"}"#.into(),
+            }],
+            tool_result: None,
+        })]);
+    let outcome = futures::executor::block_on(drive_automation_run(
+        &claimed[0],
+        dir.path(),
+        Some(dir.path()),
+        &provider,
+        &RefuseTools,
+    ));
+    assert!(
+        matches!(outcome, ExecutionOutcome::NeedsApproval { .. }),
+        "{outcome:?}"
+    );
+    let effect = manager
+        .complete_run(&claimed[0].run_id, outcome, 12)
+        .unwrap();
+    let presentation = approval_presentation(NotificationPolicy::Actionable);
+    assert!(!presentation.open_modal);
+    assert!(!presentation.auto_approve);
+    assert!(presentation.notify);
+    assert_eq!(effect.status, RunStatus::WaitingUser);
+    assert!(effect.notify);
+    assert!(!effect.auto_approved);
+    let approval = manager
+        .store
+        .audit
+        .iter()
+        .find(|event| event.kind == "approval")
+        .unwrap();
+    assert_eq!(approval.approval.as_deref(), Some("waiting"));
+    assert_ne!(approval.approval.as_deref(), Some("approved"));
+    assert_eq!(approval.template_version, Some(claimed[0].template_version));
+    assert_eq!(
+        approval.dedupe_key.as_deref(),
+        Some(claimed[0].dedupe_key.as_str())
+    );
+
+    let recovered = termior_ai::TaskRuntime::recover_journal(
+        dir.path(),
+        &claimed[0].task_id,
+        termior_ai::ApprovalPolicy::Prompt,
+        termior_ai::ToolRegistry::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        recovered.task().state,
+        termior_ai::TaskState::WaitingApproval
+    );
+    assert!(recovered.invocations().iter().all(|invocation| {
+        invocation
+            .decision
+            .as_ref()
+            .is_none_or(|decision| !decision.approved)
+    }));
+    assert!(recovered
+        .invocations()
+        .iter()
+        .all(|invocation| invocation.state != termior_ai::ToolState::Approved));
+
+    auto.notification = NotificationPolicy::Muted;
+    manager.upsert(auto).unwrap();
+    manager.trigger_manual("daily", 20).unwrap();
+    let muted_run = manager.claim_queued(21, host_limits(2, 0, 0)).unwrap();
+    assert_eq!(muted_run.len(), 1);
+    let muted = manager
+        .complete_run(
+            &muted_run[0].run_id,
+            ExecutionOutcome::NeedsApproval {
+                detail: "needs a person".into(),
+            },
+            22,
+        )
+        .unwrap();
+    let muted_presentation = approval_presentation(NotificationPolicy::Muted);
+    assert!(!muted_presentation.open_modal);
+    assert!(!muted_presentation.auto_approve);
+    assert!(!muted_presentation.notify);
+    assert!(!muted.notify);
+    assert!(!muted.auto_approved);
+    assert_eq!(muted.status, RunStatus::WaitingUser);
+
+    manager.trigger_manual("daily", 30).unwrap();
+    let retry_run = manager.claim_queued(31, host_limits(1, 0, 0)).unwrap();
+    let retried = manager
+        .complete_run(
+            &retry_run[0].run_id,
+            ExecutionOutcome::Failed {
+                class: FailureClass::Transient,
+                idempotent: true,
+                result_known: true,
+                detail: "timeout".into(),
+            },
+            32,
+        )
+        .unwrap();
+    assert_eq!(retried.status, RunStatus::Failed);
+    assert!(manager.store.audit.iter().any(|event| {
+        event.kind == "retry" && event.retry_decision.as_deref() == Some("retry")
+    }));
+    assert!(manager
+        .store
+        .recent_runs
+        .iter()
+        .any(|run| run.schedule_reason == "retry" && run.status == RunStatus::Queued));
+    assert!(manager
+        .store
+        .audit
+        .iter()
+        .all(|event| { event.approval.as_deref() != Some("approved") }));
 }

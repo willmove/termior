@@ -43,14 +43,14 @@
 - [x] 5.4 实现受控本地 repo event trigger、稳定 dedupe key 和事件风暴合并
 - [x] 5.5 实现 retry classifier：只读/幂等 transient 可重试，unknown/非幂等进入 waiting-user
 - [x] 5.6 实现模板版本语义，编辑不会改变运行中 task 的后端/权限/预算
-- [ ] 5.7 增加 Automation 管理、next run、last runs、missed/coalesced/duplicate 和磁盘预算 UI
+- [x] 5.7 增加 Automation 管理、next run、last runs、missed/coalesced/duplicate 和磁盘预算 UI
 
 ## 6. 通知、预算与审计
 
 - [ ] 6.1 聚合 working 事件，只为 completed/failed/waiting/conflict/budget 发送可行动通知
-- [ ] 6.2 自动化等待审批时遵守通知策略，不弹出不可见的模态框或自动批准
+- [x] 6.2 自动化等待审批时遵守通知策略，不弹出不可见的模态框或自动批准
 - [ ] 6.3 展示 root task 与各 child/backend 的实际 token/cost/time/output，unknown cost 不显示为 0
-- [ ] 6.4 审计记录 trigger、template version、dedupe、调度原因、重试决策、审批和合并
+- [x] 6.4 审计记录 trigger、template version、dedupe、调度原因、重试决策、审批和合并
 
 ## 7. 评测与收尾
 
@@ -68,6 +68,6 @@
 - 0.x 阶段门禁未完成。
 - 2.5 无 queued reason 与并发上限调优 UI；4.2/4.3 仅有 `TaskTreeSnapshot` 数据，无任务树/DAG UI 与单个子任务取消入口。
 - 3.6 非 Git 项目、磁盘不足等边界场景未全部覆盖。
-- 5.7 Automations 面板已有 next run / last run / manual run，缺 missed/coalesced/duplicate 与磁盘预算展示；手动触发只写入 queued task，宿主尚无领取执行循环。
-- 6.x 通知聚合、预算用量展示与审计 UI 未完成。
+- 5.7、6.2、6.4 已由宿主调度循环补齐：运行中领取 queued run，管理面板显示 next/last、missed/coalesced/duplicate 与磁盘预算；审批等待不弹模态、不自动批准，审计含 trigger、template version、dedupe、调度原因、重试、审批与合并。
+- 6.1 通知聚合与 6.3 分后端用量展示仍未完成。
 - 7.3–7.6 基线对比、长期 smoke、用户文档与 strict 验证未完成。

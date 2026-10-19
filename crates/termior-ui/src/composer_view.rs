@@ -17,7 +17,11 @@ use termior_agent_host::{
     reconcile_persisted_backend_bindings, BackendEvent, CodexBackend, ExternalRecoveryTarget,
     ManagedAgentSession, PumpOutcome, TaskLaunch,
 };
-use termior_ai::automation::{next_run_after, AutomationManager, AutomationStore};
+use termior_ai::automation::{
+    admin_summary, approval_presentation, drive_automation_run, AutomationManager, AutomationRun,
+    AutomationStore, ExecutionOutcome, FailureClass, HostLimits, NotificationPolicy, RunEffect,
+    RunStatus,
+};
 use termior_ai::context_engine::{
     ContextAssembler, ContextCategory, ContextItem, ContextPlan, ContextSource, MemoryStatus,
     MemoryStore, RuleResolver, SkillIndex, SkillMetadata,
@@ -265,6 +269,12 @@ pub struct ComposerView {
     expanded_tools: HashSet<String>,
     /// history 末尾是否为流式文本占位：运行时实时推送的定稿消息到达时替换它。
     streaming_draft: bool,
+    /// 应用运行期间的 Automation 宿主循环是否已经启动。
+    automation_host_started: bool,
+    /// 设置里的 Agent 磁盘预算，宿主用它拒绝新的领取。
+    automation_disk_budget: u64,
+    /// 最近一次测到的 Agent 数据占用。`u64::MAX` 表示测量失败，按预算耗尽处理。
+    automation_disk_used: Option<u64>,
 }
 
 /// 消息区最多渲染的最近消息条数，超出部分丢弃以约束流式期间的重排成本。
