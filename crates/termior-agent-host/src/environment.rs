@@ -460,6 +460,10 @@ fn macos_profile(root: &Path, program: &Path, allow_network: bool) -> String {
         "(allow file-ioctl)".to_owned(),
         "(allow file-read-metadata)".to_owned(),
         "(allow file-map-executable)".to_owned(),
+        // macOS 26 aborts during dyld if the root vnode itself is unreadable,
+        // even when /usr and /System are allowed. A literal is not a subpath,
+        // so this does not grant the directory tree under /.
+        "(allow file-read* (literal \"/\"))".to_owned(),
     ];
     for subpath in [
         "/usr",

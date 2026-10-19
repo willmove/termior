@@ -35,7 +35,7 @@ Escape suite 在 Core 矩阵的 Ubuntu、macOS、Windows 上随 `cargo test` 运
 | 平台 | 文件/凭据/网络 | 进程树 | 行为 |
 |---|---|---|---|
 | Linux + `bwrap` | verified | verified | 系统库目录只读，工作区绑定到 `/workspace`，不挂载宿主根；清空环境；默认 unshare network/PID，沙箱退出后不留子进程 |
-| macOS + `sandbox-exec` | verified | verified | profile 默认拒绝；允许 dyld/libsystem 启动，只允许工作区写入和系统目录读取，默认拒绝网络，清空环境，退出时结束进程组 |
+| macOS + `sandbox-exec` | verified | verified | profile 默认拒绝；允许 dyld/libsystem 启动（含根 vnode 的 literal 读取，不含子树），只允许工作区写入和系统目录读取，默认拒绝网络，清空环境，退出时结束进程组 |
 | Windows | unsupported | verified | 当前没有经黑盒验证的文件/网络/凭据隔离；required 请求拒绝执行，escape suite 断言 fail closed |
 
 Windows 不会把普通进程或 Job Object 描述成完整 sandbox。选择 sandboxed 且要求上述能力时会 fail closed。direct/worktree 也不会被显示为 sandboxed。

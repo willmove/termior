@@ -106,6 +106,7 @@ fn platform_command_wrapper_fails_closed_or_uses_the_verified_native_boundary() 
                 for needle in [
                     "(allow file-map-executable)",
                     "(allow file-read-metadata)",
+                    "(allow file-read* (literal \"/\"))",
                     "(allow mach-priv-host-port)",
                     "(allow process-info* (target self))",
                     "(deny network*)",
