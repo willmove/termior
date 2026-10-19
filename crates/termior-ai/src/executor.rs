@@ -816,7 +816,7 @@ impl ToolExecutor {
         }
         std::fs::symlink_metadata(path)
             .ok()
-            .is_some_and(|metadata| !is_hardlinked_file(&metadata))
+            .is_some_and(|metadata| !is_hardlinked_file(path, &metadata))
     }
 
     fn ensure_inside_root(&self, path: &Path) -> Result<(), ToolError> {
@@ -842,7 +842,7 @@ impl ToolExecutor {
         };
         // Directories report nlink > 1 because of `.` and `..`. Only regular-file
         // hardlinks alias another inode without leaving the worktree root.
-        if is_hardlinked_file(&metadata) {
+        if is_hardlinked_file(path, &metadata) {
             return Err(ToolError::NotAuthorized(format!(
                 "hardlink escapes worktree: {}",
                 path.display()
@@ -1093,26 +1093,39 @@ fn collect_until_marker(
     }
 }
 
-fn is_hardlinked_file(metadata: &std::fs::Metadata) -> bool {
-    metadata.is_file() && link_count(metadata) > 1
+fn is_hardlinked_file(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file() && link_count(path, metadata) > 1
 }
 
-fn link_count(metadata: &std::fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.nlink()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        metadata.number_of_links()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = metadata;
-        1
-    }
+/// Same probe as checkpoint hardlink rejection. Windows `MetadataExt::number_of_links` is unstable.
+#[cfg(unix)]
+fn link_count(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink()
+}
+
+#[cfg(windows)]
+fn link_count(path: &Path, _metadata: &std::fs::Metadata) -> u64 {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("fsutil")
+        .args(["hardlink", "list"])
+        .arg(path)
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count() as u64
+        })
+        .unwrap_or(1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn link_count(_path: &Path, _metadata: &std::fs::Metadata) -> u64 {
+    1
 }
 
 fn shell_program(kind: ShellKind) -> &'static str {

@@ -897,7 +897,7 @@ impl RepoMap {
             return Err(ContextError::OutsideWorkspace(path));
         }
         if std::fs::symlink_metadata(&path)
-            .is_ok_and(|metadata| metadata.is_file() && metadata_link_count(&metadata) > 1)
+            .is_ok_and(|metadata| metadata.is_file() && metadata_link_count(&path, &metadata) > 1)
         {
             return Err(ContextError::OutsideWorkspace(path));
         }
@@ -1046,22 +1046,35 @@ fn stable_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn metadata_link_count(metadata: &std::fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.nlink()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        metadata.number_of_links()
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = metadata;
-        1
-    }
+/// Same probe as checkpoint hardlink rejection. Windows `MetadataExt::number_of_links` is unstable.
+#[cfg(unix)]
+fn metadata_link_count(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink()
+}
+
+#[cfg(windows)]
+fn metadata_link_count(path: &Path, _metadata: &std::fs::Metadata) -> u64 {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("fsutil")
+        .args(["hardlink", "list"])
+        .arg(path)
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count() as u64
+        })
+        .unwrap_or(1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_link_count(_path: &Path, _metadata: &std::fs::Metadata) -> u64 {
+    1
 }
 
 fn lexical_symbols(content: &str) -> Vec<String> {
