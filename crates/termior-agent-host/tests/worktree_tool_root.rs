@@ -21,6 +21,7 @@ fn worktree_tools_rules_and_repo_map_cannot_touch_the_main_checkout() {
     let repository = root.path().join("main");
     std::fs::create_dir(&repository).unwrap();
     git(&repository, &["init"]);
+    git(&repository, &["config", "core.autocrlf", "false"]);
     git(&repository, &["config", "user.email", "test@example.com"]);
     git(&repository, &["config", "user.name", "Termior Test"]);
     std::fs::write(repository.join("shared.txt"), "base\n").unwrap();
@@ -69,12 +70,15 @@ fn worktree_tools_rules_and_repo_map_cannot_touch_the_main_checkout() {
             .unwrap(),
         WORKTREE_BODY
     );
+    let shared = std::fs::read_to_string(environment.path.join("shared.txt")).unwrap();
     assert_eq!(
         executor
             .execute_auto("read_file", r#"{"path":"shared.txt"}"#)
             .unwrap(),
-        "base\n"
+        shared,
+        "read_file must return the worktree checkout, not the main working copy"
     );
+    assert_eq!(shared.replace("\r\n", "\n"), "base\n");
 
     for args in [
         serde_json::json!({"path": repository.join("secret.txt")}).to_string(),
@@ -154,8 +158,8 @@ fn worktree_tools_rules_and_repo_map_cannot_touch_the_main_checkout() {
         .unwrap();
     let canonical_worktree = std::fs::canonicalize(&environment.path).unwrap();
     assert!(
-        output.contains(&canonical_worktree.display().to_string())
-            || output.contains(&environment.path.display().to_string()),
+        output_contains_path(&output, &canonical_worktree)
+            || output_contains_path(&output, &environment.path),
         "command cwd was not the worktree: {output}"
     );
 
@@ -221,6 +225,24 @@ fn worktree_tools_rules_and_repo_map_cannot_touch_the_main_checkout() {
         }),
         "repo map included the main checkout: {main_hits:?}"
     );
+}
+
+fn output_contains_path(output: &str, path: &Path) -> bool {
+    let display = path.display().to_string();
+    let stripped = display
+        .trim_start_matches(r"\\?\")
+        .trim_start_matches("//?/")
+        .to_string();
+    let variants = [
+        display.clone(),
+        stripped.clone(),
+        stripped.replace('\\', "/"),
+        stripped.replace('/', "\\"),
+    ];
+    let folded = output.to_ascii_lowercase();
+    variants
+        .iter()
+        .any(|variant| folded.contains(&variant.to_ascii_lowercase()))
 }
 
 fn git(path: &Path, args: &[&str]) {
