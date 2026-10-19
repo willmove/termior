@@ -6,7 +6,7 @@ use tree_sitter::{InputEdit, Language, Parser, Point, Tree};
 
 use crate::BufferEdit;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyntaxLanguage {
     TypeScript,
     Tsx,
@@ -70,7 +70,7 @@ impl SyntaxLanguage {
         }
     }
 
-    fn tree_sitter_language(self) -> Option<Language> {
+    pub(crate) fn tree_sitter_language(self) -> Option<Language> {
         match self {
             Self::TypeScript => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
             Self::Tsx => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),

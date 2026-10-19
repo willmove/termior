@@ -8,6 +8,7 @@
 
 pub mod buffer;
 pub mod completion;
+pub mod outline;
 pub mod syntax;
 pub mod theme;
 pub mod vim;
@@ -16,6 +17,7 @@ pub use buffer::{
     BufferEdit, Cursor, EditError, EditorBuffer, SearchMatch, Selection, TextPoint, ViewportText,
 };
 pub use completion::{CompletionController, CompletionState};
+pub use outline::{FileOutline, OutlineExtractor, OutlineSymbol, SymbolKind};
 pub use syntax::{HighlightKind, HighlightSpan, SyntaxDocument, SyntaxLanguage};
 pub use theme::{builtin_editor_themes, EditorTheme};
 pub use vim::{Motion, VimCommand, VimEngine, VimMode};
