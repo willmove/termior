@@ -1,6 +1,7 @@
 //! Command/event driven reliable single-agent runtime (FR-ARUN / FR-ACHG).
 
 use crate::approval::ApprovalRequest;
+use crate::environment_pin::{EnvironmentPins, EnvironmentProfile, PinError, PinnedEnvironment};
 use crate::message::{ChatEvent, Message, Role, ToolResult};
 use crate::provider::{Provider, ProviderRequest};
 use crate::task::{
@@ -23,6 +24,9 @@ struct PersistedRuntimeState {
     task: Task,
     history: Vec<Message>,
     invocations: Vec<ToolInvocation>,
+    /// Environment ids pinned for this task. Absent on snapshots written before pinning.
+    #[serde(default)]
+    environment_pins: EnvironmentPins,
 }
 
 #[derive(Debug, Default)]
@@ -177,6 +181,7 @@ pub struct TaskRuntime {
     consecutive_compactions: u32,
     max_consecutive_compactions: u32,
     journal_data_root: Option<PathBuf>,
+    environment_pins: EnvironmentPins,
     /// Held for the lifetime of a journaled task so retention skips this session.
     session_lease: Option<termior_store::SessionLease>,
     persistence_error: Option<String>,
@@ -228,10 +233,38 @@ impl TaskRuntime {
             consecutive_compactions: 0,
             max_consecutive_compactions: 2,
             journal_data_root: None,
+            environment_pins: EnvironmentPins::default(),
             session_lease: None,
             persistence_error: None,
             message_observer: None,
         }
+    }
+
+    /// Record the environment this task was created in. The task id field becomes the pin id.
+    pub fn with_pinned_environment(mut self, pin: PinnedEnvironment) -> Result<Self, PinError> {
+        self.environment_pins.restore_pin(pin.clone())?;
+        self.task.environment_id = pin.id;
+        Ok(self)
+    }
+
+    pub fn pinned_environment(&self) -> Option<&PinnedEnvironment> {
+        self.environment_pins.get(&self.task.environment_id)
+    }
+
+    pub fn environment_pin(&self, id: &str) -> Option<&PinnedEnvironment> {
+        self.environment_pins.get(id)
+    }
+
+    /// Switch profile by allocating a new environment. The previous id keeps its grant.
+    pub fn rebind_environment(
+        &mut self,
+        profile: EnvironmentProfile,
+        root: impl Into<PathBuf>,
+    ) -> Result<PinnedEnvironment, PinError> {
+        let id = self.task.environment_id.clone();
+        let created = self.environment_pins.change_profile(&id, profile, root)?;
+        self.task.environment_id = created.id.clone();
+        Ok(created)
     }
 
     pub fn with_tools(mut self, tools: ToolRegistry) -> Self {
@@ -301,14 +334,20 @@ impl TaskRuntime {
         let snapshot = termior_store::TaskJournal::load_snapshot(&tasks_root, task_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "task snapshot is missing".to_owned())?;
-        let (mut task, mut history, mut invocations) =
+        let (mut task, mut history, mut invocations, snapshot_pins) =
             match serde_json::from_value::<PersistedRuntimeState>(snapshot.state.clone()) {
-                Ok(state) => (state.task, state.history, state.invocations),
+                Ok(state) => (
+                    state.task,
+                    state.history,
+                    state.invocations,
+                    state.environment_pins,
+                ),
                 Err(_) => (
                     serde_json::from_value::<Task>(snapshot.state)
                         .map_err(|error| format!("task snapshot is invalid: {error}"))?,
                     vec![],
                     vec![],
+                    EnvironmentPins::default(),
                 ),
             };
         let mut events = Vec::with_capacity(recovery.events.len());
@@ -367,6 +406,7 @@ impl TaskRuntime {
             consecutive_compactions: 0,
             max_consecutive_compactions: 2,
             journal_data_root: Some(data_root.to_path_buf()),
+            environment_pins: snapshot_pins,
             session_lease,
             persistence_error: None,
             message_observer: None,
@@ -504,16 +544,19 @@ impl TaskRuntime {
                 .map_err(|error| error.to_string())?;
         }
         journal
-            .write_snapshot(
-                serde_json::to_value(PersistedRuntimeState {
-                    task: self.task.clone(),
-                    history: self.history.clone(),
-                    invocations: self.invocations.clone(),
-                })
-                .map_err(|error| error.to_string())?,
-            )
+            .write_snapshot(self.persisted_state()?)
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    fn persisted_state(&self) -> Result<serde_json::Value, String> {
+        serde_json::to_value(PersistedRuntimeState {
+            task: self.task.clone(),
+            history: self.history.clone(),
+            invocations: self.invocations.clone(),
+            environment_pins: self.environment_pins.clone(),
+        })
+        .map_err(|error| error.to_string())
     }
 
     pub fn pending_approval(&self) -> Option<ApprovalRequest> {
@@ -1662,14 +1705,7 @@ impl TaskRuntime {
                 .map_err(|error| error.to_string())?;
             if task_event_is_critical(&event.kind) {
                 journal
-                    .write_snapshot(
-                        serde_json::to_value(PersistedRuntimeState {
-                            task: self.task.clone(),
-                            history: self.history.clone(),
-                            invocations: self.invocations.clone(),
-                        })
-                        .map_err(|error| error.to_string())?,
-                    )
+                    .write_snapshot(self.persisted_state()?)
                     .map_err(|error| error.to_string())?;
             }
             Ok(())

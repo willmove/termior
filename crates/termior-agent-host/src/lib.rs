@@ -13,6 +13,7 @@ mod cli;
 mod codex;
 mod environment;
 mod in_process;
+mod matrix;
 mod mcp;
 mod projection;
 mod restore;
@@ -35,6 +36,7 @@ pub use environment::{
     SandboxCapability, SandboxCommand, SandboxError, SandboxRequest, SandboxedProcess, TrustLevel,
 };
 pub use in_process::InProcessBackend;
+pub use matrix::{apply_sandbox_probe, capability_matrix, CapabilityMatrixRow};
 pub use mcp::{
     confine_workspace_path, ingest_tool_declarations, sanitize_untrusted_description, McpCatalog,
     McpDiscovery, McpHttpClient, McpHttpToolHandler, McpIngest, McpServerPool, McpStdioClient,

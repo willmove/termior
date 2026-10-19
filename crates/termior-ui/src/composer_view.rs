@@ -25,11 +25,11 @@ use termior_ai::context_engine::{
 use termior_ai::slash::{self, ComposerCommand, SlashAction, SlashCommand};
 use termior_ai::{
     AgentDefinition, AgentDefinitionStore, ApprovalPolicy, Attachment, AttachmentSource,
-    CancellationToken, ChangeSetId, ComposerDraft, EditProposalSummary, HttpProvider,
-    KeyringSecretStore, Message, Mode, ProviderConfig, Role, RuntimeBudgets, SecretStore,
-    SessionModel, SessionStore, Snippet, SnippetError, SnippetStore, TaskCommand, TaskConfig,
-    TaskRuntime, TaskState, TaskSummary, TaskSummaryStore, TerminalContext,
-    TerminalContextProvider, TodoStore, ToolExecutor, ToolRegistry, WaitingReason,
+    CancellationToken, ChangeSetId, ComposerDraft, EditProposalSummary, EnvironmentProfile,
+    HttpProvider, KeyringSecretStore, Message, Mode, PinnedEnvironment, ProviderConfig, Role,
+    RuntimeBudgets, SecretStore, SessionModel, SessionStore, Snippet, SnippetError, SnippetStore,
+    TaskCommand, TaskConfig, TaskRuntime, TaskState, TaskSummary, TaskSummaryStore,
+    TerminalContext, TerminalContextProvider, TodoStore, ToolExecutor, ToolRegistry, WaitingReason,
 };
 use termior_explorer_core::fuzzy::fuzzy_match;
 use termior_platform::AgentStatus;

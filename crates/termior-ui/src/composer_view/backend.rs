@@ -129,6 +129,20 @@ impl ComposerView {
             return;
         };
         let execution = self.orchestrator.take_execution_root(&self.workspace_root);
+        let profile = if execution.worktree.is_some() {
+            EnvironmentProfile::Worktree
+        } else {
+            EnvironmentProfile::Direct
+        };
+        let environment_pin = if execution.worktree.is_some() {
+            PinnedEnvironment::with_id(
+                execution.environment_id.clone(),
+                profile,
+                execution.root.clone(),
+            )
+        } else {
+            PinnedEnvironment::pin(profile, execution.root.clone())
+        };
         let mut rule_targets = self
             .draft
             .attachments
@@ -368,12 +382,15 @@ impl ComposerView {
         let policy = self.approval_policy();
         // 终端快捷入口和 worktree 都把这一任务的执行器钉在自己的根上，并放进 active_runtime。
         let mut runtime = runtime;
-        if execution.worktree.is_some() || execution.root != self.workspace_root {
+        if execution.worktree.is_some()
+            || execution.root != self.workspace_root
+            || execution.environment_id != environment_pin.id
+        {
             let registry = self
                 .full_tools
                 .clone()
                 .unwrap_or_else(|| runtime.tools.clone());
-            match self.executor_for_root(&execution.root, &registry, &execution.environment_id) {
+            match self.executor_for_root(&execution.root, &registry, &environment_pin.id) {
                 Ok(executor) => runtime.executor = executor,
                 Err(error) => {
                     self.set_status(tf!(
@@ -390,9 +407,9 @@ impl ComposerView {
         let task = TaskRuntime::new(
             TaskConfig::new(
                 user_input.clone(),
-                execution.root.clone(),
+                environment_pin.root.clone(),
                 "native",
-                execution.environment_id.clone(),
+                environment_pin.id.clone(),
             ),
             if policy == ApprovalPolicy::Yolo {
                 RuntimeBudgets::autonomous()
@@ -405,6 +422,18 @@ impl ComposerView {
         .with_history(history_before)
         .with_system_prompt(prompt)
         .with_model(runtime.config.model.clone());
+        let task = match task.with_pinned_environment(environment_pin) {
+            Ok(task) => task,
+            Err(error) => {
+                self.set_status(tf!(
+                    "composer.status.environment_pin_failed",
+                    "error" => error
+                ));
+                cx.emit(AgentStatus::Error);
+                cx.notify();
+                return;
+            }
+        };
         let task = if let Some(data_dir) = self.data_dir.as_ref() {
             task.with_output_store(data_dir.join("agent-artifacts"), 32 * 1024)
         } else {
@@ -559,9 +588,25 @@ impl ComposerView {
         self.draft.attachments.clear();
         self.cursor = 0;
         self.persist_session();
+        let environment_id = if self.orchestrator.external_session.is_some() {
+            self.orchestrator
+                .pinned_environment
+                .as_ref()
+                .map(|pin| pin.id.clone())
+                .unwrap_or_else(|| "codex-workspace-write".into())
+        } else {
+            let pin = PinnedEnvironment::pin(
+                EnvironmentProfile::external("codex"),
+                self.workspace_root.clone(),
+            );
+            let id = pin.id.clone();
+            self.orchestrator.remember_environment(pin);
+            id
+        };
         self.dispatch_external_command(
             ExternalCommand::Start {
                 task_id: new_session_id(),
+                environment_id,
                 text: user_input,
             },
             t!("composer.status.codex_working"),
@@ -864,8 +909,12 @@ fn run_external_command(
     let session = match existing {
         Some(session) => session,
         None => {
-            let task_id = match &command {
-                ExternalCommand::Start { task_id, .. } => task_id.clone(),
+            let (task_id, environment_id) = match &command {
+                ExternalCommand::Start {
+                    task_id,
+                    environment_id,
+                    ..
+                } => (task_id.clone(), environment_id.clone()),
                 ExternalCommand::Respond { .. } => {
                     return ExternalRunResult {
                         session: None,
@@ -888,7 +937,7 @@ fn run_external_command(
                 TaskLaunch {
                     task_id,
                     project_dir: project_dir.display().to_string(),
-                    environment_id: "codex-workspace-write".into(),
+                    environment_id,
                     model: None,
                 },
             );

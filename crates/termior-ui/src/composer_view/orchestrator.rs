@@ -12,9 +12,9 @@ use termior_agent_host::{
 };
 use termior_ai::context_engine::RepoMap;
 use termior_ai::{
-    ApprovalPolicy, ApprovalRequest, CancellationToken, EditProposalSummary, Mode, ProviderConfig,
-    RuntimeBudgets, TaskRuntime, TaskState, ToolContract, ToolExecutor, ToolRegistry,
-    WaitingReason,
+    ApprovalPolicy, ApprovalRequest, CancellationToken, EditProposalSummary, Mode,
+    PinnedEnvironment, ProviderConfig, RuntimeBudgets, TaskRuntime, TaskState, ToolContract,
+    ToolExecutor, ToolRegistry, WaitingReason,
 };
 use termior_platform::AgentStatus;
 use termior_vcs::{MergeBack, WorktreeEnvironment, WorktreeError, WorktreeManager};
@@ -130,6 +130,7 @@ impl ExternalPendingApproval {
 pub(super) enum ExternalCommand {
     Start {
         task_id: String,
+        environment_id: String,
         text: String,
     },
     Respond {
@@ -334,6 +335,8 @@ pub(super) struct ComposerOrchestrator {
     pub(super) active_runtime: Option<AgentRuntime>,
     pub(super) task_project_override: Option<PathBuf>,
     pub(super) bound_worktree: Option<WorktreeEnvironment>,
+    /// Environment pinned for the active or most recent task. Backend switches do not edit it.
+    pub(super) pinned_environment: Option<PinnedEnvironment>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) pending_git_review: Option<PendingGitReview>,
     repo_map: Option<RepoMap>,
@@ -359,6 +362,7 @@ impl ComposerOrchestrator {
             active_runtime: None,
             task_project_override: None,
             bound_worktree: None,
+            pinned_environment: None,
             pending_git_review: None,
             repo_map: None,
             repo_map_root: None,
@@ -542,10 +546,17 @@ impl ComposerOrchestrator {
         runtime: AgentRuntime,
         plan_request: bool,
     ) {
+        if let Some(pin) = task.pinned_environment().cloned() {
+            self.pinned_environment = Some(pin);
+        }
         self.active_runtime = Some(runtime);
         self.active_cancellation = Some(task.cancellation_token());
         self.active_plan_request = plan_request;
         self.active_task = Some(task);
+    }
+
+    pub(super) fn remember_environment(&mut self, pin: PinnedEnvironment) {
+        self.pinned_environment = Some(pin);
     }
 
     pub(super) fn clear_for_new_session(&mut self) {
@@ -1626,6 +1637,25 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn switching_backend_does_not_rewrite_a_pinned_environment() {
+        let mut orch = ComposerOrchestrator::new();
+        let pin = PinnedEnvironment::pin(
+            termior_ai::EnvironmentProfile::Sandboxed {
+                allow_network: false,
+            },
+            "/ws",
+        );
+        let before = pin.clone();
+        orch.remember_environment(pin);
+        orch.backend_choice = AgentBackendChoice::CodexAppServer;
+        assert_eq!(orch.pinned_environment.as_ref(), Some(&before));
+        assert_eq!(
+            orch.pinned_environment.as_ref().unwrap().grant.network,
+            termior_ai::AccessGrant::None
+        );
     }
 
     fn sample_runtime() -> AgentRuntime {
