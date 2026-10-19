@@ -6,7 +6,8 @@ use crate::{
     app_identity,
     composer_view::{
         ComposerAppAction, ComposerCollapse, ComposerCommandNotice, ComposerDockToggle,
-        ComposerLaunchCliAgent, ComposerView, EditReviewRequested, TerminalAgentAction,
+        ComposerLaunchCliAgent, ComposerView, EditReviewRequested, GitReviewRequested,
+        TerminalAgentAction,
     },
     editor_view::EditorView,
     git_views::{GitDiffAction, GitDiffView, GitHistoryAction, GitHistoryView},
@@ -539,6 +540,13 @@ impl WorkspaceView {
             &composer,
             |workspace, _composer, request: &EditReviewRequested, cx| {
                 workspace.open_ai_diff(request.0.clone(), cx);
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &composer,
+            |workspace, _composer, request: &GitReviewRequested, cx| {
+                workspace.open_worktree_git_review(request, cx);
             },
         )
         .detach();

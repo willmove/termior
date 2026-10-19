@@ -12,4 +12,7 @@ pub use repository::{
     parse_diff_hunks, BranchState, ChangeGroup, ChangedFile, CommitInfo, GitDiffHunk, GitError,
     GitRepository, RemoteOperation,
 };
-pub use worktree::{IntegrationPreview, WorktreeEnvironment, WorktreeError, WorktreeManager};
+pub use worktree::{
+    IntegrationPreview, MergeBack, MergeBackMethod, MergeBackReason, WorktreeEnvironment,
+    WorktreeError, WorktreeManager,
+};

@@ -548,7 +548,11 @@ impl RuleResolver {
             }
             let path = current.join("AGENTS.md");
             if path.is_file() {
-                let content = std::fs::read_to_string(&path)?;
+                let canonical = std::fs::canonicalize(&path)?;
+                if !canonical.starts_with(&self.root) {
+                    return Err(ContextError::OutsideWorkspace(canonical));
+                }
+                let content = std::fs::read_to_string(&canonical)?;
                 result.push(RuleDocument {
                     path,
                     scope: current.clone(),
@@ -892,6 +896,11 @@ impl RepoMap {
         if !path.starts_with(&root) {
             return Err(ContextError::OutsideWorkspace(path));
         }
+        if std::fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata_link_count(&path, &metadata) > 1)
+        {
+            return Err(ContextError::OutsideWorkspace(path));
+        }
         let content = std::fs::read_to_string(&path)?;
         let symbols = lexical_symbols(&content);
         let references = lexical_references(&content, &symbols);
@@ -1035,6 +1044,37 @@ fn field<'a>(front: &'a str, name: &str) -> Option<&'a str> {
 }
 fn stable_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Same probe as checkpoint hardlink rejection. Windows `MetadataExt::number_of_links` is unstable.
+#[cfg(unix)]
+fn metadata_link_count(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.nlink()
+}
+
+#[cfg(windows)]
+fn metadata_link_count(path: &Path, _metadata: &std::fs::Metadata) -> u64 {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("fsutil")
+        .args(["hardlink", "list"])
+        .arg(path)
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count() as u64
+        })
+        .unwrap_or(1)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_link_count(_path: &Path, _metadata: &std::fs::Metadata) -> u64 {
+    1
 }
 
 fn lexical_symbols(content: &str) -> Vec<String> {

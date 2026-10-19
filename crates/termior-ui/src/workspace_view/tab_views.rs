@@ -332,6 +332,57 @@ impl WorkspaceView {
         self.activate_runtime(id, cx);
         cx.notify();
     }
+
+    /// Source Control plus a read-only patch tab. The target checkout is not modified here.
+    pub(super) fn open_worktree_git_review(
+        &mut self,
+        request: &GitReviewRequested,
+        cx: &mut Context<Self>,
+    ) {
+        self.model.sidebar_panel = SidebarPanel::SourceControl;
+        self.refresh_workspace_data(cx);
+        let resource = format!("worktree-review:{}", request.worktree_path.display());
+        if let Some(id) = self
+            .model
+            .tabs
+            .iter()
+            .find(|tab| {
+                tab.kind == TabKind::GitDiff && tab.resource.as_deref() == Some(resource.as_str())
+            })
+            .map(|tab| tab.id)
+        {
+            self.activate_runtime(id, cx);
+            cx.notify();
+            return;
+        }
+        let title = if request.conflicts.is_empty() {
+            format!("{} ({})", t!("ws.worktree_review"), request.reason)
+        } else {
+            format!(
+                "{} ({}; {})",
+                t!("ws.worktree_review"),
+                request.reason,
+                request.conflicts.join(", ")
+            )
+        };
+        let entity = cx.new(|_| {
+            GitDiffView::commit_file(
+                request.repository.display().to_string(),
+                request.patch.clone(),
+            )
+        });
+        let id = self.model.new_tab(TabKind::GitDiff, title, false);
+        if let Some(tab) = self.model.active_tab_mut() {
+            tab.resource = Some(resource);
+        }
+        self.tabs.push(AppTab {
+            id,
+            panes: single_pane(PaneContent::GitDiff(entity)),
+        });
+        self.activate_runtime(id, cx);
+        cx.notify();
+    }
+
     fn handle_git_diff_action(
         &mut self,
         view: &Entity<GitDiffView>,

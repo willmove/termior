@@ -4,6 +4,59 @@ use super::helpers::{new_session_id, requested_skill_names, user_home_dir};
 use super::*;
 
 impl ComposerView {
+    /// Bind later builtin tasks to a worktree. The executor, terminal cwd, rules, and repo map
+    /// then use the worktree path until the binding is replaced.
+    #[allow(dead_code)]
+    pub fn bind_worktree(&mut self, environment: termior_vcs::WorktreeEnvironment) {
+        self.orchestrator.bind_worktree(environment);
+    }
+
+    /// Merge the bound worktree when that is a conflict-free fast-forward or cherry-pick.
+    /// Every other outcome opens the Git review flow and leaves the target checkout unchanged.
+    #[allow(dead_code)]
+    pub fn merge_bound_worktree(
+        &mut self,
+        target_ref: &str,
+        validation_passed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match self
+            .orchestrator
+            .integrate_worktree(target_ref, validation_passed)
+        {
+            Ok(termior_vcs::MergeBack::Applied { method, .. }) => {
+                self.set_status(tf!(
+                    "composer.status.worktree_merged",
+                    "target" => target_ref,
+                    "method" => method.to_string()
+                ));
+            }
+            Ok(termior_vcs::MergeBack::Review { .. }) => {
+                if let Some(review) = self.orchestrator.take_git_review() {
+                    self.set_status(tf!(
+                        "composer.status.worktree_review",
+                        "reason" => review.reason.clone()
+                    ));
+                    cx.emit(GitReviewRequested {
+                        repository: review.repository,
+                        worktree_path: review.worktree_path,
+                        reason: review.reason,
+                        patch: review.patch,
+                        conflicts: review.conflicts,
+                    });
+                }
+            }
+            Err(error) => {
+                self.set_status(tf!(
+                    "composer.status.worktree_merge_failed",
+                    "error" => error.to_string()
+                ));
+                cx.emit(AgentStatus::Error);
+            }
+        }
+        cx.notify();
+    }
+
     pub(super) fn cycle_custom_agent(&mut self, cx: &mut Context<Self>) {
         if self.orchestrator.submission_blocked() {
             return;
@@ -75,6 +128,7 @@ impl ComposerView {
             cx.notify();
             return;
         };
+        let execution = self.orchestrator.take_execution_root(&self.workspace_root);
         let mut rule_targets = self
             .draft
             .attachments
@@ -84,8 +138,19 @@ impl ComposerView {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        if execution.worktree.is_some() {
+            rule_targets.retain(|path| path != &self.workspace_root);
+        }
         if rule_targets.is_empty() {
-            rule_targets.push(self.workspace_root.clone());
+            rule_targets.push(execution.root.clone());
+        }
+        if execution.worktree.is_some() {
+            if let Err(path) = paths_inside(&execution.root, &rule_targets) {
+                self.set_status(tf!("composer.status.outside_worktree", "path" => path.display()));
+                cx.emit(AgentStatus::Error);
+                cx.notify();
+                return;
+            }
         }
         let mut payload = match self.draft.build_payload(&runtime.tools) {
             Ok(payload) => payload,
@@ -139,7 +204,7 @@ impl ComposerView {
                 100,
             ),
         ];
-        let rules = match RuleResolver::new(&self.workspace_root).and_then(|resolver| {
+        let rules = match RuleResolver::new(&execution.root).and_then(|resolver| {
             let mut unique = BTreeMap::new();
             for target in &rule_targets {
                 for rule in resolver.for_path(target)? {
@@ -167,20 +232,36 @@ impl ComposerView {
             item.required = true;
             context_items.push(item);
         }
+        if execution.worktree.is_some() {
+            if let Ok(excerpt) = self
+                .orchestrator
+                .worktree_repo_excerpt(&execution.root, &user_input)
+            {
+                if !excerpt.is_empty() {
+                    context_items.push(ContextItem::inline(
+                        "worktree-repo-map",
+                        ContextCategory::Evidence,
+                        ContextSource::Workspace(execution.root.clone()),
+                        redactor.redact(&excerpt).text,
+                        80,
+                    ));
+                }
+            }
+        }
         let requested_skills = requested_skill_names(&user_input, &self.skills);
         self.active_skills.clear();
         if !requested_skills.is_empty() {
             let user_skills_root = user_home_dir().map(|home| home.join(".agents").join("skills"));
-            let index =
-                match SkillIndex::scan_sources(&self.workspace_root, user_skills_root.as_deref()) {
-                    Ok(index) => index,
-                    Err(error) => {
-                        self.set_status(tf!("composer.status.skill_failed", "error" => error));
-                        cx.emit(AgentStatus::Error);
-                        cx.notify();
-                        return;
-                    }
-                };
+            let index = match SkillIndex::scan_sources(&execution.root, user_skills_root.as_deref())
+            {
+                Ok(index) => index,
+                Err(error) => {
+                    self.set_status(tf!("composer.status.skill_failed", "error" => error));
+                    cx.emit(AgentStatus::Error);
+                    cx.notify();
+                    return;
+                }
+            };
             let task_tools = runtime
                 .tools
                 .contracts()
@@ -285,35 +366,34 @@ impl ComposerView {
             runtime.tools.clone()
         };
         let policy = self.approval_policy();
-        // 终端快捷入口把任务固定到命令所在项目：执行器以该目录为根，任务的 project_dir 随之固定。
+        // 终端快捷入口和 worktree 都把这一任务的执行器钉在自己的根上，并放进 active_runtime。
         let mut runtime = runtime;
-        let project_dir = match self.orchestrator.take_project_override() {
-            Some(dir) if dir != self.workspace_root => {
-                let tools = self
-                    .full_tools
-                    .clone()
-                    .unwrap_or_else(|| runtime.tools.clone());
-                match self.build_executor(&dir, &tools) {
-                    Ok(executor) => {
-                        runtime.executor = executor;
-                        dir
-                    }
-                    Err(error) => {
-                        self.set_status(tf!(
-                            "composer.status.project_pin_failed",
-                            "dir" => dir.display(),
-                            "error" => error
-                        ));
-                        cx.emit(AgentStatus::Error);
-                        cx.notify();
-                        return;
-                    }
+        if execution.worktree.is_some() || execution.root != self.workspace_root {
+            let registry = self
+                .full_tools
+                .clone()
+                .unwrap_or_else(|| runtime.tools.clone());
+            match self.executor_for_root(&execution.root, &registry, &execution.environment_id) {
+                Ok(executor) => runtime.executor = executor,
+                Err(error) => {
+                    self.set_status(tf!(
+                        "composer.status.project_pin_failed",
+                        "dir" => execution.root.display(),
+                        "error" => error
+                    ));
+                    cx.emit(AgentStatus::Error);
+                    cx.notify();
+                    return;
                 }
             }
-            _ => self.workspace_root.clone(),
-        };
+        }
         let task = TaskRuntime::new(
-            TaskConfig::new(user_input.clone(), project_dir, "native", "direct"),
+            TaskConfig::new(
+                user_input.clone(),
+                execution.root.clone(),
+                "native",
+                execution.environment_id.clone(),
+            ),
             if policy == ApprovalPolicy::Yolo {
                 RuntimeBudgets::autonomous()
             } else {
@@ -920,4 +1000,15 @@ fn run_external_command(
             }
         };
     }
+}
+
+fn paths_inside(root: &Path, paths: &[PathBuf]) -> Result<(), PathBuf> {
+    let root = std::fs::canonicalize(root).map_err(|_| root.to_path_buf())?;
+    for path in paths {
+        let canonical = std::fs::canonicalize(path).map_err(|_| path.clone())?;
+        if canonical != root && !canonical.starts_with(&root) {
+            return Err(canonical);
+        }
+    }
+    Ok(())
 }

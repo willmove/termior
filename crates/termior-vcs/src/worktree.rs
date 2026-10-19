@@ -25,6 +25,56 @@ pub struct IntegrationPreview {
     pub conflicts: Vec<String>,
 }
 
+/// How a conflict-free worktree was applied onto the target checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeBackMethod {
+    FastForward,
+    CherryPick,
+}
+
+impl std::fmt::Display for MergeBackMethod {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::FastForward => "fast-forward",
+            Self::CherryPick => "cherry-pick",
+        })
+    }
+}
+
+/// Why automatic merge-back stopped and the existing Git review flow should open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeBackReason {
+    ValidationFailed,
+    DirtyWorktree,
+    DirtyTarget,
+    Conflict,
+    NotSafe,
+}
+
+impl std::fmt::Display for MergeBackReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ValidationFailed => "validation-failed",
+            Self::DirtyWorktree => "dirty-worktree",
+            Self::DirtyTarget => "dirty-target",
+            Self::Conflict => "conflict",
+            Self::NotSafe => "not-safe",
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeBack {
+    Applied {
+        method: MergeBackMethod,
+        commit: String,
+    },
+    Review {
+        reason: MergeBackReason,
+        preview: IntegrationPreview,
+    },
+}
+
 pub struct WorktreeManager;
 impl WorktreeManager {
     pub fn create(
@@ -104,6 +154,105 @@ impl WorktreeManager {
         })
     }
 
+    /// Apply the worktree onto `target_ref` only when that is a clean fast-forward or a
+    /// conflict-free cherry-pick. Every other case returns [`MergeBack::Review`] and leaves
+    /// both checkouts untouched, including uncommitted user edits in the target.
+    pub fn merge_back(
+        environment: &WorktreeEnvironment,
+        target_ref: &str,
+        validation_passed: bool,
+    ) -> Result<MergeBack, WorktreeError> {
+        let mut preview = Self::integration_preview(environment, target_ref)?;
+        let repository = &environment.repository;
+        let target_dirty = !git(repository, &["status", "--porcelain"])?
+            .trim()
+            .is_empty();
+        let review = |reason: MergeBackReason, preview: IntegrationPreview| MergeBack::Review {
+            reason,
+            preview,
+        };
+        if !validation_passed {
+            return Ok(review(MergeBackReason::ValidationFailed, preview));
+        }
+        if preview.dirty {
+            return Ok(review(MergeBackReason::DirtyWorktree, preview));
+        }
+        if target_dirty {
+            return Ok(review(MergeBackReason::DirtyTarget, preview));
+        }
+        if git_succeeded(repository, &["rev-parse", "-q", "--verify", "MERGE_HEAD"])?
+            || git_succeeded(
+                repository,
+                &["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"],
+            )?
+        {
+            return Ok(review(MergeBackReason::NotSafe, preview));
+        }
+
+        let head = git(&environment.path, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+        let checked_out = git(repository, &["rev-parse", "HEAD"])?.trim().to_owned();
+        if checked_out != preview.target_commit {
+            return Ok(review(MergeBackReason::NotSafe, preview));
+        }
+        if git_succeeded(
+            repository,
+            &["merge-base", "--is-ancestor", &head, &checked_out],
+        )? {
+            return Ok(MergeBack::Applied {
+                method: MergeBackMethod::FastForward,
+                commit: checked_out,
+            });
+        }
+        if git_succeeded(
+            repository,
+            &["merge-base", "--is-ancestor", &preview.target_commit, &head],
+        )? {
+            if git(repository, &["merge", "--ff-only", &head]).is_err() {
+                return Ok(review(MergeBackReason::NotSafe, preview));
+            }
+            let commit = git(repository, &["rev-parse", "HEAD"])?.trim().to_owned();
+            return Ok(MergeBack::Applied {
+                method: MergeBackMethod::FastForward,
+                commit,
+            });
+        }
+
+        if let Some(conflicts) = merge_tree_conflicts(repository, &preview.target_commit, &head)? {
+            preview.conflicts = conflicts;
+            return Ok(review(MergeBackReason::Conflict, preview));
+        }
+        let range = format!("{}..{head}", preview.target_commit);
+        match git(
+            repository,
+            &["rev-list", "--merges", "--max-count=1", &range],
+        ) {
+            Ok(text) if text.trim().is_empty() => {}
+            _ => return Ok(review(MergeBackReason::NotSafe, preview)),
+        }
+
+        let before = checked_out;
+        if git(repository, &["cherry-pick", &range]).is_err() {
+            let _ = git(repository, &["cherry-pick", "--abort"]);
+            let restored = git(repository, &["rev-parse", "HEAD"])
+                .map(|commit| commit.trim() == before)
+                .unwrap_or(false);
+            if !restored {
+                return Err(WorktreeError::Git(
+                    "cherry-pick abort did not restore the target checkout".into(),
+                ));
+            }
+            preview.conflicts = vec!["cherry-pick".into()];
+            return Ok(review(MergeBackReason::Conflict, preview));
+        }
+        let commit = git(repository, &["rev-parse", "HEAD"])?.trim().to_owned();
+        Ok(MergeBack::Applied {
+            method: MergeBackMethod::CherryPick,
+            commit,
+        })
+    }
+
     pub fn remove(
         environment: &WorktreeEnvironment,
         active_processes: bool,
@@ -125,15 +274,26 @@ impl WorktreeManager {
     }
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
+fn git_command(cwd: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
-    command.arg("-C").arg(cwd).args(args).stdin(Stdio::null());
+    command
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdin(Stdio::null())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let output = command
+    command
+}
+
+fn git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
+    let output = git_command(cwd, args)
         .output()
         .map_err(|error| WorktreeError::Git(error.to_string()))?;
     if output.status.success() {
@@ -143,6 +303,58 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, WorktreeError> {
             String::from_utf8_lossy(&output.stderr).trim().into(),
         ))
     }
+}
+
+/// `true` when git exits 0. Exit code 1 is `false` (ancestor checks, missing refs).
+fn git_succeeded(cwd: &Path, args: &[&str]) -> Result<bool, WorktreeError> {
+    let status = git_command(cwd, args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| WorktreeError::Git(error.to_string()))?;
+    if status.success() {
+        Ok(true)
+    } else if status.code() == Some(1) {
+        Ok(false)
+    } else {
+        Err(WorktreeError::Git(format!(
+            "git {args:?} exited with {status}"
+        )))
+    }
+}
+
+/// `Ok(None)` when the two trees merge cleanly. `Ok(Some)` lists conflicted paths and does not
+/// touch either checkout. A git that cannot run `merge-tree --write-tree` is not a safe path.
+fn merge_tree_conflicts(
+    repository: &Path,
+    target: &str,
+    head: &str,
+) -> Result<Option<Vec<String>>, WorktreeError> {
+    let output = git_command(
+        repository,
+        &["merge-tree", "--write-tree", "--name-only", target, head],
+    )
+    .output()
+    .map_err(|error| WorktreeError::Git(error.to_string()))?;
+    if output.status.success() {
+        return Ok(None);
+    }
+    if output.status.code() == Some(1) {
+        let names = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        return Ok(Some(if names.is_empty() {
+            vec!["conflict".into()]
+        } else {
+            names
+        }));
+    }
+    Err(WorktreeError::Git(
+        String::from_utf8_lossy(&output.stderr).trim().into(),
+    ))
 }
 
 #[derive(Debug, Error)]
