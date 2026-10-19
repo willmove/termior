@@ -1570,6 +1570,7 @@ mod tests {
         let repository = root.path().join("main");
         std::fs::create_dir(&repository).unwrap();
         git(&repository, &["init"]);
+        git(&repository, &["config", "core.autocrlf", "false"]);
         git(&repository, &["config", "user.email", "test@example.com"]);
         git(&repository, &["config", "user.name", "Termior Test"]);
         std::fs::write(repository.join("a.txt"), "base\n").unwrap();

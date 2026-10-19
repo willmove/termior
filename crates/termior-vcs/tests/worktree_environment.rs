@@ -15,6 +15,7 @@ fn git(path: &std::path::Path, args: &[&str]) {
 fn worktree_creation_binds_task_and_removal_checks_dirty_and_processes() {
     let root = tempfile::tempdir().unwrap();
     git(root.path(), &["init"]);
+    git(root.path(), &["config", "core.autocrlf", "false"]);
     git(root.path(), &["config", "user.email", "test@example.com"]);
     git(root.path(), &["config", "user.name", "Termior Test"]);
     std::fs::write(root.path().join("a.txt"), "base\n").unwrap();
@@ -181,6 +182,7 @@ fn repo_with_worktree() -> Checkout {
     let repository = root.path().join("main");
     std::fs::create_dir(&repository).unwrap();
     git(&repository, &["init"]);
+    git(&repository, &["config", "core.autocrlf", "false"]);
     git(&repository, &["config", "user.email", "test@example.com"]);
     git(&repository, &["config", "user.name", "Termior Test"]);
     std::fs::write(repository.join("a.txt"), "base\n").unwrap();
