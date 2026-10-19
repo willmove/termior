@@ -17,6 +17,10 @@ termior-store = { workspace = true }
 wait-timeout = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+url = { workspace = true }
+getrandom = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

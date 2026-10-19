@@ -38,7 +38,7 @@
 
 - [x] 5.1 选择许可兼容的 Rust MCP 实现或写最小协议层，记录依赖体积/启动/RSS 影响
 - [x] 5.2 实现 stdio server 进程管理、初始化、tools/resources/prompts discovery 和连接隔离
-- [ ] 5.3 实现 Streamable HTTP、授权发现、PKCE/resource binding、token refresh 和 keyring 存储
+- [x] 5.3 实现 Streamable HTTP、授权发现、PKCE/resource binding、token refresh 和 keyring 存储
 - [x] 5.4 将 MCP tools 映射为 server-qualified ToolContract，接入 schema/审批/超时/输出/脱敏/审计
 - [ ] 5.5 处理 list-changed 通知、server 断开、同名工具和不可信描述；单 server 故障不拖垮任务
 - [ ] 5.6 建立恶意 fake MCP server 红队：工具投毒、超大输出、路径逃逸、token 泄漏和断线重连
@@ -72,7 +72,6 @@
 
 - 0.x 阶段门禁：M7 未归档。
 - 3.3 仓库地图基于词法 symbol/reference 提取，尚未接入 tree-sitter（偏差，需更新 design 或补实现）。
-- 5.3 MCP HTTP 仅完成 HTTPS 限制、Bearer/session 与 callback state/resource 校验；授权服务器发现、PKCE 登录、refresh token 与 keyring UI 未接入。
 - 5.5 未处理 `list_changed` 通知。
 - 5.6 恶意 fake MCP server 红队未覆盖 token 泄漏与断线重连。
 - 7.5 未用 Gemini CLI / OpenCode 做真实 ACP 端到端 smoke。

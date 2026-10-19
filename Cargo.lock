@@ -6547,10 +6547,13 @@ dependencies = [
 name = "termior-agent-host"
 version = "0.2.4"
 dependencies = [
+ "base64",
  "futures",
+ "getrandom 0.2.17",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "termior-ai",
  "termior-security",
@@ -6558,6 +6561,7 @@ dependencies = [
  "termior-terminal",
  "termior-vcs",
  "thiserror 1.0.69",
+ "url",
  "wait-timeout",
 ]
 

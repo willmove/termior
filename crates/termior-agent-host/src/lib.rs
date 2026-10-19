@@ -15,6 +15,7 @@ mod environment;
 mod in_process;
 mod matrix;
 mod mcp;
+mod mcp_oauth;
 mod projection;
 mod restore;
 mod session;
@@ -43,6 +44,12 @@ pub use mcp::{
     McpStdioSpec, McpStdioToolHandler, McpToolDeclaration, McpTransport, OAuthPkceRequest,
     QualifiedMcpTool, ServerLink, ServerLinkState, MCP_DESCRIPTION_MAX_CHARS, MCP_MAX_OUTPUT_BYTES,
     MCP_PROTOCOL_VERSION, TOOLS_LIST_CHANGED,
+};
+pub use mcp_oauth::{
+    discover_authorization, login_with_browser, logout_mcp_server, mcp_oauth_key, mcp_servers_path,
+    oauth_code_challenge_s256, system_clock, DiscoveredAuthorization, McpClock, McpLoginStatus,
+    McpLogoutReport, McpOAuthBinding, McpRemoteServer, McpServerCatalog, PkceLoginOptions,
+    MCP_AUTH_DETAIL_REFRESH_REJECTED, MCP_AUTH_DETAIL_REVOKE_FAILED,
 };
 pub use projection::BackendTaskProjector;
 pub use restore::{
