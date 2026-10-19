@@ -98,6 +98,7 @@ impl gpui::Render for ComposerView {
         let context_inspector = self.render_context_inspector(&p, cx);
         let recovery_center = self.render_recovery_center(&p, cx);
         let automation_center = self.render_automation_center(&p, cx);
+        let task_tree_center = self.render_task_tree_center(&p, cx);
         let checkpoint_center = self.render_checkpoint_center(&p, cx);
         let skill_center = self.render_skill_center(&p, cx);
         let memory_center = self.render_memory_center(&p, cx);
@@ -162,6 +163,7 @@ impl gpui::Render for ComposerView {
             .or(skill_center)
             .or(checkpoint_center)
             .or(automation_center)
+            .or(task_tree_center)
             .or(recovery_center)
             .or(context_inspector);
         let prompt_row = self.render_prompt_row(&p, window, placeholder_active, input_display);
@@ -302,6 +304,29 @@ impl gpui::Render for ComposerView {
                                                 cx.listener(|this, _, _, cx| {
                                                     cx.stop_propagation();
                                                     this.toggle_center(ComposerCenter::Automations);
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("composer-task-tree")
+                                            .debug_selector(|| "composer-task-tree".into())
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .rounded_md()
+                                            .bg(crate::ui::alpha(p.accent, 0.16))
+                                            .text_xs()
+                                            .cursor_pointer()
+                                            .child(tf!(
+                                                "composer.task_tree.badge",
+                                                "count" => self.task_tree.nodes.len()
+                                            ))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.toggle_center(ComposerCenter::TaskTree);
                                                     cx.notify();
                                                 }),
                                             ),

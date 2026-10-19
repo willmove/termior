@@ -17,7 +17,7 @@
 - [x] 2.2 实现持久 ready queue 和公平排序，应用关闭/重启后从 journal 重建
 - [x] 2.3 实现 global/provider/workspace/environment slots 与父任务 token/time/cost/output 预留
 - [x] 2.4 集中处理 Provider rate limit/backoff，禁止各子任务叠加无界重试
-- [ ] 2.5 增加 queued reason、预计可运行条件和用户调优并发上限 UI
+- [x] 2.5 增加 queued reason、预计可运行条件和用户调优并发上限 UI
 
 ## 3. 读写隔离与结果合并
 
@@ -31,8 +31,8 @@
 ## 4. 任务树与计划接入
 
 - [x] 4.1 把 PlanStepKind::Subagent 映射为 ChildTaskSpec，spawn 前保留用户拒绝入口
-- [ ] 4.2 增加任务树/DAG UI，显示后端、环境、依赖、状态、预算、验证和 blockers
-- [ ] 4.3 支持查看/取消单个子任务和聚合取消；不得从 UI 删除尚有 unknown 副作用的记录
+- [x] 4.2 增加任务树/DAG UI，显示后端、环境、依赖、状态、预算、验证和 blockers
+- [x] 4.3 支持查看/取消单个子任务和聚合取消；不得从 UI 删除尚有 unknown 副作用的记录
 - [x] 4.4 限制默认派生深度为 2，提供循环/爆炸性 spawn 的红队测试
 
 ## 5. Automation 模型与触发
@@ -49,7 +49,7 @@
 
 - [ ] 6.1 聚合 working 事件，只为 completed/failed/waiting/conflict/budget 发送可行动通知
 - [x] 6.2 自动化等待审批时遵守通知策略，不弹出不可见的模态框或自动批准
-- [ ] 6.3 展示 root task 与各 child/backend 的实际 token/cost/time/output，unknown cost 不显示为 0
+- [x] 6.3 展示 root task 与各 child/backend 的实际 token/cost/time/output，unknown cost 不显示为 0
 - [x] 6.4 审计记录 trigger、template version、dedupe、调度原因、重试决策、审批和合并
 
 ## 7. 评测与收尾
@@ -66,8 +66,8 @@
 代码已随 `8d294f0` 落地，但当时未回写本文件。以上勾选以仓库内实现与测试为证据；以下未勾项仍未完成，本 change 暂不归档：
 
 - 0.x 阶段门禁未完成。
-- 2.5 无 queued reason 与并发上限调优 UI；4.2/4.3 仅有 `TaskTreeSnapshot` 数据，无任务树/DAG UI 与单个子任务取消入口。
+- 2.5、4.2、4.3、6.3 已由 Composer 任务树补齐：排队原因、可运行条件、可调并发上限、DAG 字段、单个/聚合取消，以及不把未知成本显示为 0。未知副作用记录不能从 UI 删除。
 - 3.6 非 Git 项目、磁盘不足等边界场景未全部覆盖。
 - 5.7、6.2、6.4 已由宿主调度循环补齐：运行中领取 queued run，管理面板显示 next/last、missed/coalesced/duplicate 与磁盘预算；审批等待不弹模态、不自动批准，审计含 trigger、template version、dedupe、调度原因、重试、审批与合并。
-- 6.1 通知聚合与 6.3 分后端用量展示仍未完成。
+- 6.1 通知聚合仍未完成。6.3 的 root/child/backend 用量已在任务树展示。
 - 7.3–7.6 基线对比、长期 smoke、用户文档与 strict 验证未完成。

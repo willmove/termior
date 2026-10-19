@@ -225,6 +225,7 @@ fn write_results_require_evidence_freshness_changes_and_acceptance() {
         change_sets: vec![],
         acceptance_verified: false,
         usage_known: true,
+        usage: TaskResourceUsage::default(),
         stale: false,
         unknown: false,
         writes: true,
@@ -278,6 +279,7 @@ fn child_results_must_match_the_declared_output_schema() {
         change_sets: vec![],
         acceptance_verified: true,
         usage_known: true,
+        usage: TaskResourceUsage::default(),
         stale: false,
         unknown: false,
         writes: false,
@@ -610,6 +612,7 @@ fn orchestration_runtime_executes_ready_children_in_parallel_and_then_dependenci
                     change_sets: vec![],
                     acceptance_verified: true,
                     usage_known: true,
+                    usage: TaskResourceUsage::default(),
                     stale: false,
                     unknown: false,
                     writes: false,
@@ -995,4 +998,407 @@ fn automation_approval_waits_are_notified_and_never_auto_approved() {
         .audit
         .iter()
         .all(|event| { event.approval.as_deref() != Some("approved") }));
+}
+
+fn child_spec(id: &str, dependencies: Vec<String>) -> ChildTaskSpec {
+    ChildTaskSpec {
+        task_id: id.into(),
+        parent_task_id: "root".into(),
+        agent_id: "worker".into(),
+        goal: id.into(),
+        input_refs: vec![],
+        output_schema: json!({"type":"object"}),
+        tools: BTreeSet::new(),
+        budgets: budgets(),
+        environment_id: format!("env-{id}"),
+        provider_id: "provider".into(),
+        workspace_id: "workspace".into(),
+        project_dir: "C:/workspace".into(),
+        dependencies,
+        depth: TaskDepth(1),
+        writes: false,
+        snapshot: SnapshotVersion(1),
+    }
+}
+
+fn unknown_result(spec: &ChildTaskSpec) -> ChildTaskResult {
+    ChildTaskResult {
+        task_id: spec.task_id.clone(),
+        data: json!({"ok": false}),
+        evidence: vec!["journal:event".into()],
+        snapshot: spec.snapshot,
+        change_sets: vec![],
+        acceptance_verified: false,
+        usage_known: false,
+        usage: TaskResourceUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cost_usd: Some(0.0),
+            wall_clock_ms: Some(0),
+            output_bytes: Some(0),
+        },
+        stale: false,
+        unknown: true,
+        writes: false,
+    }
+}
+
+#[test]
+fn cancel_guards_keep_unknown_side_effect_records() {
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let launcher = {
+        let release = release.clone();
+        Arc::new(
+            move |spec: ChildTaskSpec, cancellation: termior_ai::CancellationToken| {
+                if spec.task_id == "running" {
+                    release.wait();
+                    while !cancellation.is_cancelled() {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    return Ok(unknown_result(&spec));
+                }
+                Ok(ChildTaskResult {
+                    task_id: spec.task_id.clone(),
+                    data: json!({"ok": true}),
+                    evidence: vec!["journal:event".into()],
+                    snapshot: spec.snapshot,
+                    change_sets: vec![],
+                    acceptance_verified: true,
+                    usage_known: true,
+                    usage: TaskResourceUsage {
+                        input_tokens: Some(4),
+                        output_tokens: Some(2),
+                        cost_usd: Some(0.25),
+                        wall_clock_ms: Some(15),
+                        output_bytes: Some(32),
+                    },
+                    stale: false,
+                    unknown: false,
+                    writes: false,
+                })
+            },
+        )
+    };
+    let mut runtime = OrchestrationRuntime::new(
+        SlotLimits {
+            global: 1,
+            per_provider: 2,
+            per_workspace: 2,
+            per_environment: 2,
+        },
+        launcher,
+    );
+    runtime.submit(child_spec("running", vec![]), 1).unwrap();
+    runtime
+        .submit(child_spec("queued", vec!["running".into()]), 1)
+        .unwrap();
+    runtime.tick(0);
+    release.wait();
+    let before = runtime.task_tree(1);
+    assert_eq!(before.nodes.len(), 2);
+    let queued = before
+        .nodes
+        .iter()
+        .find(|node| node.task_id == "queued")
+        .unwrap();
+    assert_eq!(queued.state, NodeState::Queued);
+    assert_eq!(queued.queue_reason.as_deref(), Some("waiting for running"));
+    assert_eq!(
+        queued.ready_condition.as_deref(),
+        Some("dependencies succeed: running")
+    );
+    assert_eq!(queued.blockers, vec!["running".to_string()]);
+    assert_eq!(before.concurrency_cap, 1);
+
+    runtime.cancel_child("running").unwrap();
+    let cancelled = runtime.task_tree(2);
+    assert_eq!(cancelled.nodes.len(), 2, "cancel does not drop records");
+    let running = cancelled
+        .nodes
+        .iter()
+        .find(|node| node.task_id == "running")
+        .unwrap();
+    assert_eq!(running.state, NodeState::Unknown);
+    assert!(running.unknown_side_effects);
+    assert!(!can_delete_task_record(running));
+    assert_eq!(
+        runtime.delete_record("running").unwrap_err(),
+        OrchestrationError::UnknownRecordRetained
+    );
+    assert!(runtime
+        .task_tree(3)
+        .nodes
+        .iter()
+        .any(|node| node.task_id == "running"));
+
+    runtime.cancel_all();
+    let aggregate = runtime.task_tree(4);
+    assert_eq!(aggregate.nodes.len(), 2);
+    let queued = aggregate
+        .nodes
+        .iter()
+        .find(|node| node.task_id == "queued")
+        .unwrap();
+    assert_eq!(queued.state, NodeState::Cancelled);
+    assert!(!queued.unknown_side_effects);
+    runtime.delete_record("queued").unwrap();
+    let remaining = runtime.task_tree(5);
+    assert!(remaining.nodes.iter().any(|node| node.task_id == "running"));
+    assert!(!remaining.nodes.iter().any(|node| node.task_id == "queued"));
+    assert_eq!(
+        runtime.delete_record("running").unwrap_err(),
+        OrchestrationError::UnknownRecordRetained
+    );
+
+    runtime.set_global_concurrency(3);
+    assert_eq!(runtime.global_concurrency(), 3);
+    assert_eq!(runtime.task_tree(6).concurrency_cap, 3);
+}
+
+#[test]
+fn snapshot_cancel_and_concurrency_cap_keep_unknown_nodes() {
+    let mut snapshot = TaskTreeSnapshot {
+        generated_at_ms: 1,
+        concurrency_cap: 2,
+        nodes: vec![
+            tree_node("root-child", NodeState::Running, vec![], false),
+            tree_node("later", NodeState::Queued, vec!["root-child".into()], false),
+        ],
+        aggregate: TaskResourceUsage::default(),
+        backends: vec![],
+    };
+    snapshot.nodes[1].queue_reason = Some("waiting for root-child".into());
+    snapshot.nodes[1].ready_condition = Some("dependencies succeed: root-child".into());
+    snapshot.nodes[1].blockers = vec!["root-child".into()];
+    snapshot.cancel_child("root-child").unwrap();
+    assert_eq!(snapshot.nodes.len(), 2);
+    assert_eq!(snapshot.nodes[0].state, NodeState::Unknown);
+    assert!(snapshot.nodes[0].unknown_side_effects);
+    assert_eq!(snapshot.nodes[1].state, NodeState::Cancelled);
+    assert_eq!(
+        snapshot.delete_record("root-child").unwrap_err(),
+        OrchestrationError::UnknownRecordRetained
+    );
+    snapshot.cancel_all();
+    assert_eq!(snapshot.nodes.len(), 2);
+    snapshot.set_concurrency_cap(1);
+    assert_eq!(snapshot.concurrency_cap, 1);
+    snapshot.delete_record("later").unwrap();
+    assert_eq!(snapshot.nodes.len(), 1);
+    assert_eq!(snapshot.nodes[0].task_id, "root-child");
+}
+
+#[test]
+fn unknown_cost_renders_as_unknown_and_does_not_sum_as_zero() {
+    let known = TaskResourceUsage {
+        input_tokens: Some(10),
+        output_tokens: Some(4),
+        cost_usd: Some(1.5),
+        wall_clock_ms: Some(20),
+        output_bytes: Some(8),
+    };
+    let unknown_price = TaskResourceUsage {
+        input_tokens: Some(3),
+        output_tokens: Some(1),
+        cost_usd: None,
+        wall_clock_ms: Some(5),
+        output_bytes: Some(2),
+    };
+    let missing = TaskResourceUsage::default();
+    assert_eq!(format_cost_usd(None), "unknown");
+    assert_eq!(format_cost_usd(Some(0.0)), "0");
+    assert_eq!(format_cost_usd(Some(1.5)), "1.5");
+    assert_eq!(format_optional_quantity(None), "unknown");
+    assert_eq!(format_optional_quantity(Some(0)), "0");
+    let unknown_line = format_task_usage(&unknown_price);
+    assert_eq!(
+        unknown_line,
+        "tokens 3/1 · cost unknown · time 5 · output 2"
+    );
+    assert!(!unknown_line.contains("cost 0"));
+    let missing_line = format_task_usage(&missing);
+    assert_eq!(
+        missing_line,
+        "tokens unknown/unknown · cost unknown · time unknown · output unknown"
+    );
+    assert!(!missing_line.contains("cost 0"));
+    assert!(!missing_line.contains("time 0"));
+
+    let mixed = aggregate_usage([&known, &unknown_price]);
+    assert_eq!(mixed.cost_usd, None);
+    assert_eq!(mixed.input_tokens, Some(13));
+    assert_eq!(format_cost_usd(mixed.cost_usd), "unknown");
+    let with_gap = aggregate_usage([&known, &missing]);
+    assert_eq!(with_gap.cost_usd, None);
+    assert_eq!(with_gap.wall_clock_ms, None);
+    assert_eq!(with_gap.output_bytes, None);
+    assert!(!format_task_usage(&with_gap).contains("cost 0"));
+
+    let known_zero = aggregate_usage([&TaskResourceUsage {
+        input_tokens: Some(0),
+        output_tokens: Some(0),
+        cost_usd: Some(0.0),
+        wall_clock_ms: Some(0),
+        output_bytes: Some(0),
+    }]);
+    assert_eq!(known_zero.cost_usd, Some(0.0));
+    assert_eq!(format_cost_usd(known_zero.cost_usd), "0");
+
+    let reported = known.clone();
+    let mut runtime = OrchestrationRuntime::new(
+        SlotLimits {
+            global: 2,
+            per_provider: 2,
+            per_workspace: 2,
+            per_environment: 2,
+        },
+        Arc::new(
+            move |spec: ChildTaskSpec, _: termior_ai::CancellationToken| {
+                let unpriced = spec.task_id == "unpriced";
+                Ok(ChildTaskResult {
+                    unknown: false,
+                    usage_known: !unpriced,
+                    usage: if unpriced {
+                        TaskResourceUsage {
+                            input_tokens: Some(9),
+                            output_tokens: Some(1),
+                            cost_usd: Some(0.0),
+                            wall_clock_ms: Some(4),
+                            output_bytes: Some(1),
+                        }
+                    } else {
+                        reported.clone()
+                    },
+                    task_id: spec.task_id,
+                    data: json!({"ok": true}),
+                    evidence: vec!["journal:event".into()],
+                    snapshot: spec.snapshot,
+                    change_sets: vec![],
+                    acceptance_verified: true,
+                    stale: false,
+                    writes: false,
+                })
+            },
+        ),
+    );
+    runtime.submit(child_spec("known", vec![]), 1).unwrap();
+    runtime.submit(child_spec("unpriced", vec![]), 1).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !runtime.is_settled() && std::time::Instant::now() < deadline {
+        runtime.tick(0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    runtime.tick(0);
+    let tree = runtime.task_tree(9);
+    let known_node = tree
+        .nodes
+        .iter()
+        .find(|node| node.task_id == "known")
+        .unwrap();
+    let unpriced_node = tree
+        .nodes
+        .iter()
+        .find(|node| node.task_id == "unpriced")
+        .unwrap();
+    assert_eq!(
+        format_task_usage(&known_node.usage),
+        format_task_usage(&known)
+    );
+    assert_eq!(unpriced_node.usage.cost_usd, None);
+    assert_eq!(unpriced_node.usage.input_tokens, None);
+    assert_eq!(
+        format_task_usage(&unpriced_node.usage),
+        "tokens unknown/unknown · cost unknown · time 4 · output 1"
+    );
+    assert_eq!(tree.aggregate.cost_usd, None);
+    assert_eq!(format_cost_usd(tree.aggregate.cost_usd), "unknown");
+    assert_eq!(tree.backends[0].usage.cost_usd, None);
+    assert!(!format_task_usage(&tree.aggregate).contains("cost 0"));
+}
+
+#[test]
+fn queued_ready_condition_follows_the_user_concurrency_cap() {
+    let mut runtime = OrchestrationRuntime::new(
+        SlotLimits {
+            global: 1,
+            per_provider: 2,
+            per_workspace: 2,
+            per_environment: 2,
+        },
+        Arc::new(
+            |spec: ChildTaskSpec, cancellation: termior_ai::CancellationToken| {
+                while !cancellation.is_cancelled() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(unknown_result(&spec))
+            },
+        ),
+    );
+    runtime.submit(child_spec("first", vec![]), 1).unwrap();
+    runtime.submit(child_spec("second", vec![]), 1).unwrap();
+    runtime.tick(0);
+    let waiting = runtime
+        .task_tree(1)
+        .nodes
+        .into_iter()
+        .find(|node| node.task_id == "second")
+        .unwrap();
+    assert_eq!(waiting.state, NodeState::Ready);
+    assert_eq!(waiting.queue_reason.as_deref(), Some("global-slot"));
+    assert_eq!(
+        waiting.ready_condition.as_deref(),
+        Some("a global concurrency slot is free (cap 1)")
+    );
+    runtime.set_global_concurrency(2);
+    let released = runtime
+        .task_tree(2)
+        .nodes
+        .into_iter()
+        .find(|node| node.task_id == "second")
+        .unwrap();
+    assert_eq!(released.queue_reason, None);
+    assert_eq!(released.ready_condition.as_deref(), Some("ready to run"));
+    let mut view = runtime.task_tree(3);
+    view.nodes
+        .iter_mut()
+        .find(|node| node.task_id == "second")
+        .unwrap()
+        .queue_reason = Some("global-slot".into());
+    view.set_concurrency_cap(4);
+    assert_eq!(view.concurrency_cap, 4);
+    assert_eq!(
+        view.nodes
+            .iter()
+            .find(|node| node.task_id == "second")
+            .unwrap()
+            .ready_condition
+            .as_deref(),
+        Some("a global concurrency slot is free (cap 4)")
+    );
+    runtime.cancel_all();
+}
+
+fn tree_node(
+    id: &str,
+    state: NodeState,
+    dependencies: Vec<String>,
+    unknown_side_effects: bool,
+) -> TaskTreeNode {
+    TaskTreeNode {
+        task_id: id.into(),
+        parent_task_id: "root".into(),
+        agent_id: "worker".into(),
+        provider_id: "provider".into(),
+        environment_id: format!("env-{id}"),
+        project_dir: "C:/workspace".into(),
+        dependencies,
+        state,
+        budgets: budgets(),
+        queue_reason: None,
+        blockers: vec![],
+        ready_condition: None,
+        result_verified: None,
+        unknown_side_effects,
+        usage: TaskResourceUsage::default(),
+    }
 }

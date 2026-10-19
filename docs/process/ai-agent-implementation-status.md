@@ -49,6 +49,8 @@
 - 版本化 Automation、manual/interval/local-time/repo-event、dedupe/coalesce/catch-up/retry/notification
 - 每个 Automation run 使用不可变模板并创建独立 task ID 与 journal
 - Composer Automation 面板以及供 UI 使用的完整 TaskTreeSnapshot
+- Composer 任务树：后端、环境、依赖、状态、预算、验证、blockers、排队原因、可运行条件和可调并发上限；可查看并取消单个子任务或整棵树，未知副作用记录不可删除
+- 根任务、子任务和各 backend 展示实际 token/cost/time/output；未报告的成本保持 unknown，不显示为 0
 - 应用运行期间的宿主调度循环：领取 queued run，按模板并发与磁盘预算执行；审批等待不自动批准
 
 ## 当前主机已验证

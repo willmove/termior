@@ -31,6 +31,6 @@ cargo test -p termior-ai --test runtime_reliability
 4. 创建 interval 或本地时区 automation，触发两次相同 dedupe key。每次触发都有不同 run/task ID，但第二次状态为 Duplicate，不执行副作用。
 5. 在 automation 运行后修改模板。已运行 task 的 backend、权限、预算和模板版本不得变化。
 6. 关闭 Termior 一段时间再启动。CatchUpPolicy 分别验证 Skip、RunOnce、RunEach maximum；应用关闭期间没有后台守护进程，只有重启后的本地 catch-up。
-7. 点击 Composer 标题栏的 `Automations N`，核对 enabled、Trigger、next run、last run 和不可变 template version。点击 `Queue manual run` 后应生成独立 run ID、task ID 和 journal。任务树快照应同时列出 child 的 provider、project root、environment、依赖、预算、queue reason、验证状态和 unknown 标记。
+7. 点击 Composer 标题栏的 `Automations N`，核对 enabled、Trigger、next run、last run 和不可变 template version。点击 `Queue manual run` 后应生成独立 run ID、task ID 和 journal。再点击 `Task tree N`：DAG 列出 child 的 backend、environment、依赖、状态、预算、验证、blockers、queue reason 和可运行条件，并发上限可加减。取消单个子任务或 `Cancel all` 后记录仍在；带 unknown 副作用的记录没有删除按钮。未知 token/cost/time/output 显示为 unknown，不显示为 0。
 
 评测报告中的未知 token/cost 保持 `null`，不会显示为 0。是否值得并行由完成率、验证数、墙钟、冲突和重复副作用共同判断，子任务数量本身不算质量提升。

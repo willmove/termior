@@ -244,7 +244,12 @@ impl TaskGraph {
         for id in descendants {
             let next = match self.nodes.get(&id).copied() {
                 Some(NodeState::Running) if !confirmed_stopped.contains(&id) => NodeState::Unknown,
-                Some(NodeState::Succeeded | NodeState::Failed | NodeState::Cancelled) => continue,
+                Some(
+                    NodeState::Succeeded
+                    | NodeState::Failed
+                    | NodeState::Cancelled
+                    | NodeState::Unknown,
+                ) => continue,
                 _ => NodeState::Cancelled,
             };
             self.nodes.insert(id, next);
@@ -277,13 +282,40 @@ pub struct SlotLimits {
     pub per_workspace: usize,
     pub per_environment: usize,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueReason {
     ProviderSlot,
     WorkspaceSlot,
     EnvironmentSlot,
     GlobalSlot,
     ProviderBackoff,
+}
+
+impl QueueReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ProviderSlot => "provider-slot",
+            Self::WorkspaceSlot => "workspace-slot",
+            Self::EnvironmentSlot => "environment-slot",
+            Self::GlobalSlot => "global-slot",
+            Self::ProviderBackoff => "provider-backoff",
+        }
+    }
+
+    /// Condition that must become true before a ready task can leave the queue.
+    pub fn ready_condition(self, task: &ScheduledTask, global_cap: usize) -> String {
+        match self {
+            Self::GlobalSlot => {
+                format!("a global concurrency slot is free (cap {global_cap})")
+            }
+            Self::ProviderSlot => format!("a provider slot for {} is free", task.provider),
+            Self::WorkspaceSlot => format!("a workspace slot for {} is free", task.workspace),
+            Self::EnvironmentSlot => {
+                format!("an environment slot for {} is free", task.environment)
+            }
+            Self::ProviderBackoff => format!("provider {} backoff ends", task.provider),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledTask {
@@ -342,6 +374,23 @@ pub struct OrchestrationRuntime<L: TaskLauncher> {
     next_sequence: u64,
 }
 
+/// Actual consumption reported by a task. Every field stays `None` until that
+/// dimension is known, so an unreported price cannot be shown as zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TaskResourceUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
+    pub wall_clock_ms: Option<u64>,
+    pub output_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackendUsageRollup {
+    pub provider_id: String,
+    pub usage: TaskResourceUsage,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskTreeNode {
     pub task_id: String,
@@ -354,14 +403,247 @@ pub struct TaskTreeNode {
     pub state: NodeState,
     pub budgets: RuntimeBudgets,
     pub queue_reason: Option<String>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default)]
+    pub ready_condition: Option<String>,
     pub result_verified: Option<bool>,
     pub unknown_side_effects: bool,
+    #[serde(default)]
+    pub usage: TaskResourceUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskTreeSnapshot {
     pub generated_at_ms: u64,
+    #[serde(default = "default_concurrency_cap")]
+    pub concurrency_cap: usize,
     pub nodes: Vec<TaskTreeNode>,
+    #[serde(default)]
+    pub aggregate: TaskResourceUsage,
+    #[serde(default)]
+    pub backends: Vec<BackendUsageRollup>,
+}
+
+fn default_concurrency_cap() -> usize {
+    2
+}
+
+impl Default for TaskTreeSnapshot {
+    fn default() -> Self {
+        Self {
+            generated_at_ms: 0,
+            concurrency_cap: default_concurrency_cap(),
+            nodes: Vec::new(),
+            aggregate: TaskResourceUsage::default(),
+            backends: Vec::new(),
+        }
+    }
+}
+
+impl TaskTreeSnapshot {
+    pub fn set_concurrency_cap(&mut self, cap: usize) {
+        let cap = cap.clamp(1, 64);
+        self.concurrency_cap = cap;
+        for node in &mut self.nodes {
+            if node.queue_reason.as_deref() == Some(QueueReason::GlobalSlot.code()) {
+                node.ready_condition =
+                    Some(format!("a global concurrency slot is free (cap {cap})"));
+            }
+        }
+    }
+
+    pub fn cancel_child(&mut self, task_id: &str) -> Result<(), OrchestrationError> {
+        if !self.nodes.iter().any(|node| node.task_id == task_id) {
+            return Err(OrchestrationError::MissingNode);
+        }
+        let affected = descendant_task_ids(&self.nodes, task_id);
+        self.cancel_ids(&affected);
+        Ok(())
+    }
+
+    pub fn cancel_all(&mut self) {
+        let ids = self
+            .nodes
+            .iter()
+            .map(|node| node.task_id.clone())
+            .collect::<BTreeSet<_>>();
+        self.cancel_ids(&ids);
+    }
+
+    pub fn delete_record(&mut self, task_id: &str) -> Result<(), OrchestrationError> {
+        let Some(node) = self.nodes.iter().find(|node| node.task_id == task_id) else {
+            return Err(OrchestrationError::MissingNode);
+        };
+        if !can_delete_task_record(node) {
+            return Err(OrchestrationError::UnknownRecordRetained);
+        }
+        self.nodes.retain(|node| node.task_id != task_id);
+        for node in &mut self.nodes {
+            node.dependencies.retain(|dependency| dependency != task_id);
+            node.blockers.retain(|blocker| blocker != task_id);
+        }
+        self.recompute_rollups();
+        Ok(())
+    }
+
+    fn cancel_ids(&mut self, ids: &BTreeSet<String>) {
+        for node in &mut self.nodes {
+            if ids.contains(&node.task_id) {
+                apply_cancel(node);
+            }
+        }
+    }
+
+    fn recompute_rollups(&mut self) {
+        self.aggregate = aggregate_usage(self.nodes.iter().map(|node| &node.usage));
+        self.backends = backend_rollups(&self.nodes);
+    }
+}
+
+/// Records with unknown side effects stay visible. In-flight nodes must be cancelled first.
+pub fn can_delete_task_record(node: &TaskTreeNode) -> bool {
+    if node.unknown_side_effects || node.state == NodeState::Unknown {
+        return false;
+    }
+    matches!(
+        node.state,
+        NodeState::Succeeded
+            | NodeState::Failed
+            | NodeState::Cancelled
+            | NodeState::Blocked
+            | NodeState::Stale
+    )
+}
+
+pub fn format_cost_usd(cost: Option<f64>) -> String {
+    let Some(value) = cost else {
+        return "unknown".to_owned();
+    };
+    if !value.is_finite() {
+        return "unknown".to_owned();
+    }
+    let rendered = format!("{value:.6}");
+    if rendered.trim_start_matches('-') == "0.000000" {
+        return "0".to_owned();
+    }
+    let mut text = rendered;
+    while text.contains('.') && (text.ends_with('0') || text.ends_with('.')) {
+        text.pop();
+    }
+    text
+}
+
+pub fn format_optional_quantity(value: Option<u64>) -> String {
+    match value {
+        Some(value) => value.to_string(),
+        None => "unknown".to_owned(),
+    }
+}
+
+/// Display line for token, cost, time, and output. Unknown cost is the word `unknown`.
+pub fn format_task_usage(usage: &TaskResourceUsage) -> String {
+    format!(
+        "tokens {}/{} · cost {} · time {} · output {}",
+        format_optional_quantity(usage.input_tokens),
+        format_optional_quantity(usage.output_tokens),
+        format_cost_usd(usage.cost_usd),
+        format_optional_quantity(usage.wall_clock_ms),
+        format_optional_quantity(usage.output_bytes),
+    )
+}
+
+pub fn aggregate_usage<'a>(
+    usages: impl IntoIterator<Item = &'a TaskResourceUsage>,
+) -> TaskResourceUsage {
+    let usages = usages.into_iter().collect::<Vec<_>>();
+    TaskResourceUsage {
+        input_tokens: sum_optional_u64(usages.iter().map(|usage| usage.input_tokens)),
+        output_tokens: sum_optional_u64(usages.iter().map(|usage| usage.output_tokens)),
+        cost_usd: sum_optional_cost(usages.iter().map(|usage| usage.cost_usd)),
+        wall_clock_ms: sum_optional_u64(usages.iter().map(|usage| usage.wall_clock_ms)),
+        output_bytes: sum_optional_u64(usages.iter().map(|usage| usage.output_bytes)),
+    }
+}
+
+pub fn backend_rollups(nodes: &[TaskTreeNode]) -> Vec<BackendUsageRollup> {
+    let providers = nodes
+        .iter()
+        .map(|node| node.provider_id.clone())
+        .collect::<BTreeSet<_>>();
+    providers
+        .into_iter()
+        .map(|provider_id| {
+            let usage = aggregate_usage(
+                nodes
+                    .iter()
+                    .filter(|node| node.provider_id == provider_id)
+                    .map(|node| &node.usage),
+            );
+            BackendUsageRollup { provider_id, usage }
+        })
+        .collect()
+}
+
+fn sum_optional_u64(values: impl Iterator<Item = Option<u64>>) -> Option<u64> {
+    let mut total = 0u64;
+    let mut seen = false;
+    for value in values {
+        total = total.saturating_add(value?);
+        seen = true;
+    }
+    seen.then_some(total)
+}
+
+fn sum_optional_cost(values: impl Iterator<Item = Option<f64>>) -> Option<f64> {
+    let mut total = 0.0;
+    let mut seen = false;
+    for value in values {
+        let value = value.filter(|value| value.is_finite())?;
+        total += value;
+        seen = true;
+    }
+    seen.then_some(total)
+}
+
+fn apply_cancel(node: &mut TaskTreeNode) {
+    match node.state {
+        NodeState::Running => {
+            node.state = NodeState::Unknown;
+            node.unknown_side_effects = true;
+            node.queue_reason = None;
+            node.ready_condition = None;
+        }
+        NodeState::Queued | NodeState::Ready | NodeState::Blocked | NodeState::Stale => {
+            node.state = NodeState::Cancelled;
+            node.queue_reason = None;
+            node.ready_condition = None;
+            node.blockers.clear();
+        }
+        NodeState::Succeeded | NodeState::Failed | NodeState::Cancelled | NodeState::Unknown => {}
+    }
+}
+
+fn descendant_task_ids(nodes: &[TaskTreeNode], root: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::from([root.to_owned()]);
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for node in nodes {
+            if found.contains(&node.task_id) {
+                continue;
+            }
+            if node
+                .dependencies
+                .iter()
+                .any(|dependency| found.contains(dependency))
+                && found.insert(node.task_id.clone())
+            {
+                grew = true;
+            }
+        }
+    }
+    found
 }
 
 impl<L: TaskLauncher> OrchestrationRuntime<L> {
@@ -485,6 +767,50 @@ impl<L: TaskLauncher> OrchestrationRuntime<L> {
         }
     }
 
+    pub fn set_global_concurrency(&mut self, cap: usize) {
+        self.scheduler.set_global_concurrency(cap);
+    }
+
+    pub fn global_concurrency(&self) -> usize {
+        self.scheduler.global_concurrency()
+    }
+
+    /// Cancels one child and every task that depends on it. Records stay in the tree.
+    pub fn cancel_child(&mut self, task_id: &str) -> Result<(), OrchestrationError> {
+        if !self.specs.contains_key(task_id) {
+            return Err(OrchestrationError::MissingNode);
+        }
+        self.cancel_tree(task_id);
+        Ok(())
+    }
+
+    pub fn cancel_all(&mut self) {
+        let ids = self.specs.keys().cloned().collect::<Vec<_>>();
+        for id in ids {
+            self.cancel_tree(&id);
+        }
+    }
+
+    /// Drops a settled record. Unknown side effects are retained for inspection.
+    pub fn delete_record(&mut self, task_id: &str) -> Result<(), OrchestrationError> {
+        let snapshot = self.task_tree(0);
+        let Some(node) = snapshot.nodes.iter().find(|node| node.task_id == task_id) else {
+            return Err(OrchestrationError::MissingNode);
+        };
+        if !can_delete_task_record(node) {
+            return Err(OrchestrationError::UnknownRecordRetained);
+        }
+        self.specs.remove(task_id);
+        self.results.remove(task_id);
+        self.graph.nodes.remove(task_id);
+        self.graph
+            .relations
+            .retain(|relation| relation.prerequisite != task_id && relation.dependent != task_id);
+        self.scheduler.remove(task_id);
+        self.cancellations.remove(task_id);
+        Ok(())
+    }
+
     pub fn cancel_tree(&mut self, root: &str) {
         let affected = descendants_including(&self.graph, root);
         for task_id in &affected {
@@ -495,11 +821,11 @@ impl<L: TaskLauncher> OrchestrationRuntime<L> {
         }
         self.graph.cancel_descendants(root, &BTreeSet::new());
         if let Some(state) = self.graph.nodes.get_mut(root) {
-            *state = if self.cancellations.contains_key(root) {
-                NodeState::Unknown
-            } else {
-                NodeState::Cancelled
-            };
+            *state = retained_cancel_state(
+                *state,
+                self.cancellations.contains_key(root)
+                    || self.results.get(root).is_some_and(|result| result.unknown),
+            );
         }
     }
 
@@ -523,6 +849,7 @@ impl<L: TaskLauncher> OrchestrationRuntime<L> {
 
     /// Produces the complete user-facing DAG state without dropping unknown records.
     pub fn task_tree(&self, now_ms: u64) -> TaskTreeSnapshot {
+        let concurrency_cap = self.scheduler.global_concurrency();
         let nodes = self
             .specs
             .values()
@@ -533,26 +860,38 @@ impl<L: TaskLauncher> OrchestrationRuntime<L> {
                     .get(&spec.task_id)
                     .copied()
                     .unwrap_or(NodeState::Unknown);
-                let queue_reason = match state {
-                    NodeState::Queued => {
-                        let blockers = spec
-                            .dependencies
-                            .iter()
-                            .filter(|dependency| {
-                                self.graph.nodes.get(*dependency) != Some(&NodeState::Succeeded)
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        (!blockers.is_empty())
-                            .then(|| format!("waiting for {}", blockers.join(", ")))
+                let blockers = open_blockers(spec, &self.graph);
+                let (queue_reason, ready_condition) = match state {
+                    NodeState::Queued if !blockers.is_empty() => (
+                        Some(format!("waiting for {}", blockers.join(", "))),
+                        Some(format!("dependencies succeed: {}", blockers.join(", "))),
+                    ),
+                    NodeState::Ready => {
+                        let scheduled = scheduled(spec, 0, 0);
+                        match self.scheduler.reason(&scheduled, now_ms) {
+                            Some(reason) => (
+                                Some(reason.code().to_owned()),
+                                Some(reason.ready_condition(&scheduled, concurrency_cap)),
+                            ),
+                            None => (None, Some("ready to run".to_owned())),
+                        }
                     }
-                    NodeState::Ready => self
-                        .scheduler
-                        .reason(&scheduled(spec, 0, 0), now_ms)
-                        .map(|reason| format!("{reason:?}")),
-                    NodeState::Blocked => Some("dependency failed or is unknown".into()),
-                    NodeState::Stale => Some("project snapshot changed".into()),
-                    _ => None,
+                    NodeState::Blocked => (
+                        Some("dependency-blocked".to_owned()),
+                        Some(format!(
+                            "a blocker is resolved: {}",
+                            if blockers.is_empty() {
+                                "dependency failed or is unknown".to_owned()
+                            } else {
+                                blockers.join(", ")
+                            }
+                        )),
+                    ),
+                    NodeState::Stale => (
+                        Some("snapshot-stale".to_owned()),
+                        Some("the project snapshot is refreshed".to_owned()),
+                    ),
+                    _ => (None, None),
                 };
                 let result = self.results.get(&spec.task_id);
                 TaskTreeNode {
@@ -566,17 +905,25 @@ impl<L: TaskLauncher> OrchestrationRuntime<L> {
                     state,
                     budgets: spec.budgets.clone(),
                     queue_reason,
+                    blockers,
+                    ready_condition,
                     result_verified: result.map(|result| {
                         result.validate_for(spec).is_ok() && result.acceptance_verified
                     }),
                     unknown_side_effects: state == NodeState::Unknown
                         || result.is_some_and(|result| result.unknown),
+                    usage: usage_from_result(result),
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let aggregate = aggregate_usage(nodes.iter().map(|node| &node.usage));
+        let backends = backend_rollups(&nodes);
         TaskTreeSnapshot {
             generated_at_ms: now_ms,
+            concurrency_cap,
             nodes,
+            aggregate,
+            backends,
         }
     }
 }
@@ -674,6 +1021,14 @@ impl Scheduler {
     }
     pub fn finish(&mut self, id: &str) {
         self.running.remove(id);
+    }
+
+    pub fn global_concurrency(&self) -> usize {
+        self.limits.global
+    }
+
+    pub fn set_global_concurrency(&mut self, cap: usize) {
+        self.limits.global = cap.clamp(1, 64);
     }
 
     pub fn remove(&mut self, id: &str) {
@@ -835,6 +1190,8 @@ pub struct ChildTaskResult {
     pub change_sets: Vec<String>,
     pub acceptance_verified: bool,
     pub usage_known: bool,
+    #[serde(default)]
+    pub usage: TaskResourceUsage,
     pub stale: bool,
     pub unknown: bool,
     pub writes: bool,
@@ -978,4 +1335,43 @@ pub enum OrchestrationError {
     NotSubagentStep(String),
     #[error("plan step was not approved for spawning: {0}")]
     StepNotApproved(String),
+    #[error("a record with unknown side effects cannot be deleted")]
+    UnknownRecordRetained,
+}
+
+fn retained_cancel_state(current: NodeState, unconfirmed: bool) -> NodeState {
+    if current == NodeState::Unknown || unconfirmed {
+        return NodeState::Unknown;
+    }
+    if matches!(
+        current,
+        NodeState::Succeeded | NodeState::Failed | NodeState::Cancelled
+    ) {
+        return current;
+    }
+    NodeState::Cancelled
+}
+
+fn open_blockers(spec: &ChildTaskSpec, graph: &TaskGraph) -> Vec<String> {
+    spec.dependencies
+        .iter()
+        .filter(|dependency| graph.nodes.get(*dependency) != Some(&NodeState::Succeeded))
+        .cloned()
+        .collect()
+}
+
+fn usage_from_result(result: Option<&ChildTaskResult>) -> TaskResourceUsage {
+    let Some(result) = result else {
+        return TaskResourceUsage::default();
+    };
+    let mut usage = result.usage.clone();
+    if !result.usage_known {
+        usage.input_tokens = None;
+        usage.output_tokens = None;
+        usage.cost_usd = None;
+    }
+    if !usage.cost_usd.is_some_and(|cost| cost.is_finite()) {
+        usage.cost_usd = None;
+    }
+    usage
 }

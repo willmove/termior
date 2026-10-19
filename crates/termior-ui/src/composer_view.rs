@@ -26,6 +26,7 @@ use termior_ai::context_engine::{
     ContextAssembler, ContextCategory, ContextItem, ContextPlan, ContextSource, MemoryStatus,
     MemoryStore, RuleResolver, SkillIndex, SkillMetadata,
 };
+use termior_ai::orchestration::TaskTreeSnapshot;
 use termior_ai::slash::{self, ComposerCommand, SlashAction, SlashCommand};
 use termior_ai::{
     AgentDefinition, AgentDefinitionStore, ApprovalPolicy, Attachment, AttachmentSource,
@@ -62,6 +63,7 @@ mod orchestrator;
 mod render;
 mod session;
 mod task_details;
+mod task_tree;
 mod tool_blocks;
 
 use orchestrator::{
@@ -85,6 +87,7 @@ enum ComposerCenter {
     ContextInspector,
     Recovery,
     Automations,
+    TaskTree,
     Checkpoints,
     Skills,
     Memory,
@@ -240,6 +243,8 @@ pub struct ComposerView {
     open_center: Option<ComposerCenter>,
     recovery_tasks: Vec<RecoveryTaskSummary>,
     automations: AutomationStore,
+    task_tree: TaskTreeSnapshot,
+    task_tree_selected: Option<String>,
     checkpoints: Vec<CheckpointManifest>,
     skills: Vec<SkillMetadata>,
     skill_scan_error: Option<String>,
