@@ -72,6 +72,9 @@ impl ComposerView {
             command_watch_running: false,
             expanded_tools: HashSet::new(),
             streaming_draft: false,
+            automation_host_started: false,
+            automation_disk_budget: 0,
+            automation_disk_used: None,
         }
     }
 
@@ -164,7 +167,9 @@ impl ComposerView {
         self.full_tools = Some(full_tools);
         self.model_settings = settings.models.clone();
         self.custom_instructions = settings.custom_instructions.clone();
+        self.automation_disk_budget = settings.agent_retention.max_disk_bytes;
         self.rebuild_runtime(cx);
+        self.ensure_automation_host(cx);
     }
 
     /// 选定模型所在 profile（已启用），模型字段替换为所选模型。

@@ -107,6 +107,189 @@ impl ComposerView {
         cx.notify();
     }
 
+    pub(super) fn ensure_automation_host(&mut self, cx: &mut Context<Self>) {
+        if self.automation_host_started || self.data_dir.is_none() {
+            return;
+        }
+        self.automation_host_started = true;
+        if let Some(data_dir) = self.data_dir.clone() {
+            if let Ok(mut manager) = AutomationManager::load(&data_dir) {
+                match manager.recover_interrupted(unix_now()) {
+                    Ok(effects) => {
+                        self.automations = manager.store;
+                        for effect in effects {
+                            self.present_automation_effect(&effect, cx);
+                        }
+                    }
+                    Err(error) => log::warn!("automation recovery failed: {error}"),
+                }
+            }
+        }
+        cx.spawn(async move |view, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(2))
+                .await;
+            let request = view.update(cx, |view, _| view.automation_tick_request());
+            let Ok(Some(request)) = request else {
+                break;
+            };
+            let used = cx
+                .background_executor()
+                .spawn({
+                    let data_dir = request.data_dir.clone();
+                    async move {
+                        termior_store::measure_agent_disk_usage(&data_dir)
+                            .map(|usage| usage.total())
+                            .unwrap_or(u64::MAX)
+                    }
+                })
+                .await;
+            let claimed = view.update(cx, |view, cx| view.claim_automation_runs(used, cx));
+            let Ok(claimed) = claimed else {
+                break;
+            };
+            for run in claimed {
+                let request = request.clone();
+                let view = view.clone();
+                cx.spawn(async move |cx| {
+                    let finished = cx
+                        .background_executor()
+                        .spawn(async move { execute_claimed_run(run, request).await })
+                        .await;
+                    let _ = view.update(cx, |view, cx| view.finish_automation_run(finished, cx));
+                })
+                .detach();
+            }
+        })
+        .detach();
+    }
+
+    fn automation_tick_request(&self) -> Option<AutomationTickRequest> {
+        let data_dir = self.data_dir.clone()?;
+        let runtime = self.orchestrator.runtime.as_ref();
+        Some(AutomationTickRequest {
+            data_dir,
+            project_dir: self.workspace_root.clone(),
+            provider: runtime.map(|runtime| runtime.config.clone()),
+            tools: runtime.map(|runtime| runtime.tools.clone()),
+        })
+    }
+
+    fn automation_global_concurrency(&self) -> u16 {
+        self.automations
+            .automations
+            .iter()
+            .filter(|automation| automation.enabled)
+            .fold(0u16, |total, automation| {
+                total.saturating_add(automation.template.max_concurrency)
+            })
+            .max(1)
+    }
+
+    fn claim_automation_runs(
+        &mut self,
+        disk_used: u64,
+        cx: &mut Context<Self>,
+    ) -> Vec<AutomationRun> {
+        self.automation_disk_used = Some(disk_used);
+        let Some(data_dir) = self.data_dir.clone() else {
+            return Vec::new();
+        };
+        let mut manager = match AutomationManager::load(&data_dir) {
+            Ok(manager) => manager,
+            Err(error) => {
+                log::warn!("automation host load failed: {error}");
+                return Vec::new();
+            }
+        };
+        let now = unix_now();
+        if let Err(error) = manager.poll_due(now) {
+            log::warn!("automation schedule poll failed: {error}");
+        }
+        let claimed = match manager.claim_queued(
+            now,
+            HostLimits {
+                max_concurrency: self.automation_global_concurrency(),
+                disk_budget_bytes: self.automation_disk_budget,
+                disk_used_bytes: disk_used,
+            },
+        ) {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                log::warn!("automation claim failed: {error}");
+                Vec::new()
+            }
+        };
+        self.automations = manager.store;
+        cx.notify();
+        claimed
+    }
+
+    fn finish_automation_run(
+        &mut self,
+        finished: (String, ExecutionOutcome),
+        cx: &mut Context<Self>,
+    ) {
+        let (run_id, outcome) = finished;
+        let Some(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let mut manager = match AutomationManager::load(&data_dir) {
+            Ok(manager) => manager,
+            Err(error) => {
+                log::warn!("automation host load failed: {error}");
+                return;
+            }
+        };
+        match manager.complete_run(&run_id, outcome, unix_now()) {
+            Ok(effect) => {
+                self.automations = manager.store;
+                self.present_automation_effect(&effect, cx);
+            }
+            Err(error) => log::warn!("automation completion failed: {error}"),
+        }
+        cx.notify();
+    }
+
+    /// Approval waits update the admin list and, when the policy says so, a notification.
+    /// They never install the composer approval card and never approve the call.
+    fn present_automation_effect(&mut self, effect: &RunEffect, cx: &mut Context<Self>) {
+        let policy = self
+            .automations
+            .automations
+            .iter()
+            .find(|automation| automation.id == effect.automation_id)
+            .map(|automation| automation.notification)
+            .unwrap_or(NotificationPolicy::Actionable);
+        if effect.approval_wait {
+            let presentation = approval_presentation(policy);
+            if presentation.notify && !presentation.open_modal && !presentation.auto_approve {
+                self.set_status(tf!(
+                    "composer.automation.approval_waiting",
+                    "id" => effect.automation_id.clone(),
+                    "run" => effect.run_id.clone()
+                ));
+                cx.emit(AgentStatus::Attention);
+            }
+            return;
+        }
+        if !effect.notify {
+            return;
+        }
+        self.set_status(tf!(
+            "composer.automation.host_status",
+            "id" => effect.automation_id.clone(),
+            "status" => format!("{:?}", effect.status),
+            "run" => effect.run_id.clone()
+        ));
+        let status = match effect.status {
+            RunStatus::Completed => AgentStatus::Finished,
+            RunStatus::Failed => AgentStatus::Error,
+            _ => AgentStatus::Attention,
+        };
+        cx.emit(status);
+    }
+
     pub(super) fn apply_memory_action(
         &mut self,
         id: &str,
@@ -587,72 +770,123 @@ impl ComposerView {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let rows =
-                self.automations
-                    .automations
-                    .iter()
-                    .enumerate()
-                    .map(|(index, automation)| {
-                        let automation_id = automation.id.clone();
-                        let next = next_run_after(automation, now)
-                            .map(|timestamp| timestamp.to_string())
-                            .unwrap_or_else(|| "event/manual".into());
-                        let last = self
-                            .automations
-                            .recent_runs
-                            .iter()
-                            .rev()
-                            .find(|run| run.automation_id == automation.id)
-                            .map(|run| format!("{:?} ({})", run.status, run.run_id))
-                            .unwrap_or_else(|| "never".into());
-                        div()
-                            .id(SharedString::from(format!("automation-entry-{index}")))
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .p_2()
-                            .rounded_md()
-                            .bg(crate::ui::alpha(p.foreground, 0.04))
-                            .child(
+            let disk_label = self.automation_disk_label();
+            let store = self.automations.clone();
+            let rows = store
+                .automations
+                .iter()
+                .enumerate()
+                .map(|(index, automation)| {
+                    let automation_id = automation.id.clone();
+                    let summary = admin_summary(&store, &automation.id, now);
+                    let next = summary
+                        .as_ref()
+                        .and_then(|summary| summary.next_run_at)
+                        .map(|timestamp| timestamp.to_string())
+                        .unwrap_or_else(|| "event/manual".into());
+                    let last = summary
+                        .as_ref()
+                        .and_then(|summary| summary.last_runs.first())
+                        .map(|run| format!("{:?} ({})", run.status, run.run_id))
+                        .unwrap_or_else(|| "never".into());
+                    let missed = summary.as_ref().map(|summary| summary.missed).unwrap_or(0);
+                    let coalesced = summary
+                        .as_ref()
+                        .map(|summary| summary.coalesced)
+                        .unwrap_or(0);
+                    let duplicate = summary
+                        .as_ref()
+                        .map(|summary| summary.duplicate)
+                        .unwrap_or(0);
+                    let last_runs = summary
+                        .as_ref()
+                        .map(|summary| summary.last_runs.clone())
+                        .unwrap_or_default();
+                    div()
+                        .id(SharedString::from(format!("automation-entry-{index}")))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .p_2()
+                        .rounded_md()
+                        .bg(crate::ui::alpha(p.foreground, 0.04))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .child(SharedString::from(automation.name.clone()))
+                                .child(if automation.enabled {
+                                    t!("composer.automation.enabled")
+                                } else {
+                                    t!("composer.automation.disabled")
+                                }),
+                        )
+                        .child(div().text_xs().text_color(crate::ui::muted(p)).child(tf!(
+                            "composer.automation.detail",
+                            "version" => automation.template.version,
+                            "next" => next,
+                            "last" => last,
+                            "trigger" => format!("{:?}", automation.trigger)
+                        )))
+                        .child(div().text_xs().text_color(crate::ui::muted(p)).child(tf!(
+                            "composer.automation.counts",
+                            "missed" => missed,
+                            "coalesced" => coalesced,
+                            "duplicate" => duplicate
+                        )))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(crate::ui::muted(p))
+                                .child(disk_label.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(crate::ui::muted(p))
+                                .child(t!("composer.automation.last_title")),
+                        )
+                        .children(last_runs.iter().enumerate().map(|(run_index, run)| {
+                            let reason = if run.schedule_reason.is_empty() {
+                                "—".to_owned()
+                            } else {
+                                run.schedule_reason.clone()
+                            };
+                            div()
+                                .id(SharedString::from(format!(
+                                    "automation-run-{index}-{run_index}"
+                                )))
+                                .text_xs()
+                                .text_color(crate::ui::muted(p))
+                                .child(tf!(
+                                    "composer.automation.run_line",
+                                    "status" => format!("{:?}", run.status),
+                                    "run" => run.run_id.clone(),
+                                    "reason" => reason
+                                ))
+                        }))
+                        .when(automation.enabled, |row| {
+                            row.child(
                                 div()
-                                    .flex()
-                                    .justify_between()
-                                    .child(SharedString::from(automation.name.clone()))
-                                    .child(if automation.enabled {
-                                        t!("composer.automation.enabled")
-                                    } else {
-                                        t!("composer.automation.disabled")
-                                    }),
+                                    .id(SharedString::from(format!("run-automation-{index}")))
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(crate::ui::border(p))
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .child(t!("composer.automation.queue_run"))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.trigger_automation(&automation_id, cx);
+                                        }),
+                                    ),
                             )
-                            .child(div().text_xs().text_color(crate::ui::muted(p)).child(tf!(
-                                "composer.automation.detail",
-                                "version" => automation.template.version,
-                                "next" => next,
-                                "last" => last,
-                                "trigger" => format!("{:?}", automation.trigger)
-                            )))
-                            .when(automation.enabled, |row| {
-                                row.child(
-                                    div()
-                                        .id(SharedString::from(format!("run-automation-{index}")))
-                                        .px_2()
-                                        .py(px(2.0))
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(crate::ui::border(p))
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .child(t!("composer.automation.queue_run"))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.trigger_automation(&automation_id, cx);
-                                            }),
-                                        ),
-                                )
-                            })
-                    });
+                        })
+                });
             div()
                 .id("automation-center-panel")
                 .flex()
@@ -1031,4 +1265,72 @@ impl ComposerView {
         });
         memory_center.map(IntoElement::into_any_element)
     }
+}
+
+#[derive(Clone)]
+struct AutomationTickRequest {
+    data_dir: PathBuf,
+    project_dir: PathBuf,
+    provider: Option<ProviderConfig>,
+    tools: Option<ToolRegistry>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+impl ComposerView {
+    fn automation_disk_label(&self) -> SharedString {
+        match self.automation_disk_used {
+            Some(used) if self.automation_disk_budget > 0 && used < u64::MAX => tf!(
+                "composer.automation.disk",
+                "used" => used / (1024 * 1024),
+                "budget" => self.automation_disk_budget / (1024 * 1024)
+            ),
+            _ => t!("composer.automation.disk_unavailable"),
+        }
+    }
+}
+
+async fn execute_claimed_run(
+    run: AutomationRun,
+    request: AutomationTickRequest,
+) -> (String, ExecutionOutcome) {
+    let unavailable = |detail: String| {
+        (
+            run.run_id.clone(),
+            ExecutionOutcome::Failed {
+                class: FailureClass::Permanent,
+                idempotent: true,
+                result_known: true,
+                detail,
+            },
+        )
+    };
+    let Some(config) = request.provider else {
+        return unavailable("model provider is not configured".into());
+    };
+    let Some(tools) = request.tools else {
+        return unavailable("automation tools are not configured".into());
+    };
+    let provider = match HttpProvider::new(config) {
+        Ok(provider) => provider,
+        Err(error) => return unavailable(error.to_string()),
+    };
+    let executor = match ToolExecutor::new(&request.project_dir, tools) {
+        Ok(executor) => executor,
+        Err(error) => return unavailable(error.to_string()),
+    };
+    let outcome = drive_automation_run(
+        &run,
+        &request.project_dir,
+        Some(&request.data_dir),
+        &provider,
+        &executor,
+    )
+    .await;
+    (run.run_id, outcome)
 }

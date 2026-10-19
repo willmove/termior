@@ -49,6 +49,7 @@
 - 版本化 Automation、manual/interval/local-time/repo-event、dedupe/coalesce/catch-up/retry/notification
 - 每个 Automation run 使用不可变模板并创建独立 task ID 与 journal
 - Composer Automation 面板以及供 UI 使用的完整 TaskTreeSnapshot
+- 应用运行期间的宿主调度循环：领取 queued run，按模板并发与磁盘预算执行；审批等待不自动批准
 
 ## 当前主机已验证
 
@@ -65,4 +66,4 @@
 - Windows 当前仅验证进程树控制，不宣称完整的文件、网络或凭据 sandbox；这些能力报告为 unsupported，sandboxed 任务和 escape suite 都 fail closed。
 - MCP HTTP 已实现 HTTPS 限制、Bearer/session 保持和 OAuth callback 的 state/resource 校验。完整授权服务器发现、浏览器 PKCE 登录、refresh token 周期和系统 keyring UI 尚未接入，因此不能宣称远端 OAuth 生命周期已端到端验证。
 - ACP 自动测试使用恶意/双向 fake server。当前主机没有安装并验证 Gemini CLI 或 OpenCode 的真实 ACP 端到端流程；未握手声明的 optional capability 始终保持 unsupported。
-- 本地 Automation 的 schedule/catch-up/repo-event 引擎和持久 run factory 已实现。应用关闭期间不会运行；Composer 的手动入口创建独立 queued task/journal，实际后台执行仍需宿主调度循环领取该队列。
+- 本地 Automation 的 schedule/catch-up/repo-event 引擎、持久 run factory 和宿主调度循环已实现。应用关闭期间不会运行；应用运行时循环领取 queued run，并受并发与磁盘预算限制。等待审批时按通知策略提醒，不弹出模态框，也不自动批准。
