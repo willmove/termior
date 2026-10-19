@@ -144,6 +144,7 @@ pub enum SettingsPage {
     Shortcuts,
     Agents,
     Hooks,
+    Mcp,
     About,
 }
 

@@ -530,24 +530,18 @@ pub struct McpHttpClient {
     next_id: u64,
     known_secrets: Vec<String>,
     workspace_root: Option<PathBuf>,
+    oauth: Option<crate::mcp_oauth::McpOAuthBinding>,
 }
 
 impl McpHttpClient {
     pub fn new(endpoint: impl Into<String>, bearer: Option<String>) -> Result<Self, BackendError> {
         let endpoint = endpoint.into();
-        if !endpoint.starts_with("https://")
-            && !endpoint.starts_with("http://localhost")
-            && !endpoint.starts_with("http://127.0.0.1")
-        {
+        if !crate::mcp_oauth::allowed_mcp_http_url(&endpoint) {
             return Err(BackendError::Transport(
                 "remote MCP endpoint must use HTTPS".into(),
             ));
         }
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| BackendError::Transport(error.to_string()))?;
+        let client = crate::mcp_oauth::blocking_http()?;
         let mut known_secrets = Vec::new();
         if let Some(token) = bearer.clone().filter(|token| !token.is_empty()) {
             known_secrets.push(token);
@@ -560,7 +554,23 @@ impl McpHttpClient {
             next_id: 1,
             known_secrets,
             workspace_root: None,
+            oauth: None,
         })
+    }
+
+    /// Streamable HTTP client that loads and refreshes an OAuth token from the secret store.
+    pub fn with_oauth(
+        endpoint: impl Into<String>,
+        oauth: crate::mcp_oauth::McpOAuthBinding,
+    ) -> Result<Self, BackendError> {
+        if !valid_server_id(&oauth.server_id) {
+            return Err(BackendError::Protocol(
+                "MCP server id is not a safe identifier".into(),
+            ));
+        }
+        let mut client = Self::new(endpoint, None)?;
+        client.oauth = Some(oauth);
+        Ok(client)
     }
 
     pub fn set_workspace_root(&mut self, root: impl Into<PathBuf>) {
@@ -603,28 +613,19 @@ impl McpHttpClient {
     }
 
     pub fn notify(&mut self, method: &str, params: Value) -> Result<(), BackendError> {
-        let mut request = self
-            .client
-            .post(&self.endpoint)
-            .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
-            .header("Accept", "application/json, text/event-stream")
-            .json(&serde_json::json!({"jsonrpc":"2.0","method":method,"params":params}));
-        if let Some(token) = &self.bearer {
-            request = request.bearer_auth(token);
-        }
-        if let Some(session) = &self.session_id {
-            request = request.header("Mcp-Session-Id", session);
-        }
-        let response = request
-            .send()
-            .map_err(|error| BackendError::Transport(error.to_string()))?;
-        if response.status().is_success() {
-            Ok(())
-        } else {
-            Err(BackendError::Transport(format!(
-                "MCP HTTP status {}",
-                response.status()
-            )))
+        let refreshed = self.prepare_oauth(false)?;
+        let body = serde_json::json!({"jsonrpc":"2.0","method":method,"params":params});
+        match self.post_json(body.clone())? {
+            HttpPost::Unauthorized if self.oauth.is_some() && !refreshed => {
+                self.prepare_oauth(true)?;
+                match self.post_json(body)? {
+                    HttpPost::Unauthorized => self.fail_relogin::<()>(),
+                    HttpPost::Response(response) => self.empty_success(response),
+                }
+            }
+            HttpPost::Unauthorized if self.oauth.is_some() => self.fail_relogin::<()>(),
+            HttpPost::Unauthorized => Err(BackendError::Transport("MCP HTTP status 401".into())),
+            HttpPost::Response(response) => self.empty_success(response),
         }
     }
 
@@ -669,21 +670,71 @@ impl McpHttpClient {
     }
 
     pub fn request(&mut self, id: u64, method: &str, params: Value) -> Result<Value, BackendError> {
+        let refreshed = self.prepare_oauth(false)?;
+        let body = serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+        match self.post_json(body.clone())? {
+            HttpPost::Unauthorized if self.oauth.is_some() && !refreshed => {
+                self.prepare_oauth(true)?;
+                match self.post_json(body)? {
+                    HttpPost::Unauthorized => self.fail_relogin(),
+                    HttpPost::Response(response) => self.parse_rpc(response),
+                }
+            }
+            HttpPost::Unauthorized if self.oauth.is_some() => self.fail_relogin(),
+            HttpPost::Unauthorized => Err(BackendError::Transport("MCP HTTP status 401".into())),
+            HttpPost::Response(response) => self.parse_rpc(response),
+        }
+    }
+
+    fn prepare_oauth(&mut self, force: bool) -> Result<bool, BackendError> {
+        let Some(oauth) = self.oauth.clone() else {
+            return Ok(false);
+        };
+        let prepared =
+            crate::mcp_oauth::prepare_access_token(&self.client, &oauth, force, &self.endpoint)
+                .map_err(|error| redact_backend_error(error, &self.known_secrets))?;
+        self.remember_secrets(prepared.secrets);
+        self.bearer = Some(prepared.access);
+        Ok(prepared.refreshed)
+    }
+
+    fn fail_relogin<T>(&mut self) -> Result<T, BackendError> {
+        if let Some(oauth) = self.oauth.clone() {
+            crate::mcp_oauth::mark_relogin_required(&oauth);
+        }
+        self.bearer = None;
+        Err(BackendError::Unavailable(
+            "MCP authorization needs sign-in".into(),
+        ))
+    }
+
+    fn remember_secrets(&mut self, secrets: Vec<String>) {
+        for secret in secrets {
+            if secret.len() >= 8 && !self.known_secrets.iter().any(|known| known == &secret) {
+                self.known_secrets.push(secret);
+            }
+        }
+    }
+
+    fn post_json(&mut self, body: Value) -> Result<HttpPost, BackendError> {
         let mut request = self
             .client
             .post(&self.endpoint)
             .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
             .header("Accept", "application/json, text/event-stream")
-            .json(&serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}));
+            .json(&body);
         if let Some(token) = &self.bearer {
             request = request.bearer_auth(token);
         }
         if let Some(session) = &self.session_id {
             request = request.header("Mcp-Session-Id", session);
         }
-        let response = request
-            .send()
-            .map_err(|error| BackendError::Transport(error.to_string()))?;
+        let response = request.send().map_err(|error| {
+            redact_backend_error(
+                BackendError::Transport(error.to_string()),
+                &self.known_secrets,
+            )
+        })?;
         if let Some(session) = response
             .headers()
             .get("Mcp-Session-Id")
@@ -691,29 +742,61 @@ impl McpHttpClient {
         {
             self.session_id = Some(session.into());
         }
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let _ = response.bytes();
+            return Ok(HttpPost::Unauthorized);
+        }
+        Ok(HttpPost::Response(response))
+    }
+
+    fn empty_success(&self, response: reqwest::blocking::Response) -> Result<(), BackendError> {
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(BackendError::Transport(format!(
+                "MCP HTTP status {}",
+                response.status()
+            )))
+        }
+    }
+
+    fn parse_rpc(&self, response: reqwest::blocking::Response) -> Result<Value, BackendError> {
         if !response.status().is_success() {
             return Err(BackendError::Transport(format!(
                 "MCP HTTP status {}",
                 response.status()
             )));
         }
-        let text = response
-            .text()
-            .map_err(|error| BackendError::Transport(error.to_string()))?;
+        let text = response.text().map_err(|error| {
+            redact_backend_error(
+                BackendError::Transport(error.to_string()),
+                &self.known_secrets,
+            )
+        })?;
+        let text = redact_text(&text, &self.known_secrets);
         let payload = text
             .lines()
             .find_map(|line| line.strip_prefix("data: "))
             .unwrap_or(text.trim());
-        let value: Value = serde_json::from_str(payload)
-            .map_err(|error| BackendError::Protocol(error.to_string()))?;
+        let value: Value = serde_json::from_str(payload).map_err(|error| {
+            BackendError::Protocol(redact_text(&error.to_string(), &self.known_secrets))
+        })?;
         if let Some(error) = value.get("error") {
-            return Err(BackendError::Protocol(error.to_string()));
+            return Err(BackendError::Protocol(redact_text(
+                &error.to_string(),
+                &self.known_secrets,
+            )));
         }
         value
             .get("result")
             .cloned()
             .ok_or_else(|| BackendError::Protocol("MCP response has no result".into()))
     }
+}
+
+enum HttpPost {
+    Response(reqwest::blocking::Response),
+    Unauthorized,
 }
 
 #[derive(Clone)]
@@ -834,7 +917,7 @@ fn valid_tool_name(name: &str) -> bool {
     true
 }
 
-fn valid_server_id(server_id: &str) -> bool {
+pub(crate) fn valid_server_id(server_id: &str) -> bool {
     let mut chars = server_id.chars();
     let Some(first) = chars.next() else {
         return false;

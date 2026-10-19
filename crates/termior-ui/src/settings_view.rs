@@ -134,6 +134,8 @@ pub struct SettingsView {
     lifecycle_hooks: termior_hooks::HookCatalog,
     hook_runs: Vec<termior_hooks::HookRunRecord>,
     hook_load_error: Option<String>,
+    mcp_servers: termior_agent_host::McpServerCatalog,
+    mcp_load_error: Option<String>,
     _updater_subscription: gpui::Subscription,
 }
 
@@ -145,6 +147,7 @@ mod edit;
 mod general;
 mod helpers;
 mod hooks;
+mod mcp;
 mod models;
 mod persist;
 mod shortcuts;
@@ -155,6 +158,8 @@ mod widgets;
 mod edit_tests;
 #[cfg(test)]
 mod hooks_tests;
+#[cfg(test)]
+mod mcp_tests;
 
 use edit::SettingsInputHandler;
 use helpers::{bytes_to_mib, char_to_byte, on_off};
@@ -223,7 +228,10 @@ impl SettingsView {
             lifecycle_hooks: termior_hooks::HookCatalog::default(),
             hook_runs: Vec::new(),
             hook_load_error: None,
+            mcp_servers: termior_agent_host::McpServerCatalog::default(),
+            mcp_load_error: None,
         };
+        view.reload_mcp_servers();
         view.refresh_credential_state();
         // shell 探测两段式：原生条目（PATH 检查，即时）先到，WSL 枚举
         // （wsl.exe 子进程，带超时）完成后再追加（FR-TERM-05）。
@@ -263,6 +271,9 @@ impl SettingsView {
         if page == SettingsPage::Hooks {
             self.reload_lifecycle_hooks();
         }
+        if page == SettingsPage::Mcp {
+            self.reload_mcp_servers();
+        }
         cx.notify();
     }
 
@@ -278,6 +289,7 @@ impl SettingsView {
             SettingsPage::Shortcuts => t!("settings.page.shortcuts"),
             SettingsPage::Agents => t!("settings.page.agents"),
             SettingsPage::Hooks => t!("settings.page.hooks"),
+            SettingsPage::Mcp => t!("settings.page.mcp"),
             SettingsPage::About => t!("settings.page.about"),
         }
     }
@@ -290,6 +302,7 @@ impl SettingsView {
             SettingsPage::Shortcuts => self.shortcuts_page(cx),
             SettingsPage::Agents => self.agents_page(cx),
             SettingsPage::Hooks => self.hooks_page(cx),
+            SettingsPage::Mcp => self.mcp_page(cx),
             SettingsPage::About => self.about_page(cx),
         }
     }
@@ -338,6 +351,7 @@ impl gpui::Render for SettingsView {
             SettingsPage::Shortcuts,
             SettingsPage::Agents,
             SettingsPage::Hooks,
+            SettingsPage::Mcp,
             SettingsPage::About,
         ]
         .into_iter()
