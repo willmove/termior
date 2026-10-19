@@ -22,7 +22,7 @@
 
 - [x] 3.1 实现全局/根/嵌套 AGENTS 规则发现、路径作用域和来源排序，替换单文件 ProjectMemory 注入
 - [x] 3.2 对同 Turn 多文件分别计算规则；共同 prompt 去重，文件特定规则靠近工具上下文
-- [ ] 3.3 基于现有 tree-sitter/文件索引建立增量 symbol/reference map，尊重 ignore、授权和文件 hash
+- [x] 3.3 基于现有 tree-sitter/文件索引建立增量 symbol/reference map，尊重 ignore、授权和文件 hash
 - [x] 3.4 实现路径+词法+引用关系的有界相关切片；无 parser 语言降级到文件/grep
 - [x] 3.5 定义 MemoryCandidate/MemoryEntry 和 review UI，含来源、编辑、删除、暂停与过期状态
 - [x] 3.6 在持久化前对记忆运行 deny-list/secret scanner；添加投毒和过期来源测试
@@ -71,7 +71,7 @@
 代码已随 `8d294f0` 落地，但当时未回写本文件。以上勾选以仓库内实现与测试为证据；以下未勾项仍未完成，本 change 暂不归档：
 
 - 0.x 阶段门禁：M7 未归档。
-- 3.3 仓库地图基于词法 symbol/reference 提取，尚未接入 tree-sitter（偏差，需更新 design 或补实现）。
+- 3.3（2026-10-19 补实现，Refs #11）：`termior-editor::outline` 用现有 tree-sitter 语法提取定义（名称、类型、所属容器、签名、行号）与引用，覆盖 Rust/Python/JS/TS/TSX/Go/C/C++/Java，其余语言降级到词法；`termior-ai::repo_map` 以 `termior-explorer` 文件索引列文件（ignore 规则），按 SHA-256 内容 hash 增量更新（未改文件靠 size+mtime 跳过，racy 窗口内重 hash；改名/复制复用已解析大纲），拒绝 deny-list、未授权根、符号链接逃逸与硬链接，大文件与二进制只列路径不解析。`RepoMapService` 在后台线程建索引与刷新，UI 线程只读已落定快照；Composer 在输入时预热、每次内置任务提交时取 1,200 token 相关切片（不再只限 worktree 任务）。失效测试覆盖改名、删除（文件与目录）、大文件、同长度 racy 改写与查询时陈旧排除。上下文延迟门禁见 CI `Context latency (linux/macos/windows)` 与 `docs/process/nfr-baselines.md`。仍未做：文件系统 watcher（两轮之间的改动靠提交时的刷新 sweep 与查询时陈旧检查兜底，首次提交可能在首轮 sweep 完成前拿到空切片）；D4 中的测试邻近关系未建边。
 - 5.5 未处理 `list_changed` 通知。
 - 5.6 恶意 fake MCP server 红队未覆盖 token 泄漏与断线重连。
 - 7.5 未用 Gemini CLI / OpenCode 做真实 ACP 端到端 smoke。
