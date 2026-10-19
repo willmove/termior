@@ -52,6 +52,8 @@ impl ComposerView {
             open_center: None,
             recovery_tasks: Vec::new(),
             automations: AutomationStore::default(),
+            task_tree: TaskTreeSnapshot::default(),
+            task_tree_selected: None,
             checkpoints: Vec::new(),
             skills: Vec::new(),
             skill_scan_error: None,

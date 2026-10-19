@@ -921,3 +921,128 @@ fn permission_card_shows_unknown_scope_and_grants_for_the_turn() {
         );
     });
 }
+
+fn task_node(
+    id: &str,
+    state: termior_ai::orchestration::NodeState,
+    dependencies: Vec<String>,
+    usage: termior_ai::orchestration::TaskResourceUsage,
+) -> termior_ai::orchestration::TaskTreeNode {
+    termior_ai::orchestration::TaskTreeNode {
+        task_id: id.into(),
+        parent_task_id: "root".into(),
+        agent_id: "worker".into(),
+        provider_id: "provider".into(),
+        environment_id: format!("env-{id}"),
+        project_dir: "C:/workspace".into(),
+        dependencies,
+        state,
+        budgets: termior_ai::RuntimeBudgets::default(),
+        queue_reason: None,
+        blockers: vec![],
+        ready_condition: None,
+        result_verified: None,
+        unknown_side_effects: false,
+        usage,
+    }
+}
+
+/// 任务树展示排队原因和未知成本，取消后保留 unknown 记录且不能删除。
+#[test]
+fn task_tree_renders_unknown_cost_and_refuses_to_delete_it() {
+    use termior_ai::orchestration::{NodeState, TaskResourceUsage, TaskTreeSnapshot};
+    let mut cx = TestAppContext::single();
+    let (composer, vcx) = cx.add_window_view(|_, cx| ComposerView::new(cx));
+    composer.update(vcx, |view, _| {
+        view.panel_height = 640.0;
+        view.history.push(Message::user("打开任务树"));
+        let mut queued = task_node(
+            "queued",
+            NodeState::Queued,
+            vec!["running".into()],
+            TaskResourceUsage {
+                input_tokens: Some(3),
+                output_tokens: Some(1),
+                cost_usd: None,
+                wall_clock_ms: None,
+                output_bytes: None,
+            },
+        );
+        queued.queue_reason = Some("waiting for running".into());
+        queued.blockers = vec!["running".into()];
+        queued.ready_condition = Some("dependencies succeed: running".into());
+        view.set_task_tree(TaskTreeSnapshot {
+            generated_at_ms: 1,
+            concurrency_cap: 2,
+            nodes: vec![
+                task_node(
+                    "running",
+                    NodeState::Running,
+                    vec![],
+                    TaskResourceUsage::default(),
+                ),
+                queued,
+            ],
+            aggregate: TaskResourceUsage::default(),
+            backends: vec![],
+        });
+        view.open_center = Some(ComposerCenter::TaskTree);
+        let lines = view
+            .task_tree_lines()
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            lines.iter().any(|line| line.contains("cost unknown")),
+            "unknown cost stays visible: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("cost 0")),
+            "unknown cost must not render as zero: {lines:?}"
+        );
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("waiting for running")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("dependencies succeed: running")));
+        assert_eq!(view.task_tree.concurrency_cap, 2);
+        assert!(view.cancel_task_tree_child("running"));
+        let running = view
+            .task_tree
+            .nodes
+            .iter()
+            .find(|node| node.task_id == "running")
+            .unwrap();
+        assert_eq!(running.state, NodeState::Unknown);
+        assert!(running.unknown_side_effects);
+        assert!(!view.delete_task_tree_record("running"));
+        assert!(view
+            .task_tree
+            .nodes
+            .iter()
+            .any(|node| node.task_id == "running"));
+        view.cancel_task_tree_all();
+        assert!(view.delete_task_tree_record("queued"));
+        assert_eq!(view.task_tree.nodes.len(), 1);
+        view.adjust_task_tree_concurrency(-1);
+        assert_eq!(view.task_tree.concurrency_cap, 1);
+        view.select_task_tree_node("running");
+        assert_eq!(view.task_tree_selected.as_deref(), Some("running"));
+        let detail = view
+            .task_tree_lines()
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(detail.iter().any(|line| line.contains("cost unknown")));
+        assert!(detail.iter().all(|line| !line.contains("cost 0")));
+    });
+    draw(vcx);
+    assert!(vcx.debug_bounds("composer-task-tree").is_some());
+    assert!(vcx.debug_bounds("task-tree-panel").is_some());
+    assert!(vcx.debug_bounds("task-tree-view-0").is_some());
+    assert!(
+        vcx.debug_bounds("task-tree-delete-0").is_none(),
+        "unknown side-effect records have no delete control"
+    );
+}
