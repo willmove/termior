@@ -109,7 +109,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 ## 4. 平台与运行环境
 
 - **macOS** ≥ 13（Metal），Apple Silicon 优先优化 — P0
-- **Linux** X11/Wayland（Vulkan；提供软件渲染回退开关）— P0
+- **Linux** X11/Wayland（Vulkan；提供软件渲染回退开关），glibc ≥ 2.31 — P0
 - **Windows** 10 22H2+（DirectX 11+，ConPTY）— P0
 - 单窗口 = 单工作区；支持多窗口多工作区（P1）
 - 发行物：macOS `.dmg`（签名+公证）、Linux `.AppImage`/`.deb`、Windows `.msi`

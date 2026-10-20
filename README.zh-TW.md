@@ -16,7 +16,7 @@ Termior 在單一原生視窗中組合真 PTY 終端機、輕量程式碼編輯�
 
 ### 安裝
 
-從[最新 release](https://github.com/willmove/termior/releases/latest) 下載對應平台產物：Windows 為 Inno Setup 安裝器 `*-setup.exe` 或可攜版 `*.zip`，macOS 為拖曳安裝的 `*.dmg` 或可攜版 `*.tar.gz`，Linux 為 `*.deb` 或 `*.tar.gz`。所有產物均附帶 SHA-256 校驗檔案。目前 macOS 建置面向 macOS 13+ 的 Apple Silicon，尚無 Intel 版本。
+從[最新 release](https://github.com/willmove/termior/releases/latest) 下載對應平台產物：Windows 為 Inno Setup 安裝器 `*-setup.exe` 或可攜版 `*.zip`，macOS 為拖曳安裝的 `*.dmg` 或可攜版 `*.tar.gz`，Linux 為 `*.deb` 或 `*.tar.gz`。所有產物均附帶 SHA-256 校驗檔案。目前 macOS 建置面向 macOS 13+ 的 Apple Silicon，尚無 Intel 版本。Linux 安裝包需要 glibc 2.31 或更高版本（Ubuntu 20.04、麒麟 V10 及更新的發行版）。`.deb` 與可攜版 `.tar.gz` 是同一個二進位。目前不提供 AppImage。
 
 **macOS Gatekeeper 說明。** 發布流水線設定了 Apple Developer 憑據時，應用與 DMG 會完成簽署與公證，可正常開啟。在未簽署建置上，Gatekeeper 會彈出誤導性的「"Termior"已損毀，無法開啟」提示——下載檔案本身並未損壞。遇到該提示時，把 `Termior.app` 拖入 `/Applications`，清除隔離屬性後再開啟：
 

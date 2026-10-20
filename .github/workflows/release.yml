@@ -35,7 +35,9 @@ jobs:
           - os: windows-latest
             platform: windows
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75
+    # Linux links inside an Ubuntu 20.04 image (glibc 2.31). Cold image builds
+    # plus a thin-LTO release need more than the previous 75 minute budget.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - name: Resolve and validate version
@@ -47,11 +49,6 @@ jobs:
           if ($manifest -notmatch '(?ms)\[workspace\.package\].*?version\s*=\s*"([^"]+)"') { throw "workspace package version not found" }
           if ($requested -ne $Matches[1]) { throw "Release version $requested does not match Cargo.toml version $($Matches[1])" }
           "version=$requested" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-      - name: Install Linux desktop dependencies
-        if: matrix.platform == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libdbus-1-dev libfontconfig-dev libfreetype-dev libx11-dev libx11-xcb-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev libudev-dev dpkg-dev
       - name: Ensure Inno Setup
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -63,9 +60,20 @@ jobs:
           }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        if: matrix.platform != 'linux'
         with:
           workspaces: "."
+      # ubuntu-latest is glibc 2.39 (and moving to a newer image). Linking the
+      # published binary there makes cargo-deb emit libc6 (>= 2.39). Linux
+      # artifacts are built in Ubuntu 20.04 so the binary and Depends stay on
+      # glibc 2.31. The host rustc is only used afterwards to name the tarball.
+      - name: Build Linux release on Ubuntu 20.04 (glibc 2.31)
+        if: matrix.platform == 'linux'
+        env:
+          TERMIOR_VERSION: ${{ steps.version.outputs.version }}
+        run: bash packaging/linux/ci-build.sh
       - name: Build optimized binary
+        if: matrix.platform != 'linux'
         run: cargo build -p termior --release --locked
       # macOS signing and notarization activate only when these repository secrets are set:
       #   MACOS_CERTIFICATE_P12_BASE64       base64-encoded Developer ID Application certificate (.p12)
@@ -128,18 +136,14 @@ jobs:
           # Run inside dist/ so the checksum file records the bare asset name, matching termior-platform's parser.
           name="$(basename "$dmg")"
           (cd dist && shasum -a 256 "$name" > "$name.sha256")
-      - name: Build Linux .deb installer
-        if: matrix.platform == 'linux'
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-deb
-      - name: Package .deb with checksum
+      # Runs on the runner as well as inside the container, so a later step cannot
+      # swap in a binary linked on ubuntu-latest without failing the job.
+      - name: Check Linux glibc baseline (2.31)
         if: matrix.platform == 'linux'
         run: |
-          deb="dist/termior-${{ steps.version.outputs.version }}-linux-x86_64.deb"
-          cargo deb -p termior --no-build --no-strip --output "$deb"
-          hash=$(sha256sum "$deb" | cut -d' ' -f1)
-          echo "$hash  $(basename "$deb")" > "$deb.sha256"
+          bash packaging/linux/check-glibc-baseline.sh --self-test
+          deb=$(ls dist/termior-*-linux-*.deb)
+          bash packaging/linux/check-glibc-baseline.sh target/release/termior "$deb"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}

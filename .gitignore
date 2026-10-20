@@ -1,5 +1,6 @@
 /target
 /dist
+/.cache/
 /node_modules
 *.rs.bk
 

@@ -42,7 +42,10 @@ long_description = "Termior combines a native terminal, editor, Git, preview, an
 osx_minimum_system_version = "13.0"
 
 # cargo-deb（release 工作流的 Linux .deb 安装包）。资产路径相对于本包目录；
-# depends 走 $auto 由 dpkg-shlibdeps 依据实际动态链接解析。
+# depends 保持默认 $auto，由 dpkg-shlibdeps 按实际动态符号解析。
+# 发布二进制必须在 Ubuntu 20.04（glibc 2.31）容器里链接。在 ubuntu-latest
+# （glibc 2.39）上链接会让 $auto 写成 libc6 (>= 2.39)，而手改 Depends
+# 不能让加载器接受 GLIBC_2.39 的 VERNEED。
 [package.metadata.deb]
 maintainer = "Willmove <willmove@qq.com>"
 section = "utils"
