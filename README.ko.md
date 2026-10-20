@@ -16,7 +16,7 @@ Termior는 실제 PTY 터미널, 가벼운 코드 에디터, 파일 탐색기, G
 
 ### 설치
 
-[최신 릴리스](https://github.com/willmove/termior/releases/latest)에서 플랫폼에 맞는 아티팩트를 내려받으세요. Windows는 Inno Setup 설치 관리자 `*-setup.exe` 또는 포터블 `*.zip`, macOS는 드래그 설치 `*.dmg` 또는 포터블 `*.tar.gz`, Linux는 `*.deb` 또는 `*.tar.gz`입니다. 모든 아티팩트에는 SHA-256 체크섬이 따릅니다. 현재 macOS 빌드는 macOS 13+ Apple Silicon 대상이며 Intel 패키지는 아직 없습니다.
+[최신 릴리스](https://github.com/willmove/termior/releases/latest)에서 플랫폼에 맞는 아티팩트를 내려받으세요. Windows는 Inno Setup 설치 관리자 `*-setup.exe` 또는 포터블 `*.zip`, macOS는 드래그 설치 `*.dmg` 또는 포터블 `*.tar.gz`, Linux는 `*.deb` 또는 `*.tar.gz`입니다. 모든 아티팩트에는 SHA-256 체크섬이 따릅니다. 현재 macOS 빌드는 macOS 13+ Apple Silicon 대상이며 Intel 패키지는 아직 없습니다. Linux 패키지는 glibc 2.31 이상(Ubuntu 20.04, Kylin V10 및 이후 배포판)이 필요합니다. `.deb`와 포터블 `.tar.gz`는 같은 바이너리입니다. AppImage는 제공하지 않습니다.
 
 **macOS Gatekeeper 안내.** 릴리스 파이프라인에 Apple Developer 자격 증명이 설정되어 있으면 앱 번들과 DMG가 코드 서명·공증되어 정상적으로 열립니다. 미서명 빌드에서는 Gatekeeper가 "Termior가 손상되어 열 수 없습니다"라는 오도하는 대화상자를 보여줍니다 — 내려받은 파일 자체는 문제 없습니다. 이 대화상자가 뜨면 `Termior.app`을 `/Applications`로 드래그한 뒤 격리 속성을 제거하고 실행하세요:
 

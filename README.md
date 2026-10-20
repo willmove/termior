@@ -18,7 +18,7 @@ Termior brings a real PTY terminal, a lightweight code editor, a file explorer, 
 
 ### Installation
 
-Download the artifact for your platform from the [latest release](https://github.com/willmove/termior/releases/latest): an Inno Setup `*-setup.exe` or a portable `*.zip` on Windows, a drag-to-install `*.dmg` or a portable `*.tar.gz` on macOS, and a `*.deb` or `*.tar.gz` on Linux. Every asset carries a SHA-256 checksum. The current macOS builds target macOS 13+ on Apple Silicon; there is no Intel package yet.
+Download the artifact for your platform from the [latest release](https://github.com/willmove/termior/releases/latest): an Inno Setup `*-setup.exe` or a portable `*.zip` on Windows, a drag-to-install `*.dmg` or a portable `*.tar.gz` on macOS, and a `*.deb` or `*.tar.gz` on Linux. Every asset carries a SHA-256 checksum. The current macOS builds target macOS 13+ on Apple Silicon; there is no Intel package yet. Linux packages require glibc 2.31 or newer (Ubuntu 20.04, Kylin V10, and later distributions). The `.deb` and the portable `.tar.gz` ship the same binary. No AppImage is published.
 
 **macOS Gatekeeper note.** When the release pipeline runs with Apple Developer credentials configured, the app bundle and DMG are signed and notarized and open normally. On unsigned builds, Gatekeeper shows a misleading "Termior is damaged and can't be opened" dialog — the download itself is intact. If you see it, drag `Termior.app` to `/Applications`, then clear the quarantine attribute and open the app:
 
@@ -156,7 +156,7 @@ cargo run -p termior
 
 #### Release
 
-A release tag (`v<workspace-version>`) triggers a three-platform release build that produces portable ZIP/TAR archives with SHA-256 checksums plus per-platform installers: an Inno Setup `*-setup.exe` on Windows, a drag-to-install `.dmg` on macOS, and a `cargo-deb`-generated `.deb` on Linux. The pipeline enforces the 60 MiB single-binary limit and the 100 MiB archive/installer limit from Spec NFR-05. When the Apple Developer secrets listed in `release.yml` are configured on the repository, macOS packaging additionally code-signs the app bundle and DMG, notarizes and staples the DMG, and regenerates its checksum; without them the artifacts are published unsigned. Locally you can reproduce the check and packaging with `scripts/check-release-binary.ps1` and `scripts/package-release.ps1` (the Windows installer requires Inno Setup 6 on the machine; pass `-MacosSigningIdentity` to sign a local macOS build).
+A release tag (`v<workspace-version>`) triggers a three-platform release build that produces portable ZIP/TAR archives with SHA-256 checksums plus per-platform installers: an Inno Setup `*-setup.exe` on Windows, a drag-to-install `.dmg` on macOS, and a `cargo-deb`-generated `.deb` on Linux. The Linux binary is linked in an Ubuntu 20.04 container so the executable and the `.deb` `Depends` line target glibc 2.31; the release job fails if any `GLIBC_` symbol version is newer than that. The pipeline enforces the 60 MiB single-binary limit and the 100 MiB archive/installer limit from Spec NFR-05. When the Apple Developer secrets listed in `release.yml` are configured on the repository, macOS packaging additionally code-signs the app bundle and DMG, notarizes and staples the DMG, and regenerates its checksum; without them the artifacts are published unsigned. Locally you can reproduce the check and packaging with `scripts/check-release-binary.ps1` and `scripts/package-release.ps1` (the Windows installer requires Inno Setup 6 on the machine; pass `-MacosSigningIdentity` to sign a local macOS build).
 
 Release size comes mainly from the GPUI native rendering stack, the terminal/VTE layer, per-language tree-sitter grammars, and TLS, keychain, and provider clients. Web preview hands off to the system browser instead of embedding a WebView (ADR 0002), which keeps the dependency surface identical across platforms; PNG decoding and tree-sitter languages use explicit minimal features, so new UI, preview, or grammar capabilities must be evaluated against the CI dependency-tree and size reports.
 
@@ -196,7 +196,7 @@ Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、�
 
 ### 安装
 
-从[最新 release](https://github.com/willmove/termior/releases/latest) 下载对应平台产物：Windows 为 Inno Setup 安装器 `*-setup.exe` 或便携版 `*.zip`，macOS 为拖拽安装的 `*.dmg` 或便携版 `*.tar.gz`，Linux 为 `*.deb` 或 `*.tar.gz`。所有产物均附带 SHA-256 校验文件。当前 macOS 构建面向 macOS 13+ 的 Apple Silicon，暂无 Intel 版本。
+从[最新 release](https://github.com/willmove/termior/releases/latest) 下载对应平台产物：Windows 为 Inno Setup 安装器 `*-setup.exe` 或便携版 `*.zip`，macOS 为拖拽安装的 `*.dmg` 或便携版 `*.tar.gz`，Linux 为 `*.deb` 或 `*.tar.gz`。所有产物均附带 SHA-256 校验文件。当前 macOS 构建面向 macOS 13+ 的 Apple Silicon，暂无 Intel 版本。Linux 安装包需要 glibc 2.31 或更高版本（Ubuntu 20.04、麒麟 V10 及更新的发行版）。`.deb` 与便携版 `.tar.gz` 是同一个二进制。当前不提供 AppImage。
 
 **macOS Gatekeeper 说明。** 发布流水线配置了 Apple Developer 凭据时，应用与 DMG 会完成签名与公证，可正常打开。在未签名构建上，Gatekeeper 会弹出误导性的「“Termior”已损坏，无法打开」提示——下载文件本身并未损坏。遇到该提示时，把 `Termior.app` 拖入 `/Applications`，清除隔离属性后再打开：
 
@@ -338,7 +338,7 @@ cargo run -p termior
 
 #### 发布
 
-发布 tag（`v<workspace-version>`）会触发三平台 release 构建，产出 portable ZIP/TAR 与 SHA-256 校验文件，并附带各平台安装包：Windows 为 Inno Setup 安装器 `*-setup.exe`，macOS 为拖拽安装的 `.dmg`，Linux 为 `cargo-deb` 生成的 `.deb`。流水线按 Spec NFR-05 将单二进制限制为 60 MiB，并将压缩包/安装包限制为 100 MiB；仓库配置了 `release.yml` 中列出的 Apple Developer secrets 时，macOS 打包会额外对 app bundle 与 DMG 代码签名、对 DMG 公证并 staple、并重新生成其校验文件，否则产物以未签名形式发布；本地可用 `scripts/check-release-binary.ps1` 和 `scripts/package-release.ps1` 复现检查与打包（Windows 安装器需本机装有 Inno Setup 6，本地 macOS 打包可传 `-MacosSigningIdentity` 完成签名）。
+发布 tag（`v<workspace-version>`）会触发三平台 release 构建，产出 portable ZIP/TAR 与 SHA-256 校验文件，并附带各平台安装包：Windows 为 Inno Setup 安装器 `*-setup.exe`，macOS 为拖拽安装的 `.dmg`，Linux 为 `cargo-deb` 生成的 `.deb`。Linux 二进制在 Ubuntu 20.04 容器中链接，使可执行文件与 `.deb` 的 `Depends` 面向 glibc 2.31；若出现高于该版本的 `GLIBC_` 符号，发布任务会失败。流水线按 Spec NFR-05 将单二进制限制为 60 MiB，并将压缩包/安装包限制为 100 MiB；仓库配置了 `release.yml` 中列出的 Apple Developer secrets 时，macOS 打包会额外对 app bundle 与 DMG 代码签名、对 DMG 公证并 staple、并重新生成其校验文件，否则产物以未签名形式发布；本地可用 `scripts/check-release-binary.ps1` 和 `scripts/package-release.ps1` 复现检查与打包（Windows 安装器需本机装有 Inno Setup 6，本地 macOS 打包可传 `-MacosSigningIdentity` 完成签名）。
 
 Release 体积主要来自 GPUI 原生渲染栈、终端/VTE、按语言引入的 tree-sitter grammar，以及 TLS、钥匙串和 Provider 客户端。Web 预览统一交系统浏览器打开、不内嵌 WebView（ADR 0002），三平台依赖面一致；PNG 解码和 tree-sitter 语言均采用显式最小 feature，新增 UI、预览或语法能力时须结合 CI 的依赖树和体积报告评估增量。
 

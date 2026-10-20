@@ -134,7 +134,12 @@ gh run watch <tag-run-id> --exit-status --interval 15
 
 All of these jobs must succeed:
 
-- `Package (linux)` — tar.gz + .deb + checksums.
+- `Package (linux)` — tar.gz + .deb + checksums. The binary and the `.deb` are
+  linked and packaged inside Ubuntu 20.04 (glibc 2.31), not on `ubuntu-latest`.
+  `packaging/linux/check-glibc-baseline.sh` fails the job when `objdump -T` or
+  `readelf -V` shows a `GLIBC_` version newer than 2.31, or when the `.deb`
+  `Depends` line requires a newer `libc6`. The tarball is that same binary.
+  There is no AppImage.
 - `Package (macos)` — tar.gz + .dmg + checksums.
 - `Package (windows)` — zip + Inno Setup `-setup.exe` + checksums.
 - `Publish GitHub Release` — attaches all artifacts and creates the Release with generated notes.
@@ -187,7 +192,8 @@ One-sentence summary of the release.
 
 - Windows x64: Inno Setup installer (`termior-X.Y.Z-windows-x86_64-setup.exe`) and portable zip.
 - macOS: `termior-X.Y.Z-macos-x86_64.dmg` and `.tar.gz`.
-- Linux x86_64: `.deb` and `.tar.gz`.
+- Linux x86_64: `.deb` and `.tar.gz`, built for glibc 2.31 or newer (Ubuntu 20.04,
+  Kylin V10, and later). No AppImage is published.
 - Every asset ships with a matching `.sha256` checksum.
 
 ## Verification
@@ -223,7 +229,8 @@ One-sentence summary of the release.
 
 - Windows x64：Inno Setup 安装程序（`termior-X.Y.Z-windows-x86_64-setup.exe`）与便携版 zip。
 - macOS：`termior-X.Y.Z-macos-x86_64.dmg` 与 `.tar.gz`。
-- Linux x86_64：`.deb` 与 `.tar.gz`。
+- Linux x86_64：`.deb` 与 `.tar.gz`，面向 glibc 2.31 及以上（Ubuntu 20.04、麒麟 V10
+  及更新的发行版）。不发布 AppImage。
 - 每个产物均附带对应的 `.sha256` 校验文件。
 
 ## 验证
