@@ -134,12 +134,15 @@ gh run watch <tag-run-id> --exit-status --interval 15
 
 All of these jobs must succeed:
 
-- `Package (linux)` — tar.gz + .deb + checksums. The binary and the `.deb` are
-  linked and packaged inside Ubuntu 20.04 (glibc 2.31), not on `ubuntu-latest`.
-  `packaging/linux/check-glibc-baseline.sh` fails the job when `objdump -T` or
-  `readelf -V` shows a `GLIBC_` version newer than 2.31, or when the `.deb`
-  `Depends` line requires a newer `libc6`. The tarball is that same binary.
-  There is no AppImage.
+- `Package (linux)` — tar.gz + .deb + .AppImage + checksums. The binary, the
+  `.deb`, and the `.AppImage` are linked and packaged inside Ubuntu 20.04
+  (glibc 2.31), not on `ubuntu-latest`. `packaging/linux/check-glibc-baseline.sh`
+  fails the job when `objdump -T` or `readelf -V` shows a `GLIBC_` version newer
+  than 2.31, or when the `.deb` `Depends` line requires a newer `libc6`. The
+  tarball is that same binary. `packaging/linux/build-appimage.sh` assembles the
+  AppImage from it: the binary's shared-library dependencies are bundled
+  (glibc and the graphics driver stack stay host-provided) using a pinned
+  appimagetool and type-2 runtime.
 - `Package (macos)` — tar.gz + .dmg + checksums.
 - `Package (windows)` — zip + Inno Setup `-setup.exe` + checksums.
 - `Publish GitHub Release` — attaches all artifacts and creates the Release with generated notes.
@@ -187,13 +190,16 @@ One-sentence summary of the release.
 - State whether settings or persisted data require migration.
 - State relevant platform limitations. Termior's Windows and macOS installers are unsigned, so
   SmartScreen or Gatekeeper bypass steps are normally required.
+- In-app updates on Linux deliver the `.deb` installer; `.AppImage` users update by downloading
+  the new `.AppImage`.
 
 ## Downloads
 
 - Windows x64: Inno Setup installer (`termior-X.Y.Z-windows-x86_64-setup.exe`) and portable zip.
 - macOS: `termior-X.Y.Z-macos-x86_64.dmg` and `.tar.gz`.
-- Linux x86_64: `.deb` and `.tar.gz`, built for glibc 2.31 or newer (Ubuntu 20.04,
-  Kylin V10, and later). No AppImage is published.
+- Linux x86_64: `.deb`, `.AppImage`, and `.tar.gz`, built for glibc 2.31 or newer
+  (Ubuntu 20.04, Kylin V10, and later). The `.AppImage` bundles the shared
+  libraries Termior links against.
 - Every asset ships with a matching `.sha256` checksum.
 
 ## Verification
@@ -224,13 +230,14 @@ One-sentence summary of the release.
 - 说明设置或持久化数据是否需要迁移。
 - 说明相关的平台限制。Termior 的 Windows 与 macOS 安装包未签名，通常需要手动绕过
   SmartScreen 或 Gatekeeper。
+- Linux 的应用内更新下载的是 `.deb` 安装包；`.AppImage` 用户请下载新版 `.AppImage` 更新。
 
 ## 下载
 
 - Windows x64：Inno Setup 安装程序（`termior-X.Y.Z-windows-x86_64-setup.exe`）与便携版 zip。
 - macOS：`termior-X.Y.Z-macos-x86_64.dmg` 与 `.tar.gz`。
-- Linux x86_64：`.deb` 与 `.tar.gz`，面向 glibc 2.31 及以上（Ubuntu 20.04、麒麟 V10
-  及更新的发行版）。不发布 AppImage。
+- Linux x86_64：`.deb`、`.AppImage` 与 `.tar.gz`，面向 glibc 2.31 及以上（Ubuntu 20.04、
+  麒麟 V10 及更新的发行版）。`.AppImage` 自带 Termior 所需的动态库。
 - 每个产物均附带对应的 `.sha256` 校验文件。
 
 ## 验证
@@ -264,8 +271,8 @@ Confirm that:
 - The title is `Termior vX.Y.Z` and the tag is `vX.Y.Z`.
 - The Release is published, not a draft, and not an unintended prerelease.
 - The curated bilingual notes and the full comparison link are present.
-- The assets include all 12 files: per platform (windows zip + setup.exe, macos tar.gz + dmg,
-  linux tar.gz + deb), each with its `.sha256` sidecar.
+- The assets include all 14 files: per platform (windows zip + setup.exe, macos tar.gz + dmg,
+  linux tar.gz + deb + AppImage), each with its `.sha256` sidecar.
 - Installer names must match the updater contract: `termior-X.Y.Z-<platform>-<arch>` plus
   `-setup.exe` (windows), `.dmg` (macos), or `.deb` (linux). `arch` is the actual Rust build
   architecture (`x86_64` or `aarch64`), not an assumed runner architecture. macOS native

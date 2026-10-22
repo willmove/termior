@@ -45,6 +45,8 @@ cargo deb -p termior --no-build --no-strip --output "$deb"
 hash=$(sha256sum "$deb" | awk '{ print $1 }')
 printf '%s  %s\n' "$hash" "$(basename "$deb")" >"$deb.sha256"
 
+bash packaging/linux/build-appimage.sh target/release/termior "$arch"
+
 bash packaging/linux/check-glibc-baseline.sh target/release/termior "$deb"
 
 if [ -n "${HOST_UID:-}" ] && [ -n "${HOST_GID:-}" ]; then

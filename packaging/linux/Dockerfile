@@ -30,6 +30,7 @@ RUN printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99no-ch
         clang \
         cmake \
         curl \
+        desktop-file-utils \
         dpkg-dev \
         fakeroot \
         file \
@@ -49,6 +50,7 @@ RUN printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99no-ch
         libxkbcommon-dev \
         libxkbcommon-x11-dev \
         pkg-config \
+        squashfs-tools \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 

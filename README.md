@@ -18,7 +18,7 @@ Termior brings a real PTY terminal, a lightweight code editor, a file explorer, 
 
 ### Installation
 
-Download the artifact for your platform from the [latest release](https://github.com/willmove/termior/releases/latest): an Inno Setup `*-setup.exe` or a portable `*.zip` on Windows, a drag-to-install `*.dmg` or a portable `*.tar.gz` on macOS, and a `*.deb` or `*.tar.gz` on Linux. Every asset carries a SHA-256 checksum. The current macOS builds target macOS 13+ on Apple Silicon; there is no Intel package yet. Linux packages require glibc 2.31 or newer (Ubuntu 20.04, Kylin V10, and later distributions). The `.deb` and the portable `.tar.gz` ship the same binary. No AppImage is published.
+Download the artifact for your platform from the [latest release](https://github.com/willmove/termior/releases/latest): an Inno Setup `*-setup.exe` or a portable `*.zip` on Windows, a drag-to-install `*.dmg` or a portable `*.tar.gz` on macOS, and a `*.deb`, `*.AppImage`, or `*.tar.gz` on Linux. Every asset carries a SHA-256 checksum. The current macOS builds target macOS 13+ on Apple Silicon; there is no Intel package yet. Linux packages require glibc 2.31 or newer (Ubuntu 20.04, Kylin V10, and later distributions). The `.deb` and the portable `.tar.gz` ship the same binary; the `.AppImage` bundles the shared libraries Termior links against and runs without installation.
 
 **macOS Gatekeeper note.** When the release pipeline runs with Apple Developer credentials configured, the app bundle and DMG are signed and notarized and open normally. On unsigned builds, Gatekeeper shows a misleading "Termior is damaged and can't be opened" dialog — the download itself is intact. If you see it, drag `Termior.app` to `/Applications`, then clear the quarantine attribute and open the app:
 
@@ -196,7 +196,7 @@ Termior 在单一原生窗口中组合真 PTY 终端、轻量代码编辑器、�
 
 ### 安装
 
-从[最新 release](https://github.com/willmove/termior/releases/latest) 下载对应平台产物：Windows 为 Inno Setup 安装器 `*-setup.exe` 或便携版 `*.zip`，macOS 为拖拽安装的 `*.dmg` 或便携版 `*.tar.gz`，Linux 为 `*.deb` 或 `*.tar.gz`。所有产物均附带 SHA-256 校验文件。当前 macOS 构建面向 macOS 13+ 的 Apple Silicon，暂无 Intel 版本。Linux 安装包需要 glibc 2.31 或更高版本（Ubuntu 20.04、麒麟 V10 及更新的发行版）。`.deb` 与便携版 `.tar.gz` 是同一个二进制。当前不提供 AppImage。
+从[最新 release](https://github.com/willmove/termior/releases/latest) 下载对应平台产物：Windows 为 Inno Setup 安装器 `*-setup.exe` 或便携版 `*.zip`，macOS 为拖拽安装的 `*.dmg` 或便携版 `*.tar.gz`，Linux 为 `*.deb`、`*.AppImage` 或 `*.tar.gz`。所有产物均附带 SHA-256 校验文件。当前 macOS 构建面向 macOS 13+ 的 Apple Silicon，暂无 Intel 版本。Linux 安装包需要 glibc 2.31 或更高版本（Ubuntu 20.04、麒麟 V10 及更新的发行版）。`.deb` 与便携版 `.tar.gz` 是同一个二进制；`.AppImage` 自带 Termior 所需的动态库，无需安装即可运行。
 
 **macOS Gatekeeper 说明。** 发布流水线配置了 Apple Developer 凭据时，应用与 DMG 会完成签名与公证，可正常打开。在未签名构建上，Gatekeeper 会弹出误导性的「“Termior”已损坏，无法打开」提示——下载文件本身并未损坏。遇到该提示时，把 `Termior.app` 拖入 `/Applications`，清除隔离属性后再打开：
 

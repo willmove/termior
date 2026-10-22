@@ -16,7 +16,7 @@ Termior は、本物の PTY ターミナル、軽量コードエディター、�
 
 ### インストール
 
-[最新のリリース](https://github.com/willmove/termior/releases/latest)からプラットフォームに合うアーティファクトをダウンロードしてください。Windows は Inno Setup インストーラー `*-setup.exe` またはポータブル `*.zip`、macOS はドラッグでインストールする `*.dmg` またはポータブル `*.tar.gz`、Linux は `*.deb` または `*.tar.gz` です。すべてのアーティファクトに SHA-256 チェックサムが付きます。現在の macOS ビルドは macOS 13+ の Apple Silicon 向けで、Intel パッケージはまだありません。Linux パッケージは glibc 2.31 以降（Ubuntu 20.04、麒麟 V10、およびそれ以降のディストリビューション）が必要です。`.deb` とポータブル `.tar.gz` は同じバイナリです。AppImage は公開していません。
+[最新のリリース](https://github.com/willmove/termior/releases/latest)からプラットフォームに合うアーティファクトをダウンロードしてください。Windows は Inno Setup インストーラー `*-setup.exe` またはポータブル `*.zip`、macOS はドラッグでインストールする `*.dmg` またはポータブル `*.tar.gz`、Linux は `*.deb`、`*.AppImage` または `*.tar.gz` です。すべてのアーティファクトに SHA-256 チェックサムが付きます。現在の macOS ビルドは macOS 13+ の Apple Silicon 向けで、Intel パッケージはまだありません。Linux パッケージは glibc 2.31 以降（Ubuntu 20.04、麒麟 V10、およびそれ以降のディストリビューション）が必要です。`.deb` とポータブル `.tar.gz` は同じバイナリです。`.AppImage` は Termior に必要な共有ライブラリを同梱し、インストールなしで実行できます。
 
 **macOS Gatekeeper に関する注意。** リリースパイプラインに Apple Developer 資格情報が設定されている場合、アプリバンドルと DMG はコード署名・公証され、通常どおり開けます。未署名ビルドでは、Gatekeeper が「"Termior"が破損しているため開けません」という誤解を招くダイアログを表示します — ダウンロードしたファイル自体は壊れていません。この表示が出た場合は、`Termior.app` を `/Applications` にドラッグした後、隔離属性を解除してから開いてください：
 

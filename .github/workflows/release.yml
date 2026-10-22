@@ -153,6 +153,7 @@ jobs:
             dist/*.exe
             dist/*.dmg
             dist/*.deb
+            dist/*.AppImage
             dist/*.sha256
           if-no-files-found: error
 
@@ -177,4 +178,5 @@ jobs:
             dist/*.exe
             dist/*.dmg
             dist/*.deb
+            dist/*.AppImage
             dist/*.sha256
