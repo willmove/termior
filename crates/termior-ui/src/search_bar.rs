@@ -9,13 +9,13 @@
 //! `handle_mouse_down`，把查询区点击误当成终端划选。
 
 use gpui::{
-    div, prelude::FluentBuilder, px, App, AnyElement, Bounds, ClipboardItem, Context, FocusHandle,
+    div, prelude::FluentBuilder, px, AnyElement, App, Bounds, ClipboardItem, Context, FocusHandle,
     InteractiveElement, IntoElement, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point, SharedString, StatefulInteractiveElement, Styled,
     UTF16Selection, Window,
 };
 use termior_theme::ResolvedPalette;
-use termior_ui_kit::{tokens, theme::active_wash, Icon, SearchOverlay, Tooltip};
+use termior_ui_kit::{theme::active_wash, tokens, Icon, SearchOverlay, Tooltip};
 
 use crate::ime_anchor::ImeAnchor;
 use crate::ui;
@@ -29,9 +29,7 @@ pub(crate) enum SearchBarEvent {
         click_count: usize,
     },
     /// 查询区按住左键拖拽。
-    InputDrag {
-        position: Point<Pixels>,
-    },
+    InputDrag { position: Point<Pixels> },
     /// 左键抬起：结束拖选。
     InputUp,
     /// Aa：切换大小写敏感（需重跑搜索）。
@@ -415,14 +413,16 @@ pub(crate) fn render_search_bar<V: 'static>(
             .aria_label(case_label)
             .tooltip(move |_window, cx| Tooltip::view(tooltip_label.clone(), &chip_palette, cx))
             .when(overlay.options.case_sensitive, |chip| {
-                chip.bg(active_wash(p))
-                    .text_color(ui::color(p.accent))
+                chip.bg(active_wash(p)).text_color(ui::color(p.accent))
             })
             .when(!overlay.options.case_sensitive, |chip| {
                 chip.text_color(ui::muted(p))
             })
             .child(SharedString::from("Aa"))
-            .on_mouse_down(MouseButton::Left, forward_click(cx, &on_event, SearchBarEvent::ToggleCase))
+            .on_mouse_down(
+                MouseButton::Left,
+                forward_click(cx, &on_event, SearchBarEvent::ToggleCase),
+            )
     };
 
     div()
@@ -451,17 +451,26 @@ pub(crate) fn render_search_bar<V: 'static>(
         .child(
             ui::icon_button("find-bar-prev", Icon::ChevronUp, t!("find.previous"), p)
                 .debug_selector(|| "find-bar-prev".to_owned())
-                .on_mouse_down(MouseButton::Left, forward_click(cx, &on_event, SearchBarEvent::Prev)),
+                .on_mouse_down(
+                    MouseButton::Left,
+                    forward_click(cx, &on_event, SearchBarEvent::Prev),
+                ),
         )
         .child(
             ui::icon_button("find-bar-next", Icon::ChevronDown, t!("find.next"), p)
                 .debug_selector(|| "find-bar-next".to_owned())
-                .on_mouse_down(MouseButton::Left, forward_click(cx, &on_event, SearchBarEvent::Next)),
+                .on_mouse_down(
+                    MouseButton::Left,
+                    forward_click(cx, &on_event, SearchBarEvent::Next),
+                ),
         )
         .child(
             ui::icon_button("find-bar-close", Icon::Close, t!("find.close"), p)
                 .debug_selector(|| "find-bar-close".to_owned())
-                .on_mouse_down(MouseButton::Left, forward_click(cx, &on_event, SearchBarEvent::Close)),
+                .on_mouse_down(
+                    MouseButton::Left,
+                    forward_click(cx, &on_event, SearchBarEvent::Close),
+                ),
         )
         .into_any_element()
 }

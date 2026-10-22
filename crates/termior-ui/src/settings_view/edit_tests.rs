@@ -427,7 +427,10 @@ fn agents_page_shows_disk_usage_and_cleanup_keeps_the_journal(cx: &mut TestAppCo
         "agent-data-usage-hook-mcp",
         "agent-data-usage-crash",
     ] {
-        assert!(vcx.debug_bounds(detail).is_none(), "{detail} should not render");
+        assert!(
+            vcx.debug_bounds(detail).is_none(),
+            "{detail} should not render"
+        );
     }
     let cleanup = vcx
         .debug_bounds("agent-data-cleanup")

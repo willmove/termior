@@ -1294,21 +1294,24 @@ impl Render for TerminalView {
                 },
             ))
             // 查找条打开时预编辑串显示在查询框里，不再画到终端光标单元格上。
-            .when(!marked_text.is_empty() && !self.search_overlay.visible, |element| {
-                element.child(
-                    div()
-                        .absolute()
-                        .left(px(TERMINAL_PANE_PADDING
-                            + marked_col as f32 * marked_cell_width
-                            + 2.0))
-                        .top(px(TERMINAL_PANE_PADDING
-                            + marked_row as f32 * marked_line_height
-                            + 1.0))
-                        .px_1()
-                        .bg(crate::ui::alpha(self.palette.accent, 0.35))
-                        .child(SharedString::from(marked_text)),
-                )
-            })
+            .when(
+                !marked_text.is_empty() && !self.search_overlay.visible,
+                |element| {
+                    element.child(
+                        div()
+                            .absolute()
+                            .left(px(TERMINAL_PANE_PADDING
+                                + marked_col as f32 * marked_cell_width
+                                + 2.0))
+                            .top(px(TERMINAL_PANE_PADDING
+                                + marked_row as f32 * marked_line_height
+                                + 1.0))
+                            .px_1()
+                            .bg(crate::ui::alpha(self.palette.accent, 0.35))
+                            .child(SharedString::from(marked_text)),
+                    )
+                },
+            )
             .when(self.search_overlay.visible, |element| {
                 element.child(render_search_bar(
                     cx,
@@ -3018,9 +3021,7 @@ mod protocol_tests {
 #[cfg(test)]
 mod find_bar_tests {
     use super::*;
-    use gpui::{
-        point, size, AppContext as _, Modifiers, TestAppContext, VisualTestContext,
-    };
+    use gpui::{point, size, AppContext as _, Modifiers, TestAppContext, VisualTestContext};
     use termior_theme::default_theme;
 
     fn terminal_window(cx: &mut TestAppContext) -> gpui::WindowHandle<TerminalView> {
@@ -3038,11 +3039,7 @@ mod find_bar_tests {
 
     /// 打开查找条、填入查询串、聚焦 pane，并绘制两帧让控件进入 `debug_bounds`
     /// （resize 调度 + paint 收敛，对照 `protocol_tests` 的画帧方式）。
-    fn prime_find_bar(
-        cx: &mut TestAppContext,
-        window: gpui::AnyWindowHandle,
-        query: &str,
-    ) {
+    fn prime_find_bar(cx: &mut TestAppContext, window: gpui::AnyWindowHandle, query: &str) {
         cx.update_window(window, |terminal, window, cx| {
             let terminal = terminal.downcast::<TerminalView>().expect("terminal root");
             terminal.update(cx, |view, cx| {

@@ -1110,9 +1110,7 @@ impl WorkspaceView {
         let main_window = window.window_handle();
         let entity = cx.entity();
         cx.spawn(async move |_, cx| {
-            cx.background_executor()
-                .timer(Duration::from_secs(6))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(6)).await;
             let _ = main_window.update(cx, |_, _window, cx| {
                 entity.update(cx, |workspace, cx| {
                     let Some(terminal) = workspace
