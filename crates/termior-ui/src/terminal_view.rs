@@ -3162,8 +3162,9 @@ mod find_bar_tests {
         prime_find_bar(&mut cx, window.into(), "alpha");
         let mut vcx = VisualTestContext::from_window(window.into(), &cx);
 
-        // Ctrl+A 全选后，IME 提交的文本替换选区而不是追加。
-        vcx.simulate_keystrokes("ctrl-a");
+        // 全选后，IME 提交的文本替换选区而不是追加。全选键随平台变化
+        // （macOS Cmd+A，其它 Ctrl+A），用 gpui 的 secondary 别名。
+        vcx.simulate_keystrokes("secondary-a");
         cx.update_window(window.into(), |terminal, window, cx| {
             let terminal = terminal.downcast::<TerminalView>().expect("terminal root");
             let mut handler = TerminalInputHandler {
