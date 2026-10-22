@@ -312,44 +312,19 @@ impl SettingsView {
     }
 
     pub(super) fn agent_data_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let usage: Vec<AnyElement> = if let Some(error) = &self.agent_usage_error {
-            vec![self.usage_line("agent-data-usage-error", error.clone().into())]
+        // 只展示合计一行；分类明细属于诊断信息，保留在数据目录里而不进设置页。
+        let usage = if let Some(error) = &self.agent_usage_error {
+            self.usage_line("agent-data-usage-error", error.clone().into())
         } else if let Some(usage) = self.agent_usage {
-            vec![
-                self.usage_line(
-                    "agent-data-usage-total",
-                    tf!("settings.agents.data_usage_total", "size" => crate::updater::format_bytes(usage.total())),
-                ),
-                self.usage_line(
-                    "agent-data-usage-journal",
-                    tf!("settings.agents.data_usage_journal", "size" => crate::updater::format_bytes(usage.journal)),
-                ),
-                self.usage_line(
-                    "agent-data-usage-blobs",
-                    tf!("settings.agents.data_usage_blobs", "size" => crate::updater::format_bytes(usage.blobs)),
-                ),
-                self.usage_line(
-                    "agent-data-usage-context",
-                    tf!("settings.agents.data_usage_context", "size" => crate::updater::format_bytes(usage.context)),
-                ),
-                self.usage_line(
-                    "agent-data-usage-hook-mcp",
-                    tf!("settings.agents.data_usage_hook_mcp", "size" => crate::updater::format_bytes(usage.hook_mcp)),
-                ),
-                self.usage_line(
-                    "agent-data-usage-crash",
-                    tf!("settings.agents.data_usage_crash", "size" => crate::updater::format_bytes(usage.crash)),
-                ),
-                self.usage_line(
-                    "agent-data-usage-other",
-                    tf!("settings.agents.data_usage_other", "size" => crate::updater::format_bytes(usage.other)),
-                ),
-            ]
+            self.usage_line(
+                "agent-data-usage-total",
+                tf!("settings.agents.data_usage_total", "size" => crate::updater::format_bytes(usage.total())),
+            )
         } else {
-            vec![self.usage_line(
+            self.usage_line(
                 "agent-data-usage-loading",
                 t!("settings.agents.data_usage_loading"),
-            )]
+            )
         };
         let action = if self.cleanup_running {
             Self::button(
@@ -379,76 +354,22 @@ impl SettingsView {
         self.section(
             t!("settings.agents.data_title"),
             t!("settings.agents.data_description"),
-            usage
-                .into_iter()
-                .chain([
-                    self.edit_row(
-                        t!("settings.agents.data_retention_days_label"),
-                        t!("settings.agents.data_retention_days_description"),
-                        EditField::RetentionDays,
-                        cx,
-                    ),
-                    self.edit_row(
-                        t!("settings.agents.data_retention_capacity_label"),
-                        t!("settings.agents.data_retention_capacity_description"),
-                        EditField::RetentionCapacity,
-                        cx,
-                    ),
-                    action,
-                ])
-                .collect::<Vec<_>>(),
-        )
-    }
-
-    fn capability_matrix_section(&self) -> AnyElement {
-        let rows = termior_agent_host::capability_matrix()
-            .into_iter()
-            .map(|row| {
-                let label = match row.backend {
-                    "direct" => t!("settings.agents.matrix_direct"),
-                    "worktree" => t!("settings.agents.matrix_worktree"),
-                    "sandboxed" => t!("settings.agents.matrix_sandboxed"),
-                    "external" => t!("settings.agents.matrix_external"),
-                    _ => SharedString::from(row.backend.to_owned()),
-                };
-                let detail = tf!(
-                    "composer.environment.capabilities",
-                    "host" => row.host,
-                    "root" => row.root,
-                    "file" => row.file,
-                    "network" => row.network,
-                    "credentials" => row.credentials,
-                    "process" => row.process
-                );
-                div()
-                    .id(SharedString::from(format!(
-                        "settings-capability-{}",
-                        row.backend
-                    )))
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .child(div().text_sm().child(label))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(crate::ui::muted(&self.palette))
-                            .child(detail),
-                    )
-                    .into_any_element()
-            });
-        self.section(
-            t!("settings.agents.matrix_title"),
-            t!("settings.agents.matrix_description"),
-            std::iter::once(
-                div()
-                    .id("settings-capability-matrix")
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .children(rows)
-                    .into_any_element(),
-            ),
+            [
+                usage,
+                self.edit_row(
+                    t!("settings.agents.data_retention_days_label"),
+                    t!("settings.agents.data_retention_days_description"),
+                    EditField::RetentionDays,
+                    cx,
+                ),
+                self.edit_row(
+                    t!("settings.agents.data_retention_capacity_label"),
+                    t!("settings.agents.data_retention_capacity_description"),
+                    EditField::RetentionCapacity,
+                    cx,
+                ),
+                action,
+            ],
         )
     }
 
@@ -614,8 +535,6 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_6()
-            .child(self.capability_matrix_section())
-            .child(self.agent_data_section(cx))
             .child(
                 self.section(
                     t!("settings.agents.title"),
@@ -629,6 +548,30 @@ impl SettingsView {
                             .into_any_element(),
                         agent_controls,
                     ],
+                ),
+            )
+            .child(self.agent_data_section(cx))
+            .child(
+                self.section(
+                    t!("settings.agents.notifications_title"),
+                    t!("settings.agents.notifications_description"),
+                    [Self::button(
+                        tf!(
+                            "settings.agents.notifications",
+                            "state" => on_off(self.settings.agent_notifications)
+                        ),
+                        "agent-notifications",
+                        &self.palette,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.settings.agent_notifications = !this.settings.agent_notifications;
+                            this.schedule_save(cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element()],
                 ),
             )
             .child(
@@ -667,29 +610,6 @@ impl SettingsView {
                             )
                             .into_any_element(),
                     ],
-                ),
-            )
-            .child(
-                self.section(
-                    t!("settings.agents.notifications_title"),
-                    t!("settings.agents.notifications_description"),
-                    [Self::button(
-                        tf!(
-                            "settings.agents.notifications",
-                            "state" => on_off(self.settings.agent_notifications)
-                        ),
-                        "agent-notifications",
-                        &self.palette,
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.settings.agent_notifications = !this.settings.agent_notifications;
-                            this.schedule_save(cx);
-                            cx.notify();
-                        }),
-                    )
-                    .into_any_element()],
                 ),
             )
             .into_any_element()

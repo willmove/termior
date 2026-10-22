@@ -419,10 +419,16 @@ fn agents_page_shows_disk_usage_and_cleanup_keeps_the_journal(cx: &mut TestAppCo
         assert_eq!(usage.crash, b"boom".len() as u64);
         assert_eq!(view.settings.agent_retention.max_age_days, 30);
     });
-    assert!(vcx.debug_bounds("agent-data-usage-journal").is_some());
-    assert!(vcx.debug_bounds("agent-data-usage-blobs").is_some());
-    assert!(vcx.debug_bounds("agent-data-usage-hook-mcp").is_some());
-    assert!(vcx.debug_bounds("agent-data-usage-crash").is_some());
+    assert!(vcx.debug_bounds("agent-data-usage-total").is_some());
+    // 明细行已随设置页简化移除，只保留合计一行。
+    for detail in [
+        "agent-data-usage-journal",
+        "agent-data-usage-blobs",
+        "agent-data-usage-hook-mcp",
+        "agent-data-usage-crash",
+    ] {
+        assert!(vcx.debug_bounds(detail).is_none(), "{detail} should not render");
+    }
     let cleanup = vcx
         .debug_bounds("agent-data-cleanup")
         .expect("cleanup action");
