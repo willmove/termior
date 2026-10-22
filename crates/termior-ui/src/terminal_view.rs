@@ -40,6 +40,10 @@ use termior_theme::{Color as ThemeColor, ResolvedPalette, TerminalPalette};
 use termior_ui_kit::{tokens, Icon, SearchOverlay};
 
 use crate::keystroke::{encode_paste, keystroke_to_pty_bytes};
+use crate::search_bar::{
+    handle_search_bar_event, render_search_bar, search_caret_bounds, search_edit_key,
+    search_utf16_selection, SearchBarOutcome, SearchKeyOutcome,
+};
 
 const MAX_PTY_BATCH_BYTES: usize = 256 * 1024;
 static NEXT_TERMINAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -127,6 +131,8 @@ pub struct TerminalView {
     output_sequence: u64,
     marked_text: String,
     search_overlay: SearchOverlay,
+    /// 查找条查询串的 IME 锚点 + 鼠标命中测试基准（文本区探针每帧刷新）。
+    search_ime_anchor: crate::ime_anchor::ImeAnchor,
     search: TerminalSearch,
     snapshot_text: String,
     /// 可视区每行的文本与在 snapshot_text 中的起始字节偏移（每帧渲染时刷新），
@@ -377,6 +383,7 @@ impl TerminalView {
             output_sequence: 0,
             marked_text: String::new(),
             search_overlay: SearchOverlay::default(),
+            search_ime_anchor: crate::ime_anchor::ImeAnchor::new(),
             search: TerminalSearch::default(),
             snapshot_text: String::new(),
             snapshot_rows: std::collections::BTreeMap::new(),
@@ -801,11 +808,21 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// 查找条 UI 截图（对照 `open_settings_for_ui_shot`）：打开并填入全选中的
+    /// 查询串，供 `scripts/ui-screenshot.ps1 -FindBar` 审阅布局与选区高亮。
+    pub(crate) fn open_search_for_ui_shot(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.search_overlay.open();
+        self.search_overlay.insert_text(query);
+        self.search_overlay.select_all();
+        self.update_search();
+        cx.notify();
+    }
+
     /// 处理键盘输入：编码成 PTY 字节写回。
     fn handle_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let modifiers = ev.keystroke.modifiers;
         let key = ev.keystroke.key.as_str();
-        if self.keymap.bindings.values().any(|binding| {
+        let bound = self.keymap.bindings.values().any(|binding| {
             let primary_matches = if binding.primary {
                 if cfg!(target_os = "macos") {
                     modifiers.platform && !modifiers.control
@@ -819,28 +836,54 @@ impl TerminalView {
                 && modifiers.shift == binding.shift
                 && modifiers.alt == binding.alt
                 && key.eq_ignore_ascii_case(&binding.key)
-        }) {
-            return;
-        }
+        });
         if self.search_overlay.visible {
-            match key {
-                "escape" => self.search_overlay.close(),
-                "enter" | "return" => {
-                    self.search.next(modifiers.shift);
+            // 查找条打开：编辑按键先给查询框（含 Ctrl+C/V/X/A），全局快捷键
+            // 照常分发，其余按键吞掉——绝不回传 PTY。
+            match search_edit_key(cx, &mut self.search_overlay, key, modifiers) {
+                SearchKeyOutcome::Ignored => {
+                    if !bound {
+                        return;
+                    }
+                }
+                SearchKeyOutcome::QueryChanged => {
+                    self.update_search();
+                    cx.notify();
+                    return;
+                }
+                SearchKeyOutcome::SelectionChanged => {
+                    cx.notify();
+                    return;
+                }
+                SearchKeyOutcome::Close => {
+                    self.search_overlay.close();
+                    cx.notify();
+                    return;
+                }
+                SearchKeyOutcome::Submit { backwards } => {
+                    self.search.next(backwards);
                     self.search_overlay.current = self.search.current;
+                    cx.notify();
+                    return;
                 }
-                "backspace" => {
-                    self.search_overlay.query.pop();
-                    self.update_search();
+                SearchKeyOutcome::Paste => {
+                    let entity = cx.entity().downgrade();
+                    cx.defer(move |cx| {
+                        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+                        else {
+                            return;
+                        };
+                        let _ = entity.update(cx, |view, cx| {
+                            view.search_overlay.insert_text(&text);
+                            view.update_search();
+                            cx.notify();
+                        });
+                    });
+                    return;
                 }
-                "c" if modifiers.alt => {
-                    self.search_overlay.options.case_sensitive =
-                        !self.search_overlay.options.case_sensitive;
-                    self.update_search();
-                }
-                _ => return,
             }
-            cx.notify();
+        }
+        if bound {
             return;
         }
         if is_copy_shortcut(&ev.keystroke) {
@@ -1250,7 +1293,8 @@ impl Render for TerminalView {
                     );
                 },
             ))
-            .when(!marked_text.is_empty(), |element| {
+            // 查找条打开时预编辑串显示在查询框里，不再画到终端光标单元格上。
+            .when(!marked_text.is_empty() && !self.search_overlay.visible, |element| {
                 element.child(
                     div()
                         .absolute()
@@ -1266,40 +1310,36 @@ impl Render for TerminalView {
                 )
             })
             .when(self.search_overlay.visible, |element| {
-                element.child(
-                    div()
-                        .absolute()
-                        .top(px(8.0))
-                        .right(px(10.0))
-                        .flex()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(crate::ui::color(self.palette.accent))
-                        .bg(crate::ui::color(self.palette.overlay))
-                        .text_color(crate::ui::color(self.palette.foreground))
-                        .shadow_md()
-                        .child(SharedString::from(format!(
-                            "{}|",
-                            tf!("terminal.find_prompt", "query" => self.search_overlay.query.clone())
-                        )))
-                        .child(tf!(
-                            "terminal.find_counter",
-                            "current" => if self.search_overlay.total == 0 {
-                                0
-                            } else {
-                                self.search_overlay.current + 1
-                            },
-                            "total" => self.search_overlay.total,
-                            "case" => if self.search_overlay.options.case_sensitive {
-                                "Aa"
-                            } else {
-                                "aa"
+                element.child(render_search_bar(
+                    cx,
+                    &self.marked_text,
+                    &self.search_overlay,
+                    &self.palette,
+                    &self.search_ime_anchor,
+                    |view, event, window, cx| {
+                        match handle_search_bar_event(
+                            event,
+                            &mut view.search_overlay,
+                            &view.search_ime_anchor,
+                            &view.focus_handle,
+                            window,
+                            cx,
+                        ) {
+                            SearchBarOutcome::Redraw => {}
+                            SearchBarOutcome::QueryChanged => view.update_search(),
+                            SearchBarOutcome::Prev => {
+                                view.search.next(true);
+                                view.search_overlay.current = view.search.current;
                             }
-                        )),
-                )
+                            SearchBarOutcome::Next => {
+                                view.search.next(false);
+                                view.search_overlay.current = view.search.current;
+                            }
+                            SearchBarOutcome::Close => view.search_overlay.close(),
+                        }
+                        cx.notify();
+                    },
+                ))
             })
             .when_some(control_banner, |element, banner| {
                 let p = &self.palette;
@@ -1418,8 +1458,14 @@ impl InputHandler for TerminalInputHandler {
         &mut self,
         _ignore_disabled_input: bool,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Option<UTF16Selection> {
+        let view = self.view.upgrade()?;
+        let view = view.read(cx);
+        // 查找条打开时上报查询框的真实选区：IME 组词提交替换选中文字。
+        if view.search_overlay.visible {
+            return Some(search_utf16_selection(&view.search_overlay));
+        }
         Some(UTF16Selection {
             range: 0..0,
             reversed: false,
@@ -1456,7 +1502,8 @@ impl InputHandler for TerminalInputHandler {
         if let Some(view) = self.view.upgrade() {
             view.update(cx, |view, cx| {
                 if view.search_overlay.visible {
-                    view.search_overlay.query.push_str(text);
+                    view.search_overlay.insert_text(text);
+                    view.marked_text.clear();
                     view.update_search();
                     cx.notify();
                     return;
@@ -1500,7 +1547,7 @@ impl InputHandler for TerminalInputHandler {
     fn bounds_for_range(
         &mut self,
         range: std::ops::Range<usize>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
         // IME 候选窗定位（Windows 在 WM_IME_STARTCOMPOSITION 时经 GPUI 读取）：
@@ -1509,6 +1556,10 @@ impl InputHandler for TerminalInputHandler {
         // 窗口左上角、微软拼音在右下角）。
         let view = self.view.upgrade()?;
         let view = view.read(cx);
+        // 查找条打开时候选窗贴住查询框光标，而不是终端光标单元格。
+        if view.search_overlay.visible {
+            return search_caret_bounds(&view.search_overlay, &view.search_ime_anchor, window);
+        }
         let mut bounds = view.ime_cursor_bounds.get()?;
         bounds.origin.x += px(view.cell_width * range.start as f32);
         Some(bounds)
@@ -2960,5 +3011,189 @@ mod protocol_tests {
 
         assert_eq!(tail, "two\nthree\nfour");
         assert!(!tail.contains(' '));
+    }
+}
+
+/// 查找条的端到端交互：真实鼠标/键盘事件打到渲染出的控件上（FR-TERM-04）。
+#[cfg(test)]
+mod find_bar_tests {
+    use super::*;
+    use gpui::{
+        point, size, AppContext as _, Modifiers, TestAppContext, VisualTestContext,
+    };
+    use termior_theme::default_theme;
+
+    fn terminal_window(cx: &mut TestAppContext) -> gpui::WindowHandle<TerminalView> {
+        let bridge = TerminalBridge::spawn(&PtySessionConfig::default()).expect("PTY spawn");
+        cx.open_window(size(px(640.0), px(480.0)), move |_, cx| {
+            TerminalView::from_bridge(
+                bridge,
+                default_theme().palette().clone(),
+                TerminalSettings::default(),
+                UserKeymap::default(),
+                cx,
+            )
+        })
+    }
+
+    /// 打开查找条、填入查询串、聚焦 pane，并绘制两帧让控件进入 `debug_bounds`
+    /// （resize 调度 + paint 收敛，对照 `protocol_tests` 的画帧方式）。
+    fn prime_find_bar(
+        cx: &mut TestAppContext,
+        window: gpui::AnyWindowHandle,
+        query: &str,
+    ) {
+        cx.update_window(window, |terminal, window, cx| {
+            let terminal = terminal.downcast::<TerminalView>().expect("terminal root");
+            terminal.update(cx, |view, cx| {
+                view.open_search(cx);
+                view.search_overlay.insert_text(query);
+                view.update_search();
+                cx.notify();
+            });
+            let focus = terminal.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+            window.draw(cx).clear();
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear();
+            window.simulate_next_frame(cx);
+        })
+        .unwrap();
+    }
+
+    fn overlay_state(
+        cx: &mut TestAppContext,
+        window: gpui::AnyWindowHandle,
+    ) -> (bool, String, usize, Option<std::ops::Range<usize>>) {
+        cx.update_window(window, |terminal, _window, cx| {
+            let terminal = terminal.downcast::<TerminalView>().expect("terminal root");
+            let overlay = &terminal.read(cx).search_overlay;
+            (
+                overlay.visible,
+                overlay.query.clone(),
+                overlay.cursor,
+                overlay.selection(),
+            )
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn close_next_prev_and_case_buttons_actually_fire() {
+        let mut cx = TestAppContext::single();
+        let window = terminal_window(&mut cx);
+        prime_find_bar(&mut cx, window.into(), "term");
+        let mut vcx = VisualTestContext::from_window(window.into(), &cx);
+
+        // Aa：切换大小写敏感（点击后需重跑搜索，不校验命中数）。
+        let case = vcx.debug_bounds("find-bar-case").expect("case toggle");
+        vcx.simulate_click(case.center(), Modifiers::default());
+        let case_sensitive = cx
+            .update_window(window.into(), |terminal, _window, cx| {
+                let terminal = terminal.downcast::<TerminalView>().expect("terminal root");
+                terminal.read(cx).search_overlay.options.case_sensitive
+            })
+            .unwrap();
+        assert!(case_sensitive, "Aa toggle must flip case sensitivity");
+
+        // 上一处/下一处按钮：0 命中时 current 保持 0，但事件链必须到达。
+        let prev = vcx.debug_bounds("find-bar-prev").expect("prev button");
+        vcx.simulate_click(prev.center(), Modifiers::default());
+        let next = vcx.debug_bounds("find-bar-next").expect("next button");
+        vcx.simulate_click(next.center(), Modifiers::default());
+
+        // 关闭按钮：唯一不靠 ESC 的关闭入口。
+        let close = vcx.debug_bounds("find-bar-close").expect("close button");
+        vcx.simulate_click(close.center(), Modifiers::default());
+        let (visible, ..) = overlay_state(&mut cx, window.into());
+        assert!(!visible, "close button must dismiss the find bar");
+    }
+
+    #[test]
+    fn input_click_double_click_and_drag_select_query_text() {
+        let mut cx = TestAppContext::single();
+        let window = terminal_window(&mut cx);
+        prime_find_bar(&mut cx, window.into(), "hello world");
+        let mut vcx = VisualTestContext::from_window(window.into(), &cx);
+
+        let input = vcx.debug_bounds("find-bar-input").expect("input box");
+        let mid_y = input.origin.y + input.size.height / 2.0;
+        let left = point(input.origin.x + px(12.0), mid_y);
+        let right = point(input.origin.x + input.size.width - px(12.0), mid_y);
+
+        // 双击选词："hello world" 的左半词。
+        vcx.simulate_event(MouseDownEvent {
+            position: left,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 2,
+            first_mouse: false,
+        });
+        vcx.simulate_event(MouseUpEvent {
+            position: left,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 2,
+        });
+        let (_, _, _, selection) = overlay_state(&mut cx, window.into());
+        assert_eq!(selection, Some(0..5), "double click must select the word");
+
+        // 拖拽划选：固定端停在按下处，游标端跟随指针。
+        vcx.simulate_mouse_down(left, MouseButton::Left, Modifiers::default());
+        vcx.simulate_mouse_move(right, MouseButton::Left, Modifiers::default());
+        vcx.simulate_mouse_up(right, MouseButton::Left, Modifiers::default());
+        let (visible, query, _, selection) = overlay_state(&mut cx, window.into());
+        assert!(visible);
+        assert_eq!(query, "hello world", "selection must not edit the query");
+        let range = selection.expect("drag must produce a selection");
+        assert!(
+            range.end - range.start >= 8,
+            "drag across the input must span the text, got {range:?}"
+        );
+
+        // 单击折叠：选区消失，光标落到点击处（右端 = 末尾）。
+        vcx.simulate_click(right, Modifiers::default());
+        let (_, _, cursor, selection) = overlay_state(&mut cx, window.into());
+        assert_eq!(selection, None);
+        assert_eq!(cursor, "hello world".chars().count());
+    }
+
+    #[test]
+    fn keyboard_edits_query_and_escape_closes() {
+        let mut cx = TestAppContext::single();
+        let window = terminal_window(&mut cx);
+        prime_find_bar(&mut cx, window.into(), "alpha");
+        let mut vcx = VisualTestContext::from_window(window.into(), &cx);
+
+        // Ctrl+A 全选后，IME 提交的文本替换选区而不是追加。
+        vcx.simulate_keystrokes("ctrl-a");
+        cx.update_window(window.into(), |terminal, window, cx| {
+            let terminal = terminal.downcast::<TerminalView>().expect("terminal root");
+            let mut handler = TerminalInputHandler {
+                view: terminal.downgrade(),
+            };
+            // 选中状态下 IME 必须上报真实选区（组词提交替换选中文字的前提）。
+            let reported = handler
+                .selected_text_range(false, window, cx)
+                .expect("selection report");
+            assert_ne!(reported.range.start, reported.range.end);
+            handler.replace_text_in_range(None, "beta", window, cx);
+        })
+        .unwrap();
+        let (visible, query, cursor, selection) = overlay_state(&mut cx, window.into());
+        assert!(visible);
+        assert_eq!(query, "beta");
+        assert_eq!(cursor, "beta".chars().count());
+        assert_eq!(selection, None);
+
+        // Backspace 删光标前字符。
+        vcx.simulate_keystrokes("backspace");
+        let (_, query, ..) = overlay_state(&mut cx, window.into());
+        assert_eq!(query, "bet");
+
+        // ESC 关闭（与关闭按钮等价的键盘入口）。
+        vcx.simulate_keystrokes("escape");
+        let (visible, ..) = overlay_state(&mut cx, window.into());
+        assert!(!visible);
     }
 }

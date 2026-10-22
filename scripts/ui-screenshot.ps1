@@ -11,6 +11,7 @@
 .EXAMPLE
     ./scripts/ui-screenshot.ps1 -Label before
     ./scripts/ui-screenshot.ps1 -Theme "tokyo-night" -Appearance dark -Maximized -Settings
+    ./scripts/ui-screenshot.ps1 -FindBar
     ./scripts/ui-screenshot.ps1 -ShellPicker
     ./scripts/ui-screenshot.ps1 -Settings -SettingsSize 780x420
     ./scripts/ui-screenshot.ps1 -SshManager
@@ -35,6 +36,9 @@ param(
     # Seed terminal.shell_prompt and capture an extra shot with the new-terminal
     # shell picker open (Ctrl+T): <Label>-shell-picker.png.
     [switch]$ShellPicker,
+    # Open the terminal find bar (TERMIOR_UI_SHOT_FIND) after the clean main shot
+    # and capture <Label>-find-bar.png.
+    [switch]$FindBar,
     # Seed terminal.shell_detection = manual with this program, so the first terminal runs
     # a fixture (e.g. a .cmd that prints styled text) instead of the user's shell.
     [string]$Shell = "",
@@ -239,6 +243,7 @@ if ($SshManager) {
         $env:TERMIOR_WORKSPACE = $repoRoot
         if ($Settings) { $env:TERMIOR_OPEN_SETTINGS = "1" }
         if ($SshManager) { $env:TERMIOR_OPEN_SSH_MANAGER = "1" }
+        if ($FindBar) { $env:TERMIOR_UI_SHOT_FIND = "1" }
         $app = Start-Process -FilePath $binary -WorkingDirectory $repoRoot -PassThru
 
     $main = (Wait-ForWindow $app 1 $TimeoutSeconds)[0]
@@ -260,6 +265,13 @@ if ($SshManager) {
         [System.Windows.Forms.SendKeys]::SendWait("^t")
         Start-Sleep -Seconds 3
         Save-WindowShot $main (Join-Path $shotDir "$Label-shell-picker.png")
+    }
+
+    if ($FindBar) {
+        # The probe opens the find bar 6s after startup so <Label>-main.png stays
+        # clean; wait it out, then grab the overlay on the main window.
+        Start-Sleep -Seconds 5
+        Save-WindowShot $main (Join-Path $shotDir "$Label-find-bar.png")
     }
 
     if ($Settings) {
@@ -287,6 +299,7 @@ finally {
     Remove-Item Env:\TERMIOR_WORKSPACE -ErrorAction SilentlyContinue
     Remove-Item Env:\TERMIOR_OPEN_SETTINGS -ErrorAction SilentlyContinue
     Remove-Item Env:\TERMIOR_OPEN_SSH_MANAGER -ErrorAction SilentlyContinue
+    Remove-Item Env:\TERMIOR_UI_SHOT_FIND -ErrorAction SilentlyContinue
     if ($app -and -not $app.HasExited) {
         Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
         [void]$app.WaitForExit(5000)

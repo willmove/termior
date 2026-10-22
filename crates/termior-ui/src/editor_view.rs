@@ -20,6 +20,11 @@ use termior_editor::{
 };
 use termior_ui_kit::SearchOverlay;
 
+use crate::search_bar::{
+    handle_search_bar_event, render_search_bar, search_caret_bounds, search_edit_key,
+    search_utf16_selection, SearchBarOutcome, SearchKeyOutcome,
+};
+
 /// Editor-side debounce: how long after the last keystroke before a completion request fires
 /// (FR-EDIT-05「停顿触发」). Continuous typing keeps resetting this timer, cancelling in-flight
 /// requests along the way so no stale completion ever renders.
@@ -50,6 +55,8 @@ pub struct EditorView {
     title: String,
     theme: EditorTheme,
     search: SearchOverlay,
+    /// 查找条查询串的 IME 锚点 + 鼠标命中测试基准（文本区探针每帧刷新）。
+    search_ime_anchor: crate::ime_anchor::ImeAnchor,
     search_matches: Vec<termior_editor::SearchMatch>,
     vim_enabled: bool,
     vim: VimEngine,
@@ -76,6 +83,7 @@ impl EditorView {
             title: t!("editor.untitled").to_string(),
             theme: default_editor_theme(),
             search: SearchOverlay::default(),
+            search_ime_anchor: crate::ime_anchor::ImeAnchor::new(),
             search_matches: Vec::new(),
             vim_enabled: false,
             vim: VimEngine::default(),
@@ -111,6 +119,7 @@ impl EditorView {
                 .to_owned(),
             theme: default_editor_theme(),
             search: SearchOverlay::default(),
+            search_ime_anchor: crate::ime_anchor::ImeAnchor::new(),
             search_matches: Vec::new(),
             vim_enabled: false,
             vim: VimEngine::default(),
@@ -229,32 +238,48 @@ impl EditorView {
         } else {
             modifiers.control
         };
-        if primary {
-            if key == "s" {
-                if let Err(error) = self.buffer.save() {
-                    log::warn!("save failed: {error}");
-                }
+        if primary && key == "s" {
+            if let Err(error) = self.buffer.save() {
+                log::warn!("save failed: {error}");
             }
             return;
         }
         if self.search.visible {
-            match key {
-                "escape" => self.search.close(),
-                "enter" | "return" => {
-                    self.search.next(modifiers.shift);
+            // 查找条打开：编辑按键先给查询框（含 Ctrl+C/V/X/A）；其余按键
+            // 一律吞掉，绝不落进缓冲（Ctrl+S 保存除外，见上）。
+            match search_edit_key(cx, &mut self.search, key, modifiers) {
+                SearchKeyOutcome::Ignored => return,
+                SearchKeyOutcome::QueryChanged => {
+                    self.update_search();
+                }
+                SearchKeyOutcome::SelectionChanged => {}
+                SearchKeyOutcome::Close => {
+                    self.search.close();
+                }
+                SearchKeyOutcome::Submit { backwards } => {
+                    self.search.next(backwards);
                     self.select_current_search();
                 }
-                "backspace" => {
-                    self.search.query.pop();
-                    self.update_search();
+                SearchKeyOutcome::Paste => {
+                    let entity = cx.entity().downgrade();
+                    cx.defer(move |cx| {
+                        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+                        else {
+                            return;
+                        };
+                        let _ = entity.update(cx, |view, cx| {
+                            view.search.insert_text(&text);
+                            view.update_search();
+                            cx.notify();
+                        });
+                    });
+                    return;
                 }
-                "c" if modifiers.alt => {
-                    self.search.options.case_sensitive = !self.search.options.case_sensitive;
-                    self.update_search();
-                }
-                _ => return,
             }
             cx.notify();
+            return;
+        }
+        if primary {
             return;
         }
         if self.vim_enabled && self.vim.mode() != VimMode::Insert {
@@ -512,7 +537,12 @@ impl EditorView {
             .filter(|byte| *byte >= viewport.start_byte && *byte <= global_end)
             .map(|byte| byte - viewport.start_byte)
             .unwrap_or(usize::MAX);
-        let marked_text = self.marked_text.clone();
+        // 查找条打开时预编辑串显示在查询框里，不再画进缓冲行。
+        let marked_text = if self.search.visible {
+            String::new()
+        } else {
+            self.marked_text.clone()
+        };
         let theme = self.theme.clone();
         // Ghost text 只在光标行渲染，且仅当光标落在当前视口内时才有意义。
         let cursor_line = self
@@ -799,38 +829,36 @@ impl Render for EditorView {
 
         let p = crate::ui::palette(cx);
         let search_overlay = self.search.visible.then(|| {
-            div()
-                .absolute()
-                .top(px(8.0))
-                .right(px(12.0))
-                .flex()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .border_1()
-                .border_color(crate::ui::color(p.accent))
-                .bg(crate::ui::color(p.overlay))
-                .text_color(crate::ui::color(p.foreground))
-                .shadow_md()
-                .child(SharedString::from(format!(
-                    "{}|",
-                    tf!("editor.find_prompt", "query" => self.search.query.clone())
-                )))
-                .child(tf!(
-                    "editor.find_counter",
-                    "current" => if self.search.total == 0 {
-                        0
-                    } else {
-                        self.search.current + 1
-                    },
-                    "total" => self.search.total,
-                    "case" => if self.search.options.case_sensitive {
-                        "Aa"
-                    } else {
-                        "aa"
+            render_search_bar(
+                cx,
+                &self.marked_text,
+                &self.search,
+                &p,
+                &self.search_ime_anchor,
+                |view, event, window, cx| {
+                    match handle_search_bar_event(
+                        event,
+                        &mut view.search,
+                        &view.search_ime_anchor,
+                        &view.focus_handle,
+                        window,
+                        cx,
+                    ) {
+                        SearchBarOutcome::Redraw => {}
+                        SearchBarOutcome::QueryChanged => view.update_search(),
+                        SearchBarOutcome::Prev => {
+                            view.search.next(true);
+                            view.select_current_search();
+                        }
+                        SearchBarOutcome::Next => {
+                            view.search.next(false);
+                            view.select_current_search();
+                        }
+                        SearchBarOutcome::Close => view.search.close(),
                     }
-                ))
+                    cx.notify();
+                },
+            )
         });
         let vim_status = self.vim_enabled.then(|| {
             let command = if self.vim.mode() == VimMode::CommandLine {
@@ -992,6 +1020,10 @@ impl InputHandler for EditorInputHandler {
     ) -> Option<UTF16Selection> {
         let view = self.view.upgrade()?;
         let view = view.read(cx);
+        // 查找条打开时上报查询框的真实选区：IME 组词提交替换选中文字。
+        if view.search.visible {
+            return Some(search_utf16_selection(&view.search));
+        }
         let text = view.buffer.text();
         let selection = view
             .buffer
@@ -1039,7 +1071,8 @@ impl InputHandler for EditorInputHandler {
         };
         view.update(cx, |view, cx| {
             if view.search.visible {
-                view.search.query.push_str(text);
+                view.search.insert_text(text);
+                view.marked_text.clear();
                 view.update_search();
                 cx.notify();
                 return;
@@ -1101,6 +1134,10 @@ impl InputHandler for EditorInputHandler {
         // IME 候选窗锚点：光标行文本区 bounds + 光标列前的前缀宽度（探针每帧刷新）。
         let view = self.view.upgrade()?;
         let view = view.read(cx);
+        // 查找条打开时候选窗贴住查询框光标，而不是缓冲光标行。
+        if view.search.visible {
+            return search_caret_bounds(&view.search, &view.search_ime_anchor, window);
+        }
         let (line, col) = view
             .buffer
             .line_col_for_char(view.buffer.cursor().char_index)

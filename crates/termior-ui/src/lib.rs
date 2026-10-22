@@ -24,6 +24,7 @@ mod markdown_render;
 pub mod monospace_font;
 pub mod nfr;
 mod preview_view;
+mod search_bar;
 mod settings_view;
 mod shell_select;
 pub mod ssh_askpass;

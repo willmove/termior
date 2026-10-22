@@ -7,8 +7,8 @@
 //! `None` 会让各 IME 退回默认位置（小狼毫在窗口左上角、微软拼音在右下角）。
 
 use gpui::{
-    canvas, point, px, size, AnyElement, App, Bounds, Font, IntoElement, Pixels, Styled, TextRun,
-    Window,
+    canvas, point, px, size, AnyElement, App, Bounds, Font, IntoElement, Pixels, Point, Styled,
+    TextRun, Window,
 };
 use std::{cell::RefCell, rc::Rc};
 
@@ -76,6 +76,36 @@ impl ImeAnchor {
             origin: state.text_bounds.origin + point(x, px(0.0)),
             size: size(px(2.0), state.line_height),
         })
+    }
+
+    /// 鼠标命中测试：窗口坐标换算成 `text` 的字符下标（单行，只看 x）。
+    /// 未记录 bounds（尚未 paint）时退回文本末尾。
+    pub(crate) fn char_index_at(
+        &self,
+        text: &str,
+        position: Point<Pixels>,
+        window: &mut Window,
+    ) -> usize {
+        let Some(state) = self.0.borrow().clone() else {
+            return text.chars().count();
+        };
+        if text.is_empty() {
+            return 0;
+        }
+        let run = TextRun {
+            len: text.len(),
+            font: state.font,
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = window
+            .text_system()
+            .layout_line(text, state.font_size, &[run], None);
+        let local_x = (position.x - state.text_bounds.origin.x).max(px(0.0));
+        let byte = line.closest_index_for_x(local_x).min(text.len());
+        text[..byte].chars().count()
     }
 }
 

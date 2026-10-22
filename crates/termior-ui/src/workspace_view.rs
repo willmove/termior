@@ -1100,6 +1100,36 @@ impl WorkspaceView {
         })
         .detach();
     }
+
+    /// Find bar UI shot (`TERMIOR_UI_SHOT_FIND=1`).
+    ///
+    /// 等首终端与文件树落定（脚本先截干净的主窗）后，打开终端查找条并填入
+    /// 全选中的查询串，供 `scripts/ui-screenshot.ps1 -FindBar` 截图审阅
+    /// 关闭按钮、匹配计数与按钮组布局。
+    pub fn start_find_bar_shot(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let main_window = window.window_handle();
+        let entity = cx.entity();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(6))
+                .await;
+            let _ = main_window.update(cx, |_, _window, cx| {
+                entity.update(cx, |workspace, cx| {
+                    let Some(terminal) = workspace
+                        .focused_terminal()
+                        .or_else(|| workspace.active_terminal())
+                        .cloned()
+                    else {
+                        return;
+                    };
+                    terminal.update(cx, |view, cx| {
+                        view.open_search_for_ui_shot("termior", cx);
+                    });
+                });
+            });
+        })
+        .detach();
+    }
 }
 
 use commands::CommandMode;

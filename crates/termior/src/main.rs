@@ -129,6 +129,11 @@ fn main() {
                                 .update(cx, |workspace, cx| workspace.open_ssh_manager(window, cx));
                         });
                     }
+                    if std::env::var_os("TERMIOR_UI_SHOT_FIND").is_some() {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.start_find_bar_shot(window, cx);
+                        });
+                    }
                     if nfr_measure {
                         schedule_nfr_measurement(window, workspace.clone(), nfr_echo_samples);
                     }
