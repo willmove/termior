@@ -46,16 +46,13 @@ gh release view vX.Y.Z   # expected to return not-found for a new version
 ```
 
 - The latest `main` CI state is green, **or** every red job is a failure that has been understood
-  and documented before tagging. As of v0.2.3 the known pre-existing red state on `main` is: on
-  `ubuntu-latest` the `Core (ubuntu-latest)` job fails in its `Clippy` step, and the
-  `Core coverage ≥ 80%` job fails in `Measure line coverage`. Both fail because those jobs never
-  install the Linux desktop dependencies and the runner image does not provide the `fontconfig`
-  development package that `yeslogic-fontconfig-sys` locates through pkg-config.
-  `Desktop (linux)` installs those dependencies and passes, and so do `Core (windows-latest)`,
-  `Core (macos-latest)`, all three `Desktop` jobs, the generated-icon check, and the editor and PTY
-  benchmarks. The publication gate is the Release workflow
-  (`.github/workflows/release.yml`), which builds and packages on all three platforms but does not
-  run those tests.
+  and documented before tagging. As of v0.3.1 there is no known pre-existing red state on `main`:
+  the v0.2.3-era `Core (ubuntu-latest)` Clippy and `Core coverage ≥ 80%` failures (those jobs
+  lacked the `fontconfig` development package that `yeslogic-fontconfig-sys` locates through
+  pkg-config) were fixed by installing the Linux link dependencies in those jobs. A red job at
+  tagging time is a blocker unless its cause has been understood and recorded here first. The
+  publication gate is the Release workflow (`.github/workflows/release.yml`), which builds and
+  packages on all three platforms but does not run those tests.
 
 ## 2. Build the change summary
 
