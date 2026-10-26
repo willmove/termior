@@ -5,11 +5,17 @@ use std::fs::File;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, SetHandleInformation, HANDLE};
-use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+use windows_sys::Win32::Security::Authorization::{
+    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+    NO_MULTIPLE_TRUSTEE, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+};
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
-use windows_sys::Win32::Security::{GetLengthSid, PSID, SECURITY_CAPABILITIES};
+use windows_sys::Win32::Security::{
+    GetLengthSid, ACL, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
+    SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+};
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -23,12 +29,14 @@ use windows_sys::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
-const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
-const ACCESS_ALLOWED_ACE_TYPE: u16 = 0x00;
-const OBJECT_INHERIT_ACE: u16 = 0x01;
-const CONTAINER_INHERIT_ACE: u16 = 0x02;
-const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
-const ACL_REVISION: u8 = 2;
+/// The access the container is granted on the shared directory.
+///
+/// This is `FILE_ALL_ACCESS` without `WRITE_DAC` and `WRITE_OWNER`. `FILE_ALL_ACCESS`
+/// hands the container the right to rewrite the security descriptors of everything it
+/// is given, which would let a confined process take ownership of the workspace and
+/// change who else may enter it. The remaining rights are everything a task needs to
+/// read, write and run inside the workspace.
+const CONTAINER_ACCESS: u32 = 0x0013_01FF;
 
 /// Environment variables the sandbox copies from the parent process.
 ///
@@ -310,10 +318,12 @@ impl Drop for Job {
     }
 }
 
-/// Build an ACL that grants the AppContainer SID full access to one directory.
+/// Grant the AppContainer SID full access to one directory, keeping the existing ACL.
 ///
-/// The ACL is assembled in a byte buffer so the layout matches the Windows `ACL` and
-/// `ACCESS_ALLOWED_ACE` structures exactly.
+/// The grant is *additive*. Writing a whole DACL with `SetNamedSecurityInfoW` would
+/// drop every other principal's entry, which takes the host's own access away and
+/// removes the traversal rights the ancestors need. `SetEntriesInAclW` merges the new
+/// entry into the *current* DACL instead, so nothing else changes.
 fn grant_directory_to(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
     // SAFETY: `sid` is a valid SID.
     let length = unsafe { GetLengthSid(sid) };
@@ -322,44 +332,97 @@ fn grant_directory_to(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
             "invalid AppContainer SID".into(),
         ));
     }
-    // The ACL header is 8 bytes. An ACE is a 4-byte header (type, flags, size), a
-    // 4-byte access mask, and the SID that follows.
-    let ace_size = 8 + length as usize;
-    let acl_size = 8 + ace_size;
-    let mut buffer = vec![0u8; acl_size];
-    buffer[0] = ACL_REVISION;
-    buffer[2..4].copy_from_slice(&(acl_size as u16).to_le_bytes());
-    buffer[4..6].copy_from_slice(&1u16.to_le_bytes());
-    let ace = &mut buffer[8..];
-    ace[0] = ACCESS_ALLOWED_ACE_TYPE as u8;
-    // Only a directory can pass its access down to the files below it. A file grant
-    // applies to that file alone.
-    ace[1] = if path.is_dir() {
-        (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8
-    } else {
-        0
+    // The trustee carries the SID itself. `TRUSTEE_IS_SID` means `ptstrName` points
+    // at a `PSID`, not at a name, so the raw SID goes there.
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_USER,
+        ptstrName: sid as *mut u16,
     };
-    ace[2..4].copy_from_slice(&(ace_size as u16).to_le_bytes());
-    ace[4..8].copy_from_slice(&FILE_ALL_ACCESS.to_le_bytes());
-    // SAFETY: `sid` points to a SID of exactly `length` bytes and the destination region
-    // of `ace` is large enough to hold it.
-    unsafe {
-        std::ptr::copy_nonoverlapping(sid as *const u8, ace.as_mut_ptr().add(8), length as usize);
-    }
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: CONTAINER_ACCESS,
+        // `SET_ACCESS` replaces the container's own entry instead of stacking a new
+        // one on top of it, so granting the same directory twice does not grow the
+        // DACL.
+        grfAccessMode: SET_ACCESS,
+        // Only a directory can pass its access down to the files below it. A file
+        // grant applies to that file alone.
+        grfInheritance: if path.is_dir() {
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT
+        } else {
+            windows_sys::Win32::Security::NO_INHERITANCE
+        },
+        Trustee: trustee,
+    };
+    // The current DACL is the base for the merge. Building the new ACL without it
+    // would produce a one-entry ACL that replaces everything else on the path.
     let wide = wide_null(&path.to_string_lossy());
-    // SAFETY: `wide` is a valid null-terminated path and `buffer` holds an ACL whose
-    // revision, size, and ace count are set above.
+    let mut existing: *mut ACL = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is a valid null-terminated path and both out-parameters are
+    // valid for the duration of the call.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            windows_sys::Win32::Security::DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut existing,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(AppContainerError::Acl(format!(
+            "cannot read the ACL of {}: status={status:#x}",
+            path.display()
+        )));
+    }
+    let mut merged: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `entry` is a valid explicit access entry for one trustee, and the
+    // trustee points at the live SID, which outlives the call.
+    let status = unsafe {
+        SetEntriesInAclW(
+            1,
+            &entry as *const EXPLICIT_ACCESS_W,
+            existing,
+            &mut merged as *mut *mut ACL,
+        )
+    };
+    // SAFETY: the DACL and the security descriptor were allocated by
+    // `GetNamedSecurityInfoW`. The DACL pointer points *into* the security
+    // descriptor buffer, so only the descriptor itself is freed.
+    unsafe {
+        if !descriptor.is_null() {
+            LocalFree(descriptor);
+        }
+    }
+    if status != 0 || merged.is_null() {
+        return Err(AppContainerError::Acl(format!(
+            "cannot build the AppContainer grant for {}: status={status:#x}",
+            path.display()
+        )));
+    }
+    // SAFETY: `wide` is a valid null-terminated path and `merged` is the ACL
+    // `SetEntriesInAclW` just built.
     let status = unsafe {
         SetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            windows_sys::Win32::Security::DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            buffer.as_mut_ptr() as *mut windows_sys::Win32::Security::ACL,
+            merged,
             std::ptr::null_mut(),
         )
     };
+    // SAFETY: the ACL was allocated by `SetEntriesInAclW` and is freed exactly once.
+    unsafe {
+        LocalFree(merged as *mut std::ffi::c_void);
+    }
     if status != 0 {
         return Err(AppContainerError::Acl(format!(
             "cannot grant the AppContainer access to {}: status={status:#x}",

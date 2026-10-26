@@ -263,3 +263,123 @@ fn a_confined_command_can_run_system_binaries_without_an_explicit_grant() {
         println!("{program}: exit={code:?}");
     }
 }
+
+/// A program under the user profile is a different case: the profile directory's own
+/// ACL does not grant a low-privilege token traversal, so the confined loader cannot
+/// even open the image.
+#[test]
+fn a_confined_command_can_run_a_program_under_the_user_profile() {
+    let Some(container) = require_container() else {
+        return;
+    };
+    let directory = std::env::temp_dir().join("termior-appcontainer-profile-probe");
+    std::fs::create_dir_all(&directory).unwrap();
+    let payload = directory.join("probe.cmd");
+    std::fs::write(&payload, "@echo /b 0\n").unwrap();
+    container.grant(&directory).expect("the grant must succeed");
+
+    // The payload is named relative to the working directory. `cmd.exe /c` has its
+    // own quoting rules for an absolute path with spaces in it, and the path is not
+    // what is under test here: what matters is that a confined token can reach the
+    // image under the user profile at all.
+    let code = run(&container, &["/c".into(), "probe.cmd".into()], &directory);
+    println!("profile payload exit={code:?}");
+    assert_eq!(code, Some(0), "the confined command must run");
+}
+
+/// The same problem for a real image: the CI runner builds into a directory whose
+/// ancestors grant access to the runner account only, so a confined process cannot
+/// traverse down to the program even though the program itself was granted.
+#[test]
+fn a_confined_command_can_run_a_program_below_a_restricted_directory() {
+    let Some(container) = require_container() else {
+        return;
+    };
+    let root = std::env::temp_dir().join("termior-appcontainer-restricted-root");
+    let _ = std::fs::remove_dir_all(&root);
+    let leaf = root.join("a").join("b");
+    std::fs::create_dir_all(&leaf).unwrap();
+
+    // The image is the test binary itself, copied next to the restricted directory.
+    let exe = std::env::current_exe().unwrap();
+    let target = leaf.join("payload.exe");
+    std::fs::copy(&exe, &target).unwrap();
+
+    container.grant(&leaf).expect("the grant must succeed");
+
+    let code = run(&container, &["/c".into(), "echo ok".into()], &leaf);
+    println!("restricted leaf exit={code:?}");
+    // The working directory must be reachable, otherwise the confined process cannot
+    // even start.
+    assert_eq!(code, Some(0), "the confined command must run");
+}
+
+/// A grant must not take the host's own access away. The grant is done with
+/// `SetNamedSecurityInfoW`, which replaces the whole DACL, so this test checks what
+/// the directory looks like afterwards.
+#[test]
+fn granting_a_directory_keeps_the_hosts_own_access() {
+    let Some(container) = require_container() else {
+        return;
+    };
+    let directory = std::env::temp_dir().join("termior-appcontainer-acl-probe");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("before.txt"), b"before").unwrap();
+
+    container.grant(&directory).expect("the grant must succeed");
+
+    // The host can still read its own file, and can still write into the directory.
+    assert_eq!(
+        std::fs::read_to_string(directory.join("before.txt")).unwrap(),
+        "before",
+        "the grant took the host's own access to the granted directory away"
+    );
+    std::fs::write(directory.join("after.txt"), b"after").unwrap();
+    println!("granted directory: {}", directory.display());
+}
+
+/// The grant must also keep the *other* principals' entries. Replacing the whole
+/// DACL drops them, which takes the host's own write access away and removes the
+/// traversal rights the ancestors need.
+#[test]
+fn granting_a_directory_keeps_the_other_principals_entries() {
+    let Some(container) = require_container() else {
+        return;
+    };
+    let directory = std::env::temp_dir().join("termior-appcontainer-preserve-probe");
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let file = directory.join("kept.txt");
+    std::fs::write(&file, b"kept").unwrap();
+
+    let before = acl_entries(&directory);
+    container.grant(&directory).expect("the grant must succeed");
+    let after = acl_entries(&directory);
+
+    // Everything that was there before is still there, plus the container entry.
+    for entry in &before {
+        assert!(
+            after.contains(entry),
+            "the grant dropped the {entry:?} entry of {}",
+            directory.display()
+        );
+    }
+    // The file inside the directory keeps its content and stays writable.
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept");
+    std::fs::write(&file, b"rewritten").unwrap();
+}
+
+/// The raw ACL entries of a path, as `icacls` reports them.
+fn acl_entries(path: &Path) -> Vec<String> {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .output()
+        .expect("icacls must run");
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .skip(1)
+        .map(|line| line.trim().to_owned())
+        .filter(|line| !line.is_empty() && !line.starts_with("Successfully processed"))
+        .collect()
+}

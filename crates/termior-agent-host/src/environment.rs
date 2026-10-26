@@ -325,8 +325,13 @@ impl SandboxedProcess {
             return;
         }
         self.reaped = true;
-        if let SandboxChild::Plain(child) = &self.child {
-            reap_process_group(child.id());
+        // A `match` rather than an `if let`: on the platforms without the AppContainer
+        // backend `SandboxChild` has a single variant, and an `if let` on a single-variant
+        // enum is an irrefutable pattern that clippy rejects.
+        match &self.child {
+            SandboxChild::Plain(child) => reap_process_group(child.id()),
+            #[cfg(windows)]
+            SandboxChild::Confined(_) => {}
         }
     }
 }
@@ -370,56 +375,27 @@ impl SandboxBackend for PlatformSandbox {
         }
     }
     fn probe(&self) -> BTreeMap<SandboxCapability, TrustLevel> {
-        if cfg!(windows) {
-            return WindowsAppContainerSandbox.probe();
-        }
-        let filesystem = if (cfg!(target_os = "linux") && command_exists("bwrap"))
-            || (cfg!(target_os = "macos") && command_exists("sandbox-exec"))
+        // The Windows backend is a separate type that only exists on Windows, so the
+        // dispatch has to be a compile-time one: a runtime `cfg!` check would name a
+        // type that does not exist on the other platforms.
+        #[cfg(windows)]
         {
-            TrustLevel::Verified
-        } else {
-            TrustLevel::Unsupported
-        };
-        BTreeMap::from([
-            (SandboxCapability::Filesystem, filesystem),
-            (
-                SandboxCapability::Network,
-                if filesystem == TrustLevel::Verified {
-                    TrustLevel::Verified
-                } else {
-                    TrustLevel::Unsupported
-                },
-            ),
-            (
-                SandboxCapability::Credentials,
-                if filesystem == TrustLevel::Verified {
-                    TrustLevel::Verified
-                } else {
-                    TrustLevel::Unsupported
-                },
-            ),
-            (SandboxCapability::ProcessTree, TrustLevel::Verified),
-        ])
+            WindowsAppContainerSandbox.probe()
+        }
+        #[cfg(not(windows))]
+        {
+            unix_sandbox_probe()
+        }
     }
     fn prepare(&self, request: &SandboxRequest) -> Result<ExecutionEnvironment, SandboxError> {
-        if cfg!(windows) {
-            return WindowsAppContainerSandbox.prepare(request);
+        #[cfg(windows)]
+        {
+            WindowsAppContainerSandbox.prepare(request)
         }
-        let root = std::fs::canonicalize(&request.root)
-            .map_err(|error| SandboxError::Io(error.to_string()))?;
-        let capabilities = self.probe();
-        let environment = ExecutionEnvironment {
-            id: request.id.clone(),
-            kind: EnvironmentKind::Sandboxed,
-            host: std::env::consts::OS.into(),
-            root: root.clone(),
-            writable_paths: vec![root],
-            capabilities,
-            backend_owner: self.name().into(),
-            verified_at_ms: Some(now_ms()),
-        };
-        environment.validate_required(&request.required)?;
-        Ok(environment)
+        #[cfg(not(windows))]
+        {
+            unix_sandbox_prepare(request)
+        }
     }
     fn cleanup(&self, _environment: &ExecutionEnvironment) -> Result<(), SandboxError> {
         Ok(())
@@ -431,31 +407,93 @@ impl SandboxBackend for PlatformSandbox {
         args: &[String],
         allow_network: bool,
     ) -> Result<SandboxCommand, SandboxError> {
-        if cfg!(windows) {
-            return WindowsAppContainerSandbox.wrap_command(
-                environment,
-                program,
-                args,
-                allow_network,
-            );
+        #[cfg(windows)]
+        {
+            WindowsAppContainerSandbox.wrap_command(environment, program, args, allow_network)
         }
-        let mut required = vec![
-            SandboxCapability::Filesystem,
-            SandboxCapability::Credentials,
-            SandboxCapability::ProcessTree,
-        ];
-        if !allow_network {
-            required.push(SandboxCapability::Network);
+        #[cfg(not(windows))]
+        {
+            unix_sandbox_wrap_command(environment, program, args, allow_network)
         }
-        environment.validate_required(&required)?;
-        if cfg!(target_os = "linux") {
-            return linux_sandbox_command(environment, program, args, allow_network);
-        }
-        if cfg!(target_os = "macos") {
-            return macos_sandbox_command(environment, program, args, allow_network);
-        }
-        Err(SandboxError::CommandIsolationUnsupported)
     }
+}
+
+/// The Linux and macOS sandbox capabilities, probed from the host.
+#[cfg(not(windows))]
+fn unix_sandbox_probe() -> BTreeMap<SandboxCapability, TrustLevel> {
+    let filesystem = if (cfg!(target_os = "linux") && command_exists("bwrap"))
+        || (cfg!(target_os = "macos") && command_exists("sandbox-exec"))
+    {
+        TrustLevel::Verified
+    } else {
+        TrustLevel::Unsupported
+    };
+    BTreeMap::from([
+        (SandboxCapability::Filesystem, filesystem),
+        (
+            SandboxCapability::Network,
+            if filesystem == TrustLevel::Verified {
+                TrustLevel::Verified
+            } else {
+                TrustLevel::Unsupported
+            },
+        ),
+        (
+            SandboxCapability::Credentials,
+            if filesystem == TrustLevel::Verified {
+                TrustLevel::Verified
+            } else {
+                TrustLevel::Unsupported
+            },
+        ),
+        (SandboxCapability::ProcessTree, TrustLevel::Verified),
+    ])
+}
+
+/// Prepare a Linux or macOS sandboxed environment.
+#[cfg(not(windows))]
+fn unix_sandbox_prepare(request: &SandboxRequest) -> Result<ExecutionEnvironment, SandboxError> {
+    let root = std::fs::canonicalize(&request.root)
+        .map_err(|error| SandboxError::Io(error.to_string()))?;
+    let capabilities = unix_sandbox_probe();
+    let environment = ExecutionEnvironment {
+        id: request.id.clone(),
+        kind: EnvironmentKind::Sandboxed,
+        host: std::env::consts::OS.into(),
+        root: root.clone(),
+        writable_paths: vec![root],
+        capabilities,
+        backend_owner: PlatformSandbox.name().into(),
+        verified_at_ms: Some(now_ms()),
+    };
+    environment.validate_required(&request.required)?;
+    Ok(environment)
+}
+
+/// Wrap a command for the Linux or macOS sandbox.
+#[cfg(not(windows))]
+fn unix_sandbox_wrap_command(
+    environment: &ExecutionEnvironment,
+    program: &str,
+    args: &[String],
+    allow_network: bool,
+) -> Result<SandboxCommand, SandboxError> {
+    let mut required = vec![
+        SandboxCapability::Filesystem,
+        SandboxCapability::Credentials,
+        SandboxCapability::ProcessTree,
+    ];
+    if !allow_network {
+        required.push(SandboxCapability::Network);
+    }
+    environment.validate_required(&required)?;
+    if cfg!(target_os = "linux") {
+        return linux_sandbox_command(environment, program, args, allow_network);
+    }
+    if cfg!(target_os = "macos") {
+        return macos_sandbox_command(environment, program, args, allow_network);
+    }
+    Err(SandboxError::CommandIsolationUnsupported)
 }
 
 /// Windows sandbox backend based on an AppContainer identity (Stage D task 6.2).
@@ -563,6 +601,7 @@ impl SandboxBackend for WindowsAppContainerSandbox {
 }
 
 /// Fail closed when a required capability is not verified.
+#[cfg(windows)]
 fn environment_capabilities_checked(
     capabilities: &BTreeMap<SandboxCapability, TrustLevel>,
     required: &[SandboxCapability],
@@ -575,6 +614,7 @@ fn environment_capabilities_checked(
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn linux_sandbox_command(
     environment: &ExecutionEnvironment,
     program: &str,
@@ -642,6 +682,7 @@ fn linux_sandbox_command(
     })
 }
 
+#[cfg(not(windows))]
 fn map_linux_program(program: &Path, args: &mut Vec<String>) -> Result<String, SandboxError> {
     let text = program.display().to_string();
     const PREFIXES: &[&str] = &[
@@ -672,6 +713,7 @@ fn map_linux_program(program: &Path, args: &mut Vec<String>) -> Result<String, S
     Ok(format!("/termior-bin/{}", file_name.to_string_lossy()))
 }
 
+#[cfg(not(windows))]
 fn macos_sandbox_command(
     environment: &ExecutionEnvironment,
     program: &str,
@@ -691,6 +733,7 @@ fn macos_sandbox_command(
     })
 }
 
+#[cfg(not(windows))]
 fn macos_profile(root: &Path, program: &Path, allow_network: bool) -> String {
     let root = scheme_escape(&root.display().to_string());
     // `(deny default)` also blocks the mach and mmap operations dyld and libsystem
@@ -749,6 +792,7 @@ fn macos_profile(root: &Path, program: &Path, allow_network: bool) -> String {
     rules.join("\n")
 }
 
+#[cfg(not(windows))]
 fn scheme_subpath(path: &Path) -> Option<String> {
     let text = path.display().to_string();
     if text.is_empty() || text == "/" {
@@ -758,6 +802,7 @@ fn scheme_subpath(path: &Path) -> Option<String> {
     }
 }
 
+#[cfg(not(windows))]
 fn scheme_escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -776,9 +821,31 @@ fn resolve_host_program(program: &str) -> Result<PathBuf, SandboxError> {
             })
             .ok_or_else(|| SandboxError::Io(format!("sandbox program not found: {program}")))?
     };
-    candidate
+    let resolved = candidate
         .canonicalize()
-        .map_err(|error| SandboxError::Io(error.to_string()))
+        .map_err(|error| SandboxError::Io(error.to_string()))?;
+    // `canonicalize` on Windows returns a verbatim path (`\\?\C:\...`). The Windows
+    // image loader cannot open a verbatim path, so `CreateProcessW` reports
+    // ERROR_FILE_NOT_FOUND for a program that is really there. The path is only
+    // resolved so that a relative program cannot be picked up from the current
+    // directory, so dropping the prefix loses nothing.
+    Ok(strip_windows_verbatim_prefix(&resolved))
+}
+
+/// Drop the Windows verbatim (`\\?\`) prefix from a path.
+///
+/// `\\?\` disables the normalization the Win32 path parser does, which breaks
+/// `CreateProcessW` and every shell that resolves a program by path.
+fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    let trimmed = match text.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => text
+            .strip_prefix(r"\\?\")
+            .map(str::to_owned)
+            .unwrap_or(text.to_string()),
+    };
+    PathBuf::from(trimmed)
 }
 
 fn reap_process_group(pid: u32) {
@@ -806,6 +873,7 @@ fn safe_path() -> String {
     }
 }
 
+#[cfg(not(windows))]
 fn command_exists(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|path| {
@@ -820,6 +888,53 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Windows image loader cannot open a verbatim path.
+    ///
+    /// `canonicalize` returns one on Windows, so a sandboxed program that was
+    /// resolved through it fails to start with `ERROR_FILE_NOT_FOUND` even though
+    /// the file is really there.
+    #[test]
+    fn a_verbatim_windows_path_is_stripped() {
+        let stripped = strip_windows_verbatim_prefix(Path::new(r"\\?\C:\Program Files\tool.exe"));
+        assert_eq!(stripped, PathBuf::from(r"C:\Program Files\tool.exe"));
+    }
+
+    /// A verbatim UNC path becomes an ordinary UNC path.
+    #[test]
+    fn a_verbatim_unc_path_becomes_a_unc_path() {
+        let stripped = strip_windows_verbatim_prefix(Path::new(r"\\?\UNC\server\share\tool.exe"));
+        assert_eq!(stripped, PathBuf::from(r"\\server\share\tool.exe"));
+    }
+
+    /// A path that is already normal is left alone.
+    #[test]
+    fn a_normal_path_is_left_alone() {
+        let stripped = strip_windows_verbatim_prefix(Path::new(r"C:\Windows\System32\cmd.exe"));
+        assert_eq!(stripped, PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+    }
+
+    /// The resolved program of a sandboxed command must be startable.
+    ///
+    /// This is the regression test for the Windows CI failure: the sandbox handed
+    /// `CreateProcessW` a verbatim path and the spawn failed with
+    /// `ERROR_FILE_NOT_FOUND`.
+    #[test]
+    fn a_resolved_program_is_not_a_verbatim_path() {
+        let program = if cfg!(windows) { "cmd.exe" } else { "sh" };
+        let resolved = resolve_host_program(program).expect("the program must resolve");
+        let text = resolved.to_string_lossy();
+        assert!(
+            !text.starts_with(r"\\?\"),
+            "the resolved program is a verbatim path: {text}"
+        );
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SandboxError {
     #[error("required sandbox capability is unavailable: {0:?}")]
