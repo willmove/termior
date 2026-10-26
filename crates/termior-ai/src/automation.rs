@@ -81,10 +81,13 @@ pub struct AutomationStore {
     pub engine: AutomationEngine,
 }
 
+/// The automation store schema this build reads and writes.
+pub const AUTOMATION_SCHEMA_VERSION: u32 = 2;
+
 impl Default for AutomationStore {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: AUTOMATION_SCHEMA_VERSION,
             automations: vec![],
             recent_runs: vec![],
             audit: vec![],
@@ -106,11 +109,41 @@ impl AutomationStore {
     pub fn load(data_root: &Path) -> Result<Self, std::io::Error> {
         let path = data_root.join("automations.json");
         match std::fs::read_to_string(path) {
-            Ok(json) => serde_json::from_str(&json)
-                .map_err(|error| std::io::Error::other(error.to_string())),
+            Ok(json) => {
+                let mut store: Self = serde_json::from_str(&json)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                store.migrate()?;
+                Ok(store)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(error),
         }
+    }
+
+    /// Bring a store written by an older build up to the current schema.
+    ///
+    /// A store written by a *newer* build is refused instead of being read with the
+    /// wrong meaning: silently accepting it would turn an unknown field into a lost
+    /// schedule. The caller keeps the file and reports the error.
+    pub fn migrate(&mut self) -> Result<(), std::io::Error> {
+        if self.schema_version > AUTOMATION_SCHEMA_VERSION {
+            return Err(std::io::Error::other(format!(
+                "the automation store uses schema {} but this build supports up to {}",
+                self.schema_version, AUTOMATION_SCHEMA_VERSION
+            )));
+        }
+        if self.schema_version < 2 {
+            // v1 → v2: the run reason and the audit fields did not exist. They are
+            // optional in the wire format, so the migration only stamps the version
+            // and leaves the older rows readable.
+            for run in &mut self.recent_runs {
+                if run.schedule_reason.is_empty() {
+                    run.schedule_reason = "unknown".to_string();
+                }
+            }
+        }
+        self.schema_version = AUTOMATION_SCHEMA_VERSION;
+        Ok(())
     }
 }
 
