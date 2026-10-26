@@ -61,7 +61,21 @@ jobs:
       # could run — the same action resolved fine in a sibling job of the same
       # run. A commit SHA cannot be moved or deleted, so the lookup cannot fail
       # this way, and it caches the same artifacts the tag would fetch.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      # Cargo registry and build cache. The action used to be spelled
+      # "Swatinin/rust-cache", which is not the name of the repository:
+      # GitHub reported "Unable to resolve action swatinin/rust-cache,
+      # repository not found" and took the whole job down while it prepared
+      # the actions, before any step could run. The first-party cache action
+      # does the same job, and a cache that cannot be restored only costs time.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
         with:
           workspaces: "."
       - name: rustfmt
@@ -107,7 +121,21 @@ jobs:
         with:
           components: clippy
       # Pinned to the commit the v2 tag points at; see the note in the Core job.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      # Cargo registry and build cache. The action used to be spelled
+      # "Swatinin/rust-cache", which is not the name of the repository:
+      # GitHub reported "Unable to resolve action swatinin/rust-cache,
+      # repository not found" and took the whole job down while it prepared
+      # the actions, before any step could run. The first-party cache action
+      # does the same job, and a cache that cannot be restored only costs time.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
         with:
           workspaces: "."
       - name: Check desktop application
@@ -261,7 +289,21 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       # Pinned to the commit the v2 tag points at; see the note in the Core job.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      # Cargo registry and build cache. The action used to be spelled
+      # "Swatinin/rust-cache", which is not the name of the repository:
+      # GitHub reported "Unable to resolve action swatinin/rust-cache,
+      # repository not found" and took the whole job down while it prepared
+      # the actions, before any step could run. The first-party cache action
+      # does the same job, and a cache that cannot be restored only costs time.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
         with:
           workspaces: "."
       - name: Measure line coverage
@@ -290,7 +332,21 @@ jobs:
           sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       # Pinned to the commit the v2 tag points at; see the note in the Core job.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      # Cargo registry and build cache. The action used to be spelled
+      # "Swatinin/rust-cache", which is not the name of the repository:
+      # GitHub reported "Unable to resolve action swatinin/rust-cache,
+      # repository not found" and took the whole job down while it prepared
+      # the actions, before any step could run. The first-party cache action
+      # does the same job, and a cache that cannot be restored only costs time.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
         with:
           workspaces: "."
       - name: Run quick benchmark gate
@@ -336,7 +392,21 @@ jobs:
           sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       # Pinned to the commit the v2 tag points at; see the note in the Core job.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      # Cargo registry and build cache. The action used to be spelled
+      # "Swatinin/rust-cache", which is not the name of the repository:
+      # GitHub reported "Unable to resolve action swatinin/rust-cache,
+      # repository not found" and took the whole job down while it prepared
+      # the actions, before any step could run. The first-party cache action
+      # does the same job, and a cache that cannot be restored only costs time.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
         with:
           workspaces: "."
       - name: NFR context latency gate (repo map)
@@ -385,7 +455,21 @@ jobs:
           sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       # Pinned to the commit the v2 tag points at; see the note in the Core job.
-      - uses: Swatinin/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      # Cargo registry and build cache. The action used to be spelled
+      # "Swatinin/rust-cache", which is not the name of the repository:
+      # GitHub reported "Unable to resolve action swatinin/rust-cache,
+      # repository not found" and took the whole job down while it prepared
+      # the actions, before any step could run. The first-party cache action
+      # does the same job, and a cache that cannot be restored only costs time.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
         with:
           workspaces: "."
       - name: NFR Agent IO gate (task journal write path)
@@ -433,7 +517,21 @@ jobs:
           sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       # Pinned to the commit the v2 tag points at; see the note in the Core job.
-      - uses: Swatinin/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+      # Cargo registry and build cache. The action used to be spelled
+      # "Swatinin/rust-cache", which is not the name of the repository:
+      # GitHub reported "Unable to resolve action swatinin/rust-cache,
+      # repository not found" and took the whole job down while it prepared
+      # the actions, before any step could run. The first-party cache action
+      # does the same job, and a cache that cannot be restored only costs time.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
         with:
           workspaces: "."
       - name: NFR residual gate (long-run resource residual)
