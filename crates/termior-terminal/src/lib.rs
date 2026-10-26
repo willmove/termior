@@ -11,6 +11,7 @@
 pub mod bridge;
 pub mod pty;
 pub mod service;
+pub mod windows_sandbox;
 
 pub use bridge::{PtyData, TerminalBridge, TerminalEventProxy, WriterHandle};
 pub use pty::{
@@ -27,3 +28,7 @@ pub use termior_terminal_core::command::{
 };
 pub use termior_terminal_core::shell_integration::ShellKind;
 pub use termior_terminal_core::{TerminalCommandRecord, TerminalContextReference};
+pub use windows_sandbox::{
+    app_container_available, build_command_line, delete_profile, grant_directory, quote_argument,
+    AppContainer, AppContainerError, ConfinedProcess, PipedConfinedProcess, APP_CONTAINER_NAME,
+};

@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -14,6 +15,64 @@ use crate::{
 pub const CODEX_COMPATIBLE_MINOR: &str = "0.164";
 
 pub const PERMISSIONS_APPROVAL_METHOD: &str = "item/permissions/requestApproval";
+
+/// Sandbox mode requested for Codex threads.
+///
+/// The Codex app-server runs its own commands in a Windows sandbox that needs the
+/// `CodexSandboxOffline` / `CodexSandboxOnline` local accounts. A machine without those
+/// accounts fails every command with `CryptUnprotectData failed: 2148073483`, which is a
+/// provisioning gap and not a protocol or version problem.
+///
+/// Termior keeps the sandboxed mode as the default so an agent cannot write outside the
+/// workspace by accident. A user on a machine without the sandbox accounts can select the
+/// unrestricted mode explicitly; the choice is recorded in the task's capability matrix
+/// instead of being hidden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CodexSandboxMode {
+    /// Codex confines commands to the workspace and its writable roots.
+    #[default]
+    WorkspaceWrite,
+    /// Codex confines commands to a read-only view of the workspace.
+    ReadOnly,
+    /// Codex runs commands without its own sandbox. Requires an explicit opt-in.
+    DangerFullAccess,
+}
+
+impl CodexSandboxMode {
+    /// Map a textual mode onto the enum. Unknown values keep the confined default so a
+    /// typo never silently widens the sandbox.
+    pub fn parse(value: &str) -> Self {
+        match value.trim() {
+            "read-only" => Self::ReadOnly,
+            "danger-full-access" => Self::DangerFullAccess,
+            _ => Self::WorkspaceWrite,
+        }
+    }
+
+    /// The `sandbox` value the app-server's `thread/start` method accepts.
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::WorkspaceWrite => "workspace-write",
+            Self::ReadOnly => "read-only",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+
+    /// Whether the mode drops Codex's own command confinement entirely.
+    pub fn is_unrestricted(self) -> bool {
+        matches!(self, Self::DangerFullAccess)
+    }
+
+    /// Read the mode from the environment. Unrecognized values keep the default so a
+    /// typo never silently widens the sandbox.
+    pub fn from_env() -> Self {
+        match std::env::var("TERMIOR_CODEX_SANDBOX") {
+            Ok(value) => Self::parse(&value),
+            Err(_) => Self::default(),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CodexProtocol {
@@ -87,6 +146,7 @@ impl CodexProtocol {
 pub struct CodexBackend {
     executable: String,
     protocol: CodexProtocol,
+    sandbox: CodexSandboxMode,
     transport: Option<StdioTransport>,
     initialized_version: Option<String>,
     /// Requested permission profiles of unanswered `item/permissions/requestApproval` requests,
@@ -94,6 +154,8 @@ pub struct CodexBackend {
     pending_permissions: HashMap<String, Value>,
     stderr_log: Option<PathBuf>,
     known_secrets: Vec<String>,
+    /// Whether the missing Windows sandbox accounts have already been reported once.
+    reported_sandbox_gap: bool,
 }
 
 impl CodexBackend {
@@ -101,12 +163,25 @@ impl CodexBackend {
         Self {
             executable: executable.into(),
             protocol: CodexProtocol::stable_verified(),
+            sandbox: CodexSandboxMode::default(),
             transport: None,
             initialized_version: None,
             pending_permissions: HashMap::new(),
             stderr_log: None,
             known_secrets: Vec::new(),
+            reported_sandbox_gap: false,
         }
+    }
+
+    /// Select the sandbox mode the app-server applies to this backend's threads.
+    pub fn with_sandbox(mut self, sandbox: CodexSandboxMode) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// The sandbox mode this backend requests.
+    pub fn sandbox(&self) -> CodexSandboxMode {
+        self.sandbox
     }
 
     /// Persist backend stderr after streaming redaction.
@@ -206,13 +281,14 @@ impl AgentBackend for CodexBackend {
     }
 
     fn create_task(&mut self, launch: TaskLaunch) -> Result<BackendBinding, BackendError> {
+        let sandbox = self.sandbox.wire_value();
         let result = self.transport()?.request(
             "thread/start",
             json!({
                 "cwd": launch.project_dir,
                 "model": launch.model,
                 "approvalPolicy": "on-request",
-                "sandbox": "workspace-write"
+                "sandbox": sandbox
             }),
             Duration::from_secs(30),
         )?;
@@ -294,6 +370,15 @@ impl AgentBackend for CodexBackend {
         let Some(raw) = self.transport()?.next_event(timeout)? else {
             return Ok(None);
         };
+        // A Windows machine without the Codex sandbox accounts makes every command fail
+        // before it starts. That reads like a protocol failure in the UI, so report the
+        // provisioning gap once instead of repeating a raw crypto error.
+        if let Some(hint) = sandbox_provisioning_hint(&raw) {
+            if !self.reported_sandbox_gap {
+                self.reported_sandbox_gap = true;
+                return Ok(Some(BackendEvent::Error { message: hint, raw }));
+            }
+        }
         let event = map_codex_message(&raw);
         if raw.get("method").is_some()
             && raw.get("id").is_some_and(|id| !id.is_null())
@@ -425,6 +510,26 @@ pub fn map_codex_message(value: &Value) -> BackendEvent {
             raw: value.clone(),
         },
     }
+}
+
+/// Detect the Windows sandbox provisioning gap in a Codex notification payload.
+///
+/// A machine without the `CodexSandboxOffline` / `CodexSandboxOnline` local accounts makes
+/// every Codex command fail with `CryptUnprotectData failed: 2148073483`. That reads like a
+/// protocol or version problem in the UI, but it is a missing local account. This helper
+/// turns the raw payload into an actionable message.
+pub fn sandbox_provisioning_hint(raw: &Value) -> Option<String> {
+    let text = serde_json::to_string(raw).unwrap_or_default();
+    if !text.contains("CryptUnprotectData") {
+        return None;
+    }
+    Some(
+        "the Codex Windows sandbox accounts are missing, so every Codex command fails before \
+         it starts. Run `codex sandbox setup --elevated --current-user` from an elevated shell, \
+         or set TERMIOR_CODEX_SANDBOX=danger-full-access to run Codex commands without its \
+         sandbox."
+            .into(),
+    )
 }
 
 /// One grantable line inside a Codex permission profile.
@@ -797,5 +902,75 @@ mod tests {
             backend.approval_result(&decision(false)),
             json!({"decision":"decline"})
         );
+    }
+
+    #[test]
+    fn sandbox_mode_defaults_to_the_confined_workspace() {
+        let backend = CodexBackend::new("codex");
+        assert_eq!(backend.sandbox(), CodexSandboxMode::WorkspaceWrite);
+        assert!(!backend.sandbox().is_unrestricted());
+    }
+
+    #[test]
+    fn sandbox_mode_wire_values_match_the_app_server_schema() {
+        assert_eq!(
+            CodexSandboxMode::WorkspaceWrite.wire_value(),
+            "workspace-write"
+        );
+        assert_eq!(CodexSandboxMode::ReadOnly.wire_value(), "read-only");
+        assert_eq!(
+            CodexSandboxMode::DangerFullAccess.wire_value(),
+            "danger-full-access"
+        );
+    }
+
+    #[test]
+    fn sandbox_mode_is_only_unrestricted_when_asked_explicitly() {
+        let backend = CodexBackend::new("codex").with_sandbox(CodexSandboxMode::ReadOnly);
+        assert!(!backend.sandbox().is_unrestricted());
+        let backend = CodexBackend::new("codex").with_sandbox(CodexSandboxMode::DangerFullAccess);
+        assert!(backend.sandbox().is_unrestricted());
+    }
+
+    #[test]
+    fn sandbox_mode_from_env_keeps_the_default_for_unknown_values() {
+        // The environment lookup is process-wide, so this test asserts the mapping
+        // logic through the same helper the backend uses, without mutating the
+        // caller's environment.
+        for (value, expected) in [
+            ("read-only", CodexSandboxMode::ReadOnly),
+            ("danger-full-access", CodexSandboxMode::DangerFullAccess),
+            ("workspace-write", CodexSandboxMode::WorkspaceWrite),
+            ("nonsense", CodexSandboxMode::WorkspaceWrite),
+            ("", CodexSandboxMode::WorkspaceWrite),
+        ] {
+            assert_eq!(
+                CodexSandboxMode::parse(value),
+                expected,
+                "sandbox value {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_provisioning_gap_is_recognized_and_explained() {
+        let raw = json!({
+            "method": "item/commandExecution/outputDelta",
+            "params": {
+                "delta": "Failed to create unified exec process: CryptUnprotectData failed: 2148073483"
+            }
+        });
+        let hint = sandbox_provisioning_hint(&raw).expect("the crypto failure must be recognized");
+        assert!(hint.contains("codex sandbox setup --elevated"));
+        assert!(hint.contains("TERMIOR_CODEX_SANDBOX=danger-full-access"));
+    }
+
+    #[test]
+    fn unrelated_payloads_do_not_report_a_sandbox_gap() {
+        assert!(sandbox_provisioning_hint(&json!({"method": "turn/started"})).is_none());
+        assert!(sandbox_provisioning_hint(&json!({
+            "params": {"delta": "command failed with exit code 1"}
+        }))
+        .is_none());
     }
 }

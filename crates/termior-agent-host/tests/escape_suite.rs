@@ -69,10 +69,20 @@ fn run_suite() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, work.join("planted-symlink")).unwrap();
 
+    // The payload runs from the test binary's own directory. On Windows the sandbox
+    // grants access per directory, so the payload's directory must be reachable too.
+    grant_payload_access();
+
     match prepare(&work) {
         Err(error) => assert_all_scenarios_fail_closed(&error, &work, &outside),
         Ok(()) => {
             assert_filesystem_blocked(&work, &outside, &pwned);
+            // The payload must really have run inside the sandbox. A suite that only
+            // proves "nothing happened" would pass for the wrong reason.
+            assert!(
+                work.join(RESULT_FILE).exists(),
+                "the sandbox reported success but never ran the payload"
+            );
             assert_child_cannot_escape(&work, &outside, &pwned);
             assert_network_blocked(&work);
             assert_env_secret_blocked(&work);
@@ -82,6 +92,20 @@ fn run_suite() {
         }
     }
 }
+
+/// Make the payload binary readable and executable inside the sandbox.
+#[cfg(windows)]
+fn grant_payload_access() {
+    let exe = std::env::current_exe().unwrap();
+    let directory = exe
+        .parent()
+        .expect("the test binary has a parent directory");
+    termior_terminal::windows_sandbox::grant_directory(directory)
+        .expect("the payload directory must be shareable with the sandbox");
+}
+
+#[cfg(not(windows))]
+fn grant_payload_access() {}
 
 fn assert_all_scenarios_fail_closed(error: &SandboxError, work: &Path, outside: &Path) {
     let probe = PlatformSandbox.probe();

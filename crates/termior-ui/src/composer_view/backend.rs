@@ -930,7 +930,8 @@ fn run_external_command(
             };
             let mut backend = CodexBackend::new(
                 std::env::var("TERMIOR_CODEX_PATH").unwrap_or_else(|_| "codex".into()),
-            );
+            )
+            .with_sandbox(termior_agent_host::CodexSandboxMode::from_env());
             if let Some(dir) = &data_dir {
                 backend = backend.with_stderr_log(
                     dir.join("agent-backends").join("codex-stderr.log"),

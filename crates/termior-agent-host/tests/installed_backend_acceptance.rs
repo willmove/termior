@@ -3,7 +3,8 @@
 use std::time::{Duration, Instant};
 
 use termior_agent_host::{
-    AcpBackend, AgentBackend, BackendDecision, BackendEvent, CodexBackend, TaskLaunch, TurnLaunch,
+    AcpBackend, AgentBackend, BackendDecision, BackendEvent, CodexBackend, CodexSandboxMode,
+    TaskLaunch, TurnLaunch,
 };
 
 fn read_evidence(mut backend: Box<dyn AgentBackend>) {
@@ -99,9 +100,10 @@ fn read_evidence(mut backend: Box<dyn AgentBackend>) {
 #[test]
 #[ignore = "requires authenticated Codex and explicit TERMIOR_REAL_BACKEND_TESTS=1"]
 fn installed_codex_reads_real_workspace_evidence() {
-    read_evidence(Box::new(CodexBackend::new(
-        std::env::var("TERMIOR_CODEX_PATH").unwrap_or_else(|_| "codex".into()),
-    )));
+    read_evidence(Box::new(
+        CodexBackend::new(std::env::var("TERMIOR_CODEX_PATH").unwrap_or_else(|_| "codex".into()))
+            .with_sandbox(CodexSandboxMode::from_env()),
+    ));
 }
 
 #[test]

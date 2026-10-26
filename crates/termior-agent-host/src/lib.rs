@@ -29,12 +29,16 @@ pub use backend::{
 };
 pub use cli::{find_program, AgentBackendKind, CliAgentFeatures, CliAgentProfile, CLI_AGENTS};
 pub use codex::{
-    map_codex_message, permission_entries, permissions_approval_result, CodexBackend,
-    CodexProtocol, PermissionEntry, CODEX_COMPATIBLE_MINOR, PERMISSIONS_APPROVAL_METHOD,
+    map_codex_message, permission_entries, permissions_approval_result, sandbox_provisioning_hint,
+    CodexBackend, CodexProtocol, CodexSandboxMode, PermissionEntry, CODEX_COMPATIBLE_MINOR,
+    PERMISSIONS_APPROVAL_METHOD,
 };
+#[cfg(windows)]
+pub use environment::WindowsAppContainerSandbox;
 pub use environment::{
     ensure_confined, EnvironmentKind, ExecutionEnvironment, PlatformSandbox, SandboxBackend,
-    SandboxCapability, SandboxCommand, SandboxError, SandboxRequest, SandboxedProcess, TrustLevel,
+    SandboxCapability, SandboxCommand, SandboxError, SandboxRequest, SandboxStream,
+    SandboxedProcess, TrustLevel,
 };
 pub use in_process::InProcessBackend;
 pub use matrix::{apply_sandbox_probe, capability_matrix, CapabilityMatrixRow};

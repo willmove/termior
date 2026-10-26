@@ -285,7 +285,10 @@ fn open_backend(binding: &PersistedBackendBinding) -> Box<dyn AgentBackend> {
             binding.args.clone(),
         ))
     } else {
-        Box::new(CodexBackend::new(binding.program.clone()))
+        Box::new(
+            CodexBackend::new(binding.program.clone())
+                .with_sandbox(crate::CodexSandboxMode::from_env()),
+        )
     }
 }
 

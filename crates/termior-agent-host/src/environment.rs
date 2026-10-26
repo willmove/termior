@@ -133,10 +133,16 @@ pub struct SandboxCommand {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub clear_environment: bool,
+    /// Windows AppContainer confinement. When set, the command is launched inside the
+    /// Termior AppContainer instead of a plain child process.
+    pub app_container: bool,
 }
 
 impl SandboxCommand {
     pub fn spawn(&self) -> Result<SandboxedProcess, SandboxError> {
+        if self.app_container {
+            return self.spawn_app_container();
+        }
         let mut command = Command::new(&self.program);
         command
             .args(&self.args)
@@ -164,57 +170,152 @@ impl SandboxCommand {
             .spawn()
             .map_err(|error| SandboxError::Io(error.to_string()))?;
         Ok(SandboxedProcess {
-            child,
+            child: SandboxChild::Plain(child),
             reaped: false,
         })
     }
+
+    /// Launch the command inside the Windows AppContainer.
+    #[cfg(windows)]
+    fn spawn_app_container(&self) -> Result<SandboxedProcess, SandboxError> {
+        use termior_terminal::windows_sandbox::{AppContainer, APP_CONTAINER_NAME};
+
+        let container = AppContainer::resolve(APP_CONTAINER_NAME)
+            .map_err(|error| SandboxError::Io(error.to_string()))?;
+        let program = PathBuf::from(&self.program);
+        let process = container
+            .spawn_piped(&program, &self.args, &self.cwd)
+            .map_err(|error| SandboxError::Io(error.to_string()))?;
+        Ok(SandboxedProcess {
+            child: SandboxChild::Confined(process),
+            reaped: false,
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn spawn_app_container(&self) -> Result<SandboxedProcess, SandboxError> {
+        Err(SandboxError::CommandIsolationUnsupported)
+    }
+}
+
+/// A standard stream of a sandboxed process.
+pub enum SandboxStream {
+    Stdout(ChildStdout),
+    Stderr(ChildStderr),
+    /// A pipe owned by the Windows AppContainer backend.
+    #[cfg(windows)]
+    File(std::fs::File),
+}
+
+impl std::io::Read for SandboxStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stdout(stream) => stream.read(buffer),
+            Self::Stderr(stream) => stream.read(buffer),
+            #[cfg(windows)]
+            Self::File(stream) => stream.read(buffer),
+        }
+    }
+}
+
+/// The child process of a sandboxed command.
+enum SandboxChild {
+    /// A plain child process, used by the Linux and macOS wrappers.
+    Plain(Child),
+    /// A process running inside the Windows AppContainer.
+    #[cfg(windows)]
+    Confined(termior_terminal::windows_sandbox::PipedConfinedProcess),
 }
 
 /// Child of a sandbox wrapper. Drop, wait, and kill also signal the process group.
 pub struct SandboxedProcess {
-    child: Child,
+    child: SandboxChild,
     reaped: bool,
 }
 
 impl SandboxedProcess {
     pub fn id(&self) -> u32 {
-        self.child.id()
+        match &self.child {
+            SandboxChild::Plain(child) => child.id(),
+            #[cfg(windows)]
+            SandboxChild::Confined(process) => process.pid(),
+        }
     }
 
-    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
-        self.child.stdout.take()
+    pub fn take_stdout(&mut self) -> Option<SandboxStream> {
+        match &mut self.child {
+            SandboxChild::Plain(child) => child.stdout.take().map(SandboxStream::Stdout),
+            #[cfg(windows)]
+            SandboxChild::Confined(process) => process.take_stdout().map(SandboxStream::File),
+        }
     }
 
-    pub fn take_stderr(&mut self) -> Option<ChildStderr> {
-        self.child.stderr.take()
+    pub fn take_stderr(&mut self) -> Option<SandboxStream> {
+        match &mut self.child {
+            SandboxChild::Plain(child) => child.stderr.take().map(SandboxStream::Stderr),
+            #[cfg(windows)]
+            SandboxChild::Confined(process) => process.take_stderr().map(SandboxStream::File),
+        }
     }
 
     pub fn wait(&mut self) -> Result<ExitStatus, SandboxError> {
-        let status = self
-            .child
-            .wait()
-            .map_err(|error| SandboxError::Io(error.to_string()))?;
-        self.finish();
-        Ok(status)
+        match &mut self.child {
+            SandboxChild::Plain(child) => {
+                let status = child
+                    .wait()
+                    .map_err(|error| SandboxError::Io(error.to_string()))?;
+                self.finish();
+                Ok(status)
+            }
+            #[cfg(windows)]
+            SandboxChild::Confined(process) => {
+                let code = process
+                    .wait(Duration::from_secs(u32::MAX as u64))
+                    .ok_or_else(|| {
+                        SandboxError::Io("the sandboxed process did not exit".to_string())
+                    })?;
+                self.finish();
+                Ok(exit_status_from_code(code))
+            }
+        }
     }
 
     pub fn wait_timeout(&mut self, timeout: Duration) -> Result<Option<ExitStatus>, SandboxError> {
-        let status = self
-            .child
-            .wait_timeout(timeout)
-            .map_err(|error| SandboxError::Io(error.to_string()))?;
-        if status.is_some() {
-            self.finish();
+        match &mut self.child {
+            SandboxChild::Plain(child) => {
+                let status = child
+                    .wait_timeout(timeout)
+                    .map_err(|error| SandboxError::Io(error.to_string()))?;
+                if status.is_some() {
+                    self.finish();
+                }
+                Ok(status)
+            }
+            #[cfg(windows)]
+            SandboxChild::Confined(process) => {
+                let code = process.wait(timeout);
+                if code.is_some() {
+                    self.finish();
+                }
+                Ok(code.map(exit_status_from_code))
+            }
         }
-        Ok(status)
     }
 
     pub fn kill(&mut self) -> Result<(), SandboxError> {
-        self.child
-            .kill()
-            .map_err(|error| SandboxError::Io(error.to_string()))?;
-        reap_process_group(self.child.id());
-        let _ = self.child.wait();
+        match &mut self.child {
+            SandboxChild::Plain(child) => {
+                child
+                    .kill()
+                    .map_err(|error| SandboxError::Io(error.to_string()))?;
+                reap_process_group(child.id());
+                let _ = child.wait();
+            }
+            #[cfg(windows)]
+            SandboxChild::Confined(process) => {
+                process.kill();
+            }
+        }
         self.reaped = true;
         Ok(())
     }
@@ -224,7 +325,9 @@ impl SandboxedProcess {
             return;
         }
         self.reaped = true;
-        reap_process_group(self.child.id());
+        if let SandboxChild::Plain(child) = &self.child {
+            reap_process_group(child.id());
+        }
     }
 }
 
@@ -233,18 +336,33 @@ impl Drop for SandboxedProcess {
         if self.reaped {
             return;
         }
-        let _ = self.child.kill();
-        reap_process_group(self.child.id());
-        let _ = self.child.wait();
+        match &mut self.child {
+            SandboxChild::Plain(child) => {
+                let _ = child.kill();
+                reap_process_group(child.id());
+                let _ = child.wait();
+            }
+            #[cfg(windows)]
+            SandboxChild::Confined(process) => {
+                process.kill();
+            }
+        }
         self.reaped = true;
     }
+}
+
+/// Build an `ExitStatus` from a raw Windows exit code.
+#[cfg(windows)]
+fn exit_status_from_code(code: u32) -> ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    ExitStatus::from_raw(code)
 }
 
 pub struct PlatformSandbox;
 impl SandboxBackend for PlatformSandbox {
     fn name(&self) -> &'static str {
         if cfg!(windows) {
-            "windows-job-acl"
+            "windows-appcontainer"
         } else if cfg!(target_os = "macos") {
             "macos-sandbox"
         } else {
@@ -252,6 +370,9 @@ impl SandboxBackend for PlatformSandbox {
         }
     }
     fn probe(&self) -> BTreeMap<SandboxCapability, TrustLevel> {
+        if cfg!(windows) {
+            return WindowsAppContainerSandbox.probe();
+        }
         let filesystem = if (cfg!(target_os = "linux") && command_exists("bwrap"))
             || (cfg!(target_os = "macos") && command_exists("sandbox-exec"))
         {
@@ -281,6 +402,9 @@ impl SandboxBackend for PlatformSandbox {
         ])
     }
     fn prepare(&self, request: &SandboxRequest) -> Result<ExecutionEnvironment, SandboxError> {
+        if cfg!(windows) {
+            return WindowsAppContainerSandbox.prepare(request);
+        }
         let root = std::fs::canonicalize(&request.root)
             .map_err(|error| SandboxError::Io(error.to_string()))?;
         let capabilities = self.probe();
@@ -307,6 +431,14 @@ impl SandboxBackend for PlatformSandbox {
         args: &[String],
         allow_network: bool,
     ) -> Result<SandboxCommand, SandboxError> {
+        if cfg!(windows) {
+            return WindowsAppContainerSandbox.wrap_command(
+                environment,
+                program,
+                args,
+                allow_network,
+            );
+        }
         let mut required = vec![
             SandboxCapability::Filesystem,
             SandboxCapability::Credentials,
@@ -324,6 +456,123 @@ impl SandboxBackend for PlatformSandbox {
         }
         Err(SandboxError::CommandIsolationUnsupported)
     }
+}
+
+/// Windows sandbox backend based on an AppContainer identity (Stage D task 6.2).
+///
+/// An AppContainer is a low-privilege Windows identity. Filesystem access is granted
+/// per directory through an ACL, the process gets no network capability, and it starts
+/// from a rebuilt environment instead of the parent's. What the backend cannot enforce
+/// stays unsupported so a task that requires it fails closed.
+#[cfg(windows)]
+pub struct WindowsAppContainerSandbox;
+
+#[cfg(windows)]
+impl SandboxBackend for WindowsAppContainerSandbox {
+    fn name(&self) -> &'static str {
+        "windows-appcontainer"
+    }
+
+    fn probe(&self) -> BTreeMap<SandboxCapability, TrustLevel> {
+        let available = termior_terminal::windows_sandbox::app_container_available();
+        BTreeMap::from([
+            (
+                SandboxCapability::Filesystem,
+                if available {
+                    TrustLevel::Verified
+                } else {
+                    TrustLevel::Unsupported
+                },
+            ),
+            // The container requests no network capability, so a confined process has
+            // no network access at all. Network access is therefore denied, not merely
+            // unmeasured, which makes the capability verifiable.
+            (
+                SandboxCapability::Network,
+                if available {
+                    TrustLevel::Verified
+                } else {
+                    TrustLevel::Unsupported
+                },
+            ),
+            // The confined process starts from a rebuilt environment and runs under a
+            // separate low-privilege identity, so the parent's credentials are absent.
+            (
+                SandboxCapability::Credentials,
+                if available {
+                    TrustLevel::Verified
+                } else {
+                    TrustLevel::Unsupported
+                },
+            ),
+            (SandboxCapability::ProcessTree, TrustLevel::Verified),
+        ])
+    }
+
+    fn prepare(&self, request: &SandboxRequest) -> Result<ExecutionEnvironment, SandboxError> {
+        let root = std::fs::canonicalize(&request.root)
+            .map_err(|error| SandboxError::Io(error.to_string()))?;
+        let capabilities = self.probe();
+        // Fail closed before any directory is shared when the platform cannot confine.
+        environment_capabilities_checked(&capabilities, &request.required)?;
+        termior_terminal::windows_sandbox::grant_directory(&root)
+            .map_err(|error| SandboxError::Io(error.to_string()))?;
+        let environment = ExecutionEnvironment {
+            id: request.id.clone(),
+            kind: EnvironmentKind::Sandboxed,
+            host: std::env::consts::OS.into(),
+            root: root.clone(),
+            writable_paths: vec![root],
+            capabilities,
+            backend_owner: self.name().into(),
+            verified_at_ms: Some(now_ms()),
+        };
+        environment.validate_required(&request.required)?;
+        Ok(environment)
+    }
+
+    fn cleanup(&self, _environment: &ExecutionEnvironment) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    fn wrap_command(
+        &self,
+        environment: &ExecutionEnvironment,
+        program: &str,
+        args: &[String],
+        allow_network: bool,
+    ) -> Result<SandboxCommand, SandboxError> {
+        let mut required = vec![
+            SandboxCapability::Filesystem,
+            SandboxCapability::Credentials,
+            SandboxCapability::ProcessTree,
+        ];
+        if !allow_network {
+            required.push(SandboxCapability::Network);
+        }
+        environment.validate_required(&required)?;
+        let program = resolve_host_program(program)?;
+        Ok(SandboxCommand {
+            program: program.display().to_string(),
+            args: args.to_vec(),
+            cwd: environment.root.clone(),
+            clear_environment: true,
+            app_container: true,
+        })
+    }
+}
+
+/// Fail closed when a required capability is not verified.
+fn environment_capabilities_checked(
+    capabilities: &BTreeMap<SandboxCapability, TrustLevel>,
+    required: &[SandboxCapability],
+) -> Result<(), SandboxError> {
+    for capability in required {
+        if capabilities.get(capability) != Some(&TrustLevel::Verified) {
+            return Err(SandboxError::RequiredCapabilityUnavailable(*capability));
+        }
+    }
+    Ok(())
 }
 
 fn linux_sandbox_command(
@@ -389,6 +638,7 @@ fn linux_sandbox_command(
         args: wrapped,
         cwd: environment.root.clone(),
         clear_environment: true,
+        app_container: false,
     })
 }
 
@@ -437,6 +687,7 @@ fn macos_sandbox_command(
         args: wrapped,
         cwd: environment.root.clone(),
         clear_environment: true,
+        app_container: false,
     })
 }
 

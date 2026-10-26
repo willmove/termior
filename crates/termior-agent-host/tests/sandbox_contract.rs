@@ -77,6 +77,8 @@ fn platform_probe_never_reports_unverified_support_as_verified() {
 fn platform_command_wrapper_fails_closed_or_uses_the_verified_native_boundary() {
     let dir = tempfile::tempdir().unwrap();
     let backend = PlatformSandbox;
+    // `echo` is a shell builtin on Unix and a real program on Windows.
+    let program = if cfg!(windows) { "cmd.exe" } else { "echo" };
     let request = SandboxRequest {
         id: "command".into(),
         root: dir.path().into(),
@@ -89,10 +91,15 @@ fn platform_command_wrapper_fails_closed_or_uses_the_verified_native_boundary() 
     match backend.prepare(&request) {
         Ok(environment) => {
             let wrapped = backend
-                .wrap_command(&environment, "echo", &["ok".into()], false)
+                .wrap_command(&environment, program, &["ok".into()], false)
                 .unwrap();
             assert!(wrapped.clear_environment);
-            assert!(wrapped.program == "bwrap" || wrapped.program == "sandbox-exec");
+            assert!(
+                wrapped.program == "bwrap"
+                    || wrapped.program == "sandbox-exec"
+                    || wrapped.app_container,
+                "the sandbox must wrap the command in its native boundary"
+            );
             if wrapped.program == "bwrap" {
                 assert!(wrapped.args.iter().any(|arg| arg == "--unshare-net"));
                 assert!(wrapped.args.iter().any(|arg| arg == "--remount-ro"));
@@ -114,12 +121,24 @@ fn platform_command_wrapper_fails_closed_or_uses_the_verified_native_boundary() 
                     assert!(profile.contains(needle), "profile missing {needle}");
                 }
             }
+            if wrapped.app_container {
+                // The AppContainer starts from a rebuilt environment, so the command
+                // must not inherit the parent's variables.
+                assert!(wrapped.app_container);
+                assert!(
+                    !wrapped
+                        .args
+                        .iter()
+                        .any(|arg| arg.contains("TERMIOR_ESCAPE_SECRET")),
+                    "the sandbox must not pass secrets on the command line"
+                );
+            }
         }
         Err(SandboxError::RequiredCapabilityUnavailable(_)) => {
             assert!(backend
                 .wrap_command(
                     &ExecutionEnvironment::direct("direct", dir.path().into()),
-                    "echo",
+                    program,
                     &[],
                     false,
                 )
@@ -127,6 +146,31 @@ fn platform_command_wrapper_fails_closed_or_uses_the_verified_native_boundary() 
         }
         Err(error) => panic!("unexpected sandbox error: {error}"),
     }
+}
+
+/// The Windows backend reports verified capabilities only when the AppContainer is
+/// really usable. A platform without a usable profile fails closed.
+#[cfg(windows)]
+#[test]
+fn the_windows_backend_reports_the_appcontainer_probe() {
+    let probe = termior_agent_host::WindowsAppContainerSandbox.probe();
+    let available = termior_terminal::windows_sandbox::app_container_available();
+    for capability in [
+        SandboxCapability::Filesystem,
+        SandboxCapability::Network,
+        SandboxCapability::Credentials,
+    ] {
+        let expected = if available {
+            TrustLevel::Verified
+        } else {
+            TrustLevel::Unsupported
+        };
+        assert_eq!(probe.get(&capability), Some(&expected), "{capability:?}");
+    }
+    assert_eq!(
+        probe.get(&SandboxCapability::ProcessTree),
+        Some(&TrustLevel::Verified)
+    );
 }
 
 #[test]
