@@ -152,6 +152,16 @@ pub struct TaskJournal {
     next_sequence: u64,
     previous_hash: String,
     pending_noncritical: usize,
+    /// How many times this journal flushed and synced to disk.
+    ///
+    /// The count is what the batching actually buys, and it does not depend on how
+    /// expensive `fsync` happens to be on this machine: on Linux a flush costs
+    /// tens of microseconds, on Windows it can cost milliseconds. A timing
+    /// comparison between a batched write and a critical write therefore fails
+    /// on the platform where flushing is cheap, even though the batching is
+    /// doing exactly what it should. The flush count is the deterministic
+    /// evidence.
+    flush_count: u64,
     redactor: crate::StreamingRedactor,
     /// The append handle, kept open for the journal's lifetime.
     ///
@@ -200,6 +210,7 @@ impl TaskJournal {
             next_sequence: recovery.events.last().map_or(1, |event| event.sequence + 1),
             previous_hash,
             pending_noncritical: 0,
+            flush_count: 0,
             redactor: crate::StreamingRedactor::new(known_secrets),
             file: None,
         })
@@ -261,6 +272,7 @@ impl TaskJournal {
         if should_flush {
             file.flush()?;
             file.sync_data()?;
+            self.flush_count = self.flush_count.saturating_add(1);
         }
         self.next_sequence += 1;
         self.previous_hash = hash;
@@ -274,6 +286,15 @@ impl TaskJournal {
 
     pub fn last_sequence(&self) -> u64 {
         self.next_sequence.saturating_sub(1)
+    }
+
+    /// How many times this journal flushed and synced to disk.
+    ///
+    /// Non-critical events are batched, so a burst of them costs far fewer
+    /// flushes than the number of events it wrote. A critical event flushes
+    /// every time, because the recovery guarantee depends on it.
+    pub fn flush_count(&self) -> u64 {
+        self.flush_count
     }
 
     /// Replace a finished task's journal with a compact summary record.

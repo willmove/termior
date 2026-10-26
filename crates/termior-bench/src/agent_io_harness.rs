@@ -66,6 +66,7 @@ pub fn measure_round(root: &Path, config: AgentIoConfig) -> Result<AgentIoPayloa
         burst_samples.push(started.elapsed().as_secs_f64() * 1000.0);
     }
     let burst_elapsed = burst_started.elapsed();
+    let burst_flushes = journal.flush_count();
 
     // 2. Critical events, which flush on every append.
     let critical_started = Instant::now();
@@ -82,6 +83,7 @@ pub fn measure_round(root: &Path, config: AgentIoConfig) -> Result<AgentIoPayloa
         critical_samples.push(started.elapsed().as_secs_f64() * 1000.0);
     }
     let critical_elapsed = critical_started.elapsed();
+    let critical_flushes = journal.flush_count().saturating_sub(burst_flushes);
 
     // 3. Replay: what a restart pays to rebuild the task.
     let replay_started = Instant::now();
@@ -112,6 +114,8 @@ pub fn measure_round(root: &Path, config: AgentIoConfig) -> Result<AgentIoPayloa
         journal_bytes: std::fs::metadata(root.join(task_id).join("events.jsonl"))
             .map(|metadata| metadata.len())
             .unwrap_or(0),
+        burst_flushes,
+        critical_flushes,
         runs: Vec::new(),
     })
 }
@@ -189,12 +193,23 @@ mod tests {
         assert!(payload.critical_total_ms > 0.0);
         assert!(payload.replay_ms > 0.0);
         assert!(payload.journal_bytes > 0);
-        // The journal batches non-critical events, so a burst must be cheaper per event
-        // than a critical flush. The critical path pays an fsync per event.
+        // The journal batches non-critical events, so a burst must cost far fewer
+        // disk flushes than it has events. This is the deterministic form of the
+        // claim: a wall-clock comparison fails on a platform where flushing is
+        // cheap (Linux pays tens of microseconds per flush, Windows can pay
+        // milliseconds), even though the batching itself works everywhere.
         assert!(
-            payload.critical_total_ms / payload.critical_events as f64
-                > payload.per_event_us / 1000.0,
-            "a critical flush should cost more than a batched delta: {payload:?}"
+            payload.burst_flushes < payload.burst_events,
+            "a burst of {} deltas should be batched into fewer than one flush per \
+             event, but it cost {} flushes: {payload:?}",
+            payload.burst_events,
+            payload.burst_flushes
+        );
+        // A critical event flushes on its own, because the recovery guarantee
+        // depends on it reaching the disk immediately.
+        assert_eq!(
+            payload.critical_flushes, payload.critical_events,
+            "every critical event must flush: {payload:?}"
         );
     }
 }

@@ -357,6 +357,18 @@ pub struct AgentIoPayload {
     /// Size of the journal file after the round.
     #[serde(default)]
     pub journal_bytes: u64,
+    /// Disk flushes the non-critical burst cost.
+    ///
+    /// This is the deterministic half of the batching claim: the burst writes
+    /// far fewer flushes than it writes events. The wall-clock numbers above say
+    /// how long the burst took, but on a platform where a flush is cheap (Linux,
+    /// tens of microseconds) that time says nothing about whether the batching
+    /// works. The flush count says it regardless of the host.
+    #[serde(default)]
+    pub burst_flushes: u64,
+    /// Disk flushes the critical events cost. One per event, by definition.
+    #[serde(default)]
+    pub critical_flushes: u64,
     /// Multi-round raw values; the top-level metrics are their medians.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<AgentIoPayload>,
@@ -387,6 +399,8 @@ impl AgentIoPayload {
                 .max_by(f64::total_cmp),
             replay_ms: pick(|r| r.replay_ms),
             journal_bytes: runs.iter().map(|r| r.journal_bytes).max().unwrap_or(0),
+            burst_flushes: median_u64(runs.iter().map(|r| r.burst_flushes)),
+            critical_flushes: median_u64(runs.iter().map(|r| r.critical_flushes)),
             runs,
         }
     }
@@ -451,6 +465,21 @@ fn median(values: impl Iterator<Item = f64>) -> Option<f64> {
     } else {
         sorted[mid]
     })
+}
+
+/// The median of integer counters.
+fn median_u64(values: impl Iterator<Item = u64>) -> u64 {
+    let mut sorted: Vec<u64> = values.collect();
+    if sorted.is_empty() {
+        return 0;
+    }
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[mid - 1] + sorted[mid]) / 2
+    } else {
+        sorted[mid]
+    }
 }
 
 /// 解析 harness 输出的一行 JSON（容忍前后空白与多行 pretty JSON）。

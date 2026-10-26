@@ -55,7 +55,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      # Pinned to the commit the v2 tag points at. Resolving the floating tag
+      # failed twice in a row ("Unable to resolve action swatinin/rust-cache,
+      # repository not found") and took six jobs down at setup, before any step
+      # could run — the same action resolved fine in a sibling job of the same
+      # run. A commit SHA cannot be moved or deleted, so the lookup cannot fail
+      # this way, and it caches the same artifacts the tag would fetch.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           workspaces: "."
       - name: rustfmt
@@ -100,7 +106,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      # Pinned to the commit the v2 tag points at; see the note in the Core job.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           workspaces: "."
       - name: Check desktop application
@@ -253,7 +260,8 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: Swatinem/rust-cache@v2
+      # Pinned to the commit the v2 tag points at; see the note in the Core job.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           workspaces: "."
       - name: Measure line coverage
@@ -281,7 +289,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # Pinned to the commit the v2 tag points at; see the note in the Core job.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           workspaces: "."
       - name: Run quick benchmark gate
@@ -326,7 +335,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # Pinned to the commit the v2 tag points at; see the note in the Core job.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           workspaces: "."
       - name: NFR context latency gate (repo map)
@@ -374,7 +384,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinin/rust-cache@v2
+      # Pinned to the commit the v2 tag points at; see the note in the Core job.
+      - uses: Swatinin/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           workspaces: "."
       - name: NFR Agent IO gate (task journal write path)
@@ -421,7 +432,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinin/rust-cache@v2
+      # Pinned to the commit the v2 tag points at; see the note in the Core job.
+      - uses: Swatinin/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           workspaces: "."
       - name: NFR residual gate (long-run resource residual)
