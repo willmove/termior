@@ -2,6 +2,8 @@
 
 Stage D 在副作用前写入 hash-chained journal，并用原子 snapshot 恢复任务。正在执行且重启后无法确认的模型、工具和命令统一恢复为 unknown，不自动重放。
 
+审批、worktree、sandbox 和文件恢复的使用边界见 [用户说明](../user/agent-runtime.md)。Windows 的完整 sandbox 后端仍需实现；现有 escape suite 证明的是其 fail-closed 行为。
+
 ## 自动化验证
 
 ```powershell

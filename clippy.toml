@@ -1,4 +1,4 @@
 # clippy 配置：MSRV 与 rust-toolchain.toml 固定的版本一致——依赖的 GPUI 需要较新的编译器，
 # 项目只在固定工具链上验证，不承诺更旧版本可编译。
 # CI 以 -D warnings 强制（见 .github/workflows/ci.yml）。
-msrv = "1.98"
+msrv = "1.98.1"

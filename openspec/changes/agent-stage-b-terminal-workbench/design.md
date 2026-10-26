@@ -47,7 +47,7 @@ Termior 用 OSC 133 关联用户终端中的命令起止和退出码。没有 sh
 
 ### D6：Codex app-server 是首个专用适配器
 
-默认通过受管 stdio 启动用户已安装的 Codex app-server。适配器只启用固定兼容版本验证过的 stable methods，将 Thread→Task binding、Turn→Turn、Item→TaskEvent。审批请求回到 Termior TaskRuntime；取消使用协议 interrupt，进程退出后活动 Turn 进入 unknown/failed，由协议状态决定。
+默认通过受管 stdio 启动用户已安装的 Codex app-server。适配器只启用已验证的 stable methods，将 Thread→Task binding、Turn→Turn、Item→TaskEvent。兼容范围 `>=0.137.0, <1.0.0` 内的稳定 CLI 更新不受 minor 白名单阻断，仍需完成非实验协议握手。审批请求回到 Termior TaskRuntime；取消使用协议 interrupt，进程退出后活动 Turn 进入 unknown/failed，由协议状态决定。
 
 认证、模型和 Codex 自身配置由 Codex 管理；Termior 显示其来源。Codex 内部 shell 不声称经过 Termior ToolRegistry，直到未来后端提供可验证的 host terminal delegation。
 
@@ -60,7 +60,7 @@ CapabilityProfile 至少包含 session resume/fork、mid-turn steer、cancel、a
 ## Risks / Trade-offs
 
 - Windows 子进程 framing 与关闭顺序易死锁：transport reader/writer/stderr 必须独立，shutdown 有超时和 kill 兜底
-- Codex 协议升级快：固定版本、录制 fixture、fake server；实验字段只保留不解释
+- Codex 协议升级快：固定最低版本与 stable 方法面、稳定升级握手、录制 fixture、fake server；实验字段只保留不解释
 - 同一 PTY 的人机输入可能交错：控制权检查在 writer 最后入口执行，不只靠 UI 禁用按钮
 - 输出可能包含秘密：M7 建立输出存储接口，实际持久化与全面 redaction 在 M9 完成；本阶段默认不持久化完整输出
 

@@ -25,3 +25,6 @@ Also: in debug builds, probing `DXGIGetDebugInterface1` fails with
 "Graphics Tools" is not installed. Upstream logs that probe with `.log_err()`;
 we use `.ok()` instead so startup is quiet (DXGI debug features stay disabled,
 same as before).
+
+Upgrade cadence, upstream comparison and removal criteria are tracked in
+[`docs/process/dependency-maintenance.md`](../docs/process/dependency-maintenance.md).

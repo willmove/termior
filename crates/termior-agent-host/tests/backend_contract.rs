@@ -105,11 +105,31 @@ fn protocol_rejects_incompatible_codex_versions() {
 }
 
 #[test]
-fn current_stable_protocol_accepts_each_explicitly_verified_minor_line() {
+fn current_stable_protocol_accepts_newer_stable_minor_releases() {
     let protocol = CodexProtocol::stable_verified();
     assert!(protocol.accepts_version("codex-cli 0.137.0"));
     assert!(protocol.accepts_version("codex-cli 0.153.4"));
-    assert!(!protocol.accepts_version("codex-cli 0.154.0"));
+    assert!(protocol.accepts_version("codex-cli 0.154.0"));
+    assert!(protocol.accepts_version("codex-cli 0.164.0"));
+    assert!(protocol.accepts_version("codex-cli 0.165.1"));
+    assert!(protocol.accepts_version("codex-cli 0.164.0+local"));
+}
+
+#[test]
+fn current_stable_protocol_rejects_old_prerelease_malformed_and_new_major_versions() {
+    let protocol = CodexProtocol::stable_verified();
+    for output in [
+        "codex-cli 0.136.9",
+        "codex-cli 0.164.0-alpha.1",
+        "codex-cli 0.137.0-beta",
+        "codex-cli 1.0.0",
+        "codex-cli 0.164",
+        "codex-cli 0.164.0invalid",
+        "other-cli 0.164.0",
+        "unknown",
+    ] {
+        assert!(!protocol.accepts_version(output), "accepted {output}");
+    }
 }
 
 /// Peer script for the Windows stdio contract test.
@@ -157,7 +177,7 @@ fn stderr_until(transport: &StdioTransport, needle: &str, timeout: Duration) -> 
 fn stdio_transport_keeps_notifications_and_stderr_separate_from_responses() {
     let (program, args) = if cfg!(windows) {
         (
-            "powershell".to_string(),
+            "pwsh".to_string(),
             vec![
                 "-NoProfile".into(),
                 "-NonInteractive".into(),
@@ -196,7 +216,7 @@ fn backend_stderr_log_redacts_known_secrets_on_disk() {
     let log = dir.path().join("stderr.log");
     let (program, args) = if cfg!(windows) {
         (
-            "powershell".to_string(),
+            "pwsh".to_string(),
             vec![
                 "-NoProfile".into(),
                 "-NonInteractive".into(),

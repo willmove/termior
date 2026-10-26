@@ -1,7 +1,7 @@
 ## 0. 阶段门禁
 
 - [x] 0.1 确认 `agent-stage-a-reliable-runtime` 已归档且 M6 固定评测全绿
-- [x] 0.2 重新核验 Codex app-server 官方 stable/experimental 方法与兼容版本，记录链接和锁定策略
+- [x] 0.2 重新核验 Codex app-server stable/experimental 方法与兼容范围，记录来源、稳定升级策略及本机 0.164.0 schema/握手证据
 
 ## 1. CommandSession 领域模型
 
@@ -39,7 +39,7 @@
 
 ## 5. Codex app-server 适配器
 
-- [x] 5.1 实现 initialize/version/capability 握手，只启用锁定版本已验证的 stable 方法
+- [x] 5.1 实现 initialize/version/capability 握手，只启用已验证的 stable 方法；兼容范围内稳定 CLI 升级不受 minor 白名单阻断
 - [x] 5.2 映射 thread create/resume、turn start、item notifications 与完成/错误状态到 Termior Task/Turn/Event
 - [x] 5.3 映射 approval request/response，保留后端原始 request ID 与 Termior tool call ID 的对应
 - [x] 5.4 实现 turn interrupt 和 app-server shutdown；中途退出时正确产生 unknown 状态

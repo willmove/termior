@@ -66,7 +66,7 @@
 - [ ] 8.1 运行 journal fault injection、checkpoint 冲突、worktree 初始化/合入/清理和三平台 escape suite
 - [x] 8.2 对 direct/worktree/sandboxed 与外部后端生成用户可见 capability matrix
 - [ ] 8.3 运行相关 crate tests、三平台 smoke、clippy、存储迁移和 NFR IO/启动/体积回归
-- [ ] 8.4 更新安全文档，准确说明审批、worktree、sandbox、checkpoint 与远程副作用边界
+- [x] 8.4 更新安全文档，准确说明审批、worktree、sandbox、checkpoint 与远程副作用边界
 - [ ] 8.5 全部退出场景通过后记录偏差并严格验证本 change
 
 ## 实施核对（2026-09-30，1.6 / 6.6 于 2026-10-18 补齐）
@@ -79,4 +79,4 @@
 - 5.2 创建与 `recover_journal` 固定 environment id 和权限上限；`try_apply_grant` 拒绝原地扩大，`change_profile` / `rebind_environment` 分配新 id 并保留旧 grant。5.3 任务头、任务详情和审批卡用同一条 host/root/file/network/credential/process 能力行。8.2 的矩阵由 `capability_matrix` 生成；2026-10 起设置页不再展示整表，能力信息按当前环境在 Composer 的任务头、任务详情与审批卡展示。
 - 6.2 Windows 仅进程树控制，文件/网络/凭据隔离报告 unsupported。6.6 逃逸套件已进入 Core 三平台：Linux `bwrap` 与 macOS `sandbox-exec` 执行黑盒探测；Windows 对未支持能力断言 fail closed，不静默跳过。
 - 7.2 已在 journal、output blob、context、hook audit、MCP diagnostic、backend stderr 与 crash log 写盘前调用 StreamingRedactor，各路径有注入已知 secret 的落盘测试。7.4 无保留设置与磁盘使用 UI。
-- 8.1、8.3、8.4、8.5 仍未完成。8.2 能力矩阵由 `capability_matrix` 生成（原曾在 Settings → Agents 展示整表，2026-10 简化为仅在 Composer 按当前环境展示）。8.1 里的 journal fault injection 与三平台 escape suite 已由 Core `cargo test` 覆盖；checkpoint 冲突与 worktree 用例仍是既有测试，阶段门禁记录本身未归档。
+- 8.1、8.3、8.5 仍未完成。8.4 已于 2026-10-26 补充 `docs/user/agent-runtime.md`。8.2 能力矩阵由 `capability_matrix` 生成（原曾在 Settings → Agents 展示整表，2026-10 简化为仅在 Composer 按当前环境展示）。8.1 里的 journal fault injection 与三平台 escape suite 已由 Core `cargo test` 覆盖；checkpoint 冲突与 worktree 用例仍是既有测试，阶段门禁记录本身未归档。

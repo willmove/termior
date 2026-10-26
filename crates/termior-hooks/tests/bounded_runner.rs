@@ -54,7 +54,7 @@ fn subprocess_runner_parses_a_bounded_json_decision() {
     };
     let (program, args) = if cfg!(windows) {
         (
-            "powershell",
+            "pwsh",
             vec![
                 "-NoProfile".into(),
                 "-Command".into(),
@@ -80,7 +80,7 @@ fn hook_audit_file_redacts_known_secrets_on_disk() {
     let dir = tempfile::tempdir().unwrap();
     let (program, args) = if cfg!(windows) {
         (
-            "powershell",
+            "pwsh",
             vec![
                 "-NoProfile".into(),
                 "-Command".into(),
@@ -138,7 +138,7 @@ fn subprocess_timeout_follows_fail_closed_policy() {
     };
     let (program, args) = if cfg!(windows) {
         (
-            "powershell",
+            "pwsh",
             vec![
                 "-NoProfile".into(),
                 "-Command".into(),

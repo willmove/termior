@@ -39,12 +39,12 @@ repository = "https://github.com/willmove/termior"
 termior-ssh = { path = "crates/termior-ssh" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 # 跨 crate 共享的逻辑与运行时依赖统一在此锁定版本；各 crate 只声明实际使用项。
 similar = "1"
 nucleo = "0.5"
 nucleo-matcher = "0.3"
-dirs = "5"
+dirs = "6"
 tempfile = "3"
 globset = "0.4"
 ignore = "0.4"

@@ -35,4 +35,4 @@ M6 解决 Agent 内部执行可靠性后，Termior 仍只把终端作为“当�
 ## Dependencies
 
 - Blocked by `agent-stage-a-reliable-runtime` 全部退出标准。
-- 不依赖 M8 的通用 ACP/MCP；Codex 适配器只使用已固定版本的稳定 stdio 方法。
+- 不依赖 M8 的通用 ACP/MCP；Codex 适配器只使用已验证的稳定 stdio 方法，兼容范围内的稳定 CLI 更新经握手接入。

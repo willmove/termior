@@ -72,10 +72,14 @@ impl AgentBackend for AcpBackend {
             },
             "clientInfo":{"name":"termior","title":"Termior","version":env!("CARGO_PKG_VERSION")}
         }), Duration::from_secs(30))?;
-        self.version = result
-            .get("protocolVersion")
-            .map(ToString::to_string)
-            .unwrap_or_else(|| ACP_PROTOCOL_VERSION.to_string());
+        if result.get("protocolVersion").and_then(Value::as_u64)
+            != Some(u64::from(ACP_PROTOCOL_VERSION))
+        {
+            return Err(BackendError::Protocol(
+                "ACP agent selected an unsupported or missing protocol version".into(),
+            ));
+        }
+        self.version = ACP_PROTOCOL_VERSION.to_string();
         let caps = result
             .get("agentCapabilities")
             .cloned()

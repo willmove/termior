@@ -37,5 +37,9 @@
 ## 7. 测试与文档
 
 - [x] 7.1 `cargo test -p termior-ui` 全绿；`cargo clippy --workspace` 无新增告警
-- [ ] 7.2 手工验收：两个终端 Tab 各自打开不同文件夹互不影响；运行中终端被 `cd` 注入后会话存活；切 Tab 时 Explorer/Git/状态栏跟随；非 git 目录空态
+- [x] 7.2 手工验收：两个终端 Tab 各自打开不同文件夹互不影响；运行中终端被 `cd` 注入后会话存活；切 Tab 时 Explorer/Git/状态栏跟随；非 git 目录空态
 - [x] 7.3 回写 `docs/termior-spec.md`：6.14 授权模型（单 root → 多 root 并集）与工作区/Tab 章节的"打开文件夹"语义
+
+## 人工验收记录
+
+2026-10-26，用户在本次对话中确认：“人工测试：两个项目 Tab，这个场景已完成人工测试，已通过。”据此完成 7.2；该场景的操作与通过条件见 `docs/process/github-issue-review-2026-10-26.md`。本记录为用户执行的人工验收结果。

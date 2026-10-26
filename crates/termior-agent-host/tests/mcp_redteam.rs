@@ -486,7 +486,7 @@ fn fake_mcp_command(
         bytes.extend(body.as_bytes());
         std::fs::write(&script, bytes).unwrap();
         TransportCommand {
-            program: "powershell".into(),
+            program: "pwsh".into(),
             args: vec![
                 "-NoProfile".into(),
                 "-ExecutionPolicy".into(),

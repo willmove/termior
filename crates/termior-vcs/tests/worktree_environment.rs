@@ -12,6 +12,51 @@ fn git(path: &std::path::Path, args: &[&str]) {
 }
 
 #[test]
+fn non_git_project_rejects_a_write_worktree_without_changing_project_files() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("user.txt"), "keep this").unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let destination = parent.path().join("checkout");
+    let result = WorktreeManager::create(
+        project.path(),
+        &destination,
+        "HEAD",
+        "termior-test",
+        "task-non-git",
+    );
+    assert!(matches!(result, Err(WorktreeError::Git(_))));
+    assert!(!destination.exists());
+    assert!(!project.path().join(".git").exists());
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("user.txt")).unwrap(),
+        "keep this"
+    );
+}
+
+#[test]
+fn unavailable_worktree_parent_does_not_replace_existing_data() {
+    let fixture = repo_with_worktree();
+    let parent = tempfile::tempdir().unwrap();
+    let blocked_parent = parent.path().join("user-file");
+    std::fs::write(&blocked_parent, "keep this").unwrap();
+    let destination = blocked_parent.join("checkout");
+    let result = WorktreeManager::create(
+        &fixture.environment.repository,
+        &destination,
+        "HEAD",
+        "termior-blocked",
+        "task-blocked",
+    );
+    assert!(result.is_err());
+    assert!(!destination.exists());
+    assert_eq!(
+        std::fs::read_to_string(blocked_parent).unwrap(),
+        "keep this"
+    );
+    WorktreeManager::remove(&fixture.environment, false).unwrap();
+}
+
+#[test]
 fn worktree_creation_binds_task_and_removal_checks_dirty_and_processes() {
     let root = tempfile::tempdir().unwrap();
     git(root.path(), &["init"]);

@@ -122,7 +122,14 @@ impl NotificationRouter {
         notification: &Notification,
         context: NotificationContext,
     ) -> NotificationDecision {
-        if !self.enabled {
+        // Progress is already coalesced in the bell by agent ID. Only actionable
+        // transitions should interrupt the user, including when the app is unfocused.
+        if !self.enabled
+            || matches!(
+                notification.status,
+                AgentStatus::Started | AgentStatus::Working
+            )
+        {
             return NotificationDecision::Suppress;
         }
         if context.window_focused {
@@ -232,6 +239,57 @@ mod tests {
             ),
             NotificationDecision::Suppress
         );
+    }
+
+    #[test]
+    fn progress_updates_stay_in_the_bell_without_interrupting_the_user() {
+        let mut router = NotificationRouter::default();
+        for status in [AgentStatus::Started, AgentStatus::Working] {
+            let indicator = AgentIndicator {
+                id: "root-task".into(),
+                title: "Parallel task".into(),
+                status,
+                tab_id: None,
+            };
+            assert!(router.update_agent(indicator.clone()));
+            assert!(!router.update_agent(indicator));
+            assert_eq!(router.bell_items().len(), 1);
+            assert_eq!(router.bell_items()[0].status, status);
+            for target in [
+                NotificationTarget::Composer,
+                NotificationTarget::Tab(2),
+                NotificationTarget::Global,
+            ] {
+                let notification = Notification {
+                    status,
+                    ..notice(target)
+                };
+                for focused in [true, false] {
+                    assert_eq!(
+                        router.route(&notification, context(focused, Some(1), false)),
+                        NotificationDecision::Suppress
+                    );
+                }
+            }
+        }
+        for status in [
+            AgentStatus::Attention,
+            AgentStatus::Finished,
+            AgentStatus::Error,
+        ] {
+            let notification = Notification {
+                status,
+                ..notice(NotificationTarget::Composer)
+            };
+            assert_eq!(
+                router.route(&notification, context(false, None, false)),
+                NotificationDecision::System
+            );
+            assert_eq!(
+                router.route(&notification, context(true, None, false)),
+                NotificationDecision::InAppToast
+            );
+        }
     }
 
     #[test]

@@ -27,13 +27,25 @@ nightly **不**设置 `TERMIOR_SSH_ASKPASS_EXE`。`ssh_roundtrip` 里那段路�
 
 `installed_codex_completes_the_stable_stdio_handshake`（`crates/termior-agent-host/tests/codex_smoke.rs`）需要本机 PATH 上有兼容的 Codex CLI。托管 runner 没有这份 CLI，也不能代为登录。测试只做 stdio 握手（`initialize` / `initialized`），不发起模型回合，但 CLI 本身必须能启动 `codex app-server`。
 
-1. 安装 Codex CLI，并在需要时完成登录（`codex login`）。`codex --version` 必须是已核验的版本线：`codex-cli 0.137.x` 或 `codex-cli 0.153.x`（见 `CodexProtocol::stable_verified`）。
-2. 可执行文件名必须是 `codex` 且在 PATH 上。应用用的 `TERMIOR_CODEX_PATH` 不会传给这个测试。
+1. 安装稳定 Codex CLI（`>=0.137.0, <1.0.0`），并在需要时完成登录（`codex login`）。本机 `0.164.0` 已通过真实握手；后续稳定 minor 更新无需逐个加白名单。
+2. `codex` 在 PATH 上，或设置 `TERMIOR_CODEX_PATH` 为原生可执行文件的完整路径；应用和 smoke 均使用该覆盖项。
 3. 运行：
 
 ```bash
 cargo test -p termior-agent-host --test codex_smoke -- --ignored --nocapture
 ```
+
+## 手动运行 OpenCode ACP smoke
+
+`installed_opencode_initializes_and_creates_an_acp_session`（`crates/termior-agent-host/tests/opencode_smoke.rs`）运行 `opencode acp --pure`，验证协议版本 1 的握手与新建会话，不发起模型 Turn。默认 ignored，需本机安装可运行的 OpenCode。
+
+Windows 将 `TERMIOR_OPENCODE_PATH` 设为原生 `opencode.exe` 的完整路径（npm 安装位于全局 `node_modules/opencode-ai/bin/`），避免把 PowerShell 包装脚本当作原生程序；其他平台可使用 PATH 上的 `opencode`。
+
+```powershell
+cargo test -p termior-agent-host --test opencode_smoke -- --ignored --nocapture
+```
+
+2026-10-26，本机重装后的 OpenCode 1.19.4 已通过；真实模型任务、审批与取消仍需要 Stage C 端到端验收。
 
 ## 手动运行：系统凭据库
 

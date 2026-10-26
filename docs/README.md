@@ -8,6 +8,7 @@
 
 - [`user/termior-spec.md`](user/termior-spec.md)：权威产品与工程规格（SDD，v0.2 草案）。
 - [`user/ssh.md`](user/ssh.md)：SSH / SFTP 的使用与验证说明。
+- [`user/agent-runtime.md`](user/agent-runtime.md)：Agent 扩展、权限、检查点、恢复与本地自动化的使用边界。
 
 ## 架构决策 `adr/`
 
@@ -28,6 +29,8 @@
 
 - [`process/release-process.md`](process/release-process.md)：GitHub Release 发布流程。已发布说明的归档位置见该文第 7 节。
 - [`process/nightly-integration.md`](process/nightly-integration.md)：ignored 集成测试与 nightly 步骤。
+- [`process/dependency-maintenance.md`](process/dependency-maintenance.md)：依赖升级节奏、GPUI 补丁核对与许可门禁。
+- [`process/github-issue-review-2026-10-26.md`](process/github-issue-review-2026-10-26.md)：全部开放 issue 的处理结果与人工验收清单。
 - [`process/nfr-baselines.md`](process/nfr-baselines.md)：NFR harness 与回归门禁。基线数字仍在 [`baselines/nfr-baselines.json`](baselines/nfr-baselines.json)。
 - [`process/desktop-milestone.md`](process/desktop-milestone.md)：当前桌面交付边界。
 - [`process/ai-agent-evolution-roadmap.md`](process/ai-agent-evolution-roadmap.md)：Agent M6–M10 实施索引。

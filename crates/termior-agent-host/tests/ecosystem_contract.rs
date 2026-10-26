@@ -101,6 +101,48 @@ fn acp_capabilities_default_closed_and_events_map_to_common_model() {
 }
 
 #[test]
+fn acp_initialize_rejects_unsupported_or_missing_protocol_versions() {
+    for result in [
+        json!({"protocolVersion": 2}),
+        json!({}),
+        json!({"protocolVersion": null}),
+        json!({"protocolVersion": "1"}),
+        json!({"protocolVersion": -1}),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let response = json!({"jsonrpc":"2.0", "id":1, "result":result}).to_string();
+        let (program, args) = if cfg!(windows) {
+            let script = directory.path().join("unsupported-acp.ps1");
+            std::fs::write(
+                &script,
+                format!(
+                    "$null = [Console]::In.ReadLine()\n[Console]::Out.WriteLine('{response}')\n"
+                ),
+            )
+            .unwrap();
+            (
+                "pwsh",
+                vec![
+                    "-NoProfile".into(),
+                    "-File".into(),
+                    script.display().to_string(),
+                ],
+            )
+        } else {
+            let script = directory.path().join("unsupported-acp.sh");
+            std::fs::write(&script, format!("read init\nprintf '%s\\n' '{response}'\n")).unwrap();
+            ("sh", vec![script.display().to_string()])
+        };
+        let mut backend = AcpBackend::new(program, args);
+        let error = backend
+            .initialize()
+            .expect_err("unsupported ACP version was accepted");
+        assert!(matches!(error, BackendError::Protocol(_)), "{error:?}");
+        assert!(!backend.capabilities().can_resume());
+    }
+}
+
+#[test]
 fn fake_acp_server_passes_initialize_session_and_prompt_contract() {
     let directory = tempfile::tempdir().unwrap();
     let (program, args) = if cfg!(windows) {
@@ -113,7 +155,7 @@ fn fake_acp_server_passes_initialize_session_and_prompt_contract() {
   [Console]::Out.WriteLine((@{ jsonrpc = '2.0'; id = $request.id; result = $result } | ConvertTo-Json -Compress -Depth 8))
 }"#).unwrap();
         (
-            "powershell".to_string(),
+            "pwsh".to_string(),
             vec![
                 "-NoProfile".into(),
                 "-ExecutionPolicy".into(),
@@ -200,7 +242,7 @@ if ($callback.result.content -ne 'from-host') { exit 9 }
         )
         .unwrap();
         (
-            "powershell".to_string(),
+            "pwsh".to_string(),
             vec![
                 "-NoProfile".into(),
                 "-ExecutionPolicy".into(),
@@ -335,7 +377,7 @@ $null = [Console]::In.ReadLine()
         );
         std::fs::write(&script, body).unwrap();
         (
-            "powershell".to_string(),
+            "pwsh".to_string(),
             vec![
                 "-NoProfile".into(),
                 "-ExecutionPolicy".into(),

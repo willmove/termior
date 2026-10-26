@@ -10,28 +10,30 @@ use crate::{
     TransportCommand, TurnLaunch,
 };
 
-pub const CODEX_COMPATIBLE_MINOR: &str = "0.153";
+/// Most recent local CLI line whose generated schema and handshake were checked.
+pub const CODEX_COMPATIBLE_MINOR: &str = "0.164";
 
 pub const PERMISSIONS_APPROVAL_METHOD: &str = "item/permissions/requestApproval";
 
 #[derive(Debug, Clone)]
 pub struct CodexProtocol {
-    compatible_minors: &'static [&'static str],
+    pinned_minor: Option<u64>,
     request_timeout: Duration,
 }
 
 impl CodexProtocol {
     pub fn stable_0_137() -> Self {
         Self {
-            compatible_minors: &["0.137"],
+            pinned_minor: Some(137),
             request_timeout: Duration::from_secs(30),
         }
     }
 
-    /// Stable surface verified from generated schemas for both supported local distribution lines.
+    /// Use the verified stable surface with newer stable 0.x releases as well.
+    /// Initialization must still complete the non-experimental protocol handshake.
     pub fn stable_verified() -> Self {
         Self {
-            compatible_minors: &["0.137", "0.153"],
+            pinned_minor: None,
             request_timeout: Duration::from_secs(30),
         }
     }
@@ -63,14 +65,18 @@ impl CodexProtocol {
     }
 
     pub fn accepts_version(&self, output: &str) -> bool {
-        output
-            .split_whitespace()
-            .find(|part| part.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
-            .is_some_and(|version| {
-                self.compatible_minors
-                    .iter()
-                    .any(|minor| version == *minor || version.starts_with(&format!("{minor}.")))
-            })
+        let version = output
+            .trim()
+            .strip_prefix("codex-cli ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|version| semver::Version::parse(version).ok());
+        version.is_some_and(|version| {
+            version.major == 0
+                && version.pre.is_empty()
+                && self
+                    .pinned_minor
+                    .map_or(version.minor >= 137, |minor| version.minor == minor)
+        })
     }
 
     pub fn request_timeout(&self) -> Duration {
@@ -167,8 +173,7 @@ impl AgentBackend for CodexBackend {
         let version = String::from_utf8_lossy(&version.stdout).trim().to_owned();
         if !self.protocol.accepts_version(&version) {
             return Err(BackendError::Unavailable(format!(
-                "expected a verified codex-cli line (0.137.x or {}.x), found {version}",
-                CODEX_COMPATIBLE_MINOR,
+                "expected stable codex-cli >=0.137.0 and <1.0.0, found {version}",
             )));
         }
         let mut transport = StdioTransport::spawn_capturing(

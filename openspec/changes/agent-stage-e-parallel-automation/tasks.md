@@ -47,7 +47,7 @@
 
 ## 6. 通知、预算与审计
 
-- [ ] 6.1 聚合 working 事件，只为 completed/failed/waiting/conflict/budget 发送可行动通知
+- [x] 6.1 聚合 working 事件，只为 completed/failed/waiting/conflict/budget 发送可行动通知
 - [x] 6.2 自动化等待审批时遵守通知策略，不弹出不可见的模态框或自动批准
 - [x] 6.3 展示 root task 与各 child/backend 的实际 token/cost/time/output，unknown cost 不显示为 0
 - [x] 6.4 审计记录 trigger、template version、dedupe、调度原因、重试决策、审批和合并
@@ -58,7 +58,7 @@
 - [x] 7.2 扩展 automation harness：重复事件、漏跑 catch-up、rate limit、unknown 外部副作用和重启恢复
 - [ ] 7.3 与 M9 单代理基线比较完成率、验证、总用量、墙钟、冲突、重复副作用和人工干预
 - [ ] 7.4 运行相关 crate tests、三平台长期 smoke、clippy、存储迁移、磁盘/内存/进程残留门禁
-- [ ] 7.5 更新用户文档，明确本地应用关闭时不运行、权限/预算和非幂等重试边界
+- [x] 7.5 更新用户文档，明确本地应用关闭时不运行、权限/预算和非幂等重试边界
 - [ ] 7.6 全部退出场景通过后记录偏差并严格验证本 change
 
 ## 实施核对（2026-09-30）
@@ -69,5 +69,5 @@
 - 2.5、4.2、4.3、6.3 已由 Composer 任务树补齐：排队原因、可运行条件、可调并发上限、DAG 字段、单个/聚合取消，以及不把未知成本显示为 0。未知副作用记录不能从 UI 删除。
 - 3.6 非 Git 项目、磁盘不足等边界场景未全部覆盖。
 - 5.7、6.2、6.4 已由宿主调度循环补齐：运行中领取 queued run，管理面板显示 next/last、missed/coalesced/duplicate 与磁盘预算；审批等待不弹模态、不自动批准，审计含 trigger、template version、dedupe、调度原因、重试、审批与合并。
-- 6.1 通知聚合仍未完成。6.3 的 root/child/backend 用量已在任务树展示。
-- 7.3–7.6 基线对比、长期 smoke、用户文档与 strict 验证未完成。
+- 6.1 已于 2026-10-26 补齐：工作区按 agent ID 聚合，通知路由对 Started/Working 静默，铃铛保留状态；回归覆盖前后台与各投递目标。6.3 的 root/child/backend 用量已在任务树展示。
+- 7.5 已补充 `docs/user/agent-runtime.md`。7.3、7.4、7.6 的基线对比、长期 smoke 和退出场景仍待完成；strict 通过不等于阶段验收完成。

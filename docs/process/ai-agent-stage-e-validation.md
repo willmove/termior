@@ -2,11 +2,15 @@
 
 Stage E 提供普通 ChildTask、DAG、集中式 slot 调度、聚合预算、取消传播、snapshot freshness、写租约、串行 worktree integration queue，以及版本化本地自动化。
 
+应用关闭、权限与预算、重试边界见 [用户说明](../user/agent-runtime.md)。通知路由将 Started/Working 更新保留在铃铛中，不向前台隐藏面板或后台窗口发进度弹窗。
+
 ## 自动化验证
 
 ```powershell
 cargo test -p termior-ai --test orchestration_automation
 cargo test -p termior-ai --test runtime_reliability
+cargo test -p termior-platform notification
+cargo test -p termior-vcs --test worktree_environment
 ```
 
 编排测试会实际启动有界 worker thread，验证两个独立只读子任务并行执行，依赖节点仅在二者的结果通过 evidence/snapshot/acceptance 校验后运行。其余场景覆盖：
@@ -22,6 +26,9 @@ cargo test -p termior-ai --test runtime_reliability
 - DST spring-forward gap 跳过，fall-back overlap 只运行第一次
 - 每次 run 使用不可变 TemplateVersion 并创建独立 task ID 与 journal
 - 只有已知、幂等、transient 失败可自动重试；unknown effect 转 waiting-user
+- 非 Git 项目申请写 worktree 会失败，原文件不变且不隐式初始化 Git；目标父路径不可用时保留已有文件
+
+最后一项是可重复的创建失败用例，不等于真实磁盘耗尽验收；真实磁盘不足与清理恢复仍属于 3.6 未完成部分。
 
 ## 手工验证
 

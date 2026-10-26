@@ -142,13 +142,13 @@ fn registered_pane_shares_stable_identity_output_and_controller_state() {
 fn kill_terminates_a_spawned_child_process_tree() {
     let dir = tempfile::tempdir().unwrap();
     let command = if cfg!(windows) {
-        "$p=Start-Process ping -ArgumentList '-t','127.0.0.1' -PassThru; Set-Content -LiteralPath child.pid -Value $p.Id; Wait-Process -Id $p.Id"
+        "$p=Start-Process ping -ArgumentList '-t','127.0.0.1' -WindowStyle Hidden -PassThru; Set-Content -LiteralPath child.pid -Value $p.Id; Wait-Process -Id $p.Id"
     } else {
         "sleep 30 & echo $! > child.pid; wait"
     };
     let mut launch = request(command);
     if cfg!(windows) {
-        launch.shell = "powershell".into();
+        launch.shell = "pwsh".into();
     }
     launch.project_dir = dir.path().display().to_string();
     launch.cwd = dir.path().display().to_string();
@@ -156,14 +156,21 @@ fn kill_terminates_a_spawned_child_process_tree() {
     let id = service.create(launch).unwrap();
     let pid_path = dir.path().join("child.pid");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !pid_path.exists() && std::time::Instant::now() < deadline {
+    // File creation precedes the PID write; wait for a complete value rather
+    // than treating existence as proof the child is ready.
+    let child_pid = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child PID was not published"
+        );
         std::thread::sleep(Duration::from_millis(20));
-    }
-    let child_pid = std::fs::read_to_string(pid_path)
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap();
+    };
     service.kill(&id).unwrap();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(3);

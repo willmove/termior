@@ -11,7 +11,7 @@ cargo test -p termior-agent-host --test backend_contract
 cargo test -p termior-agent-host --test codex_smoke -- --ignored --nocapture
 ```
 
-前三条完全离线。它们验证输出游标与截断、超时不杀进程、PTY 控制权、窗格注册、进程树终止、JSON-RPC 分帧、乱序/未知事件、稳定协议映射和审批 ID。最后一条要求本机 PATH 中存在已登录的兼容 Codex CLI（`codex-cli 0.137.x` 或 `0.153.x`），只作为真实集成 smoke。托管 runner 不提供这份 CLI，nightly 不运行它；手动步骤见 `docs/process/nightly-integration.md`。
+前三条完全离线。它们验证输出游标与截断、超时不杀进程、PTY 控制权、窗格注册、进程树终止、JSON-RPC 分帧、乱序/未知事件、稳定协议映射和审批 ID。最后一条要求 `TERMIOR_CODEX_PATH` 或 PATH 中存在可运行的稳定 Codex CLI（`>=0.137.0, <1.0.0`），只作为真实握手 smoke，不发起模型 Turn；本机 `0.164.0` 已于 2026-10-26 通过。托管 runner 不提供这份 CLI，nightly 不运行它；手动步骤见 `docs/process/nightly-integration.md`。
 
 ## 手工验证
 
@@ -24,4 +24,4 @@ cargo test -p termior-agent-host --test codex_smoke -- --ignored --nocapture
 6. 让内置 Agent 获取活动终端上下文，再调用 `command_claim` 和 `command_write_input`。未批准或未持有 controller 时写入必须失败。Agent 持有控制权时，用户在该终端键入任意内容会立即 Take over，后续 Agent 写入必须失败，直到再次获批 `command_claim`。
 7. 把鼠标移到 Agent chip 上。Codex 完成握手后，提示应列出认证/模型来源以及 resume、fork、steer、cancel、approval、terminal 的实际能力；未声明的能力显示 Unknown/Unsupported。
 
-Codex 适配器只启用仓库中明确锁定和 fixture 验证过的 stable 方法。发现其他 CLI minor 版本时会拒绝启动，避免把未知协议行为伪装成已支持。
+Codex 适配器只启用已用 fixture 验证过的 stable 方法，握手保持 `experimentalApi = false`。兼容范围内的稳定 minor 更新不会被版本白名单阻断；实际协议连接仍须成功握手。
