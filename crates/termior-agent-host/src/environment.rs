@@ -553,7 +553,10 @@ impl SandboxBackend for WindowsAppContainerSandbox {
         let capabilities = self.probe();
         // Fail closed before any directory is shared when the platform cannot confine.
         environment_capabilities_checked(&capabilities, &request.required)?;
-        termior_terminal::windows_sandbox::grant_directory(&root)
+        // The ancestors need a traversal grant as well: a confined token cannot
+        // open the workspace when the directories above it belong to the user
+        // alone.
+        termior_terminal::windows_sandbox::grant_directory_with_ancestors(&root)
             .map_err(|error| SandboxError::Io(error.to_string()))?;
         let environment = ExecutionEnvironment {
             id: request.id.clone(),

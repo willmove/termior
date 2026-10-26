@@ -49,6 +49,18 @@ pub fn grant_directory(path: &Path) -> Result<(), AppContainerError> {
     container.grant(path)
 }
 
+/// Grant the Termior AppContainer access to one directory and to the path to it.
+///
+/// A confined token has to walk every directory between the volume root and the
+/// workspace before it can open anything inside the workspace. The directories
+/// above a workspace often belong to the user alone, so they need an explicit
+/// traversal grant. The grant is not inherited by the files below them: the
+/// ancestors stay unreadable, they only become walkable.
+pub fn grant_directory_with_ancestors(path: &Path) -> Result<(), AppContainerError> {
+    let container = AppContainer::resolve(APP_CONTAINER_NAME)?;
+    container.grant_with_ancestors(path)
+}
+
 /// Grant the Termior AppContainer access to one path.
 ///
 /// A directory grants access to the whole tree below it. A file grants access to that
@@ -132,6 +144,12 @@ mod imp {
         }
 
         pub fn grant(&self, _path: &Path) -> Result<(), AppContainerError> {
+            Err(AppContainerError::Acl(
+                "the Windows AppContainer backend is only available on Windows".into(),
+            ))
+        }
+
+        pub fn grant_with_ancestors(&self, _path: &Path) -> Result<(), AppContainerError> {
             Err(AppContainerError::Acl(
                 "the Windows AppContainer backend is only available on Windows".into(),
             ))

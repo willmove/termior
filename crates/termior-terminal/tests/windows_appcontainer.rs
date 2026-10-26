@@ -314,6 +314,56 @@ fn a_confined_command_can_run_a_program_below_a_restricted_directory() {
     assert_eq!(code, Some(0), "the confined command must run");
 }
 
+/// A workspace below a directory that only the user may enter.
+///
+/// The directory above the workspace grants nothing to a low-privilege token, so
+/// the confined process cannot even walk to the workspace. The grant of the
+/// workspace itself is not enough: Windows checks the traversal right on every
+/// directory in the path. This is the shape a CI runner has — its build and
+/// temporary directories sit under the runner account's profile — and it is why
+/// the escape suite failed on CI with `ERROR_FILE_NOT_FOUND` for a payload that
+/// was really there.
+#[test]
+fn a_confined_command_can_run_a_program_below_a_private_ancestor() {
+    let Some(container) = require_container() else {
+        return;
+    };
+    let root = std::env::temp_dir().join("termior-appcontainer-private-ancestor");
+    let _ = std::fs::remove_dir_all(&root);
+    let leaf = root.join("a").join("b");
+    std::fs::create_dir_all(&leaf).unwrap();
+
+    // The image is the test binary itself, staged next to the workspace.
+    let exe = std::env::current_exe().unwrap();
+    std::fs::copy(&exe, leaf.join("payload.exe")).unwrap();
+
+    // The ancestor grants the container nothing: only the user may enter it.
+    let ancestor = root.join("a");
+    let granted = container.grant_with_ancestors(&leaf);
+    if granted.is_err() {
+        // A machine that does not let the user change the ACL cannot reproduce
+        // the condition; the grant itself is still exercised by the tests above.
+        eprintln!("skipping: the ancestor grant failed: {granted:?}");
+        return;
+    }
+
+    // The ancestor must stay unreadable for the container: only traversal was
+    // granted, not the right to list or read it.
+    let mut entries = container
+        .spawn(
+            Path::new(&cmd()),
+            &["/c".into(), format!("dir \"{}\"", ancestor.display())],
+            &leaf,
+        )
+        .expect("the confined command must start");
+    let code = entries.wait(Duration::from_secs(30));
+    assert_ne!(
+        code,
+        Some(0),
+        "the ancestor became readable: the traversal grant leaked more than traversal"
+    );
+}
+
 /// A grant must not take the host's own access away. The grant is done with
 /// `SetNamedSecurityInfoW`, which replaces the whole DACL, so this test checks what
 /// the directory looks like afterwards.

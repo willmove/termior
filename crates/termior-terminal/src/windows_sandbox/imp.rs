@@ -38,6 +38,14 @@ use windows_sys::Win32::System::Threading::{
 /// read, write and run inside the workspace.
 const CONTAINER_ACCESS: u32 = 0x0013_01FF;
 
+/// The right to walk through a directory without being able to list or read it.
+///
+/// Windows checks this right on every directory in a path, so a confined token
+/// needs it on the ancestors of its workspace before it can open anything
+/// inside it. `FILE_TRAVERSE` is enough for that and nothing more: the ancestor
+/// stays unreadable.
+const FILE_TRAVERSE: u32 = 0x0000_0020;
+
 /// Environment variables the sandbox copies from the parent process.
 ///
 /// The list is deliberately short. Anything that can carry a credential
@@ -126,6 +134,20 @@ impl AppContainer {
 
     /// Grant the container full access to one directory.
     pub fn grant(&self, path: &Path) -> Result<(), AppContainerError> {
+        grant_directory_to(path, self.sid)
+    }
+
+    /// Grant the container access to one directory and to the path leading to it.
+    ///
+    /// A confined token can only reach a directory it has been granted if it can
+    /// also *walk* every ancestor of it. Windows checks the traversal right on
+    /// each directory in the path, and the directories above a workspace often
+    /// belong to the user alone: a profile directory, a temporary folder under
+    /// it, or a build directory on a CI runner. Without the traversal rights the
+    /// confined process cannot open the image at all and the spawn fails with
+    /// `ERROR_FILE_NOT_FOUND`, even though the workspace itself was granted.
+    pub fn grant_with_ancestors(&self, path: &Path) -> Result<(), AppContainerError> {
+        grant_ancestors_to(path, self.sid)?;
         grant_directory_to(path, self.sid)
     }
 
@@ -325,6 +347,52 @@ impl Drop for Job {
 /// removes the traversal rights the ancestors need. `SetEntriesInAclW` merges the new
 /// entry into the *current* DACL instead, so nothing else changes.
 fn grant_directory_to(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    grant_to(path, sid, CONTAINER_ACCESS, true)
+}
+
+/// Grant the AppContainer SID traversal on every directory above `path`.
+///
+/// The grant is deliberately **not inheritable**. An inheritable ACE on an
+/// ancestor is copied onto every existing child of that ancestor, which turns a
+/// narrow traversal grant into a full-access grant on a whole tree — the profile
+/// directory and the temporary folder below it, for instance. That is a far
+/// larger change to the machine than the sandbox needs, and it weakens the
+/// confinement instead of strengthening it.
+///
+/// Only the traversal right is granted, and only on the directories themselves.
+/// A confined token can therefore walk the path to the workspace and open the
+/// workspace, and still cannot read anything else on the way.
+fn grant_ancestors_to(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
+    let mut ancestors = Vec::new();
+    let mut current = path.parent();
+    while let Some(directory) = current {
+        ancestors.push(directory.to_path_buf());
+        current = directory.parent();
+    }
+    for ancestor in ancestors.into_iter().rev() {
+        // The volume root is always traversable, and granting it would fail on
+        // the parts of the tree the user does not own.
+        if ancestor.parent().is_none() {
+            continue;
+        }
+        // An ancestor the user cannot change — the user profile, the `C:\Users`
+        // directory above it — cannot be granted. Such a directory is usually
+        // already traversable for low-privilege tokens, and a failure here must
+        // not stop the workspace from being granted.
+        if let Err(error) = grant_to(&ancestor, sid, FILE_TRAVERSE, false) {
+            if !matches!(error, AppContainerError::Acl(_)) {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Merge one access entry for `sid` into the DACL of `path`.
+///
+/// `access` is the rights the entry grants and `inherit` says whether the entry
+/// is passed on to the objects below `path`.
+fn grant_to(path: &Path, sid: PSID, access: u32, inherit: bool) -> Result<(), AppContainerError> {
     // SAFETY: `sid` is a valid SID.
     let length = unsafe { GetLengthSid(sid) };
     if length == 0 {
@@ -342,14 +410,15 @@ fn grant_directory_to(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
         ptstrName: sid as *mut u16,
     };
     let entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: CONTAINER_ACCESS,
+        grfAccessPermissions: access,
         // `SET_ACCESS` replaces the container's own entry instead of stacking a new
         // one on top of it, so granting the same directory twice does not grow the
         // DACL.
         grfAccessMode: SET_ACCESS,
         // Only a directory can pass its access down to the files below it. A file
-        // grant applies to that file alone.
-        grfInheritance: if path.is_dir() {
+        // grant applies to that file alone. A traversal grant is never inherited:
+        // it exists to open the path, not to open everything below it.
+        grfInheritance: if inherit && path.is_dir() {
             SUB_CONTAINERS_AND_OBJECTS_INHERIT
         } else {
             windows_sys::Win32::Security::NO_INHERITANCE

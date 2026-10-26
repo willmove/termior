@@ -100,7 +100,10 @@ fn grant_payload_access() {
     let directory = exe
         .parent()
         .expect("the test binary has a parent directory");
-    termior_terminal::windows_sandbox::grant_directory(directory)
+    // The ancestors need a traversal grant too: a confined token cannot walk
+    // down to the payload when the directories above it belong to the build
+    // account alone.
+    termior_terminal::windows_sandbox::grant_directory_with_ancestors(directory)
         .expect("the payload directory must be shareable with the sandbox");
 }
 
