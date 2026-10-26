@@ -32,6 +32,7 @@
 - [`process/dependency-maintenance.md`](process/dependency-maintenance.md)：依赖升级节奏、GPUI 补丁核对与许可门禁。
 - [`process/github-issue-review-2026-10-26.md`](process/github-issue-review-2026-10-26.md)：全部开放 issue 的处理结果与人工验收清单。
 - [`process/agent-acceptance-2026-10-26.md`](process/agent-acceptance-2026-10-26.md)：桌面自动操作、真实后端、故障模拟与三平台 CI 的验收证据。
+- [`process/agent-acceptance-2026-10-27.md`](process/agent-acceptance-2026-10-27.md)：本轮修掉的两个 CI 红灯与新增的自动验收证据。
 - [`process/nfr-baselines.md`](process/nfr-baselines.md)：NFR harness 与回归门禁。基线数字仍在 [`baselines/nfr-baselines.json`](baselines/nfr-baselines.json)。
 - [`process/desktop-milestone.md`](process/desktop-milestone.md)：当前桌面交付边界。
 - [`process/ai-agent-evolution-roadmap.md`](process/ai-agent-evolution-roadmap.md)：Agent M6–M10 实施索引。

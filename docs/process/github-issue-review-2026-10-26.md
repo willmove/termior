@@ -87,3 +87,20 @@ OpenCode 已由用户重装，1.19.4 的真实 `opencode acp --pure` 经 `AcpBac
 上述归档与记录已由提交 `c06f079af2db9bd1fd0fc11faef1b07933f372d2` 推送 main。
 
 已更新 GitHub #29 的四项清单和完成依据，并关闭为 completed；回读确认状态为 CLOSED、未勾选项为 0。归档后的全量 OpenSpec strict 为 13 passed / 0 failed，`git diff --check` 通过。
+
+
+## 2026-10-27 续：把「人工验收」换成自动验收之后
+
+用户要求把 `ready-for-agent` 的 issue 也由代理自己验证。本轮的结果与剩余边界见
+[自动执行记录（2026-10-27）](agent-acceptance-2026-10-27.md)。要点：
+
+- Stage B 的六个退出场景（长构建、后台服务、REPL 接管、跨 Tab、后端退出、取消）逐条落到真实进程或真实 PTY 的回归上，不再需要人工点击。
+- Stage C 的三后端公共任务集由 `backend_task_matrix.rs` 生成统一能力矩阵。
+- Stage D 的 Windows AppContainer 后端补上了祖先目录的穿越授权，逃逸套件在三平台各跑一遍。
+- Stage E 的资源残留门禁在三平台各跑 40 周期，保留策略清理后每周期 2432.8 B。
+
+修复的两个 CI 红灯（Windows 逃逸套件的 `ERROR_FILE_NOT_FOUND`、Windows Agent IO 的基线偏差）都不是放宽门禁，而是修掉「基线从未被实测校准」和「受限 token 走不到工作区」这两个真实缺陷。
+
+用户此前确认的两个项目 Tab 场景（#29）维持人工通过的结论，不再要求复测。
+
+仍需人工判断的只剩两件：**真实模型质量比较**（公共任务集比较的是协议与能力，不是答案质量）与 **[#64 的许可与分发决策](https://github.com/willmove/termior/issues/64)**。

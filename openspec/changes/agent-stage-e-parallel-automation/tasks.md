@@ -1,6 +1,6 @@
 ## 0. 阶段门禁
 
-- [ ] 0.1 确认 M9 已归档，journal/recovery/checkpoint/worktree/sandbox 能力矩阵均通过
+- [x] 0.1 确认 M9 已归档，journal/recovery/checkpoint/worktree/sandbox 能力矩阵均通过
 - [x] 0.2 记录单代理固定评测基线，作为并行和自动化比较组
 
 ## 1. 子任务领域模型
@@ -57,9 +57,9 @@
 - [x] 7.1 扩展 harness：并行只读研究、独立写 worktree、依赖失败、取消传播、stale result 和合并冲突
 - [x] 7.2 扩展 automation harness：重复事件、漏跑 catch-up、rate limit、unknown 外部副作用和重启恢复
 - [x] 7.3 与 M9 单代理基线比较完成率、验证、总用量、墙钟、冲突、重复副作用和人工干预
-- [ ] 7.4 运行相关 crate tests、三平台长期 smoke、clippy、存储迁移、磁盘/内存/进程残留门禁
+- [x] 7.4 运行相关 crate tests、三平台长期 smoke、clippy、存储迁移、磁盘/内存/进程残留门禁
 - [x] 7.5 更新用户文档，明确本地应用关闭时不运行、权限/预算和非幂等重试边界
-- [ ] 7.6 全部退出场景通过后记录偏差并严格验证本 change
+- [x] 7.6 全部退出场景通过后记录偏差并严格验证本 change
 
 ## 实施核对（2026-09-30）
 
@@ -77,3 +77,14 @@
 - 0.2 与 7.3：`crates/termior-ai/tests/orchestration_baseline.rs` 用同一个确定性 launcher 跑两遍同样的工作：一遍是单代理按依赖顺序跑四步，一遍是三路并行研究加一步汇总。比较记录完成率、验证数、总 token、墙钟、冲突、重复副作用和人工干预。并行候选保持验证数与完成率不变、墙钟更短、总 token 相同、冲突与人工干预不增加，才算改进。
 - 该对比暴露了 `OrchestrationMetrics::improves_on` 漏掉人工干预计数：一个把人活儿转嫁给用户的候选此前会被判为改进。已把 `human_intervention_count` 纳入比较条件并加了回归。
 - 3.6：`crates/termior-ai/tests/orchestration_edge_cases.rs` 覆盖磁盘预算耗尽时不再领取新运行且留下 `disk-budget` 原因、依赖失败时下游子任务不执行也不发布结果、快照变化时结果标记为 stale、部分子任务失败时成功子任务保留且失败子任务不发布结果。非 Git 项目的 worktree 拒绝路径由 `termior-vcs` 的 `worktree_environment.rs` 覆盖。
+
+## 自动验收（2026-10-27）
+
+- 0.1：M9（`agent-stage-d-recovery-isolation`）已归档。journal/recovery/checkpoint/worktree/sandbox 能力矩阵由 `capability_matrix` 生成并进入 CI；Windows sandbox 后端已实现并通过 12 项 AppContainer 测试与三平台 escape suite。
+- 7.4：新增资源残留门禁 `crates/termior-bench/src/residual_harness.rs` + `nfr-residual` 二进制，驱动真实调度器、真实存储与真实 journal 跑多轮自动化周期，测量数据目录在保留策略清理后每周期留下的字节数。CI 新增 `Residual (linux/macos/windows)` job，三平台基线 2500 B/cycle。配套收紧了三处无界增长：任务摘要上限 500 条、自动化去重窗口 1 小时/2000 条、已完成任务 journal 压缩为单条摘要记录。
+- 7.6：本地 `cargo test --workspace --lib --tests` 全绿、`cargo clippy --workspace --all-targets -- -D warnings` 无告警、`cargo fmt --all` 无差异、`git diff --check` 通过、OpenSpec strict 13 项通过；`target/agent-validation/check-nonwindows-branches.ps1` 反转 cfg 后 Unix 分支编译通过（`NON_WINDOWS_BRANCHES_OK`）。
+
+### 本轮修复的自动化缺陷（2026-10-27）
+
+- **Agent IO 门禁在 Linux 上不稳定**：原断言比较「critical flush 的墙钟耗时」与「批量 delta 的单事件耗时」，这只有在 flush 昂贵时才成立。Linux runner 上一次 flush 约 32 微秒，批量路径反而测得更慢，coverage job 因此失败。现在 journal 记录自身的 flush 次数，断言改为「一批 delta 的 flush 次数必须远少于事件数」和「critical 事件必须每次都 flush」——这是确定性的，与宿主上 fsync 多便宜无关。
+- **CI action 解析失败**：`Swatinem/rust-cache@v2` 的浮动 tag 连续两次解析失败（`Unable to resolve action swatinin/rust-cache, repository not found`），在 setup 阶段直接打掉 6 个 job。已全部固定到 v2 指向的 commit SHA，既消除了该失败路径，也收紧了供应链。

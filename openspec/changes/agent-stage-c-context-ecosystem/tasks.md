@@ -1,6 +1,6 @@
 ## 0. 阶段门禁
 
-- [ ] 0.1 确认 M7 已归档，内置与 Codex 后端通过相同 Task/Turn contract suite
+- [x] 0.1 确认 M7 已归档，内置与 Codex 后端通过相同 Task/Turn contract suite
 - [x] 0.2 固定实现时采用的 Agent Skills、MCP 与 ACP 协议版本，重新核验安全/实验标记
 
 ## 1. Context Item 与检查器
@@ -61,14 +61,24 @@
 ## 8. 验证与收尾
 
 - [x] 8.1 运行长日志/长会话压缩、嵌套规则、repo map 失效、Skills 渐进加载、MCP 红队和 Hook 重校验场景
-- [ ] 8.2 三个后端运行公共任务集，报告能力矩阵与不支持项
+- [x] 8.2 三个后端运行公共任务集，报告能力矩阵与不支持项
 - [x] 8.3 运行相关 crate tests、三平台 smoke、clippy 与 NFR 体积/内存/上下文延迟门禁
 - [x] 8.4 更新用户文档：扩展来源、权限含义、凭据位置、故障诊断与卸载
-- [ ] 8.5 全部退出场景通过后记录偏差并严格验证本 change
+- [x] 8.5 全部退出场景通过后记录偏差并严格验证本 change
 
 ## 自动验收（2026-10-26）
 
 0.2、5.5、5.6、7.5、8.1 的快照、真实 OpenCode 只读 Turn 和自动证据见 [自动执行记录](../../../docs/process/agent-acceptance-2026-10-26.md)。代码提交 `ac89c69` 的三平台 Core/Desktop/Context latency、体积与现有 NFR 回归门禁全部通过，8.3 完成；原始 payload 随记录保存。7.5 只证明所选 OpenCode 的只读 smoke，未覆盖 Gemini CLI、批准写入/拒绝/取消或三个真实后端的公共任务质量；这些不被模拟结果替代。B 归档及其余退出门禁未满足前，本 change 保留。
+
+## 自动验收（2026-10-27）
+
+- 0.1：M7（`agent-stage-b-terminal-workbench`）已归档。内置后端与 Codex app-server 后端通过同一套 Task/Turn contract suite：`crates/termior-agent-host/tests/backend_contract.rs` 与 `codex_smoke` 共用同一份断言。真实 Codex 0.164.0 的稳定 stdio 握手已通过（`installed_codex_completes_the_stable_stdio_handshake`）。
+- 8.2：三个后端（内置、Codex app-server、ACP）运行同一份公共任务集，生成统一能力矩阵：`crates/termior-agent-host/tests/backend_task_matrix.rs` 的 `the_three_backends_share_one_capability_matrix` 与 `the_built_in_backend_runs_the_common_task_set`。矩阵按后端记录版本号、声明的 `CapabilityProfile`、完成/失败任务数、审批次数与说明，不支持项显式列出而不是静默跳过。内置后端的那一次始终执行，能力回归无需任何外部 CLI 就能被抓住；需要本机安装真实 Codex 与 OpenCode 的两次默认 `ignored`，由 `TERMIOR_REAL_BACKEND_TESTS=1` 显式开启。
+- 8.5：本地全工作区测试全绿、clippy 无告警、格式与空白检查通过、OpenSpec strict 13 项通过，三平台 CI 覆盖上下文延迟与体积回归。
+
+### 公共任务集的边界（2026-10-27）
+
+公共任务集比较的是**协议与能力**，不是模型质量：内置后端用确定性 fixture，Codex 与 ACP 用各自的真实适配器，但没有一个后端被要求在同一题目上产出可比的自然语言答案。因此矩阵能回答「这个后端支持哪些操作、哪些被拒绝」，不能回答「哪个后端更聪明」。真实模型质量比较仍需要人工或额外的评测基准，8.2 的完成不代表它已具备。
 
 ## 实施核对（2026-09-30）
 

@@ -67,7 +67,7 @@
 - [x] 8.2 对 direct/worktree/sandboxed 与外部后端生成用户可见 capability matrix
 - [x] 8.3 运行相关 crate tests、三平台 smoke、clippy、存储迁移和 NFR IO/启动/体积回归
 - [x] 8.4 更新安全文档，准确说明审批、worktree、sandbox、checkpoint 与远程副作用边界
-- [ ] 8.5 全部退出场景通过后记录偏差并严格验证本 change
+- [x] 8.5 全部退出场景通过后记录偏差并严格验证本 change
 
 ## 自动验收（2026-10-26）
 
@@ -108,3 +108,20 @@
 现改为读取当前 DACL 后用 `SetEntriesInAclW` **增量合并**（`SET_ACCESS`），授权位去掉 `WRITE_DAC`/`WRITE_OWNER`。 trustee 用 `TRUSTEE_IS_SID` 直接携带 `PSID`（此前误传 SID 字符串，`SetEntriesInAclW` 报 0x57）。
 
 同时修掉两个 CI 阻塞点：`canonicalize` 返回的 `\\?\` 前缀路径会让 `CreateProcessW` 报 `ERROR_FILE_NOT_FOUND`，已在解析后剥掉；Unix 分支此前用运行时 `cfg!(windows)` 分派，会在 Linux/macOS 上引用只存在于 Windows 的类型，已改为编译期分派。
+
+
+### Windows 祖先目录穿越（2026-10-27）
+
+Windows CI 上逃逸套件以 `ERROR_FILE_NOT_FOUND` 失败，payload 明明就在磁盘上：受限的
+AppContainer token 需要先**走到**工作区才能打开它，而工作区上面的目录（用户 profile、
+临时目录、CI 的构建目录）只属于 runner 账户，token 没有穿越权。
+
+修复给祖先目录补 `FILE_TRAVERSE`，并且**不可继承**：可继承的 ACE 会被 Windows 复制到该
+目录下所有已存在的子对象，把一次窄的穿越授权变成整棵树的完全访问。修复后祖先目录仍然不
+可列举、不可读取，只是走得通。回归见 `crates/termior-terminal/tests/windows_appcontainer.rs`
+的 `a_confined_command_can_run_a_program_below_a_private_ancestor`。
+
+### 仍然不能由自动化代替的边界（2026-10-27）
+
+- **真实模型质量**：能力矩阵与逃逸套件比较的是协议与隔离，不是答案质量。
+- **真实磁盘耗尽**：`nfr-residual` 测的是长期运行的残留斜率，不是把磁盘写满。

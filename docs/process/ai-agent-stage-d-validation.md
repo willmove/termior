@@ -22,6 +22,9 @@ Escape suite 在 Core 矩阵的 Ubuntu、macOS、Windows 上随 `cargo test` 运
 
 ## 桌面复验与已自动覆盖的场景
 
+2026-10-27 补上祖先目录穿越授权后，Windows CI 上的逃逸套件重新通过；证据与边界见 [自动执行记录（2026-10-27）](agent-acceptance-2026-10-27.md)。
+
+
 2026-10-26 已读取三平台 Core 的真实 escape/fault 日志，并运行本机真实文件 checkpoint/worktree、journal 恢复及桌面审批中强退/重启。8.1 完成。非 PTY Windows 后台命令现也绑定 Job Object；真实 owner 进程被强制终止的回归验证无后台残留。该进程清理能力不代表文件、网络或凭据隔离。详见 [自动执行记录](agent-acceptance-2026-10-26.md)。
 
 1. 发起需要审批的文件修改，批准并进入 Diff 审阅。确认 `agent-tasks/<task-id>/events.jsonl` 与 `snapshot.json` 已存在。

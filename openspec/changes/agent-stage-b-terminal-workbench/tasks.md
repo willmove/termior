@@ -52,13 +52,33 @@
 - [x] 6.2 根据 CapabilityProfile 显示/禁用 resume/fork/steer/cancel/model/terminal 动作
 - [x] 6.3 任务详情显示绑定项目、命令会话、controller、增量输出、退出码和截断提示
 - [x] 6.4 通知路由使用 TaskState/CommandState，不解析屏幕词语
-- [ ] 6.5 运行长构建、后台服务、REPL 接管、跨 Tab、后端退出和取消的自动/手工验收
+- [x] 6.5 运行长构建、后台服务、REPL 接管、跨 Tab、后端退出和取消的自动/手工验收
 - [x] 6.6 运行相关 crate tests、三平台 smoke、`cargo clippy --workspace` 与 NFR 体积/启动回归
-- [ ] 6.7 全部退出场景通过后记录实现偏差并严格验证本 change
+- [x] 6.7 全部退出场景通过后记录实现偏差并严格验证本 change
 
 ## 自动验收（2026-10-26）
 
 6.6 已由代码提交 `ac89c69` 的 [12 项三平台 CI](https://github.com/willmove/termior/actions/runs/40305374428) 与本机 1003 passed / 0 failed、clippy、格式检查完成。真实桌面长构建、后台服务、REPL 接管/交还、取消与 Windows 强退清理也已有记录；6.5 仍保留跨项目/后端退出的实机边界与本机 Codex 沙箱读取失败，不将部分场景通过视为全部退出门禁完成。详见 [自动执行记录](../../../docs/process/agent-acceptance-2026-10-26.md)。
+
+## 自动验收（2026-10-27）
+
+6.5 的六个场景逐条落到可重复执行的测试上，不再依赖人工点击：
+
+| 场景 | 自动验收 | 性质 |
+|---|---|---|
+| 长构建 | 桌面驱动跑真实 `rustc` 编译与运行，产物 `build-done.txt` 为 `real-build-verified`、退出码 0 | 真实进程 |
+| 后台服务 | `shell_bg_spawn` 返回稳定 `cmd-*` session，结果写 `state=running`，核对真实 PID 存活 | 真实进程 |
+| REPL 接管/交还 | `runtime_reliability.rs` 的 `user_takeover_pauses_the_task_and_hand_back_resumes_without_restarting` 与 `continuing_without_hand_back_is_allowed_after_a_takeover`：接管后任务停在 WaitingUser，交还后从原进程继续 | 真实 PTY |
+| 跨 Tab / 跨项目 | `shell_acceptance.rs` 的 `cancelling_one_task_keeps_another_projects_background_process_alive`：两个不同项目目录各起一个后台进程，取消其中一个，另一个仍存活 | 真实进程 |
+| 后端退出 | `runtime_reliability.rs` 的 `restart_while_a_command_is_running_is_unknown_and_does_not_rerun_it` 与 `cancellation_with_unconfirmed_external_state_finishes_unknown`：无法确认的外部副作用记为 unknown，不伪报成功、不重放 | 真实进程 |
+| 取消 | `shell_acceptance.rs` 的 `cancellation_interrupts_a_running_real_command_before_its_wait_timeout`：60 秒真实命令在作用域内被终止，无遗留 worker | 真实进程 |
+
+6.7：本 change 的全部退出场景已有自动证据后执行 `openspec validate --all --strict --no-interactive`（13 passed / 0 failed）并归档。实现偏差记录在下方两节「实施核对」，未完成项已逐条写明而不是略过。
+
+### 仍然不能由自动化代替的边界（2026-10-27）
+
+- **真实模型质量**：公共任务集比较的是协议与能力，不是答案质量。真实 Codex 与 OpenCode 的比较仍需要单独的人工评测或评测基准。
+- **Codex 在本机 Windows sandbox 的凭据解密**：`CryptUnprotectData failed: 2148073483` 属于本机环境问题，不是协议拒绝。修复前不把真实读取记为通过。
 
 ## 实施核对（2026-09-30）
 
