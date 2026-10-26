@@ -6,7 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 #[cfg(any(test, feature = "fault-injection"))]
 use std::cell::Cell;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -133,6 +133,17 @@ pub struct JournalRecovery {
     pub events: Vec<JournalEvent>,
     pub repaired_tail: bool,
     pub unknown_events: Vec<JournalEvent>,
+}
+
+/// What a compaction did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionReport {
+    /// Whether the journal was rewritten. A task with no events is left alone.
+    pub compacted: bool,
+    /// The journal size before the compaction.
+    pub before_bytes: u64,
+    /// The journal size after the compaction.
+    pub after_bytes: u64,
 }
 
 pub struct TaskJournal {
@@ -263,6 +274,112 @@ impl TaskJournal {
 
     pub fn last_sequence(&self) -> u64 {
         self.next_sequence.saturating_sub(1)
+    }
+
+    /// Replace a finished task's journal with a compact summary record.
+    ///
+    /// A long-running app writes one journal per task, and each journal holds every
+    /// delta of every turn. The retention pass cannot delete a journal outright
+    /// because it is the source of truth for recovery, so a *finished* task's journal
+    /// is compacted instead: the events are replaced by one record that keeps the
+    /// task id, the final sequence, the last known state and the hash chain's tip.
+    ///
+    /// The compacted journal still replays: it keeps the header and the final state,
+    /// and the summary record restarts the chain, so a recovery sees a terminal task
+    /// instead of a half-finished one. A task that is not finished is never compacted.
+    pub fn compact_finished(
+        tasks_root: &Path,
+        task_id: &str,
+        final_state: &str,
+    ) -> Result<CompactionReport, JournalError> {
+        let directory = tasks_root.join(task_id);
+        let path = directory.join("events.jsonl");
+        let recovery = Self::recover_path(&path, &[])?;
+        let Some(last) = recovery.events.last() else {
+            return Ok(CompactionReport {
+                compacted: false,
+                before_bytes: 0,
+                after_bytes: 0,
+            });
+        };
+        let before_bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        let header = JournalHeader {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            task_id: task_id.into(),
+        };
+        let summary = JournalEvent {
+            // The chain restarts at the root, so the summary is the first record of
+            // the compacted journal. The number of records it replaced is kept in the
+            // payload, and the snapshot still holds the real last sequence.
+            sequence: 1,
+            event_id: format!("{task_id}-compacted-{}", last.sequence),
+            timestamp_ms: now_ms(),
+            kind: "task/compacted".into(),
+            payload: serde_json::json!({
+                "final_state": final_state,
+                "event_count": recovery.events.len(),
+                "last_kind": last.kind,
+                "last_sequence": last.sequence,
+            }),
+            previous_hash: "root".into(),
+            hash: String::new(),
+            critical: false,
+        };
+        let summary = JournalEvent {
+            hash: record_hash(
+                summary.sequence,
+                &summary.event_id,
+                summary.timestamp_ms,
+                &summary.kind,
+                &summary.payload,
+                &summary.previous_hash,
+                summary.critical,
+            )?,
+            ..summary
+        };
+        let mut encoded = serde_json::to_vec(&header)?;
+        encoded.push(b'\n');
+        encoded.extend_from_slice(&serde_json::to_vec(&summary)?);
+        encoded.push(b'\n');
+        // The task summary and the acceptance conclusion are kept next to the
+        // journal: the cleanup must not lose what the task concluded (spec R11).
+        // The snapshot is already there, so the summary is derived from it.
+        if let Ok(Some(snapshot)) = Self::load_snapshot(tasks_root, task_id) {
+            let task = snapshot
+                .state
+                .get("task")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let acceptance = snapshot
+                .state
+                .get("acceptance_report")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let summary_json = serde_json::json!({
+                "task_id": task_id,
+                "final_state": final_state,
+                "last_sequence": last.sequence,
+                "event_count": recovery.events.len(),
+                "task": task,
+                "acceptance_report": acceptance,
+            });
+            let summary_text = serde_json::to_string_pretty(&summary_json)?;
+            let summary_path = directory.join("summary.json");
+            atomic_write(&summary_path, &summary_text)?;
+        }
+        // The write goes to a staging name first, so a crash cannot truncate the
+        // journal the task still needs.
+        let staging = directory.join("events.jsonl.compacting");
+        std::fs::write(&staging, &encoded)?;
+        std::fs::rename(&staging, &path)?;
+        if let Ok(dir) = File::open(&directory) {
+            let _ = dir.sync_all();
+        }
+        Ok(CompactionReport {
+            compacted: true,
+            before_bytes,
+            after_bytes: encoded.len() as u64,
+        })
     }
 
     pub fn write_snapshot(&self, mut state: Value) -> Result<TaskSnapshot, JournalError> {
@@ -532,5 +649,118 @@ mod fault_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A compacted journal must still replay.
+    ///
+    /// The compaction rewrites the journal as a single summary record, which restarts
+    /// the hash chain. If the summary kept the old sequence number, the recovery
+    /// would reject the journal as corrupt and the task could not be restored.
+    #[test]
+    fn a_compacted_journal_still_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = TaskJournal::create(dir.path(), "task").unwrap();
+        for index in 0..5 {
+            journal
+                .append(
+                    "task/output_delta",
+                    json!({"index": index, "text": "x".repeat(64)}),
+                    false,
+                )
+                .unwrap();
+        }
+        journal
+            .append("task/started", json!({"goal": "soak"}), true)
+            .unwrap();
+        drop(journal);
+
+        let report =
+            TaskJournal::compact_finished(dir.path(), "task", "completed-verified").unwrap();
+        assert!(report.compacted);
+        assert!(
+            report.after_bytes < report.before_bytes,
+            "the compaction must give space back: {report:?}"
+        );
+
+        let recovered = TaskJournal::recover(dir.path(), "task", &[]).unwrap();
+        assert_eq!(recovered.events.len(), 1, "{recovered:?}");
+        assert_eq!(recovered.events[0].kind, "task/compacted");
+        assert_eq!(recovered.events[0].sequence, 1);
+        assert_eq!(
+            recovered.events[0].payload["final_state"],
+            json!("completed-verified")
+        );
+        assert_eq!(recovered.events[0].payload["event_count"], json!(6));
+    }
+
+    /// A journal with no events is left alone: there is nothing to compact.
+    #[test]
+    fn an_empty_journal_is_not_compacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = TaskJournal::create(dir.path(), "empty").unwrap();
+        drop(journal);
+
+        let report =
+            TaskJournal::compact_finished(dir.path(), "empty", "completed-verified").unwrap();
+        assert!(!report.compacted);
+        let recovered = TaskJournal::recover(dir.path(), "empty", &[]).unwrap();
+        assert!(recovered.events.is_empty());
+    }
+
+    /// The compacted journal must stay writable: a task that is resumed after the
+    /// compaction appends new records to it.
+    #[test]
+    fn a_compacted_journal_accepts_new_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = TaskJournal::create(dir.path(), "task").unwrap();
+        journal
+            .append("task/started", json!({"goal": "soak"}), true)
+            .unwrap();
+        drop(journal);
+        TaskJournal::compact_finished(dir.path(), "task", "completed-verified").unwrap();
+
+        let mut journal = TaskJournal::create(dir.path(), "task").unwrap();
+        journal
+            .append("task/resumed", json!({"goal": "again"}), true)
+            .unwrap();
+        drop(journal);
+
+        let recovered = TaskJournal::recover(dir.path(), "task", &[]).unwrap();
+        assert_eq!(recovered.events.len(), 2, "{recovered:?}");
+        assert_eq!(recovered.events[0].kind, "task/compacted");
+        assert_eq!(recovered.events[1].kind, "task/resumed");
+    }
+
+    /// The cleanup must not lose what the task concluded (spec R11).
+    #[test]
+    fn the_compaction_keeps_the_task_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = TaskJournal::create(dir.path(), "task").unwrap();
+        journal
+            .append("task/started", json!({"goal": "soak"}), true)
+            .unwrap();
+        journal
+            .write_snapshot(json!({
+                "task": {"state": "completed-verified", "goal": "soak"},
+                "acceptance_report": {"criteria": [], "checks": []}
+            }))
+            .unwrap();
+        drop(journal);
+
+        TaskJournal::compact_finished(dir.path(), "task", "completed-verified").unwrap();
+
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("task/summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary["task_id"], json!("task"));
+        assert_eq!(summary["final_state"], json!("completed-verified"));
+        assert_eq!(summary["task"]["state"], json!("completed-verified"));
+        assert_eq!(summary["task"]["goal"], json!("soak"));
     }
 }

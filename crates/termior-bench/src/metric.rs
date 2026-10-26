@@ -46,6 +46,9 @@ pub enum MetricKind {
     /// Agent 任务日志的重放耗时：重启时重建任务状态要读的日志量，单位毫秒。
     #[serde(rename = "agent_io_replay_ms")]
     AgentIoReplayMs,
+    /// 一轮自动化运行留下的磁盘增量（每个周期）：长期运行必须保持平坦，单位字节。
+    #[serde(rename = "residual_bytes_per_cycle")]
+    ResidualBytesPerCycle,
 }
 
 impl MetricKind {
@@ -60,7 +63,8 @@ impl MetricKind {
             | MetricKind::RepoMapIncrementalMs
             | MetricKind::AgentIoBurstMs
             | MetricKind::AgentIoCriticalMs
-            | MetricKind::AgentIoReplayMs => true,
+            | MetricKind::AgentIoReplayMs
+            | MetricKind::ResidualBytesPerCycle => true,
             MetricKind::Fps | MetricKind::PtyThroughputMiBps => false,
         }
     }
@@ -79,6 +83,7 @@ impl MetricKind {
             MetricKind::RssMiB => "MiB",
             MetricKind::Fps => "fps",
             MetricKind::PtyThroughputMiBps => "MiB/s",
+            MetricKind::ResidualBytesPerCycle => "B/cycle",
         }
     }
 }

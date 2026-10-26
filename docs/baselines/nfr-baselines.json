@@ -189,6 +189,27 @@
       "scenario": "journal_replay",
       "value": 30.0,
       "threshold_percent": 100.0
+    },
+    {
+      "kind": "residual_bytes_per_cycle",
+      "platform": "linux",
+      "scenario": "automation_cycle",
+      "value": 2500.0,
+      "threshold_percent": 100.0
+    },
+    {
+      "kind": "residual_bytes_per_cycle",
+      "platform": "macos",
+      "scenario": "automation_cycle",
+      "value": 2500.0,
+      "threshold_percent": 100.0
+    },
+    {
+      "kind": "residual_bytes_per_cycle",
+      "platform": "windows",
+      "scenario": "automation_cycle",
+      "value": 2500.0,
+      "threshold_percent": 100.0
     }
   ]
 }

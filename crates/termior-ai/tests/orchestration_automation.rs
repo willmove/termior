@@ -514,6 +514,120 @@ fn repo_event_storm_is_deduplicated_and_coalesced() {
     assert_eq!(coalesced.status, RunStatus::Coalesced);
 }
 
+/// The dedupe map is a window, not a history.
+///
+/// A host that runs an automation on a schedule would otherwise keep one entry per
+/// occurrence forever, and the automation store — which is rewritten on every run —
+/// would grow without bound.
+#[test]
+fn the_dedupe_map_is_bounded() {
+    let auto = automation(CatchUpPolicy::Skip);
+    let mut engine = AutomationEngine::default();
+    for occurrence in 0..5_000u64 {
+        engine.trigger(
+            &auto,
+            occurrence,
+            format!("occurrence-{occurrence}"),
+            occurrence,
+        );
+    }
+    assert!(
+        engine.dedupe_entries() <= 2_000,
+        "the dedupe map grew to {} entries",
+        engine.dedupe_entries()
+    );
+}
+
+/// A key that falls out of the window is forgotten, so it is no longer a duplicate.
+#[test]
+fn a_dedupe_key_outside_the_window_is_forgotten() {
+    let auto = automation(CatchUpPolicy::Skip);
+    let mut engine = AutomationEngine::default();
+    let first = engine.trigger(&auto, 0, "same".into(), 0);
+    assert_eq!(first.status, RunStatus::Queued);
+    let inside = engine.trigger(&auto, 1, "same".into(), 1);
+    assert_eq!(inside.status, RunStatus::Duplicate);
+    // An hour later the window has moved past the key, which was last seen at 1.
+    let outside = engine.trigger(&auto, 2, "same".into(), 3_600_001);
+    assert_eq!(outside.status, RunStatus::Queued);
+}
+
+/// The automation store is bounded: the finished run rows fall out of the recent
+/// window instead of accumulating.
+#[test]
+fn the_automation_store_keeps_only_the_recent_finished_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = AutomationManager::load(dir.path()).unwrap();
+    manager.upsert(automation(CatchUpPolicy::Skip)).unwrap();
+    for cycle in 0..600u64 {
+        let run = manager.trigger_manual("daily", cycle).unwrap();
+        manager
+            .complete_run(
+                &run.run_id,
+                ExecutionOutcome::Completed {
+                    detail: "soak".into(),
+                },
+                cycle,
+            )
+            .unwrap();
+    }
+    assert!(
+        manager.store.recent_runs.len() <= 500,
+        "the run rows grew to {}",
+        manager.store.recent_runs.len()
+    );
+    // The store that is written to disk stays bounded too.
+    let bytes = std::fs::metadata(dir.path().join("automations.json"))
+        .unwrap()
+        .len();
+    assert!(
+        bytes < 2_000_000,
+        "the automation store grew to {bytes} bytes"
+    );
+}
+
+/// The audit trail of a dropped run goes with it.
+#[test]
+fn the_audit_trail_of_a_dropped_run_goes_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut manager = AutomationManager::load(dir.path()).unwrap();
+    manager.upsert(automation(CatchUpPolicy::Skip)).unwrap();
+    let mut dropped = Vec::new();
+    for cycle in 0..600u64 {
+        let run = manager.trigger_manual("daily", cycle).unwrap();
+        manager
+            .complete_run(
+                &run.run_id,
+                ExecutionOutcome::Completed {
+                    detail: "soak".into(),
+                },
+                cycle,
+            )
+            .unwrap();
+        dropped.push(run.run_id);
+    }
+    let kept: std::collections::BTreeSet<String> = manager
+        .store
+        .recent_runs
+        .iter()
+        .map(|run| run.run_id.clone())
+        .collect();
+    let audited: std::collections::BTreeSet<String> = manager
+        .store
+        .audit
+        .iter()
+        .filter_map(|event| event.run_id.clone())
+        .collect();
+    for run_id in &dropped {
+        if !kept.contains(run_id) {
+            assert!(
+                !audited.contains(run_id),
+                "the audit trail of the dropped run {run_id} was kept"
+            );
+        }
+    }
+}
+
 #[test]
 fn automation_run_keeps_an_immutable_template_and_creates_its_own_journaled_task() {
     let dir = tempfile::tempdir().unwrap();

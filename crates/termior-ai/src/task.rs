@@ -7,6 +7,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const TASK_EVENT_SCHEMA_VERSION: u32 = 1;
 
+/// How many task summaries the index keeps.
+///
+/// The index is a convenience view, not the source of truth: the journal under
+/// `agent-tasks/<id>/events.jsonl` is. Capping the index keeps a long-running app from
+/// growing one file without bound, while the rows that still need attention (a task
+/// that can be resumed, or whose acceptance is unverified) are always kept.
+pub const TASK_SUMMARY_LIMIT: usize = 500;
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn new_id(prefix: &str) -> String {
@@ -295,6 +303,38 @@ impl TaskSummaryStore {
         } else {
             self.tasks.push(summary);
         }
+        self.trim();
+    }
+
+    /// Drop the oldest finished tasks so the index cannot grow without bound.
+    ///
+    /// A long-running app would otherwise keep one row per task forever. Tasks that
+    /// still need attention are kept: a task that is not in a terminal state can still
+    /// be resumed, and one whose acceptance is unverified is still actionable.
+    fn trim(&mut self) {
+        if self.tasks.len() <= TASK_SUMMARY_LIMIT {
+            return;
+        }
+        let mut keep: Vec<TaskSummary> = Vec::with_capacity(self.tasks.len());
+        let mut finished: Vec<TaskSummary> = Vec::new();
+        for task in std::mem::take(&mut self.tasks) {
+            if task.state.is_terminal()
+                && task.acceptance_report.completion_state() == TaskState::CompletedVerified
+            {
+                finished.push(task);
+            } else {
+                keep.push(task);
+            }
+        }
+        // The oldest finished tasks go first; the summary list is ordered by the
+        // order the tasks were recorded in.
+        let excess = keep
+            .len()
+            .saturating_add(finished.len())
+            .saturating_sub(TASK_SUMMARY_LIMIT);
+        finished.drain(..excess.min(finished.len()));
+        keep.extend(finished);
+        self.tasks = keep;
     }
 
     pub fn persist(&self, root: &std::path::Path) -> Result<PathBuf, std::io::Error> {
@@ -670,4 +710,88 @@ pub enum TaskCommand {
         cursor: u64,
     },
     Cancel,
+}
+
+#[cfg(test)]
+mod summary_store_tests {
+    use super::*;
+
+    fn summary(id: &str, state: TaskState) -> TaskSummary {
+        TaskSummary {
+            schema_version: TASK_EVENT_SCHEMA_VERSION,
+            id: TaskId(id.to_string()),
+            title: id.to_string(),
+            goal: id.to_string(),
+            project_dir: std::path::PathBuf::from("/project"),
+            backend_id: "builtin".into(),
+            environment_id: "direct".into(),
+            state,
+            acceptance_report: AcceptanceReport::new(Vec::new()),
+            updated_at_ms: now_ms(),
+            last_event_sequence: None,
+            legacy_session_id: None,
+        }
+    }
+
+    /// A verified acceptance report is what makes a finished task safe to drop.
+    fn verified_summary(id: &str) -> TaskSummary {
+        let mut summary = summary(id, TaskState::CompletedVerified);
+        summary.acceptance_report = AcceptanceReport::new(vec![AcceptanceCriterion {
+            id: "criterion-1".into(),
+            description: "the build passes".into(),
+            required: true,
+            command: None,
+        }]);
+        summary.acceptance_report.checks.push(AcceptanceCheck {
+            criterion_id: "criterion-1".into(),
+            status: AcceptanceStatus::Passed,
+            command: None,
+            exit_code: Some(0),
+            output_reference: None,
+            duration_ms: Some(1),
+        });
+        summary
+    }
+
+    /// The index is capped, so a long-running app does not grow it without bound.
+    #[test]
+    fn the_index_is_capped() {
+        let mut store = TaskSummaryStore::default();
+        for index in 0..(TASK_SUMMARY_LIMIT + 50) {
+            store.upsert(verified_summary(&format!("task-{index}")));
+        }
+        assert_eq!(store.tasks.len(), TASK_SUMMARY_LIMIT);
+        // The oldest verified task is the one that goes.
+        assert!(!store.tasks.iter().any(|task| task.id.0 == "task-0"));
+        assert!(!store.tasks.iter().any(|task| task.id.0 == "task-49"));
+        assert!(store.tasks.iter().any(|task| task.id.0 == "task-50"));
+    }
+
+    /// A task that is not finished, or whose acceptance is unverified, is still
+    /// actionable and is never dropped.
+    #[test]
+    fn an_actionable_task_is_never_dropped() {
+        let mut store = TaskSummaryStore::default();
+        store.upsert(summary("running", TaskState::Running));
+        store.upsert(summary("unverified", TaskState::CompletedUnverified));
+        store.upsert(summary("failed", TaskState::Failed));
+        for index in 0..(TASK_SUMMARY_LIMIT + 50) {
+            store.upsert(verified_summary(&format!("task-{index}")));
+        }
+        for id in ["running", "unverified", "failed"] {
+            assert!(
+                store.tasks.iter().any(|task| task.id.0 == id),
+                "the actionable task {id} was dropped"
+            );
+        }
+    }
+
+    /// The cap is not reached, so nothing is dropped.
+    #[test]
+    fn a_short_index_is_untouched() {
+        let mut store = TaskSummaryStore::default();
+        store.upsert(summary("running", TaskState::Running));
+        store.upsert(verified_summary("done"));
+        assert_eq!(store.tasks.len(), 2);
+    }
 }

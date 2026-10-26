@@ -398,3 +398,50 @@ jobs:
           name: nfr-agent-io-payload-${{ matrix.platform }}
           path: nfr-agent-io-payload.json
           if-no-files-found: ignore
+
+  residual:
+    name: Residual (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinin/rust-cache@v2
+        with:
+          workspaces: "."
+      - name: NFR residual gate (long-run resource residual)
+        shell: bash
+        run: |
+          cargo build -p termior-bench --release --bin nfr-residual --bin nfr-gate
+          # Several rounds against one shared data directory: the slope of what a
+          # long automation run leaves behind has to stay flat.
+          ./target/release/nfr-residual --cycles 40 --rounds 3 > nfr-residual-payload.json
+          cat nfr-residual-payload.json
+          for key in cycles residual_growth_bytes reclaimed_bytes residual_queued_runs; do
+            grep -q "\"${key}\":" nfr-residual-payload.json || { echo "nfr payload missing ${key}"; exit 1; }
+          done
+          ./target/release/nfr-gate --platform ${{ matrix.platform }} \
+            --payload nfr-residual-payload.json \
+            --baselines docs/baselines/nfr-baselines.json
+      - name: Upload residual payload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfr-residual-payload-${{ matrix.platform }}
+          path: nfr-residual-payload.json
+          if-no-files-found: ignore

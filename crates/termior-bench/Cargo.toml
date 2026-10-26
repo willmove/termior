@@ -53,3 +53,7 @@ path = "src/bin/nfr-context.rs"
 [[bin]]
 name = "nfr-agent-io"
 path = "src/bin/nfr-agent-io.rs"
+
+[[bin]]
+name = "nfr-residual"
+path = "src/bin/nfr-residual.rs"

@@ -102,6 +102,8 @@ pub struct CleanupReport {
     pub deleted: Vec<PathBuf>,
     pub preserved: Vec<PathBuf>,
     pub cancelled: bool,
+    /// Journals that were compacted instead of deleted.
+    pub compacted: Vec<PathBuf>,
 }
 
 /// Exclusive lease for one running Agent task.
@@ -226,6 +228,15 @@ impl RetentionManager {
         }
         let cutoff = now_ms.saturating_sub(self.policy.max_age_days.saturating_mul(DAY_MS));
         let mut remaining = report.before_bytes;
+        // A journal is the source of truth for recovery, so it is never deleted. A
+        // *finished* task's journal is compacted instead: the events are replaced by
+        // one summary record, so a long-running app does not accumulate every delta
+        // of every task forever.
+        remaining = remaining.saturating_sub(self.compact_finished_journals(
+            &root,
+            cutoff,
+            &mut report.compacted,
+        )?);
         let mut deletable: Vec<(u8, ScannedFile)> = files
             .into_iter()
             .filter_map(|file| {
@@ -277,6 +288,92 @@ impl RetentionManager {
         report.after_bytes = remaining;
         Ok(report)
     }
+
+    /// Compact the journals of finished tasks that are past the age cutoff.
+    ///
+    /// Returns how many bytes were given back. A task whose session is still open is
+    /// left alone, and a task that is not finished keeps its full journal.
+    fn compact_finished_journals(
+        &self,
+        root: &Path,
+        cutoff: u64,
+        compacted: &mut Vec<PathBuf>,
+    ) -> Result<u64, RetentionError> {
+        let mut freed: u64 = 0;
+        let tasks_root = root.join("agent-tasks");
+        // A custom root holds the task directories directly, while an application
+        // data directory keeps them under `agent-tasks`. Both layouts are in use.
+        for base in [tasks_root.clone(), root.to_path_buf()] {
+            freed = freed.saturating_add(self.compact_under(&base, cutoff, compacted)?);
+        }
+        Ok(freed)
+    }
+
+    /// Compact the finished journals under one directory of task folders.
+    fn compact_under(
+        &self,
+        base: &Path,
+        cutoff: u64,
+        compacted: &mut Vec<PathBuf>,
+    ) -> Result<u64, RetentionError> {
+        let mut freed: u64 = 0;
+        let Ok(entries) = std::fs::read_dir(base) else {
+            return Ok(0);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let task_id = entry.file_name().to_string_lossy().to_string();
+            let journal = path.join("events.jsonl");
+            let Ok(metadata) = std::fs::metadata(&journal) else {
+                continue;
+            };
+            let modified_ms = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            if modified_ms >= cutoff {
+                continue;
+            }
+            if task_in_use(base, &task_id) {
+                continue;
+            }
+            let Some(state) = finished_task_state(&path) else {
+                continue;
+            };
+            match crate::TaskJournal::compact_finished(base, &task_id, &state) {
+                Ok(report) if report.compacted => {
+                    freed = freed
+                        .saturating_add(report.before_bytes.saturating_sub(report.after_bytes));
+                    compacted.push(journal);
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        Ok(freed)
+    }
+}
+
+/// The terminal state of a task, read from its snapshot.
+///
+/// `None` means the task is not finished, or the snapshot is unreadable. An unreadable
+/// snapshot is treated as "not finished" so a damaged task keeps its journal.
+fn finished_task_state(task_dir: &Path) -> Option<String> {
+    let snapshot = std::fs::read_to_string(task_dir.join("snapshot.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&snapshot).ok()?;
+    let state = value.get("state")?.get("task")?.get("state")?.as_str()?;
+    const FINISHED: [&str; 4] = [
+        "completed-verified",
+        "completed-unverified",
+        "failed",
+        "cancelled",
+    ];
+    FINISHED.contains(&state).then(|| state.to_owned())
 }
 
 /// Measure Agent data under an application data directory.
@@ -692,6 +789,14 @@ mod tests {
         }
     }
 
+    /// A policy whose age cutoff is already past, so the compaction pass runs.
+    fn policy_compacting() -> RetentionPolicy {
+        RetentionPolicy {
+            max_age_days: 0,
+            max_disk_bytes: 32,
+        }
+    }
+
     fn backdate(path: &Path) {
         let file = OpenOptions::new().write(true).open(path).unwrap();
         file.set_modified(UNIX_EPOCH + Duration::from_secs(5))
@@ -823,6 +928,128 @@ mod tests {
             std::fs::read(root.join("old/events.jsonl")).unwrap(),
             b"old-journal"
         );
+        drop(lease);
+    }
+
+    /// A finished task's journal is compacted, not deleted.
+    ///
+    /// The journal is the source of truth for recovery, so it is never removed. But a
+    /// long-running app writes one journal per task, and each holds every delta of
+    /// every turn. The retention pass replaces the events of a *finished* task with
+    /// one summary record, which keeps the journal replayable while giving the space
+    /// back.
+    #[test]
+    fn a_finished_tasks_journal_is_compacted_and_still_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut journal = TaskJournal::create(root, "task-done").unwrap();
+        for index in 0..40 {
+            journal
+                .append(
+                    "output",
+                    json!({"blob": "x".repeat(200), "index": index}),
+                    true,
+                )
+                .unwrap();
+        }
+        journal
+            .write_snapshot(json!({"task": {"state": "completed-verified"}}))
+            .unwrap();
+        drop(journal);
+
+        let journal_path = root.join("task-done/events.jsonl");
+        let before = std::fs::metadata(&journal_path).unwrap().len();
+
+        let report = RetentionManager::new(root, policy_compacting())
+            .cleanup(u64::MAX, &AtomicBool::new(false))
+            .unwrap();
+
+        assert!(
+            report.compacted.contains(&journal_path),
+            "the finished journal was not compacted: {report:?}"
+        );
+        let after = std::fs::metadata(&journal_path).unwrap().len();
+        assert!(
+            after < before,
+            "the compaction must give space back: {before} then {after}"
+        );
+
+        // The compacted journal still replays, and the task still reads as finished.
+        let recovered = TaskJournal::recover(root, "task-done", &[]).unwrap();
+        assert_eq!(recovered.events.len(), 1, "{recovered:?}");
+        assert_eq!(recovered.events[0].kind, "task/compacted");
+        assert_eq!(
+            recovered.events[0].payload["final_state"],
+            json!("completed-verified")
+        );
+    }
+
+    /// A task that is not finished keeps its full journal.
+    #[test]
+    fn an_unfinished_tasks_journal_is_kept_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut journal = TaskJournal::create(root, "task-running").unwrap();
+        for index in 0..40 {
+            journal
+                .append(
+                    "output",
+                    json!({"blob": "x".repeat(200), "index": index}),
+                    true,
+                )
+                .unwrap();
+        }
+        journal
+            .write_snapshot(json!({"task": {"state": "running"}}))
+            .unwrap();
+        drop(journal);
+
+        let journal_path = root.join("task-running/events.jsonl");
+        let before = std::fs::read(&journal_path).unwrap();
+
+        let report = RetentionManager::new(root, policy_compacting())
+            .cleanup(u64::MAX, &AtomicBool::new(false))
+            .unwrap();
+
+        assert!(
+            !report.compacted.contains(&journal_path),
+            "an unfinished journal was compacted: {report:?}"
+        );
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before);
+        let recovered = TaskJournal::recover(root, "task-running", &[]).unwrap();
+        assert_eq!(recovered.events.len(), 40);
+    }
+
+    /// A session that is still open keeps its journal, even when the task looks
+    /// finished.
+    #[test]
+    fn an_in_use_session_keeps_its_journal_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let lease = SessionLease::acquire(root, "task-live").unwrap();
+        let mut journal = TaskJournal::create(root, "task-live").unwrap();
+        for index in 0..10 {
+            journal
+                .append(
+                    "output",
+                    json!({"blob": "x".repeat(200), "index": index}),
+                    true,
+                )
+                .unwrap();
+        }
+        journal
+            .write_snapshot(json!({"task": {"state": "completed-verified"}}))
+            .unwrap();
+        drop(journal);
+
+        let journal_path = root.join("task-live/events.jsonl");
+        let before = std::fs::read(&journal_path).unwrap();
+
+        RetentionManager::new(root, policy_compacting())
+            .cleanup(u64::MAX, &AtomicBool::new(false))
+            .unwrap();
+
+        assert_eq!(std::fs::read(&journal_path).unwrap(), before);
         drop(lease);
     }
 

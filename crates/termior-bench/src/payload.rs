@@ -203,6 +203,124 @@ pub enum NfrPayload {
     Run(RunPayload),
     ContextLatency(ContextLatencyPayload),
     AgentIo(AgentIoPayload),
+    Residual(ResidualPayload),
+}
+
+/// `nfr-residual`'s payload: what a long automation run leaves behind.
+///
+/// The gated metric is `bytes_per_cycle`: the residual per cycle has to stay flat, or
+/// a long run grows without bound.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResidualPayload {
+    /// Automation cycles driven in the round.
+    pub cycles: u64,
+    /// Cycles that ran to completion.
+    pub completed_cycles: u64,
+    /// Wall clock for the round (ms).
+    #[serde(default)]
+    pub elapsed_ms: f64,
+    /// Data directory size before the round.
+    #[serde(default)]
+    pub disk_before_bytes: u64,
+    /// Data directory size after the round.
+    #[serde(default)]
+    pub disk_after_bytes: u64,
+    /// How much the round grew the data directory.
+    #[serde(default)]
+    pub disk_growth_bytes: u64,
+    /// Data directory size after the retention pass.
+    #[serde(default)]
+    pub disk_after_cleanup_bytes: u64,
+    /// How much the data directory grew *after* the retention pass ran.
+    ///
+    /// This is the marginal cost of one more cycle in steady state: what a long run
+    /// would keep paying per cycle. The raw growth above is dominated by the fixed
+    /// per-task records a first run writes, which is not a leak.
+    #[serde(default)]
+    pub residual_growth_bytes: u64,
+    /// How much the retention pass gave back.
+    #[serde(default)]
+    pub reclaimed_bytes: u64,
+    /// Journal records before the round.
+    #[serde(default)]
+    pub journal_records_before: u64,
+    /// Journal records after the round.
+    #[serde(default)]
+    pub journal_records_after: u64,
+    /// Journal records after the retention pass.
+    #[serde(default)]
+    pub journal_records_after_cleanup: u64,
+    /// Runs still queued when the round ended.
+    #[serde(default)]
+    pub residual_queued_runs: u64,
+    /// Multi-round raw values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<ResidualPayload>,
+}
+
+impl ResidualPayload {
+    /// The residual per cycle: the slope a long run would follow.
+    pub fn bytes_per_cycle(&self) -> f64 {
+        if self.cycles == 0 {
+            return 0.0;
+        }
+        self.residual_growth_bytes as f64 / self.cycles as f64
+    }
+
+    /// The raw growth per cycle, before the retention pass. Kept for the report, but
+    /// not the gated metric: it measures the fixed per-task records, not a leak.
+    pub fn raw_bytes_per_cycle(&self) -> f64 {
+        if self.cycles == 0 {
+            return 0.0;
+        }
+        self.disk_growth_bytes as f64 / self.cycles as f64
+    }
+
+    pub fn median_of(runs: Vec<ResidualPayload>) -> ResidualPayload {
+        let pick =
+            |field: fn(&ResidualPayload) -> f64| median(runs.iter().map(field)).unwrap_or_default();
+        ResidualPayload {
+            cycles: runs.iter().map(|r| r.cycles).max().unwrap_or(0),
+            completed_cycles: runs.iter().map(|r| r.completed_cycles).max().unwrap_or(0),
+            elapsed_ms: pick(|r| r.elapsed_ms),
+            disk_before_bytes: runs.iter().map(|r| r.disk_before_bytes).min().unwrap_or(0),
+            disk_after_bytes: runs.iter().map(|r| r.disk_after_bytes).max().unwrap_or(0),
+            disk_growth_bytes: pick(|r| r.disk_growth_bytes as f64) as u64,
+            disk_after_cleanup_bytes: pick(|r| r.disk_after_cleanup_bytes as f64) as u64,
+            residual_growth_bytes: pick(|r| r.residual_growth_bytes as f64) as u64,
+            reclaimed_bytes: pick(|r| r.reclaimed_bytes as f64) as u64,
+            journal_records_before: runs
+                .iter()
+                .map(|r| r.journal_records_before)
+                .min()
+                .unwrap_or(0),
+            journal_records_after: runs
+                .iter()
+                .map(|r| r.journal_records_after)
+                .max()
+                .unwrap_or(0),
+            journal_records_after_cleanup: runs
+                .iter()
+                .map(|r| r.journal_records_after_cleanup)
+                .max()
+                .unwrap_or(0),
+            residual_queued_runs: runs
+                .iter()
+                .map(|r| r.residual_queued_runs)
+                .max()
+                .unwrap_or(0),
+            runs,
+        }
+    }
+
+    pub fn to_samples(&self, platform: &str) -> Vec<Sample> {
+        vec![Sample::new(
+            MetricKind::ResidualBytesPerCycle,
+            platform,
+            "automation_cycle",
+            self.bytes_per_cycle(),
+        )]
+    }
 }
 
 /// `nfr-agent-io`'s payload: the task journal write path.
@@ -314,6 +432,7 @@ impl HarnessReport {
                 NfrPayload::Run(r) => out.extend(r.to_samples(&self.platform, "typical")),
                 NfrPayload::ContextLatency(c) => out.extend(c.to_samples(&self.platform)),
                 NfrPayload::AgentIo(a) => out.extend(a.to_samples(&self.platform)),
+                NfrPayload::Residual(r) => out.extend(r.to_samples(&self.platform)),
             }
         }
         out

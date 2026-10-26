@@ -196,6 +196,25 @@ pub struct AutomationEngine {
     last_checked: BTreeMap<String, u64>,
 }
 
+/// How long a dedupe key is remembered.
+///
+/// The dedupe map has to be bounded, otherwise a host that runs an automation every
+/// minute keeps one entry per occurrence forever and the automation store grows
+/// without bound. An hour is long enough to catch a restart that replays the same
+/// occurrence, and short enough that the map stays small.
+const DEDUPE_WINDOW_MS: u64 = 3_600_000;
+
+/// How many dedupe keys are kept, whatever the window says.
+const DEDUPE_MAX_ENTRIES: usize = 2_000;
+
+/// How many finished runs are kept in the automation store.
+///
+/// A run row is kept so the management panel can show what happened recently. The
+/// task itself keeps the durable record — its journal and its summary — so dropping
+/// the run row does not lose the task (spec R11: the cleanup keeps the task summary
+/// and the verification conclusion).
+const RECENT_RUN_LIMIT: usize = 500;
+
 pub struct AutomationManager {
     data_root: PathBuf,
     pub store: AutomationStore,
@@ -391,10 +410,7 @@ impl AutomationManager {
         run.schedule_reason = schedule_reason.to_owned();
         self.push_run_audit(&run, trigger, schedule_reason);
         self.store.recent_runs.push(run);
-        if self.store.recent_runs.len() > 500 {
-            let remove = self.store.recent_runs.len() - 500;
-            self.store.recent_runs.drain(..remove);
-        }
+        self.trim_finished_history();
         self.store.persist(&self.data_root).map(|_| ())
     }
 
@@ -424,6 +440,50 @@ impl AutomationManager {
             let remove = self.store.audit.len() - 2_000;
             self.store.audit.drain(..remove);
         }
+    }
+
+    /// Drop the run rows and the audit entries of the finished runs that fell out of
+    /// the recent window.
+    ///
+    /// The automation store is rewritten on every run, so a host that runs an
+    /// automation every minute would otherwise grow one file without bound. What is
+    /// dropped here is the *bookkeeping*: the run row and the audit trail. The task
+    /// itself keeps its journal and its summary, so the task is not lost (spec R11).
+    fn trim_finished_history(&mut self) {
+        if self.store.recent_runs.len() <= RECENT_RUN_LIMIT {
+            return;
+        }
+        let mut finished: Vec<(usize, String)> = Vec::new();
+        for (index, run) in self.store.recent_runs.iter().enumerate() {
+            if matches!(
+                run.status,
+                RunStatus::Completed
+                    | RunStatus::Failed
+                    | RunStatus::Duplicate
+                    | RunStatus::Coalesced
+                    | RunStatus::Missed
+            ) {
+                finished.push((index, run.run_id.clone()));
+            }
+        }
+        let excess = self.store.recent_runs.len() - RECENT_RUN_LIMIT;
+        let dropped: Vec<String> = finished
+            .into_iter()
+            .take(excess)
+            .map(|(_, run_id)| run_id)
+            .collect();
+        if dropped.is_empty() {
+            return;
+        }
+        let dropped: std::collections::BTreeSet<String> = dropped.into_iter().collect();
+        self.store
+            .recent_runs
+            .retain(|run| !dropped.contains(&run.run_id));
+        // The audit rows of a dropped run are dropped with it.
+        self.store.audit.retain(|event| match &event.run_id {
+            Some(run_id) => !dropped.contains(run_id),
+            None => true,
+        });
     }
 
     /// While the app is running, create due schedule rows from the last poll.
@@ -819,6 +879,55 @@ fn local_schedule_times_for_trigger(automation: &Automation, from: u64, to: u64)
     }
 }
 impl AutomationEngine {
+    /// How many dedupe keys are remembered.
+    ///
+    /// The map is a window, not a history: a host that runs an automation on a
+    /// schedule would otherwise keep one entry per occurrence forever.
+    pub fn dedupe_entries(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// Remember a dedupe key, dropping the ones that fell out of the window.
+    ///
+    /// The map is a *window*, not a history: a key that is older than the window is
+    /// forgotten, and the oldest entries go when the map grows past its cap. A host
+    /// that runs an automation on a schedule would otherwise keep one entry per
+    /// occurrence forever.
+    fn remember(&mut self, key: String, now: u64) -> bool {
+        self.prune(now);
+        if self.seen.insert(key, now).is_some() {
+            return false;
+        }
+        while self.seen.len() > DEDUPE_MAX_ENTRIES {
+            let Some(oldest) = self
+                .seen
+                .iter()
+                .min_by_key(|(_, timestamp)| **timestamp)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.seen.remove(&oldest);
+        }
+        true
+    }
+
+    /// Forget the dedupe keys that fell out of the window.
+    fn prune(&mut self, now: u64) {
+        // A clock that has not moved past the window yet must not evict anything:
+        // `saturating_sub` would turn a small `now` into a cutoff of zero and throw
+        // every key away.
+        if now < DEDUPE_WINDOW_MS {
+            return;
+        }
+        let cutoff = now - DEDUPE_WINDOW_MS;
+        // A key that is *exactly* at the cutoff has been out of the window for the
+        // whole of it, so it goes too.
+        self.seen.retain(|_, timestamp| *timestamp > cutoff);
+        self.repo_windows
+            .retain(|_, timestamp| *timestamp > cutoff.saturating_sub(DEDUPE_WINDOW_MS));
+    }
+
     pub fn trigger(
         &mut self,
         automation: &Automation,
@@ -827,10 +936,7 @@ impl AutomationEngine {
         now: u64,
     ) -> AutomationRun {
         self.sequence += 1;
-        let duplicate = self.seen.contains_key(&dedupe_key);
-        if !duplicate {
-            self.seen.insert(dedupe_key.clone(), now);
-        }
+        let duplicate = !self.remember(dedupe_key.clone(), now);
         AutomationRun {
             run_id: format!("run-{}-{}", automation.id, self.sequence),
             task_id: format!("task-{}-{}", automation.id, self.sequence),
@@ -926,6 +1032,7 @@ impl AutomationEngine {
         } else {
             self.repo_windows.insert(window_key, now);
         }
+        self.prune(now);
         run
     }
 }
