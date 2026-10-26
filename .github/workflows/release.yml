@@ -75,8 +75,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
         if: matrix.platform != 'linux'
-        with:
-          workspaces: "."
       # ubuntu-latest is glibc 2.39 (and moving to a newer image). Linking the
       # published binary there makes cargo-deb emit libc6 (>= 2.39). Linux
       # artifacts are built in Ubuntu 20.04 so the binary and Depends stay on
