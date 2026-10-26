@@ -504,7 +504,9 @@ fn spawn_in_container(
     // SAFETY: the list is no longer needed by the child process.
     if created == 0 {
         return Err(AppContainerError::Spawn(format!(
-            "cannot start the sandboxed command: os error {}",
+            "cannot start the sandboxed command {:?} in {:?}: os error {}",
+            program,
+            cwd,
             std::io::Error::last_os_error()
         )));
     }
@@ -646,7 +648,9 @@ fn spawn_piped_in_container(
     };
     if created == 0 {
         return Err(AppContainerError::Spawn(format!(
-            "cannot start the sandboxed command: os error {}",
+            "cannot start the sandboxed command {:?} in {:?}: os error {}",
+            program,
+            cwd,
             std::io::Error::last_os_error()
         )));
     }

@@ -334,9 +334,9 @@ fn run_mode_unchecked(work: &Path, mode: &str, outside: &Path, pwned: &Path, tar
 
 fn spawn_payload(
     environment: &termior_agent_host::ExecutionEnvironment,
-    _work: &Path,
+    work: &Path,
 ) -> (ExitStatus, String, String) {
-    let exe = std::env::current_exe().unwrap();
+    let exe = payload_exe(work);
     let command = PlatformSandbox
         .wrap_command(
             environment,
@@ -371,6 +371,28 @@ fn spawn_payload(
     let stdout = stdout_thread.join().unwrap_or_default();
     let stderr = stderr_thread.join().unwrap_or_default();
     (status, stdout, stderr)
+}
+
+/// The payload binary, staged where the confined process can reach it.
+///
+/// The payload is the test binary itself, which normally sits in the build
+/// directory. A CI runner builds into a workspace whose ancestors grant access
+/// to the runner account alone, so a confined token cannot walk down to that
+/// directory even though the directory itself was granted: the image is there,
+/// but the path to it is closed. Copying the payload into the granted
+/// workspace puts it behind a path the container can already reach.
+#[cfg(windows)]
+fn payload_exe(work: &Path) -> std::path::PathBuf {
+    let source = std::env::current_exe().unwrap();
+    let staged = work.join("escape-payload.exe");
+    fs::copy(&source, &staged)
+        .unwrap_or_else(|error| panic!("cannot stage the payload next to the sandbox: {error}"));
+    staged
+}
+
+#[cfg(not(windows))]
+fn payload_exe(_work: &Path) -> std::path::PathBuf {
+    std::env::current_exe().unwrap()
 }
 
 fn exit_summary(status: &ExitStatus) -> String {
