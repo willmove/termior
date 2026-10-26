@@ -1,7 +1,7 @@
 ## 0. 阶段门禁
 
 - [ ] 0.1 确认 M7 已归档，内置与 Codex 后端通过相同 Task/Turn contract suite
-- [ ] 0.2 固定实现时采用的 Agent Skills、MCP 与 ACP 协议版本，重新核验安全/实验标记
+- [x] 0.2 固定实现时采用的 Agent Skills、MCP 与 ACP 协议版本，重新核验安全/实验标记
 
 ## 1. Context Item 与检查器
 
@@ -40,8 +40,8 @@
 - [x] 5.2 实现 stdio server 进程管理、初始化、tools/resources/prompts discovery 和连接隔离
 - [x] 5.3 实现 Streamable HTTP、授权发现、PKCE/resource binding、token refresh 和 keyring 存储
 - [x] 5.4 将 MCP tools 映射为 server-qualified ToolContract，接入 schema/审批/超时/输出/脱敏/审计
-- [ ] 5.5 处理 list-changed 通知、server 断开、同名工具和不可信描述；单 server 故障不拖垮任务
-- [ ] 5.6 建立恶意 fake MCP server 红队：工具投毒、超大输出、路径逃逸、token 泄漏和断线重连
+- [x] 5.5 处理 list-changed 通知、server 断开、同名工具和不可信描述；单 server 故障不拖垮任务
+- [x] 5.6 建立恶意 fake MCP server 红队：工具投毒、超大输出、路径逃逸、token 泄漏和断线重连
 
 ## 6. Hooks
 
@@ -56,15 +56,19 @@
 - [x] 7.2 映射 new/load session、prompt、cancel、permission request、tool event 到统一模型
 - [x] 7.3 实现 ACP client filesystem/terminal 回调时复用 Termior 授权与 TerminalService
 - [x] 7.4 以 fake ACP server 跑完整 contract suite，覆盖缺失 optional capabilities
-- [ ] 7.5 选择 Gemini CLI 或 OpenCode 做真实端到端 smoke，并记录另一后端未覆盖的功能差异
+- [x] 7.5 选择 Gemini CLI 或 OpenCode 做真实端到端 smoke，并记录另一后端未覆盖的功能差异
 
 ## 8. 验证与收尾
 
-- [ ] 8.1 运行长日志/长会话压缩、嵌套规则、repo map 失效、Skills 渐进加载、MCP 红队和 Hook 重校验场景
+- [x] 8.1 运行长日志/长会话压缩、嵌套规则、repo map 失效、Skills 渐进加载、MCP 红队和 Hook 重校验场景
 - [ ] 8.2 三个后端运行公共任务集，报告能力矩阵与不支持项
 - [ ] 8.3 运行相关 crate tests、三平台 smoke、clippy 与 NFR 体积/内存/上下文延迟门禁
 - [x] 8.4 更新用户文档：扩展来源、权限含义、凭据位置、故障诊断与卸载
 - [ ] 8.5 全部退出场景通过后记录偏差并严格验证本 change
+
+## 自动验收（2026-10-26）
+
+0.2、5.5、5.6、7.5、8.1 的快照、真实 OpenCode 只读 Turn 和自动/三平台 CI 证据见 [自动执行记录](../../../docs/process/agent-acceptance-2026-10-26.md)。7.5 只证明所选 OpenCode 的只读 smoke，未覆盖 Gemini CLI、批准写入/拒绝/取消或三个真实后端的公共任务质量；这些不被模拟结果替代。B 归档及其余退出门禁未满足前，本 change 保留。
 
 ## 实施核对（2026-09-30）
 

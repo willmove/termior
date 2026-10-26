@@ -654,7 +654,7 @@ impl ToolExecutor {
                 environment_id: self.environment_id.clone(),
                 cwd: cwd.display().to_string(),
                 shell: if cfg!(windows) {
-                    "cmd".into()
+                    shell_program(termior_terminal::pty::default_shell()).into()
                 } else {
                     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
                 },
@@ -919,9 +919,28 @@ impl RuntimeToolExecutor for ToolExecutor {
         if cancellation.is_cancelled() {
             return Err("tool call cancelled before execution".into());
         }
-        let output = self
-            .execute_inner(tool, normalized_arguments)
-            .map_err(|error| error.to_string())?;
+        let output = if matches!(tool, "run_command" | "shell_session_run") {
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| self.execute_inner(tool, normalized_arguments));
+                while !worker.is_finished() {
+                    if cancellation.is_cancelled() {
+                        self.cancel_active();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                worker.join().unwrap_or_else(|_| {
+                    Err(ToolError::Io("command execution worker panicked".into()))
+                })
+            })
+        } else {
+            self.execute_inner(tool, normalized_arguments)
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(_) if cancellation.is_cancelled() => "tool interrupted by cancellation".into(),
+            Err(error) => return Err(error.to_string()),
+        };
         if tool == "write_file" {
             let summary: EditProposalSummary =
                 serde_json::from_str(&output).map_err(|error| error.to_string())?;
@@ -1005,7 +1024,7 @@ impl RuntimeToolExecutor for ToolExecutor {
     }
 
     fn cancel_active(&self) -> bool {
-        let mut confirmed = self.terminal.kill_all();
+        let mut confirmed = self.terminal.kill_task(&self.task_owner());
         if let Ok(mut shell) = self.shell.lock() {
             shell.take();
         } else {

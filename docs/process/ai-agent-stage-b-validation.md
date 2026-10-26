@@ -13,7 +13,9 @@ cargo test -p termior-agent-host --test codex_smoke -- --ignored --nocapture
 
 前三条完全离线。它们验证输出游标与截断、超时不杀进程、PTY 控制权、窗格注册、进程树终止、JSON-RPC 分帧、乱序/未知事件、稳定协议映射和审批 ID。最后一条要求 `TERMIOR_CODEX_PATH` 或 PATH 中存在可运行的稳定 Codex CLI（`>=0.137.0, <1.0.0`），只作为真实握手 smoke，不发起模型 Turn；本机 `0.164.0` 已于 2026-10-26 通过。托管 runner 不提供这份 CLI，nightly 不运行它；手动步骤见 `docs/process/nightly-integration.md`。
 
-## 手工验证
+## 桌面复验（可由自动驱动执行）
+
+2026-10-26 已用隔离数据目录、本地 SSE fixture 和真实 GPUI 窗口代做长构建、后台服务、审批、REPL 接管/交还与审批中崩溃恢复，并补充真实进程取消、跨任务隔离与 owner 崩溃清理回归。复现、修复和覆盖边界见 [自动执行记录](agent-acceptance-2026-10-26.md)。这些操作不再要求维护者重复点击。真实 Codex 模型读取另被本机 Windows sandbox `CryptUnprotectData failed: 2148073483` 阻塞；版本范围放宽与握手通过不能代替该读取验收。
 
 1. 启动 Termior，打开一个测试项目和 Composer。
 2. 点击 Composer 底部的 Agent 选择器，直到显示 `Codex app-server`。这里不需要 Termior 模型 API key；状态应说明认证和模型由 Codex 管理。

@@ -20,7 +20,9 @@ cargo test -p termior-agent-host --test escape_suite
 
 Escape suite 在 Core 矩阵的 Ubuntu、macOS、Windows 上随 `cargo test` 运行。Linux 需要 `bwrap`（CI 安装 `bubblewrap`，并关闭 `kernel.apparmor_restrict_unprivileged_userns`，否则 `--unshare-net` 在配置 loopback 时会因缺少 `CAP_NET_ADMIN` 失败）。macOS 使用 `sandbox-exec`，profile 带上 dyld 启动所需的 `file-map-executable` 与 mach 基线允许项。任一逃逸成功都会让该作业失败。当前 Windows 没有经黑盒验证的文件/网络/凭据隔离，套件断言 `prepare` fail closed，并且不会启动 payload。
 
-## 手工验证
+## 桌面复验与已自动覆盖的场景
+
+2026-10-26 已读取三平台 Core 的真实 escape/fault 日志，并运行本机真实文件 checkpoint/worktree、journal 恢复及桌面审批中强退/重启。8.1 完成。非 PTY Windows 后台命令现也绑定 Job Object；真实 owner 进程被强制终止的回归验证无后台残留。该进程清理能力不代表文件、网络或凭据隔离。详见 [自动执行记录](agent-acceptance-2026-10-26.md)。
 
 1. 发起需要审批的文件修改，批准并进入 Diff 审阅。确认 `agent-tasks/<task-id>/events.jsonl` 与 `snapshot.json` 已存在。
 2. 应用 Diff。输出应包含 `checkpoint=checkpoint-...`，对应 manifest 位于 `agent-checkpoints/manifests/`。在文件仍等于 expected-after 时执行 restore plan 应恢复原内容；先手工修改文件时必须变成 `SkipConflict`。

@@ -770,15 +770,16 @@ impl ComposerView {
                 "items" => plan.entries.len()
             )
         });
-        // 第 2 行：动作工具栏。图标/短 chip + 弹性空白，Send 恒在最右不被裁掉。
-        div()
+        // Scroll controls in a narrow dock; keep Send/Stop outside this group.
+        let controls = div()
+            .id("composer-toolbar-controls")
             .flex()
             .flex_row()
+            .flex_1()
             .items_center()
             .gap_1()
-            .mx_3()
-            .mt_1()
-            .mb_2()
+            .h(px(32.0))
+            .overflow_x_scroll()
             .min_w(px(0.0))
             .child(
                 crate::ui::icon_button(
@@ -961,8 +962,19 @@ impl ComposerView {
                             }),
                         ),
                 )
-            })
-            .child(div().flex_1().min_w(px(0.0)))
+            });
+        div()
+            .debug_selector(|| "composer-toolbar".into())
+            .flex()
+            .flex_none()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .mx_3()
+            .mt_1()
+            .mb_2()
+            .min_w(px(0.0))
+            .child(controls)
             .child(
                 crate::ui::icon_button(
                     "composer-send",
@@ -978,6 +990,7 @@ impl ComposerView {
                     },
                     p,
                 )
+                .debug_selector(|| "composer-send".into())
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::send)),
             )
             .into_any_element()

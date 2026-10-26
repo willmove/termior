@@ -3,6 +3,28 @@ use std::io::Write;
 use termior_store::*;
 
 #[test]
+fn journal_redaction_preserves_generated_task_ids_and_their_recovery_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = "task-1a1773a9059-1";
+    let mut journal = TaskJournal::create(dir.path(), id).unwrap();
+    let payload = json!({"task_id": id, "ref": format!("agent-tasks/{id}/events.jsonl"), "secret": "sk-12345678901234567890"});
+    journal
+        .append("waiting-approval", payload.clone(), true)
+        .unwrap();
+    journal.write_snapshot(payload).unwrap();
+    drop(journal);
+    let recovered = TaskJournal::recover(dir.path(), id, &["waiting-approval"]).unwrap();
+    let snapshot = TaskJournal::load_snapshot(dir.path(), id).unwrap().unwrap();
+    assert_eq!(snapshot.state["task_id"], id);
+    assert_eq!(recovered.events[0].payload["task_id"], id);
+    assert_eq!(
+        snapshot.state["ref"],
+        format!("agent-tasks/{id}/events.jsonl")
+    );
+    assert_eq!(snapshot.state["secret"], "[REDACTED]");
+}
+
+#[test]
 fn journal_hash_chain_snapshot_and_tail_repair_are_deterministic() {
     let dir = tempfile::tempdir().unwrap();
     let mut journal = TaskJournal::create(dir.path(), "task-1").unwrap();

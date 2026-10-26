@@ -153,7 +153,7 @@ fn worktree_tools_rules_and_repo_map_cannot_touch_the_main_checkout() {
         "user-main\n"
     );
 
-    let pwd = if cfg!(windows) { "cd" } else { "pwd" };
+    let pwd = "pwd";
     let output = executor
         .execute_approved("run_command", &format!(r#"{{"command":"{pwd}"}}"#))
         .unwrap();

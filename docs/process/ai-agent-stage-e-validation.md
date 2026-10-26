@@ -30,7 +30,9 @@ cargo test -p termior-vcs --test worktree_environment
 
 最后一项是可重复的创建失败用例，不等于真实磁盘耗尽验收；真实磁盘不足与清理恢复仍属于 3.6 未完成部分。
 
-## 手工验证
+## 可自动复验的场景
+
+2026-10-26 的时钟与持久化重建测试已覆盖停机 catch-up、去重、不可变版本和不安全重试；无需用户真实等待每一种计划时间。真实后台进程还验证取消不影响另一 task，并补齐 Windows owner 崩溃清理。真实公共模型评测、磁盘耗尽和三平台长期 soak 仍保留，短 smoke 不冒充这些门禁。详见 [自动执行记录](agent-acceptance-2026-10-26.md)。
 
 1. 建立两个无依赖只读 child 和一个依赖二者的汇总 child。任务图中前两项应同时 Running，汇总项保持 Queued；任一前置失败时汇总应 Blocked。
 2. 把 global 或 provider concurrency 调为 1。第二项应显示对应 queue reason，第一项结束后才能运行。

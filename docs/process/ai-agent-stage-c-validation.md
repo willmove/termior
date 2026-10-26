@@ -8,13 +8,13 @@ Stage C 提供有来源的上下文计划、可重取的大输出、结构化压
 |---|---|---|
 | MCP | `2025-06-18`，见 `MCP_PROTOCOL_VERSION` | stdio 与 Streamable HTTP 均校验返回版本；fake server 和 HTTP fixture 覆盖初始化、discovery、调用 |
 | ACP | 整数 `1`，见 `ACP_PROTOCOL_VERSION` | 初始化拒绝缺失、null、字符串及其他数值版本；fixture 覆盖 initialize/session/prompt 与双向回调 |
-| Agent Skills | 本地 `SKILL.md` 支持子集 | `name`、`description`、`allowed-tools` 元数据、正文按需加载与资源路径约束；尚未固定上游格式快照，不声明全规范兼容 |
+| Agent Skills | [上游格式快照 217be548](https://github.com/agentskills/agentskills/blob/217be548739f21d6008915c29aefe320ea1a90af/docs/specification.mdx) 的实现子集 | 元数据、正文按需加载与资源路径约束；本地 allowed-tools 为逗号分隔，上游为空格分隔且 Experimental。不声明全规范兼容，不将此字段解释为自动批准 |
 
-协议版本不等于真实 Agent 产品版本。Gemini CLI/OpenCode 的确切版本、认证、可选能力与公共任务集结果仍需真实后端验收；Stage C 0.2、7.5、8.2 保持未完成。ACP 没声明的能力不当成已验证支持，实验方法不从版本号推导开启。
+协议版本不等于真实 Agent 产品版本。2026-10-26 已固定格式快照，并通过 OpenCode 1.19.4 的真实只读模型 Turn，完成 0.2 与 7.5；三个后端公共任务集 8.2 仍未完成。ACP 没声明的能力不当成已验证支持，实验方法不从版本号推导开启。快照校验值、能力差异与完整记录见 [自动验收](agent-acceptance-2026-10-26.md)。
 
 使用说明见 [Agent 扩展、恢复与本地自动化](../user/agent-runtime.md)。
 
-2026-10-26，本机重装后的 OpenCode 1.19.4 已通过真实 ACP 初始化和会话创建，启动问题已解除。可用 `cargo test -p termior-agent-host --test opencode_smoke -- --ignored --nocapture` 复验，Windows 原生程序路径配置见 [集成测试说明](nightly-integration.md)。该 smoke 不发送模型 Turn，7.5 的真实端到端任务仍待验收。
+2026-10-26，本机重装后的 OpenCode 1.19.4 已通过真实 ACP 初始化、会话创建及模型读取文件，返回未包含在提示词中的随机内容并正常 end_turn。握手可用 `opencode_smoke` 复验；模型测试使用 `installed_backend_acceptance`，启用方法见 [自动验收](agent-acceptance-2026-10-26.md)。Gemini CLI、批准写入/拒绝/取消及跨后端质量比较尚未由只读 smoke 覆盖。
 
 ## 自动化验证
 

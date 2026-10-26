@@ -20,6 +20,8 @@ use crate::{PtySessionConfig, TerminalBridge, WriterHandle};
 struct ProcessHandle {
     child: Mutex<Child>,
     stdin: Mutex<Option<ChildStdin>>,
+    #[cfg(windows)]
+    _job: Option<crate::pty::WindowsJob>,
 }
 
 struct PtyHandle {
@@ -123,6 +125,27 @@ impl LocalTerminalService {
         all_stopped
     }
 
+    /// Cancel only processes created by this task. User panes and other tasks
+    /// share the service and must survive cancellation in a different project.
+    pub fn kill_task(&self, task_id: &str) -> bool {
+        let mut all_stopped = true;
+        for session in self.state.sessions() {
+            if !matches!(&session.owner, crate::CommandOwner::Task(owner) if owner == task_id)
+                || session.state.is_terminal()
+            {
+                continue;
+            }
+            all_stopped &= self.kill(&session.id).is_ok()
+                && self.state.session(&session.id).is_ok_and(|session| {
+                    matches!(
+                        session.state,
+                        CommandState::Exited | CommandState::Terminated
+                    )
+                });
+        }
+        all_stopped
+    }
+
     /// 某任务拥有或当前控制的命令会话摘要（不含已释放会话），按启动时间排序。
     pub fn task_digests(&self, task_id: &str, tail_bytes: usize) -> Vec<CommandDigest> {
         self.state
@@ -178,6 +201,17 @@ impl TerminalService for LocalTerminalService {
         let mut child = command
             .spawn()
             .map_err(|error| TerminalServiceError::Io(error.to_string()))?;
+        #[cfg(windows)]
+        let job = match crate::pty::WindowsJob::for_process(child.id()) {
+            Ok(job) => Some(job),
+            // A fast command can finish before job assignment; retain its exit evidence.
+            Err(_) if child.try_wait().ok().flatten().is_some() => None,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(TerminalServiceError::Io(error.to_string()));
+            }
+        };
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdin = child.stdin.take();
@@ -191,6 +225,8 @@ impl TerminalService for LocalTerminalService {
         let handle = Arc::new(ProcessHandle {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
+            #[cfg(windows)]
+            _job: job,
         });
         self.processes
             .lock()

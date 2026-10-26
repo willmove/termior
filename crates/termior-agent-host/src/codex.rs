@@ -291,15 +291,24 @@ impl AgentBackend for CodexBackend {
     }
 
     fn next_event(&mut self, timeout: Duration) -> Result<Option<BackendEvent>, BackendError> {
-        let event = self
-            .transport()
-            .and_then(|transport| transport.next_event(timeout))?
-            .as_ref()
-            .map(map_codex_message);
-        if let Some(event) = &event {
-            self.track_pending_permissions(event);
+        let Some(raw) = self.transport()?.next_event(timeout)? else {
+            return Ok(None);
+        };
+        let event = map_codex_message(&raw);
+        if raw.get("method").is_some()
+            && raw.get("id").is_some_and(|id| !id.is_null())
+            && !matches!(&event, BackendEvent::ApprovalRequested { .. })
+        {
+            // Unknown notifications remain diagnostics. Requests also require a reply:
+            // leaving an MCP elicitation unanswered stalls the backend indefinitely.
+            self.transport()?.respond_error(
+                raw["id"].clone(),
+                -32601,
+                "Termior does not support this server request",
+            )?;
         }
-        Ok(event)
+        self.track_pending_permissions(&event);
+        Ok(Some(event))
     }
 
     fn respond(&mut self, decision: BackendDecision) -> Result<(), BackendError> {
@@ -577,6 +586,50 @@ fn string_at(value: &Value, path: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_server_request_is_rejected_without_hanging_the_turn() {
+        #[cfg(windows)]
+        let (program, args) = (
+            "pwsh",
+            vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), r#"
+                Write-Output '{"jsonrpc":"2.0","id":17,"method":"mcpServer/elicitation/request","params":{}}'
+                $reply = [Console]::ReadLine() | ConvertFrom-Json
+                $status = if ($reply.id -eq 17 -and $reply.error.code -eq -32601) { 'completed' } else { 'failed' }
+                @{jsonrpc='2.0';method='turn/completed';params=@{threadId='fixture';turn=@{id='turn';status=$status}}} | ConvertTo-Json -Depth 5 -Compress
+            "#.into()],
+        );
+        #[cfg(not(windows))]
+        let (program, args) = (
+            "sh",
+            vec!["-c".into(), r#"
+                echo '{"jsonrpc":"2.0","id":17,"method":"mcpServer/elicitation/request","params":{}}'
+                read -r reply
+                case "$reply" in *'"code":-32601'*) status=completed;; *) status=failed;; esac
+                echo "{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"threadId\":\"fixture\",\"turn\":{\"id\":\"turn\",\"status\":\"$status\"}}}"
+            "#.into()],
+        );
+        let mut backend = CodexBackend::new("fixture");
+        backend.transport = Some(
+            StdioTransport::spawn(&TransportCommand {
+                program: program.into(),
+                args,
+            })
+            .unwrap(),
+        );
+        assert!(matches!(
+            backend.next_event(Duration::from_secs(5)).unwrap(),
+            Some(BackendEvent::Diagnostic { .. })
+        ));
+        assert!(
+            matches!(
+                backend.next_event(Duration::from_secs(5)).unwrap(),
+                Some(BackendEvent::TurnCompleted { success: true, .. })
+            ),
+            "unhandled requests must receive a JSON-RPC error so the server can finish the turn"
+        );
+        backend.shutdown(Duration::from_secs(1)).unwrap();
+    }
 
     fn permissions_request(scope: &str) -> Value {
         permissions_request_with(scope, json!({"network":{"enabled":true}}))

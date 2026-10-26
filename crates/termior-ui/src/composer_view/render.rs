@@ -222,7 +222,11 @@ impl gpui::Render for ComposerView {
                             .h(px(COMPOSER_HEADER_HEIGHT))
                             .child(
                                 div()
+                                    .id("composer-header-chips")
                                     .flex()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_x_scroll()
                                     .items_center()
                                     .gap_1()
                                     .child(
@@ -443,6 +447,7 @@ impl gpui::Render for ComposerView {
                                 div()
                                     .flex()
                                     .flex_row()
+                                    .flex_none()
                                     .items_center()
                                     .gap_1()
                                     .child(
@@ -452,6 +457,7 @@ impl gpui::Render for ComposerView {
                                             t!(self.dock.toggle_label_key()),
                                             &p,
                                         )
+                                        .debug_selector(|| "composer-dock".into())
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(|_, _, _, cx| {

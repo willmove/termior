@@ -63,11 +63,15 @@
 
 ## 8. 验证与收尾
 
-- [ ] 8.1 运行 journal fault injection、checkpoint 冲突、worktree 初始化/合入/清理和三平台 escape suite
+- [x] 8.1 运行 journal fault injection、checkpoint 冲突、worktree 初始化/合入/清理和三平台 escape suite
 - [x] 8.2 对 direct/worktree/sandboxed 与外部后端生成用户可见 capability matrix
 - [ ] 8.3 运行相关 crate tests、三平台 smoke、clippy、存储迁移和 NFR IO/启动/体积回归
 - [x] 8.4 更新安全文档，准确说明审批、worktree、sandbox、checkpoint 与远程副作用边界
 - [ ] 8.5 全部退出场景通过后记录偏差并严格验证本 change
+
+## 自动验收（2026-10-26）
+
+8.1 的关键事件 fault、真实进程退出、checkpoint 冲突、worktree 生命周期及三平台 escape suite 均有执行证据，见 [自动执行记录](../../../docs/process/agent-acceptance-2026-10-26.md)。Windows 新增的后台命令 Job Object 只解决进程清理，不将文件/网络/凭据改报 supported；0.x、6.2 及其余退出门禁仍保留。
 
 ## 实施核对（2026-09-30，1.6 / 6.6 于 2026-10-18 补齐）
 

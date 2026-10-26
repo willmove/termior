@@ -12,6 +12,52 @@ fn draw(vcx: &mut gpui::VisualTestContext) {
     });
 }
 
+struct NarrowComposer {
+    composer: gpui::Entity<ComposerView>,
+}
+
+impl gpui::Render for NarrowComposer {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .debug_selector(|| "narrow-composer".into())
+            .w(px(420.0))
+            .h(px(700.0))
+            .child(self.composer.clone())
+    }
+}
+
+#[test]
+fn right_docked_composer_keeps_stop_and_dock_controls_inside_its_bounds() {
+    let mut cx = TestAppContext::single();
+    let (host, vcx) = cx.add_window_view(|_, cx| NarrowComposer {
+        composer: cx.new(ComposerView::new),
+    });
+    let composer = host.update(vcx, |host, _| host.composer.clone());
+    composer.update(vcx, |view, _| {
+        view.dock = ComposerDock::Right;
+        view.orchestrator.busy = true;
+        view.history.push(Message::user("acceptance"));
+        view.last_context_plan = Some(ContextPlan {
+            hard_limit: 1000,
+            total_tokens: 128,
+            entries: Vec::new(),
+        });
+    });
+    draw(vcx);
+    let frame = vcx.debug_bounds("narrow-composer").unwrap();
+    assert!(
+        vcx.debug_bounds("composer-toolbar").unwrap().size.height <= px(40.0),
+        "narrow controls must not consume the conversation's height"
+    );
+    for id in ["composer-send", "composer-dock"] {
+        let bounds = vcx.debug_bounds(id).unwrap();
+        assert!(
+            bounds.right() <= frame.right() && bounds.left() >= frame.left(),
+            "{id} is clipped in a right-docked composer: frame={frame:?}, control={bounds:?}"
+        );
+    }
+}
+
 /// 真实布局下拖选跨越用户消息与 Agent 回复的多个段落，复制得到原文。
 #[test]
 fn dragging_over_messages_selects_and_copies_text() {

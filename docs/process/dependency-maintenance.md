@@ -31,3 +31,7 @@ Rust 固定在 `rust-toolchain.toml` 的 1.98.1；升级时同时更新 `clippy.
 升级前，cargo-deny 0.20.2 的 Windows 依赖图检查已报告许可失败：`gpui_shared_string`、`gpui_util` 缺少许可字段/可识别声明，`libbz2-rs-sys` 的 `bzip2-1.0.6` 不在允许列表，`zlog`、`ztracing`、`ztracing_macro` 声明 GPL-3.0-or-later。不能仅靠加入 GPL 或忽略未许可 crate 来宣称 MIT 项目的许可门禁通过；需要维护者核实授权或调整依赖。
 
 完整跨平台图还需要下载当前机器未缓存的 Linux/macOS crate。本次 Windows 检查不能替代三平台完整检查；升级后的实际结果见 [issue 核对记录](github-issue-review-2026-10-26.md)。
+
+### CI 验收与跟踪项
+
+提交 `c06f079` 的 [CI](https://github.com/willmove/termior/actions/runs/40288463484) 三平台 Core/Desktop/Context latency、体积与 NFR 回归全部通过。[Audit](https://github.com/willmove/termior/actions/runs/40288463499) 也通过；其既有范围排除了 `termior`、`termior-ui`、`termior-ui-kit`，不能据此声称完整桌面图许可通过。完整图的既有失败保留在 [#64](https://github.com/willmove/termior/issues/64)，由维护者核实授权或替换，不变更 deny 策略以掩盖失败。

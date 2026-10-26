@@ -35,6 +35,16 @@ impl StreamingRedactor {
             let mut offset = 0;
             while let Some(relative) = text[offset..].find(prefix) {
                 let start = offset + relative;
+                // API-key prefixes start a token. Matching inside identifiers such as
+                // `task-<timestamp>` corrupts task IDs and journal recovery references.
+                if text[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                {
+                    offset = start + prefix.len();
+                    continue;
+                }
                 let end = text[start..]
                     .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';'))
                     .map(|length| start + length)

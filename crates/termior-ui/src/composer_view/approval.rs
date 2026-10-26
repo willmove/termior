@@ -448,7 +448,13 @@ impl ComposerView {
             .orchestrator
             .active_task
             .as_ref()
-            .is_some_and(|runtime| runtime.task().state == TaskState::WaitingUser)
+            .is_some_and(|runtime| {
+                runtime.task().state == TaskState::WaitingUser
+                    && matches!(
+                        runtime.task().waiting_reason,
+                        Some(WaitingReason::BudgetExhausted { .. })
+                    )
+            })
             .then(|| {
                 div()
                     .mx_3()

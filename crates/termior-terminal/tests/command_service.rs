@@ -1,5 +1,78 @@
 use std::time::Duration;
 
+#[cfg(windows)]
+#[test]
+fn owner_process_crash_does_not_leave_a_background_command_alive() {
+    const ROOT_ENV: &str = "TERMIOR_COMMAND_CRASH_ROOT";
+    if let Some(root) = std::env::var_os(ROOT_ENV) {
+        let service = LocalTerminalService::new(64 * 1024);
+        let mut launch = request("pwsh -NoProfile -File background.ps1");
+        launch.shell = "pwsh".into();
+        launch.project_dir = std::path::PathBuf::from(&root).display().to_string();
+        launch.cwd = launch.project_dir.clone();
+        service.create(launch).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("background.ps1"),
+        "Set-Content background.pid $PID\nStart-Sleep -Seconds 60\n",
+    )
+    .unwrap();
+    let mut owner = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "owner_process_crash_does_not_leave_a_background_command_alive",
+        ])
+        .env(ROOT_ENV, dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let child_pid = loop {
+        if let Some(pid) = std::fs::read_to_string(dir.path().join("background.pid"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        if std::time::Instant::now() >= ready_deadline {
+            let _ = owner.kill();
+            let _ = owner.wait();
+            panic!("background command did not publish its PID");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let survived = loop {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {child_pid}"), "/NH"])
+            .output()
+            .unwrap();
+        let alive = String::from_utf8_lossy(&output.stdout).contains(&child_pid.to_string());
+        if !alive {
+            break false;
+        }
+        if std::time::Instant::now() >= deadline {
+            break true;
+        }
+    };
+    if survived {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child_pid.to_string(), "/T", "/F"])
+            .output();
+    }
+    assert!(
+        !survived,
+        "background process {child_pid} survived a real owner-process crash"
+    );
+}
+
 use termior_terminal::PtySessionConfig;
 use termior_terminal::{
     CommandCreate, CommandOwner, CommandState, Controller, LocalTerminalService, TerminalBridge,

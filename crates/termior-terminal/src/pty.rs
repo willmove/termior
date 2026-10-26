@@ -299,11 +299,11 @@ fn conpty_spawn_lock() -> &'static Mutex<()> {
 }
 
 #[cfg(windows)]
-struct WindowsJob(isize);
+pub(super) struct WindowsJob(isize);
 
 #[cfg(windows)]
 impl WindowsJob {
-    fn for_process(pid: u32) -> Result<Self, SpawnError> {
+    pub(super) fn for_process(pid: u32) -> Result<Self, SpawnError> {
         use std::mem::{size_of, zeroed};
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
         use windows_sys::Win32::System::JobObjects::{
