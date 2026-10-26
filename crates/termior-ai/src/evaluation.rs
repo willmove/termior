@@ -147,12 +147,16 @@ impl OrchestrationMetrics {
     }
 
     /// Returns true only when the candidate preserves completion and verification while reducing
-    /// wall time without increasing conflicts or duplicate effects.
+    /// wall time without increasing conflicts, duplicate effects, or human intervention.
+    ///
+    /// A candidate that only looks better because it offloaded work onto the user is not an
+    /// improvement, so the human intervention count is part of the comparison.
     pub fn improves_on(&self, baseline: &Self) -> bool {
         self.completion_rate() >= baseline.completion_rate()
             && self.verified_count >= baseline.verified_count
             && self.wall_clock_ms < baseline.wall_clock_ms
             && self.conflict_count <= baseline.conflict_count
             && self.duplicate_side_effect_count <= baseline.duplicate_side_effect_count
+            && self.human_intervention_count <= baseline.human_intervention_count
     }
 }

@@ -1,8 +1,8 @@
 ## 0. 阶段门禁与 prototype
 
 - [ ] 0.1 确认 M8 已归档，上下文/扩展/三个后端公共评测通过
-- [ ] 0.2 分别为 Windows、macOS、Linux 做 sandbox capability prototype，记录可实现矩阵、依赖、权限和已知缺口
-- [ ] 0.3 根据 prototype 更新本 design；任何无法验证的能力保持 unsupported
+- [x] 0.2 分别为 Windows、macOS、Linux 做 sandbox capability prototype，记录可实现矩阵、依赖、权限和已知缺口
+- [x] 0.3 根据 prototype 更新本 design；任何无法验证的能力保持 unsupported
 
 ## 1. 任务 Journal 与 Reducer
 
@@ -48,7 +48,7 @@
 ## 6. 平台 Sandbox
 
 - [x] 6.1 定义 `SandboxBackend` 纯接口和 fake backend contract suite
-- [ ] 6.2 实现 Windows backend：受限身份/文件 ACL 或经 prototype 选定机制、网络策略、Job Object 进程树和 cleanup
+- [x] 6.2 实现 Windows backend：受限身份/文件 ACL 或经 prototype 选定机制、网络策略、Job Object 进程树和 cleanup
 - [x] 6.3 实现 macOS backend：经 prototype 选定的原生机制、目录/network/credential/process 限制和 cleanup
 - [x] 6.4 实现 Linux backend：经 prototype 选定的 namespace/seccomp/文件/network/process 组合和 capability probe
 - [x] 6.5 所有 backend 在 prepare 后运行 capability probe；required 不满足则 fail closed
@@ -72,6 +72,16 @@
 ## 自动验收（2026-10-26）
 
 8.1 的关键事件 fault、真实进程退出、checkpoint 冲突、worktree 生命周期及三平台 escape suite 均有执行证据，见 [自动执行记录](../../../docs/process/agent-acceptance-2026-10-26.md)。Windows 新增的后台命令 Job Object 只解决进程清理，不将文件/网络/凭据改报 supported；0.x、6.2 及其余退出门禁仍保留。
+
+## Windows sandbox backend（2026-10-26）
+
+0.2、0.3 与 6.2 已实现，Windows 不再只报告进程树。受限身份用 Windows AppContainer（`TermiorSandbox` profile）：文件系统按目录写 ACL 授权，进程以 `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` 启动且拿不到任何网络 capability，因此网络是被拒绝而不是未测量；进程树由 `KILL_ON_JOB_CLOSE` 的 Job Object 收口；环境变量从短白名单重建，父进程的凭据不进入沙箱。
+
+证据：`crates/termior-terminal/tests/windows_appcontainer.rs` 直接调用真实 Windows API，证明受限进程能读授权目录、读不到同级目录、写不到授权目录之外、连不上回环监听、不继承父环境、管道输出与退出码正常、授权失败会报错。`crates/termior-agent-host/tests/escape_suite.rs` 的九项逃逸场景（父目录、符号链接、硬链接、回环/内网/公网、env secret、子进程、孤儿进程）在 Windows 上真实跑完并全部被挡住。
+
+三个 Windows 特有的坑记录在代码注释里：环境块缺少 `LOCALAPPDATA` 时 `CreateProcessW` 以 203 失败；ACL 的 ACE 头是 4 字节而不是 8 字节，否则 `SetNamedSecurityInfoW` 报 0x538；`UpdateProcThreadAttribute` 的第二个参数是 flags 而不是下标，传 1 会被当成 flags 拒绝。
+
+`C:\Windows` 由 TrustedInstaller 持有，普通用户无法追加 ACL，因此沙箱不显式授权系统目录；实测受限进程本来就能读取 `cmd.exe` 等系统二进制。
 
 ## 实施核对（2026-09-30，1.6 / 6.6 于 2026-10-18 补齐）
 

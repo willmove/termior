@@ -180,8 +180,8 @@ mod tests {
 
     #[test]
     fn a_backslash_before_a_quote_is_escaped() {
-        assert_eq!(quote_argument("a\\"), "\"a\\\\\"");
-        assert_eq!(quote_argument("a\\\"b"), "\"a\\\"\"b\"");
+        assert_eq!(quote_argument("a\\"), "a\\");
+        assert_eq!(quote_argument("a\\\"b"), "\"a\\\\\\\"b\"");
     }
 
     #[test]
@@ -189,7 +189,68 @@ mod tests {
         let program = PathBuf::from(r"C:\Windows\System32\cmd.exe");
         assert_eq!(
             build_command_line(&program, &["/c".into()]),
-            "\"[C:\\Windows\\System32\\cmd.exe]\" /c"
+            "C:\\Windows\\System32\\cmd.exe /c"
         );
+    }
+
+    /// The quoting must match what Windows itself parses. `CommandLineToArgvW` is the
+    /// parser `CreateProcessW` and every shell use, so a round trip through it is the
+    /// authoritative check.
+    #[cfg(windows)]
+    #[test]
+    fn the_command_line_survives_the_windows_argument_parser() {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+
+        let cases = [
+            vec!["plain".to_string()],
+            vec!["with space".to_string()],
+            vec!["trailing\\".to_string()],
+            vec!["quote\\\"inside".to_string()],
+            vec!["".to_string()],
+            vec!["a".to_string(), "b c".to_string(), "d\\".to_string()],
+        ];
+        for case in cases {
+            let command_line = build_command_line(Path::new("program.exe"), &case);
+            let wide: Vec<u16> = command_line
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut count: i32 = 0;
+            // SAFETY: the command line is a valid null-terminated UTF-16 string and
+            // `count` is a valid out-pointer.
+            let parsed = unsafe { CommandLineToArgvW(wide.as_ptr(), &mut count) };
+            assert!(
+                !parsed.is_null(),
+                "the command line was rejected: {command_line}"
+            );
+            let arguments = (0..count)
+                .map(|index| {
+                    // SAFETY: `parsed` holds `count` null-terminated UTF-16 strings.
+                    let start = unsafe { *parsed.offset(index as isize) };
+                    let mut length = 0usize;
+                    // SAFETY: the string is null-terminated, so the scan stops at the
+                    // terminator.
+                    unsafe {
+                        while *start.add(length) != 0 {
+                            length += 1;
+                        }
+                        String::from_utf16_lossy(std::slice::from_raw_parts(start, length))
+                    }
+                })
+                .collect::<Vec<_>>();
+            // SAFETY: the array was allocated by `CommandLineToArgvW`.
+            unsafe {
+                LocalFree(parsed as *mut std::ffi::c_void);
+            }
+            // The program path comes first, then the arguments unchanged.
+            assert_eq!(
+                arguments,
+                std::iter::once("program.exe".to_string())
+                    .chain(case.iter().cloned())
+                    .collect::<Vec<_>>(),
+                "the command line did not round trip: {command_line:?}"
+            );
+        }
     }
 }

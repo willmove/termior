@@ -733,9 +733,7 @@ impl AttributeList {
             ));
         }
         // SAFETY: `list` has the size the API requested.
-        let initialized = unsafe {
-            InitializeProcThreadAttributeList(list, count, 0, &mut size)
-        };
+        let initialized = unsafe { InitializeProcThreadAttributeList(list, count, 0, &mut size) };
         if initialized == 0 {
             // SAFETY: `list` was allocated above and is freed exactly once.
             unsafe {
@@ -745,9 +743,7 @@ impl AttributeList {
                 "cannot initialize the process attribute list".into(),
             ));
         }
-        Ok(Self {
-            pointer: list,
-        })
+        Ok(Self { pointer: list })
     }
 
     fn pointer(&mut self) -> *mut std::ffi::c_void {

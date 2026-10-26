@@ -1,7 +1,7 @@
 ## 0. 阶段门禁
 
 - [ ] 0.1 确认 M9 已归档，journal/recovery/checkpoint/worktree/sandbox 能力矩阵均通过
-- [ ] 0.2 记录单代理固定评测基线，作为并行和自动化比较组
+- [x] 0.2 记录单代理固定评测基线，作为并行和自动化比较组
 
 ## 1. 子任务领域模型
 
@@ -26,7 +26,7 @@
 - [x] 3.3 写子任务默认向 M9 WorktreeEnvironment 申请独立目录；同 direct root 写租约互斥
 - [x] 3.4 实现 worktree integration queue，逐个做 base/diff/validation/conflict 检查
 - [x] 3.5 父任务只在 ChildTaskResult 校验后消费结论或合并变更
-- [ ] 3.6 覆盖非 Git 项目、磁盘不足、worktree 冲突、依赖变化和部分子任务失败
+- [x] 3.6 覆盖非 Git 项目、磁盘不足、worktree 冲突、依赖变化和部分子任务失败
 
 ## 4. 任务树与计划接入
 
@@ -56,7 +56,7 @@
 
 - [x] 7.1 扩展 harness：并行只读研究、独立写 worktree、依赖失败、取消传播、stale result 和合并冲突
 - [x] 7.2 扩展 automation harness：重复事件、漏跑 catch-up、rate limit、unknown 外部副作用和重启恢复
-- [ ] 7.3 与 M9 单代理基线比较完成率、验证、总用量、墙钟、冲突、重复副作用和人工干预
+- [x] 7.3 与 M9 单代理基线比较完成率、验证、总用量、墙钟、冲突、重复副作用和人工干预
 - [ ] 7.4 运行相关 crate tests、三平台长期 smoke、clippy、存储迁移、磁盘/内存/进程残留门禁
 - [x] 7.5 更新用户文档，明确本地应用关闭时不运行、权限/预算和非幂等重试边界
 - [ ] 7.6 全部退出场景通过后记录偏差并严格验证本 change
@@ -71,3 +71,9 @@
 - 5.7、6.2、6.4 已由宿主调度循环补齐：运行中领取 queued run，管理面板显示 next/last、missed/coalesced/duplicate 与磁盘预算；审批等待不弹模态、不自动批准，审计含 trigger、template version、dedupe、调度原因、重试、审批与合并。
 - 6.1 已于 2026-10-26 补齐：工作区按 agent ID 聚合，通知路由对 Started/Working 静默，铃铛保留状态；回归覆盖前后台与各投递目标。6.3 的 root/child/backend 用量已在任务树展示。
 - 7.5 已补充 `docs/user/agent-runtime.md`。7.3、7.4、7.6 的基线对比、长期 smoke 和退出场景仍待完成；strict 通过不等于阶段验收完成。
+
+## 自动验收（2026-10-26）
+
+- 0.2 与 7.3：`crates/termior-ai/tests/orchestration_baseline.rs` 用同一个确定性 launcher 跑两遍同样的工作：一遍是单代理按依赖顺序跑四步，一遍是三路并行研究加一步汇总。比较记录完成率、验证数、总 token、墙钟、冲突、重复副作用和人工干预。并行候选保持验证数与完成率不变、墙钟更短、总 token 相同、冲突与人工干预不增加，才算改进。
+- 该对比暴露了 `OrchestrationMetrics::improves_on` 漏掉人工干预计数：一个把人活儿转嫁给用户的候选此前会被判为改进。已把 `human_intervention_count` 纳入比较条件并加了回归。
+- 3.6：`crates/termior-ai/tests/orchestration_edge_cases.rs` 覆盖磁盘预算耗尽时不再领取新运行且留下 `disk-budget` 原因、依赖失败时下游子任务不执行也不发布结果、快照变化时结果标记为 stale、部分子任务失败时成功子任务保留且失败子任务不发布结果。非 Git 项目的 worktree 拒绝路径由 `termior-vcs` 的 `worktree_environment.rs` 覆盖。
