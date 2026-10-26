@@ -30,6 +30,38 @@ Rust 固定在 `rust-toolchain.toml` 的 1.98.1；升级时同时更新 `clippy.
 
 升级前，cargo-deny 0.20.2 的 Windows 依赖图检查已报告许可失败：`gpui_shared_string`、`gpui_util` 缺少许可字段/可识别声明，`libbz2-rs-sys` 的 `bzip2-1.0.6` 不在允许列表，`zlog`、`ztracing`、`ztracing_macro` 声明 GPL-3.0-or-later。不能仅靠加入 GPL 或忽略未许可 crate 来宣称 MIT 项目的许可门禁通过；需要维护者核实授权或调整依赖。
 
+### 逐项核实（2026-10-27）
+
+本机没有 `cargo-deny`，所以下面这些结论来自**直接读取依赖自身的 manifest 与 LICENSE 文件**，
+不是门禁输出：
+
+| crate | `Cargo.toml` 的 `license` | 仓库内 LICENSE 文件 |
+|---|---|---|
+| `gpui` | `Apache-2.0` | `LICENSE-APACHE` → `../../LICENSE-APACHE` |
+| `sum_tree` | `Apache-2.0` | `LICENSE-APACHE` → `../../LICENSE-APACHE` |
+| `gpui_shared_string` | **无字段** | `LICENSE-APACHE` → `../../LICENSE-APACHE` |
+| `gpui_util` | **无字段** | `LICENSE-APACHE` → `../../LICENSE-APACHE` |
+| `zlog` | `GPL-3.0-or-later` | `LICENSE-GPL` → `../../LICENSE-GPL` |
+| `ztracing` | `GPL-3.0-or-later` | `LICENSE-APACHE` → `../../LICENSE-APACHE` |
+| `ztracing_macro` | `GPL-3.0-or-later` | `LICENSE-APACHE` → `../../LICENSE-APACHE` |
+| `libbz2-rs-sys 0.2.5` | `bzip2-1.0.6`（非 SPDX） | `LICENSE` |
+
+三点结论：
+
+1. `gpui_shared_string` 与 `gpui_util` **缺的是元数据，不是授权**。两者各自指向仓库根的
+   `LICENSE-APACHE`，与 `gpui` 声明的许可一致；cargo-deny 读不到 SPDX 字段就判 unlicensed。
+2. `ztracing` 与 `ztracing_macro` 的 `Cargo.toml` 说 GPL，指向的却是 Apache 许可文件。这个
+   不一致需要上游确认，但它**不改变** cargo-deny 读到的声明。
+3. `bzip2-1.0.6` 是宽松许可，但 SPDX 解析器不认这个字符串。
+
+`deny.toml` 未被修改：允许列表没有放宽，`exceptions` 仍为空。Audit 工作流仍排除
+`termior`/`termior-ui`/`termior-ui-kit`，所以 **Audit 通过不代表完整桌面产物通过许可门禁**。
+
+剩下的三项（GPL 怎么办、`bzip2-1.0.6` 怎么办、两个 GPUI crate 的元数据缺口是向上游提 PR
+还是本地标 exception）是**分发决策**，记录在
+[#64](https://github.com/willmove/termior/issues/64)，保持开放与 `ready-for-human`。
+
+
 完整跨平台图还需要下载当前机器未缓存的 Linux/macOS crate。本次 Windows 检查不能替代三平台完整检查；升级后的实际结果见 [issue 核对记录](github-issue-review-2026-10-26.md)。
 
 ### CI 验收与跟踪项
