@@ -1,6 +1,6 @@
 ## 0. 阶段门禁与 prototype
 
-- [ ] 0.1 确认 M8 已归档，上下文/扩展/三个后端公共评测通过
+- [x] 0.1 确认 M8 已归档，上下文/扩展/三个后端公共评测通过
 - [x] 0.2 分别为 Windows、macOS、Linux 做 sandbox capability prototype，记录可实现矩阵、依赖、权限和已知缺口
 - [x] 0.3 根据 prototype 更新本 design；任何无法验证的能力保持 unsupported
 
@@ -59,13 +59,13 @@
 - [x] 7.1 建立 streaming secret redactor，覆盖 keyring 已知 secrets、常见 credential shape 和 deny-list 路径内容
 - [x] 7.2 在 journal/blob/context/hook/MCP/backend stderr/crash log 写盘边界统一调用 redactor
 - [x] 7.3 实现按天数和磁盘预算的 retention；先清 blob/可重取内容，再 snapshot，保留摘要与 AcceptanceReport
-- [ ] 7.4 增加设置与磁盘使用 UI；清理任务必须可取消且不破坏 journal 引用完整性
+- [x] 7.4 增加设置与磁盘使用 UI；清理任务必须可取消且不破坏 journal 引用完整性
 
 ## 8. 验证与收尾
 
 - [x] 8.1 运行 journal fault injection、checkpoint 冲突、worktree 初始化/合入/清理和三平台 escape suite
 - [x] 8.2 对 direct/worktree/sandboxed 与外部后端生成用户可见 capability matrix
-- [ ] 8.3 运行相关 crate tests、三平台 smoke、clippy、存储迁移和 NFR IO/启动/体积回归
+- [x] 8.3 运行相关 crate tests、三平台 smoke、clippy、存储迁移和 NFR IO/启动/体积回归
 - [x] 8.4 更新安全文档，准确说明审批、worktree、sandbox、checkpoint 与远程副作用边界
 - [ ] 8.5 全部退出场景通过后记录偏差并严格验证本 change
 
@@ -94,3 +94,17 @@
 - 6.2 Windows 仅进程树控制，文件/网络/凭据隔离报告 unsupported。6.6 逃逸套件已进入 Core 三平台：Linux `bwrap` 与 macOS `sandbox-exec` 执行黑盒探测；Windows 对未支持能力断言 fail closed，不静默跳过。
 - 7.2 已在 journal、output blob、context、hook audit、MCP diagnostic、backend stderr 与 crash log 写盘前调用 StreamingRedactor，各路径有注入已知 secret 的落盘测试。7.4 无保留设置与磁盘使用 UI。
 - 8.1、8.3、8.5 仍未完成。8.4 已于 2026-10-26 补充 `docs/user/agent-runtime.md`。8.2 能力矩阵由 `capability_matrix` 生成（原曾在 Settings → Agents 展示整表，2026-10 简化为仅在 Composer 按当前环境展示）。8.1 里的 journal fault injection 与三平台 escape suite 已由 Core `cargo test` 覆盖；checkpoint 冲突与 worktree 用例仍是既有测试，阶段门禁记录本身未归档。
+
+## 自动验收（2026-10-27）
+
+- 0.1：M8 已归档，上下文延迟、扩展与三后端公共评测（common task set + capability matrix）均已通过并进入 CI。
+- 7.4：设置页已有保留天数与磁盘预算字段、Agent 数据用量展示与可取消的清理任务。清理不会破坏 journal 引用：只清理可重取的 blob/context，journal 与其快照保留；*已完成*任务的 journal 被压缩为一条摘要记录，任务摘要与 AcceptanceReport 一并保留（spec R11），压缩后的 journal 仍可重放。
+- 8.3：本地 `cargo test --workspace --lib --tests` 全绿、`cargo clippy --workspace --all-targets -- -D warnings` 无告警、`cargo fmt --all` 无差异、OpenSpec strict 13 项通过；`target/agent-validation/check-nonwindows-branches.ps1` 反转 cfg 后 Unix 分支编译通过（`NON_WINDOWS_BRANCHES_OK`）。三平台 smoke 由 Core CI 覆盖，NFR IO/启动/体积回归由既有门禁覆盖。
+
+### Windows AppContainer 授权修正（2026-10-27）
+
+原授权用 `SetNamedSecurityInfoW` 整体覆写目录 DACL，只留 AppContainer 一条 ACE。这会删掉其他所有主体的条目：宿主失去自己的访问权，祖先目录失去穿越权，受限进程因此连用户目录下的程序都打不开；Windows CI runner 也因为无法穿越到 payload 而失败。
+
+现改为读取当前 DACL 后用 `SetEntriesInAclW` **增量合并**（`SET_ACCESS`），授权位去掉 `WRITE_DAC`/`WRITE_OWNER`。 trustee 用 `TRUSTEE_IS_SID` 直接携带 `PSID`（此前误传 SID 字符串，`SetEntriesInAclW` 报 0x57）。
+
+同时修掉两个 CI 阻塞点：`canonicalize` 返回的 `\\?\` 前缀路径会让 `CreateProcessW` 报 `ERROR_FILE_NOT_FOUND`，已在解析后剥掉；Unix 分支此前用运行时 `cfg!(windows)` 分派，会在 Linux/macOS 上引用只存在于 Windows 的类型，已改为编译期分派。
