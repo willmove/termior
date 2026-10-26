@@ -37,6 +37,15 @@ pub enum MetricKind {
     /// 仓库地图增量刷新耗时：少量文件改动/改名/删除后，后台一次 sweep 落定的墙钟时间，单位毫秒。
     #[serde(rename = "repo_map_incremental_ms")]
     RepoMapIncrementalMs,
+    /// Agent 任务日志的批量写入耗时：一次流式回合的非关键事件批量落盘，单位毫秒。
+    #[serde(rename = "agent_io_burst_ms")]
+    AgentIoBurstMs,
+    /// Agent 任务日志的关键事件写入耗时：每个关键事件都单独 flush，单位毫秒。
+    #[serde(rename = "agent_io_critical_ms")]
+    AgentIoCriticalMs,
+    /// Agent 任务日志的重放耗时：重启时重建任务状态要读的日志量，单位毫秒。
+    #[serde(rename = "agent_io_replay_ms")]
+    AgentIoReplayMs,
 }
 
 impl MetricKind {
@@ -48,7 +57,10 @@ impl MetricKind {
             | MetricKind::FrameP99Ms
             | MetricKind::EchoP99Ms
             | MetricKind::ContextLatencyP99Ms
-            | MetricKind::RepoMapIncrementalMs => true,
+            | MetricKind::RepoMapIncrementalMs
+            | MetricKind::AgentIoBurstMs
+            | MetricKind::AgentIoCriticalMs
+            | MetricKind::AgentIoReplayMs => true,
             MetricKind::Fps | MetricKind::PtyThroughputMiBps => false,
         }
     }
@@ -60,7 +72,10 @@ impl MetricKind {
             | MetricKind::FrameP99Ms
             | MetricKind::EchoP99Ms
             | MetricKind::ContextLatencyP99Ms
-            | MetricKind::RepoMapIncrementalMs => "ms",
+            | MetricKind::RepoMapIncrementalMs
+            | MetricKind::AgentIoBurstMs
+            | MetricKind::AgentIoCriticalMs
+            | MetricKind::AgentIoReplayMs => "ms",
             MetricKind::RssMiB => "MiB",
             MetricKind::Fps => "fps",
             MetricKind::PtyThroughputMiBps => "MiB/s",

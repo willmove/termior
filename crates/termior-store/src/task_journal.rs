@@ -142,6 +142,12 @@ pub struct TaskJournal {
     previous_hash: String,
     pending_noncritical: usize,
     redactor: crate::StreamingRedactor,
+    /// The append handle, kept open for the journal's lifetime.
+    ///
+    /// Re-opening the file on every append cost about 1.5 ms per event on Windows, which
+    /// a streaming turn pays per delta. The handle is opened for append only, so it
+    /// cannot truncate or rewrite what recovery reads.
+    file: Option<std::fs::File>,
 }
 impl TaskJournal {
     pub fn create(tasks_root: &Path, task_id: &str) -> Result<Self, JournalError> {
@@ -184,6 +190,7 @@ impl TaskJournal {
             previous_hash,
             pending_noncritical: 0,
             redactor: crate::StreamingRedactor::new(known_secrets),
+            file: None,
         })
     }
 
@@ -221,7 +228,14 @@ impl TaskJournal {
         if let Some(fault) = fault.filter(|fault| fault.phase == JournalFaultPhase::BeforeWrite) {
             return trigger_journal_fault(fault);
         }
-        let mut file = OpenOptions::new().append(true).open(&self.path)?;
+        // The handle is taken as a field borrow so the pending counter stays writable.
+        if self.file.is_none() {
+            self.file = Some(OpenOptions::new().append(true).open(&self.path)?);
+        }
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| JournalError::Io(std::io::Error::other("the journal has no file")))?;
         if let Some(fault) = fault.filter(|fault| fault.phase == JournalFaultPhase::DuringWrite) {
             file.write_all(&encoded[..partial_record_len(encoded.len())])?;
             file.flush()?;
@@ -230,11 +244,12 @@ impl TaskJournal {
         }
         file.write_all(&encoded)?;
         file.write_all(b"\n")?;
-        self.pending_noncritical += usize::from(!critical);
-        if critical || self.pending_noncritical >= 32 {
+        let pending = self.pending_noncritical + usize::from(!critical);
+        let should_flush = critical || pending >= 32;
+        self.pending_noncritical = if should_flush { 0 } else { pending };
+        if should_flush {
             file.flush()?;
             file.sync_data()?;
-            self.pending_noncritical = 0;
         }
         self.next_sequence += 1;
         self.previous_hash = hash;
@@ -378,6 +393,13 @@ impl TaskJournal {
 impl Drop for TaskJournal {
     fn drop(&mut self) {
         if self.pending_noncritical == 0 {
+            return;
+        }
+        // Flush what the batched writes left behind. The kept handle is closed right
+        // after this, so the bytes reach the file before the journal goes away.
+        if let Some(file) = self.file.as_mut() {
+            let _ = file.flush();
+            let _ = file.sync_data();
             return;
         }
         if let Ok(file) = OpenOptions::new().append(true).open(&self.path) {

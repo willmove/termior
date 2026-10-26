@@ -202,6 +202,99 @@ pub enum NfrPayload {
     PtyThroughput(PtyThroughputPayload),
     Run(RunPayload),
     ContextLatency(ContextLatencyPayload),
+    AgentIo(AgentIoPayload),
+}
+
+/// `nfr-agent-io`'s payload: the task journal write path.
+///
+/// Only `burst_total_ms`, `critical_total_ms` and `replay_ms` gate; the rest is for
+/// reading the numbers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentIoPayload {
+    /// Non-critical events in the measured burst.
+    pub burst_events: u64,
+    /// Critical events written after the burst.
+    pub critical_events: u64,
+    /// Wall clock for the whole non-critical burst (ms).
+    #[serde(default)]
+    pub burst_total_ms: f64,
+    /// p99 of the non-critical appends (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_p99_ms: Option<f64>,
+    /// The slowest non-critical append (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_max_ms: Option<f64>,
+    /// Mean cost of one non-critical append (microseconds).
+    #[serde(default)]
+    pub per_event_us: f64,
+    /// Wall clock for the critical events (ms). Every critical event flushes.
+    #[serde(default)]
+    pub critical_total_ms: f64,
+    /// p99 of the critical appends (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub critical_p99_ms: Option<f64>,
+    /// Wall clock for replaying the journal (ms).
+    #[serde(default)]
+    pub replay_ms: f64,
+    /// Size of the journal file after the round.
+    #[serde(default)]
+    pub journal_bytes: u64,
+    /// Multi-round raw values; the top-level metrics are their medians.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<AgentIoPayload>,
+}
+
+impl AgentIoPayload {
+    /// Each metric takes the median across rounds.
+    pub fn median_of(runs: Vec<AgentIoPayload>) -> AgentIoPayload {
+        let pick =
+            |field: fn(&AgentIoPayload) -> f64| median(runs.iter().map(field)).unwrap_or_default();
+        AgentIoPayload {
+            burst_events: runs.iter().map(|r| r.burst_events).max().unwrap_or(0),
+            critical_events: runs.iter().map(|r| r.critical_events).max().unwrap_or(0),
+            burst_total_ms: pick(|r| r.burst_total_ms),
+            burst_p99_ms: runs
+                .iter()
+                .filter_map(|r| r.burst_p99_ms)
+                .min_by(f64::total_cmp),
+            burst_max_ms: runs
+                .iter()
+                .filter_map(|r| r.burst_max_ms)
+                .max_by(f64::total_cmp),
+            per_event_us: pick(|r| r.per_event_us),
+            critical_total_ms: pick(|r| r.critical_total_ms),
+            critical_p99_ms: runs
+                .iter()
+                .filter_map(|r| r.critical_p99_ms)
+                .max_by(f64::total_cmp),
+            replay_ms: pick(|r| r.replay_ms),
+            journal_bytes: runs.iter().map(|r| r.journal_bytes).max().unwrap_or(0),
+            runs,
+        }
+    }
+
+    pub fn to_samples(&self, platform: &str) -> Vec<Sample> {
+        vec![
+            Sample::new(
+                MetricKind::AgentIoBurstMs,
+                platform,
+                "journal_burst",
+                self.burst_total_ms,
+            ),
+            Sample::new(
+                MetricKind::AgentIoCriticalMs,
+                platform,
+                "journal_critical",
+                self.critical_total_ms,
+            ),
+            Sample::new(
+                MetricKind::AgentIoReplayMs,
+                platform,
+                "journal_replay",
+                self.replay_ms,
+            ),
+        ]
+    }
 }
 
 /// 完整 harness 报告：标注平台后，CI 可直接喂给 [`crate::compare`]。
@@ -220,6 +313,7 @@ impl HarnessReport {
                 NfrPayload::PtyThroughput(p) => out.push(p.to_sample(&self.platform)),
                 NfrPayload::Run(r) => out.extend(r.to_samples(&self.platform, "typical")),
                 NfrPayload::ContextLatency(c) => out.extend(c.to_samples(&self.platform)),
+                NfrPayload::AgentIo(a) => out.extend(a.to_samples(&self.platform)),
             }
         }
         out

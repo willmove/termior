@@ -26,9 +26,11 @@ pub use baselines::{Baseline, BaselineSet};
 pub use compare::{compare, Regression, RegressionReport, Verdict};
 pub use metric::{MetricKind, Sample};
 pub use payload::{
-    parse_harness_report, ContextLatencyPayload, HarnessReport, NfrPayload, PtyThroughputPayload,
-    RunPayload,
+    parse_harness_report, AgentIoPayload, ContextLatencyPayload, HarnessReport, NfrPayload,
+    PtyThroughputPayload, RunPayload,
 };
+/// `nfr-agent-io` 的任务日志写路径测量（与测试共用）。
+pub mod agent_io_harness;
 /// `nfr-context` 的合成仓库与分位数（与测试共用）。
 pub mod context_harness;
 pub use vte_harness::{new_term, synthetic_pty_output};

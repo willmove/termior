@@ -351,3 +351,50 @@ jobs:
           name: nfr-context-payload-${{ matrix.platform }}
           path: nfr-context-payload.json
           if-no-files-found: ignore
+
+  agent-io:
+    name: Agent IO (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinin/rust-cache@v2
+        with:
+          workspaces: "."
+      - name: NFR Agent IO gate (task journal write path)
+        shell: bash
+        run: |
+          cargo build -p termior-bench --release --bin nfr-agent-io --bin nfr-gate
+          # A burst of non-critical deltas (the shape of a streaming turn), the critical
+          # events that flush on every append, and the replay a restart pays.
+          ./target/release/nfr-agent-io --rounds 3 > nfr-agent-io-payload.json
+          cat nfr-agent-io-payload.json
+          for key in burst_total_ms critical_total_ms replay_ms; do
+            grep -q "\"${key}\":" nfr-agent-io-payload.json || { echo "nfr payload missing ${key}"; exit 1; }
+          done
+          ./target/release/nfr-gate --platform ${{ matrix.platform }} \
+            --payload nfr-agent-io-payload.json \
+            --baselines docs/baselines/nfr-baselines.json
+      - name: Upload Agent IO payload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfr-agent-io-payload-${{ matrix.platform }}
+          path: nfr-agent-io-payload.json
+          if-no-files-found: ignore

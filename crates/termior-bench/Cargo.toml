@@ -14,6 +14,8 @@ alacritty_terminal = { workspace = true }
 # nfr-context 测的是真实的仓库地图服务（Agent 上下文延迟）。
 termior-ai = { workspace = true }
 termior-security = { workspace = true }
+# nfr-agent-io 测的是真实的任务日志写路径（Stage D 8.3）。
+termior-store = { workspace = true }
 
 # 仅 nfr-run 二进制需要：采集子进程 RSS（spec §8 NFR-01/04）。
 sysinfo = { workspace = true, optional = true }
@@ -47,3 +49,7 @@ required-features = ["run-harness"]
 [[bin]]
 name = "nfr-context"
 path = "src/bin/nfr-context.rs"
+
+[[bin]]
+name = "nfr-agent-io"
+path = "src/bin/nfr-agent-io.rs"
