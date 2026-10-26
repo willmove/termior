@@ -45,6 +45,6 @@ GitHub Actions 另在 Windows/macOS/Linux 构建 release 桌面二进制、记�
 - FR-AGENT-06 语音输入（P2）；
 - 多窗口工作区切换与跨窗口 tab 管理；
 - 三平台安装包签名（Windows/macOS 当前未签名）；
-- Agent Stage B–E 的剩余 UI 与验收项，见各 `openspec/changes/agent-stage-*/tasks.md` 末尾的“实施核对”。
+- Agent Stage B–E 已于 2026-10-27 归档，清单与自动验收证据见各 `openspec/changes/archive/2026-10-27-agent-stage-*/tasks.md` 末尾的“自动验收”。
 
 因此，本里程碑的含义是“主要架构与安全链路已可构建、可测试、可继续迭代”，并不把尚未验收的条目宣称为完成。

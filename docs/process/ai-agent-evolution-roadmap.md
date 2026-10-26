@@ -21,10 +21,10 @@ M6 可靠单代理
 | 里程碑 | OpenSpec change | 核心退出条件 |
 |---|---|---|
 | M6 | [`agent-stage-a-reliable-runtime`](../../openspec/changes/archive/2026-10-11-agent-stage-a-reliable-runtime/)（已归档） | 单代理完整完成“读取→修改→审阅→验证→失败后修正”,工具调用不丢失、不重复执行 |
-| M7 | [`agent-stage-b-terminal-workbench`](../../openspec/changes/agent-stage-b-terminal-workbench/) | 长命令可流式观察、等待、输入、停止和接管;一个结构化外部后端端到端可用 |
-| M8 | [`agent-stage-c-context-ecosystem`](../../openspec/changes/agent-stage-c-context-ecosystem/) | 长会话能压缩并保留目标;Skills/MCP 可控可诊断;第二后端证明能力协商有效 |
-| M9 | [`agent-stage-d-recovery-isolation`](../../openspec/changes/agent-stage-d-recovery-isolation/) | 崩溃后能安全恢复;检查点范围准确;需要隔离的任务不会静默直接执行 |
-| M10 | [`agent-stage-e-parallel-automation`](../../openspec/changes/agent-stage-e-parallel-automation/) | 多任务在预算和并发限制内运行;写任务隔离;自动化每次运行可审计、可取消 |
+| M7 | [`agent-stage-b-terminal-workbench`](../../openspec/changes/archive/2026-10-27-agent-stage-b-terminal-workbench/) | 长命令可流式观察、等待、输入、停止和接管;一个结构化外部后端端到端可用 |
+| M8 | [`agent-stage-c-context-ecosystem`](../../openspec/changes/archive/2026-10-27-agent-stage-c-context-ecosystem/) | 长会话能压缩并保留目标;Skills/MCP 可控可诊断;第二后端证明能力协商有效 |
+| M9 | [`agent-stage-d-recovery-isolation`](../../openspec/changes/archive/2026-10-27-agent-stage-d-recovery-isolation/) | 崩溃后能安全恢复;检查点范围准确;需要隔离的任务不会静默直接执行 |
+| M10 | [`agent-stage-e-parallel-automation`](../../openspec/changes/archive/2026-10-27-agent-stage-e-parallel-automation/) | 多任务在预算和并发限制内运行;写任务隔离;自动化每次运行可审计、可取消 |
 
 ## 跨阶段不变量
 
