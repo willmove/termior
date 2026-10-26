@@ -53,8 +53,12 @@
 - [x] 6.3 任务详情显示绑定项目、命令会话、controller、增量输出、退出码和截断提示
 - [x] 6.4 通知路由使用 TaskState/CommandState，不解析屏幕词语
 - [ ] 6.5 运行长构建、后台服务、REPL 接管、跨 Tab、后端退出和取消的自动/手工验收
-- [ ] 6.6 运行相关 crate tests、三平台 smoke、`cargo clippy --workspace` 与 NFR 体积/启动回归
+- [x] 6.6 运行相关 crate tests、三平台 smoke、`cargo clippy --workspace` 与 NFR 体积/启动回归
 - [ ] 6.7 全部退出场景通过后记录实现偏差并严格验证本 change
+
+## 自动验收（2026-10-26）
+
+6.6 已由代码提交 `ac89c69` 的 [12 项三平台 CI](https://github.com/willmove/termior/actions/runs/40305374428) 与本机 1003 passed / 0 failed、clippy、格式检查完成。真实桌面长构建、后台服务、REPL 接管/交还、取消与 Windows 强退清理也已有记录；6.5 仍保留跨项目/后端退出的实机边界与本机 Codex 沙箱读取失败，不将部分场景通过视为全部退出门禁完成。详见 [自动执行记录](../../../docs/process/agent-acceptance-2026-10-26.md)。
 
 ## 实施核对（2026-09-30）
 

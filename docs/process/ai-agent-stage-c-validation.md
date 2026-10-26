@@ -39,7 +39,7 @@ cargo test -p termior-ai --test security_redteam
 - Hook 真实子进程、超时/输出上限、修改参数后的 schema/路径/deny-list/审批重算
 - ACP initialize/session/prompt、流式事件、权限事件，以及 prompt 尚在运行时处理宿主回调的双向协议
 
-## 手工验证
+## 场景复验（自动回归已覆盖逻辑，桌面驱动可复验界面）
 
 1. 在项目根和子目录各放一份 `AGENTS.md`，要求 Agent 修改子目录文件。Context Inspector 应显示两份来源；修改根文件时不应注入子目录规则。
    发送消息后点击 Composer 工具栏的 `Context …t · … items`，逐条核对 category、token、Included/Summarized/Truncated/Excluded 和原因。

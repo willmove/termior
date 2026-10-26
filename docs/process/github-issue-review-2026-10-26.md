@@ -6,8 +6,8 @@
 
 | Issue | 代码库现状与本次处理 | 剩余工作 |
 |---|---|---|
-| [#7 Stage B 手工验收与归档](https://github.com/willmove/termior/issues/7) | 真实桌面长构建、后台服务、REPL 接管/交还与审批/恢复已代做；修复引号命令不执行、跨任务取消、运行中取消等待及 Stop 被裁切。三平台 CI 基线全部通过 | Codex 真实读取受本机 Windows sandbox 凭据解密错误阻塞；新增修复仍须对应新 CI，跨项目/后端退出保留契约与实机证据边界，阶段不强行归档 |
-| [#13 Stage C 协议与真实后端](https://github.com/willmove/termior/issues/13) | ACP 版本严格校验；已锁定 Skills 上游格式快照，完成 0.2；MCP 5.5/5.6 和场景回归 8.1 完成；OpenCode 1.19.4 真实模型读取通过，完成 7.5；用户文档 8.4 完成 | 内置/Codex/ACP 的真实公共任务比较仍不齐全；依赖 B 归档，新增提交的三平台/NFR 证据须保留 |
+| [#7 Stage B 手工验收与归档](https://github.com/willmove/termior/issues/7) | 桌面长构建、后台服务、REPL、审批/恢复/取消及进程清理已代做；修复提交 ac89c69 的三平台 CI 全通过，6.6 完成 | Codex 真实读取受本机 Windows sandbox 凭据解密错误阻塞；跨项目/后端退出保留契约与实机证据边界，6.5/6.7 与阶段归档继续保留 |
+| [#13 Stage C 协议与真实后端](https://github.com/willmove/termior/issues/13) | 0.2 协议快照、5.5/5.6 MCP、7.5 真实 OpenCode 读取、8.1 场景回归、8.3 三平台/NFR、8.4 文档均完成；新 CI 原始 payload 已保存 | 依赖 B 归档；内置/Codex/ACP 的真实公共任务比较 8.2 及整体退出条件仍不齐全 |
 | [#14 三平台 sandbox 与 Windows 后端](https://github.com/willmove/termior/issues/14) | Windows 文件/网络/凭据能力保持 unsupported，要求隔离时 fail closed；已有 escape suite。issue 中 Linux/macOS “只有契约测试”的描述已过时，仓库已有实际黑盒套件与 CI 矩阵 | Windows AppContainer/restricted token、ACL、网络策略仍需实现及实机验证；Linux/macOS 需在对应平台保留黑盒证据。不是只点击验收即可完成的事项 |
 | [#20 Stage D 安全与回归](https://github.com/willmove/termior/issues/20) | journal fault、checkpoint 冲突、worktree 与三平台 escape suite 8.1 已有执行证据；安全文档 8.4 完成；桌面审批中崩溃不重放已验证，并修复任务 ID 脱敏破坏恢复引用的问题 | Windows 完整 sandbox、阶段前置依赖和新提交的三平台/NFR 门禁；继续保留 change |
 | [#23 Stage E 通知与评测](https://github.com/willmove/termior/issues/23) | 修复 Started/Working 进度弹窗：按 agent ID 汇总铃铛状态，前后台均静默；完成 6.1。新增非 Git 与目标父路径不可用的 worktree 回归；补齐应用关闭、预算、权限、重试边界文档，完成 7.5 | 3.6 的真实磁盘不足等退出场景，单代理与并行的真实基线比较，三平台长期 smoke/迁移/资源残留。依赖 D 归档 |
@@ -32,7 +32,7 @@
 | 通知 | 前台隐藏 Composer 与后台窗口分别运行任务；Started/Working 只更新铃铛，完成/失败/等待按策略通知。重复 working 不刷屏 | #23 |
 | 自动化停机与重试 | **时钟/重建模拟通过**：Skip/RunOnce/RunEach、模板不可变、去重及 unknown/非幂等失败不自动重试，见 orchestration_automation；长期运行另验 | #23 |
 | 资源与边界 | 隔离测试环境中模拟磁盘不足、worktree 冲突、依赖变化和部分 child 失败；恢复后无重复写入、覆盖用户修改或遗留进程 | #23 |
-| 三平台与性能 | **CI 基线通过**：三平台 Core/Desktop/Context latency、体积/首帧/RSS/FPS/回显回归；长期 soak、新提交检查和绝对产品目标不由该结果替代 | #7、#13、#20、#23、#28 |
+| 三平台与性能 | **修复提交 CI 全部通过**：ac89c69 的三平台 Core/Desktop/Context latency、体积/首帧/RSS/FPS/回显回归；长期 soak、Agent IO 专项和绝对产品目标另验 | #7、#13、#20、#23、#28 |
 
 详细步骤见现有 [Stage B](ai-agent-stage-b-validation.md)、[Stage C](ai-agent-stage-c-validation.md)、[Stage D](ai-agent-stage-d-validation.md)、[Stage E](ai-agent-stage-e-validation.md) 验证指南。用户使用边界见 [Agent 运行时说明](../user/agent-runtime.md)。
 

@@ -62,13 +62,13 @@
 
 - [x] 8.1 运行长日志/长会话压缩、嵌套规则、repo map 失效、Skills 渐进加载、MCP 红队和 Hook 重校验场景
 - [ ] 8.2 三个后端运行公共任务集，报告能力矩阵与不支持项
-- [ ] 8.3 运行相关 crate tests、三平台 smoke、clippy 与 NFR 体积/内存/上下文延迟门禁
+- [x] 8.3 运行相关 crate tests、三平台 smoke、clippy 与 NFR 体积/内存/上下文延迟门禁
 - [x] 8.4 更新用户文档：扩展来源、权限含义、凭据位置、故障诊断与卸载
 - [ ] 8.5 全部退出场景通过后记录偏差并严格验证本 change
 
 ## 自动验收（2026-10-26）
 
-0.2、5.5、5.6、7.5、8.1 的快照、真实 OpenCode 只读 Turn 和自动/三平台 CI 证据见 [自动执行记录](../../../docs/process/agent-acceptance-2026-10-26.md)。7.5 只证明所选 OpenCode 的只读 smoke，未覆盖 Gemini CLI、批准写入/拒绝/取消或三个真实后端的公共任务质量；这些不被模拟结果替代。B 归档及其余退出门禁未满足前，本 change 保留。
+0.2、5.5、5.6、7.5、8.1 的快照、真实 OpenCode 只读 Turn 和自动证据见 [自动执行记录](../../../docs/process/agent-acceptance-2026-10-26.md)。代码提交 `ac89c69` 的三平台 Core/Desktop/Context latency、体积与现有 NFR 回归门禁全部通过，8.3 完成；原始 payload 随记录保存。7.5 只证明所选 OpenCode 的只读 smoke，未覆盖 Gemini CLI、批准写入/拒绝/取消或三个真实后端的公共任务质量；这些不被模拟结果替代。B 归档及其余退出门禁未满足前，本 change 保留。
 
 ## 实施核对（2026-09-30）
 

@@ -83,7 +83,15 @@ cargo test -p termior-agent-host --test installed_backend_acceptance --offline -
 
 这证明现有共享 runner 的**回归基线门禁**通过，不证明 SDD 中所有绝对性能目标已达成，也不等同于长期 soak。三平台检查可由 CI 执行，不需要维护者逐个平台点击。
 
-新增修复应以其提交触发的新 CI 为准；上述运行保留为依赖升级与现有跨平台能力的可追溯基线。
+代码提交 `ac89c69f29b0f2cc40715c6b88baf88f2ae36e53` 的 [新 CI](https://github.com/willmove/termior/actions/runs/40305374428) **12 项全部通过**，[Audit](https://github.com/willmove/termior/actions/runs/40305374350) 也通过；不是只引用修复前的运行。作业状态保存在 [CI summary](evidence/agent-acceptance-2026-10-26/ci-ac89-summary.json)。
+
+| 平台 | 首帧 ms | RSS MiB | FPS | 回显 p99 ms | 原始 payload |
+|---|---:|---:|---:|---:|---|
+| Windows | 157.20 | 58.64 | 31 | 34.1 | [进程](evidence/agent-acceptance-2026-10-26/ci-ac89-windows-run.json) / [上下文](evidence/agent-acceptance-2026-10-26/ci-ac89-windows-context.json) |
+| macOS | 358.15 | 68.28 | 60 | 22.7 | [进程](evidence/agent-acceptance-2026-10-26/ci-ac89-macos-run.json) / [上下文](evidence/agent-acceptance-2026-10-26/ci-ac89-macos-context.json) |
+| Linux | 155.49 | 171.73 | 62 | 12.2 | [进程](evidence/agent-acceptance-2026-10-26/ci-ac89-linux-run.json) / [上下文](evidence/agent-acceptance-2026-10-26/ci-ac89-linux-context.json) |
+
+两次共享 runner 的负载与渲染环境可能不同，不把数值变化归因于本轮修复；判断仍使用未放宽的既有回归门禁。上述结果完成 B 6.6 和 C 8.3。D 8.3 的一般三平台回归已有证据，Agent IO 专项与完整阶段退出门禁仍保留。
 
 ## 协议与格式快照
 
@@ -97,7 +105,7 @@ Skills 是明确的实现子集：读取 SKILL.md 元数据并按需激活正文
 
 ## 可以解除与仍待完成的门禁
 
-- C 的协议快照、真实 OpenCode 只读端到端 smoke、上下文/压缩/规则/Skills/MCP/Hook 自动回归可以完成，具体清单同步到 tasks 与 #13。
+- B 的三平台回归 6.6，C 的协议快照、真实 OpenCode 只读端到端 smoke、上下文/压缩/规则/Skills/MCP/Hook 自动回归及三平台 NFR 门禁 8.3 已完成，清单同步到 tasks 与 #7/#13。
 - D 的 journal fault、checkpoint 冲突、worktree 生命周期及三平台 escape suite 已有自动执行证据，可以完成 8.1；Windows 的 fail-closed 通过不等于 AppContainer/ACL/网络隔离已经实现。
 - #28 的升级跟踪、补丁比较、节奏约定及现有 Audit 配置的回归已经通过；完整桌面许可检查独立保留在 [#64](https://github.com/willmove/termior/issues/64)，没有放宽许可允许列表。
 - Codex Windows 沙箱凭据问题、Windows 完整 sandbox 实现、真实公共模型任务集/并行基线、磁盘耗尽和三平台长期资源门禁仍待处理。这些分别是运行环境、实现或自动化证据缺口，不再笼统交给用户做点击测试。
