@@ -377,12 +377,19 @@ pub struct AgentIoPayload {
 impl AgentIoPayload {
     /// Each metric takes the median across rounds.
     pub fn median_of(runs: Vec<AgentIoPayload>) -> AgentIoPayload {
-        let pick =
-            |field: fn(&AgentIoPayload) -> f64| median(runs.iter().map(field)).unwrap_or_default();
+        // The write path itself is deterministic; how long it takes is not. The
+        // same code on the same macOS runner measured a 14ms burst once and a
+        // 44ms burst the next time, because the runner's own load dominates the
+        // measurement. The *fastest* round is the one that best represents the
+        // write path, and it is the one that a regression moves: a slower
+        // journal makes every round slower, including the fastest one.
+        let fastest = |field: fn(&AgentIoPayload) -> f64| {
+            runs.iter().map(field).fold(f64::INFINITY, f64::min)
+        };
         AgentIoPayload {
             burst_events: runs.iter().map(|r| r.burst_events).max().unwrap_or(0),
             critical_events: runs.iter().map(|r| r.critical_events).max().unwrap_or(0),
-            burst_total_ms: pick(|r| r.burst_total_ms),
+            burst_total_ms: fastest(|r| r.burst_total_ms),
             burst_p99_ms: runs
                 .iter()
                 .filter_map(|r| r.burst_p99_ms)
@@ -391,13 +398,13 @@ impl AgentIoPayload {
                 .iter()
                 .filter_map(|r| r.burst_max_ms)
                 .max_by(f64::total_cmp),
-            per_event_us: pick(|r| r.per_event_us),
-            critical_total_ms: pick(|r| r.critical_total_ms),
+            per_event_us: fastest(|r| r.per_event_us),
+            critical_total_ms: fastest(|r| r.critical_total_ms),
             critical_p99_ms: runs
                 .iter()
                 .filter_map(|r| r.critical_p99_ms)
                 .max_by(f64::total_cmp),
-            replay_ms: pick(|r| r.replay_ms),
+            replay_ms: fastest(|r| r.replay_ms),
             journal_bytes: runs.iter().map(|r| r.journal_bytes).max().unwrap_or(0),
             burst_flushes: median_u64(runs.iter().map(|r| r.burst_flushes)),
             critical_flushes: median_u64(runs.iter().map(|r| r.critical_flushes)),
@@ -424,6 +431,12 @@ impl AgentIoPayload {
                 platform,
                 "journal_replay",
                 self.replay_ms,
+            ),
+            Sample::new(
+                MetricKind::AgentIoBurstFlushes,
+                platform,
+                "journal_burst",
+                self.burst_flushes as f64,
             ),
         ]
     }

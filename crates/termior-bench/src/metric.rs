@@ -46,6 +46,14 @@ pub enum MetricKind {
     /// Agent 任务日志的重放耗时：重启时重建任务状态要读的日志量，单位毫秒。
     #[serde(rename = "agent_io_replay_ms")]
     AgentIoReplayMs,
+    /// Agent 任务日志批量写入的落盘次数：一次流式回合写了几百个非关键事件，
+    /// 实际 flush 了几次。
+    ///
+    /// 这个指标是**确定的**：flush 次数只取决于批处理策略，不取决于宿主上
+    /// fsync 有多贵。墙钟耗时在共享 runner 上会被负载淹没（同一份代码在 macOS
+    /// runner 上一次 14ms、下一次 44ms），而 flush 次数不会。
+    #[serde(rename = "agent_io_burst_flushes")]
+    AgentIoBurstFlushes,
     /// 一轮自动化运行留下的磁盘增量（每个周期）：长期运行必须保持平坦，单位字节。
     #[serde(rename = "residual_bytes_per_cycle")]
     ResidualBytesPerCycle,
@@ -64,6 +72,7 @@ impl MetricKind {
             | MetricKind::AgentIoBurstMs
             | MetricKind::AgentIoCriticalMs
             | MetricKind::AgentIoReplayMs
+            | MetricKind::AgentIoBurstFlushes
             | MetricKind::ResidualBytesPerCycle => true,
             MetricKind::Fps | MetricKind::PtyThroughputMiBps => false,
         }
@@ -83,6 +92,7 @@ impl MetricKind {
             MetricKind::RssMiB => "MiB",
             MetricKind::Fps => "fps",
             MetricKind::PtyThroughputMiBps => "MiB/s",
+            MetricKind::AgentIoBurstFlushes => "flushes",
             MetricKind::ResidualBytesPerCycle => "B/cycle",
         }
     }

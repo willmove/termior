@@ -502,7 +502,7 @@ fn churn_touches_every_category() {
 }
 
 #[test]
-fn the_agent_io_payload_expands_to_the_three_gated_samples() {
+fn the_agent_io_payload_expands_to_the_gated_samples() {
     let report = HarnessReport {
         platform: "windows".into(),
         payloads: vec![NfrPayload::AgentIo(AgentIoPayload {
@@ -511,6 +511,7 @@ fn the_agent_io_payload_expands_to_the_three_gated_samples() {
             burst_total_ms: 22.0,
             critical_total_ms: 3.4,
             replay_ms: 14.0,
+            burst_flushes: 16,
             ..AgentIoPayload::default()
         })],
     };
@@ -530,6 +531,12 @@ fn the_agent_io_payload_expands_to_the_three_gated_samples() {
                 "journal_replay",
                 14.0
             ),
+            Sample::new(
+                MetricKind::AgentIoBurstFlushes,
+                "windows",
+                "journal_burst",
+                16.0
+            ),
         ]
     );
     for kind in [
@@ -540,10 +547,12 @@ fn the_agent_io_payload_expands_to_the_three_gated_samples() {
         assert!(kind.lower_is_better());
         assert_eq!(kind.unit(), "ms");
     }
+    assert!(MetricKind::AgentIoBurstFlushes.lower_is_better());
+    assert_eq!(MetricKind::AgentIoBurstFlushes.unit(), "flushes");
 }
 
 #[test]
-fn the_agent_io_median_drops_one_slow_round_but_keeps_a_real_regression() {
+fn the_agent_io_estimator_drops_one_slow_round_but_keeps_a_real_regression() {
     let round = |burst: f64, critical: f64, replay: f64| AgentIoPayload {
         burst_events: 512,
         critical_events: 8,
@@ -552,20 +561,22 @@ fn the_agent_io_median_drops_one_slow_round_but_keeps_a_real_regression() {
         replay_ms: replay,
         ..AgentIoPayload::default()
     };
-    let median = AgentIoPayload::median_of(vec![
+    let merged = AgentIoPayload::median_of(vec![
         round(20.0, 3.0, 12.0),
         round(21.0, 3.1, 13.0),
         round(400.0, 30.0, 400.0),
     ]);
-    assert_eq!(median.burst_total_ms, 21.0);
-    assert_eq!(median.critical_total_ms, 3.1);
-    assert_eq!(median.replay_ms, 13.0);
+    // The fastest round is the one that represents the write path: the runner's
+    // own load only makes the other rounds slower.
+    assert_eq!(merged.burst_total_ms, 20.0);
+    assert_eq!(merged.critical_total_ms, 3.0);
+    assert_eq!(merged.replay_ms, 12.0);
 
     let all_bad = AgentIoPayload::median_of(vec![
         round(40.0, 6.0, 24.0),
         round(41.0, 6.1, 25.0),
         round(42.0, 6.2, 26.0),
     ]);
-    assert_eq!(all_bad.burst_total_ms, 41.0);
-    assert_eq!(all_bad.replay_ms, 25.0);
+    assert_eq!(all_bad.burst_total_ms, 40.0);
+    assert_eq!(all_bad.replay_ms, 24.0);
 }
