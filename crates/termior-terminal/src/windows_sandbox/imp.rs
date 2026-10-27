@@ -4,17 +4,23 @@ use super::{build_command_line, AppContainerError};
 use std::fs::File;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
+use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, SetHandleInformation, HANDLE};
 use windows_sys::Win32::Security::Authorization::{
-    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+    GetNamedSecurityInfoW, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W,
     NO_MULTIPLE_TRUSTEE, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    GetLengthSid, ACL, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
+    GetLengthSid, InitializeSecurityDescriptor, MakeSelfRelativeSD, SetFileSecurityW,
+    SetSecurityDescriptorDacl, ACL, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
     SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -45,6 +51,9 @@ const CONTAINER_ACCESS: u32 = 0x0013_01FF;
 /// inside it. `FILE_TRAVERSE` is enough for that and nothing more: the ancestor
 /// stays unreadable.
 const FILE_TRAVERSE: u32 = 0x0000_0020;
+
+/// `WRITE_DAC`: the right to change the discretionary ACL of an object.
+const WRITE_DAC: u32 = 0x0004_0000;
 
 /// Environment variables the sandbox copies from the parent process.
 ///
@@ -347,7 +356,7 @@ impl Drop for Job {
 /// removes the traversal rights the ancestors need. `SetEntriesInAclW` merges the new
 /// entry into the *current* DACL instead, so nothing else changes.
 fn grant_directory_to(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
-    grant_to(path, sid, CONTAINER_ACCESS, true)
+    grant_to(path, sid, CONTAINER_ACCESS, true, Propagation::Inherited)
 }
 
 /// Grant the AppContainer SID traversal on every directory above `path`.
@@ -379,7 +388,7 @@ fn grant_ancestors_to(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
         // directory above it — cannot be granted. Such a directory is usually
         // already traversable for low-privilege tokens, and a failure here must
         // not stop the workspace from being granted.
-        if let Err(error) = grant_to(&ancestor, sid, FILE_TRAVERSE, false) {
+        if let Err(error) = grant_to(&ancestor, sid, FILE_TRAVERSE, false, Propagation::None) {
             if !matches!(error, AppContainerError::Acl(_)) {
                 return Err(error);
             }
@@ -388,11 +397,47 @@ fn grant_ancestors_to(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
     Ok(())
 }
 
+/// How far a new DACL reaches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Propagation {
+    /// Push the new DACL onto the objects that are already below the path.
+    ///
+    /// This is what a workspace grant needs: a file that existed before the
+    /// grant keeps the DACL it was born with, so without the push the
+    /// container could create new files but not read the old ones.
+    Inherited,
+    /// Set the DACL of the path alone and leave everything below it alone.
+    ///
+    /// This is what a traversal grant on an ancestor needs. Pushing the entry
+    /// onto the subtree of an ancestor would rewrite the DACL of every file
+    /// below it, which is slow on a large tree, fails outright when one of the
+    /// files cannot be rewritten, and would widen a narrow traversal grant
+    /// into full access over the whole tree.
+    None,
+}
+
 /// Merge one access entry for `sid` into the DACL of `path`.
 ///
 /// `access` is the rights the entry grants and `inherit` says whether the entry
 /// is passed on to the objects below `path`.
-fn grant_to(path: &Path, sid: PSID, access: u32, inherit: bool) -> Result<(), AppContainerError> {
+///
+/// `propagation` says how far the new DACL reaches. The two cases need
+/// different Windows APIs, because they are different operations:
+///
+/// - `Inherited` is the workspace grant. The entry is inheritable, and Windows
+///   has to push it onto the objects that are already in the tree, or a file
+///   that existed before the grant would stay unreachable.
+/// - `None` is the traversal grant on an ancestor. The entry exists to open
+///   the path, not to open everything below it, and pushing it onto the
+///   subtree of an ancestor would turn a narrow grant into full access over a
+///   whole tree.
+fn grant_to(
+    path: &Path,
+    sid: PSID,
+    access: u32,
+    inherit: bool,
+    propagation: Propagation,
+) -> Result<(), AppContainerError> {
     // SAFETY: `sid` is a valid SID.
     let length = unsafe { GetLengthSid(sid) };
     if length == 0 {
@@ -475,27 +520,181 @@ fn grant_to(path: &Path, sid: PSID, access: u32, inherit: bool) -> Result<(), Ap
             path.display()
         )));
     }
-    // SAFETY: `wide` is a valid null-terminated path and `merged` is the ACL
-    // `SetEntriesInAclW` just built.
+    match propagation {
+        Propagation::Inherited => write_dacl_with_propagation(path, merged)?,
+        Propagation::None => write_dacl_without_propagation(path, merged)?,
+    }
+    // SAFETY: the ACL was allocated by `SetEntriesInAclW` and is freed exactly once.
+    unsafe {
+        LocalFree(merged as *mut std::ffi::c_void);
+    }
+    Ok(())
+}
+
+/// Write `dacl` onto `path` and push it onto the objects below it.
+///
+/// `SetSecurityInfo` on an open handle writes the DACL and lets Windows
+/// re-evaluate inheritance across the subtree, so a file that already existed
+/// gets the new rights too. This is the workspace grant, where the container
+/// must be able to read the whole workspace.
+fn write_dacl_with_propagation(path: &Path, dacl: *mut ACL) -> Result<(), AppContainerError> {
+    let handle = open_for_security_write(path)?;
+    // SAFETY: `handle` is a valid open handle for the duration of the call and
+    // `dacl` is the ACL that was just built for this object.
     let status = unsafe {
-        SetNamedSecurityInfoW(
-            wide.as_ptr(),
+        SetSecurityInfo(
+            handle,
             SE_FILE_OBJECT,
             windows_sys::Win32::Security::DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            merged,
+            dacl,
             std::ptr::null_mut(),
         )
     };
-    // SAFETY: the ACL was allocated by `SetEntriesInAclW` and is freed exactly once.
+    // SAFETY: the handle was opened by this function and is closed exactly once.
     unsafe {
-        LocalFree(merged as *mut std::ffi::c_void);
+        CloseHandle(handle);
     }
     if status != 0 {
         return Err(AppContainerError::Acl(format!(
             "cannot grant the AppContainer access to {}: status={status:#x}",
             path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Open a path for a security write, without asking for more than the write
+/// needs.
+///
+/// A directory is opened with `FILE_FLAG_BACKUP_SEMANTICS`, which is what
+/// makes `CreateFileW` accept a directory at all. The access mask asks for
+/// `WRITE_DAC` and the attributes only, so the handle cannot read the
+/// contents of what it opens.
+///
+/// `GENERIC_READ` is part of the mask because `SetSecurityInfo` on a
+/// directory rejects a handle that cannot read it: the security subsystem
+/// re-opens the object by name to check the result, and a handle without read
+/// access fails that check with `ACCESS_DENIED`. Read access on a directory
+/// means the right to list it, not the right to read the files in it, so the
+/// container still cannot read what it was not granted.
+fn open_for_security_write(path: &Path) -> Result<HANDLE, AppContainerError> {
+    let wide = wide_null(&path.to_string_lossy());
+    // SAFETY: `wide` is a valid null-terminated path and every out-parameter is
+    // valid for the duration of the call.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | WRITE_DAC | GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() {
+        return Err(AppContainerError::Acl(format!(
+            "cannot open {} for a security write: os error {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(handle)
+}
+
+/// Write `dacl` onto `path` without propagating it to the objects below.
+///
+/// `SetFileSecurityW` sets the descriptor on the object and leaves the objects
+/// below it alone.
+///
+/// The other ways of writing a DACL re-evaluate inheritance across the whole
+/// subtree: every child gets its own DACL rewritten. That costs about 0.35ms
+/// per entry, so the traversal grant on the user profile or the temporary
+/// folder took minutes, and on a CI runner it failed outright because one
+/// file in the subtree could not be rewritten. The grant was then skipped, the
+/// confined token could not walk down to the workspace, and the spawn failed
+/// with `ERROR_FILE_NOT_FOUND` for a payload that was really there.
+///
+/// `SetFileSecurityW` takes a security descriptor rather than a bare ACL. The
+/// descriptor is built in two steps: an absolute descriptor that owns the ACL,
+/// and then a self-relative copy of it, which is the form the file APIs
+/// expect.
+fn write_dacl_without_propagation(path: &Path, dacl: *mut ACL) -> Result<(), AppContainerError> {
+    // An absolute descriptor is four bytes of control information followed by
+    // the ACL. The buffer is generous: the merged ACL of a directory is small,
+    // and a fixed buffer keeps the allocation simple.
+    const DESCRIPTOR_BYTES: usize = 4096;
+    let mut absolute = vec![0u8; DESCRIPTOR_BYTES];
+    // SAFETY: `absolute` is a valid, writable buffer of the documented size and
+    // revision 1 is the only revision Windows has ever defined.
+    let initialized =
+        unsafe { InitializeSecurityDescriptor(absolute.as_mut_ptr() as *mut std::ffi::c_void, 1) };
+    if initialized == 0 {
+        return Err(AppContainerError::Acl(format!(
+            "cannot build the security descriptor for {}: os error {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `absolute` is a valid descriptor and `dacl` is the ACL that was
+    // just built for this object.
+    let set = unsafe {
+        SetSecurityDescriptorDacl(absolute.as_mut_ptr() as *mut std::ffi::c_void, 1, dacl, 0)
+    };
+    if set == 0 {
+        return Err(AppContainerError::Acl(format!(
+            "cannot attach the ACL of {} to the descriptor: os error {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    // The file APIs want a self-relative descriptor. The first call reports
+    // the size it needs when the buffer is too small.
+    let mut relative = vec![0u8; DESCRIPTOR_BYTES * 2];
+    let mut needed = 0u32;
+    // SAFETY: both buffers are valid for the duration of the call and `needed`
+    // is a valid out-parameter.
+    let made_relative = unsafe {
+        MakeSelfRelativeSD(
+            absolute.as_mut_ptr() as *mut std::ffi::c_void,
+            relative.as_mut_ptr() as *mut std::ffi::c_void,
+            &mut needed,
+        )
+    };
+    if made_relative == 0 {
+        relative = vec![0u8; needed as usize];
+        // SAFETY: the buffer is now exactly the size the API asked for.
+        let made_relative = unsafe {
+            MakeSelfRelativeSD(
+                absolute.as_mut_ptr() as *mut std::ffi::c_void,
+                relative.as_mut_ptr() as *mut std::ffi::c_void,
+                &mut needed,
+            )
+        };
+        if made_relative == 0 {
+            return Err(AppContainerError::Acl(format!(
+                "cannot build the relative descriptor for {}: os error {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    // SAFETY: `relative` holds a self-relative descriptor and the path is a
+    // valid null-terminated string.
+    let written = unsafe {
+        SetFileSecurityW(
+            wide_null(&path.to_string_lossy()).as_ptr(),
+            windows_sys::Win32::Security::DACL_SECURITY_INFORMATION,
+            relative.as_mut_ptr() as *mut std::ffi::c_void,
+        )
+    };
+    if written == 0 {
+        return Err(AppContainerError::Acl(format!(
+            "cannot grant the AppContainer access to {}: os error {}",
+            path.display(),
+            std::io::Error::last_os_error()
         )));
     }
     Ok(())
@@ -538,7 +737,7 @@ fn spawn_in_container(
     };
     startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     let mut command_line = wide_null(&build_command_line(program, args));
-    let wide_cwd = wide_null(&cwd.to_string_lossy());
+    let wide_cwd = wide_path(cwd);
     // An explicit environment block. Passing null would inherit the parent's
     // environment, which leaks credentials into the sandbox. Windows itself needs a few
     // variables to start a process, so those are provided and nothing else is.
@@ -686,7 +885,7 @@ fn spawn_piped_in_container(
     startup.StartupInfo.hStdError = stderr.child;
 
     let mut command_line = wide_null(&build_command_line(program, args));
-    let wide_cwd = wide_null(&cwd.to_string_lossy());
+    let wide_cwd = wide_path(cwd);
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     let entries = build_environment_block(&system_root, cwd);
     let mut environment: Vec<u16> = Vec::new();
@@ -965,4 +1164,26 @@ pub fn wide_null(text: &str) -> Vec<u16> {
     let mut wide: Vec<u16> = std::ffi::OsStr::new(text).encode_wide().collect();
     wide.push(0);
     wide
+}
+
+/// Encode a path as a null-terminated UTF-16 buffer, without the Windows
+/// verbatim (`\\?\`) prefix.
+///
+/// `std::fs::canonicalize` returns a verbatim path on Windows, and the
+/// verbatim form switches off the normalization the Win32 path parser does.
+/// A program that is handed one cannot be resolved: `CreateProcessW` reports
+/// `ERROR_FILE_NOT_FOUND` for an image that is really there, and a working
+/// directory that is handed one is rejected as a UNC path. The prefix is
+/// dropped at the API boundary so every caller gets a path the Windows APIs
+/// can actually use.
+fn wide_path(path: &Path) -> Vec<u16> {
+    let text = path.as_os_str().to_string_lossy();
+    let trimmed = match text.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => text
+            .strip_prefix(r"\\?\")
+            .map(str::to_owned)
+            .unwrap_or(text.to_string()),
+    };
+    wide_null(&trimmed)
 }

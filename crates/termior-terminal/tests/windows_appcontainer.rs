@@ -364,6 +364,51 @@ fn a_confined_command_can_run_a_program_below_a_private_ancestor() {
     );
 }
 
+/// A verbatim working directory must still start the confined process.
+///
+/// `std::fs::canonicalize` returns a verbatim path (`\\?\C:\...`) on Windows,
+/// and the sandbox hands that path to `CreateProcessW` as the working
+/// directory. The verbatim form switches off the normalization the Win32 path
+/// parser does, so the confined process either fails to start with
+/// `ERROR_FILE_NOT_FOUND` for a program that is really there, or starts in
+/// `C:\Windows` because the path was rejected as a UNC path. This is the shape
+/// the CI runner had, and it is why the escape suite failed there.
+#[test]
+fn a_confined_command_starts_in_a_verbatim_working_directory() {
+    let Some(container) = require_container() else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("inside.txt"), b"inside-value").unwrap();
+    container
+        .grant(&workspace)
+        .expect("the workspace grant must succeed");
+
+    // The verbatim form of the same directory.
+    let verbatim = {
+        let resolved = workspace.canonicalize().unwrap();
+        let text = resolved.as_os_str().to_string_lossy().to_string();
+        assert!(
+            text.starts_with(r"\\?\"),
+            "canonicalize did not return a verbatim path on this machine: {text}"
+        );
+        std::path::PathBuf::from(text)
+    };
+
+    let code = run(
+        &container,
+        &["/c".into(), "type inside.txt".into()],
+        &verbatim,
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "the confined command did not start in the verbatim working directory"
+    );
+}
+
 /// A grant must not take the host's own access away. The grant is done with
 /// `SetNamedSecurityInfoW`, which replaces the whole DACL, so this test checks what
 /// the directory looks like afterwards.
@@ -387,6 +432,49 @@ fn granting_a_directory_keeps_the_hosts_own_access() {
     );
     std::fs::write(directory.join("after.txt"), b"after").unwrap();
     println!("granted directory: {}", directory.display());
+}
+
+/// The traversal grant on an ancestor must not reach the files below it.
+///
+/// Writing a DACL the way the other Windows APIs do re-evaluates inheritance
+/// across the whole subtree: every file below the ancestor gets its own DACL
+/// rewritten. That costs about 0.35ms per file, so the grant on a CI
+/// runner's profile directory took minutes and then failed outright, because
+/// one file in the subtree could not be rewritten. The grant was skipped, the
+/// confined token could not walk down to the workspace, and the spawn failed
+/// with `ERROR_FILE_NOT_FOUND` for a payload that was really there.
+///
+/// The traversal grant is therefore written without propagation: the ancestor
+/// becomes walkable and the files below it are left alone.
+#[test]
+fn the_traversal_grant_on_an_ancestor_leaves_the_files_below_it_alone() {
+    let Some(container) = require_container() else {
+        return;
+    };
+    let root = std::env::temp_dir().join("termior-appcontainer-no-propagation");
+    let _ = std::fs::remove_dir_all(&root);
+    let ancestor = root.join("ancestor");
+    std::fs::create_dir_all(&ancestor).unwrap();
+    let child = ancestor.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    let file = ancestor.join("untouched.txt");
+    std::fs::write(&file, b"untouched").unwrap();
+
+    let before = acl_entries(&file);
+
+    // Grant traversal on the ancestor alone: the workspace below it is not
+    // part of this grant.
+    let granted = container.grant_with_ancestors(&child);
+    if granted.is_err() {
+        eprintln!("skipping: the ancestor grant failed: {granted:?}");
+        return;
+    }
+
+    let after = acl_entries(&file);
+    assert_eq!(
+        before, after,
+        "the traversal grant on the ancestor changed the files below it"
+    );
 }
 
 /// The grant must also keep the *other* principals' entries. Replacing the whole
