@@ -122,7 +122,11 @@ codegen-units = 1
 [patch.crates-io]
 # gpui-wry must share the exact GPUI source/revision with the application.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49" }
+# Legacy Mesa X11 and software-rendering compatibility. See vendor/README.md.
+wgpu-hal = { path = "vendor/wgpu-hal" }
 
 # Windows secondary-window close race fix (clear callbacks in Drop). See vendor/README.md.
 [patch."https://github.com/zed-industries/zed"]
 gpui_windows = { path = "vendor/gpui_windows" }
+# Software OpenGL backend selection and path-rendering compatibility.
+gpui_wgpu = { path = "vendor/gpui_wgpu" }

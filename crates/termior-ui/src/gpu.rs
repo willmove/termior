@@ -1,13 +1,8 @@
-//! Linux GPU 探测：在 GPUI/wgpu 启动前避开 Mesa EGL/DRI2 的失败探测。
+//! Linux GPU 探测：在 GPUI/wgpu 启动前选择可用的软件 OpenGL 实现。
 //!
-//! wgpu（`gpui_wgpu`）会同时枚举 Vulkan 和 GLES。没有可访问的 DRM render node
-//! 时（QEMU Cirrus/无 3D、未加入 `video`/`render` 组、只有 `card*` 没有
-//! `renderD*`），Mesa 的 EGL `eglInitialize` 会打出 `0x3003` /
-//! `ZINK: failed to choose pdev` 这类看起来像致命错误的日志，尽管 lavapipe
-//! Vulkan 仍能正常出窗。
-//!
-//! 此时设置 `LIBGL_ALWAYS_SOFTWARE=1`，让 GLES 探测走 llvmpipe，错误日志消失。
-//! 已有该环境变量或存在可打开的 `/dev/dri/renderD*` 时不改动。
+//! 没有可访问的 DRM render node 时（QEMU Cirrus/无 3D、未加入
+//! `video`/`render` 组、只有 `card*` 没有 `renderD*`），使用 Mesa
+//! llvmpipe，并避开可能已失效的厂商 EGL 实现。用户显式设置的环境变量优先。
 
 use std::path::Path;
 
@@ -26,33 +21,44 @@ pub fn prepare(prefer_software: bool) {
 mod linux {
     use super::*;
 
+    const MESA_EGL_VENDOR: &str = "/usr/share/glvnd/egl_vendor.d/50_mesa.json";
+
     pub(super) fn prepare(prefer_software: bool) {
-        if !should_force_software_gl(
+        if !should_use_software_rendering(
             prefer_software,
-            std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_some(),
             has_accessible_render_node_in(Path::new("/dev/dri")),
         ) {
             return;
         }
         // 进程入口、GPUI 尚未起线程。edition 2021 下 `set_var` 仍是安全函数。
-        std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
-        log::info!(
-            "No accessible DRM render node; using Mesa software GL so wgpu's GLES probe does not fail"
-        );
+        if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
+            std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+        }
+        if std::env::var_os("WGPU_BACKEND").is_none() {
+            std::env::set_var("WGPU_BACKEND", "gl");
+        }
+        if std::env::var_os("MESA_GL_VERSION_OVERRIDE").is_none() {
+            std::env::set_var("MESA_GL_VERSION_OVERRIDE", "4.5");
+        }
+        if std::env::var_os("MESA_GLSL_VERSION_OVERRIDE").is_none() {
+            std::env::set_var("MESA_GLSL_VERSION_OVERRIDE", "450");
+        }
+        if std::env::var_os("__EGL_VENDOR_LIBRARY_FILENAMES").is_none()
+            && Path::new(MESA_EGL_VENDOR).is_file()
+        {
+            std::env::set_var("__EGL_VENDOR_LIBRARY_FILENAMES", MESA_EGL_VENDOR);
+        }
+        log::info!("Software rendering fallback enabled before GPUI initialization");
     }
 }
 
 // 这两个探测辅助只被上方 cfg(linux|freebsd) 的 `linux::prepare` 调用；其余平台
 // 编译期就是死代码，仅由单元测试覆盖，故只在那些平台豁免 dead_code 检查。
 #[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
-pub(crate) fn should_force_software_gl(
+pub(crate) fn should_use_software_rendering(
     prefer_software: bool,
-    libgl_already_set: bool,
     has_accessible_render_node: bool,
 ) -> bool {
-    if libgl_already_set {
-        return false;
-    }
     prefer_software || !has_accessible_render_node
 }
 
@@ -76,12 +82,10 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn software_gl_is_forced_without_render_node_or_when_preferred() {
-        assert!(should_force_software_gl(false, false, false));
-        assert!(should_force_software_gl(true, false, true));
-        assert!(!should_force_software_gl(false, false, true));
-        assert!(!should_force_software_gl(true, true, false));
-        assert!(!should_force_software_gl(false, true, false));
+    fn software_rendering_is_used_without_render_node_or_when_preferred() {
+        assert!(should_use_software_rendering(false, false));
+        assert!(should_use_software_rendering(true, true));
+        assert!(!should_use_software_rendering(false, true));
     }
 
     #[test]

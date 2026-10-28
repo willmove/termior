@@ -26,6 +26,18 @@ Rust 固定在 `rust-toolchain.toml` 的 1.98.1；升级时同时更新 `clippy.
 
 升级 GPUI 前先重放设置窗口打开/关闭、主窗口失焦/恢复、重复关闭和进程退出；检查 `window not found`、无效 HWND、进程残留与渲染。再运行三平台 smoke 和 NFR 启动/体积/RSS 门禁。
 
+### wgpu-hal 补丁
+
+基线为 crates.io `wgpu-hal 29.0.4`，通过根 `Cargo.toml` 的 `[patch.crates-io]` 使用 `vendor/wgpu-hal`，版本不变。`src/gles/egl.rs` 在 GPUI 提供 XCB display handle、但旧 Mesa 只有 `EGL_EXT_platform_x11` 而没有 `EGL_EXT_platform_xcb` 时，回退到默认 X11 EGL display，避免误用 surfaceless 后没有可呈现窗口格式。现代 XCB 路径保持原样。桌面 OpenGL 上下文优先请求 4.5、失败时保留上游 3.3 回退，使存储缓冲 shader 与间接调用校验可使用核心能力。
+
+`termior-ui::gpu::prepare` 同时在无可用 DRM render node 或用户偏好软件渲染时选择 Mesa EGL、llvmpipe 及 GL 4.5/GLSL 450 覆盖，且不覆盖显式环境变量。升级 wgpu 时必须比较上游 EGL 平台和上下文选择；只有上游具备等价兼容后才可移除补丁。移除前需在旧 Mesa/X11 上完成真实窗口 smoke，并在硬件 Vulkan 环境确认原路径无回归。
+
+### GPUI wgpu 补丁
+
+`vendor/gpui_wgpu` 来自同一 Zed revision，通过 `[patch."https://github.com/zed-industries/zed"]` 替换。`WgpuContext::instance` 尊重标准 `WGPU_BACKEND`，使软件回退只初始化 OpenGL，不再探测当前不可用的 Vulkan 驱动；未设置时仍采用上游 Vulkan + OpenGL 默认值。`RenderingParameters::new` 对 CPU OpenGL 使用单采样路径渲染，规避旧 Mesa 只按 `GL_MAX_SAMPLES` 宣告 4x MSAA、实际分配 renderbuffer 却失败的问题；硬件后端保留 4x/2x/1x 能力选择。
+
+升级 GPUI/wgpu 时同步比较这两处。只有上游支持后端选择并正确处理旧 Mesa 的 MSAA 能力后才可移除；移除前必须重放旧 Mesa 与硬件 Vulkan 的真实窗口 smoke。
+
 ### cargo deny 的现有阻塞
 
 升级前，cargo-deny 0.20.2 的 Windows 依赖图检查已报告许可失败：`gpui_shared_string`、`gpui_util` 缺少许可字段/可识别声明，`libbz2-rs-sys` 的 `bzip2-1.0.6` 不在允许列表，`zlog`、`ztracing`、`ztracing_macro` 声明 GPL-3.0-or-later。不能仅靠加入 GPL 或忽略未许可 crate 来宣称 MIT 项目的许可门禁通过；需要维护者核实授权或调整依赖。

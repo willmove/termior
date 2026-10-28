@@ -26,8 +26,8 @@ fn main() {
     install_panic_log();
     let _ = env_logger::try_init();
     // wgpu 会同时探测 Vulkan 和 GLES。无 DRM render node 的 Linux（虚拟机、
-    // 未加入 video/render 组）上，GLES/EGL 探测会打出 Mesa DRI2/ZINK 错误，
-    // 尽管 lavapipe Vulkan 仍能出窗。必须在创建 GPUI 实例之前设置。
+    // 未加入 video/render 组）需要在创建 GPUI 实例之前选择 Mesa 软件 OpenGL，
+    // 避免失效的厂商 EGL 实现让窗口无法创建。
     let (preset, _, _) = workspace_view::load_settings();
     termior_ui::gpu::prepare(preset.prefer_software_rendering);
     let smoke_test = std::env::var_os("TERMIOR_SMOKE_TEST").is_some();
