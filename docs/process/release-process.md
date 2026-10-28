@@ -46,13 +46,41 @@ gh release view vX.Y.Z   # expected to return not-found for a new version
 ```
 
 - The latest `main` CI state is green, **or** every red job is a failure that has been understood
-  and documented before tagging. As of v0.3.1 there is no known pre-existing red state on `main`:
-  the v0.2.3-era `Core (ubuntu-latest)` Clippy and `Core coverage ≥ 80%` failures (those jobs
-  lacked the `fontconfig` development package that `yeslogic-fontconfig-sys` locates through
-  pkg-config) were fixed by installing the Linux link dependencies in those jobs. A red job at
-  tagging time is a blocker unless its cause has been understood and recorded here first. The
-  publication gate is the Release workflow (`.github/workflows/release.yml`), which builds and
-  packages on all three platforms but does not run those tests.
+  and documented before tagging. A red job at tagging time is a blocker unless its cause has been
+  understood and recorded here first. The publication gate is the Release workflow
+  (`.github/workflows/release.yml`), which builds and packages on all three platforms but does
+  not run those tests.
+- Known red states, recorded at v0.3.2 (2026-10-28), investigated by rerunning the failed jobs of
+  run 40627976442 on commit ccf18baa:
+  - `Core coverage ≥ 80%`: a microsecond-scale timing assertion in
+    `termior-bench`'s `opening_the_journal_per_append_dominates_the_write_cost` (per-append vs
+    kept-open measured at 0.004 ms vs 0.005 ms) fails when the runner is loaded and passes when
+    rerun. The release publication gate does not run it. Flaky by construction; a fix would
+    widen the margin or assert on the deterministic flush count instead.
+  - `Agent IO (linux)`: the NFR gate compares wall-clock latency against machine-specific
+    baselines (linux 2.0/0.03/1.0 ms). The journal bytes and flush counts matched the baseline
+    exactly while wall clock deviated, and the job passed on rerun; a slower machine (including
+    the maintainer's Kylin V10 box) measures 10–200× over the baseline with identical payload
+    shapes. Runner noise, not a write-path regression; the deterministic `burst_flushes` metric
+    is the part that gates behavior.
+  - `Core (windows-latest)`: `black_box_escape_suite` fails persistently (three consecutive CI
+    runs since the test was introduced) with `CreateProcessW` `ERROR_FILE_NOT_FOUND` for the
+    staged payload under the granted workspace. The mechanism is understood and documented in
+    `crates/termior-terminal/src/windows_sandbox/imp.rs` (`grant_with_ancestors`): a confined
+    AppContainer token that cannot traverse to or open the image gets exactly this error. Three
+    real causes have been fixed (staging the payload into the workspace, ancestor traversal
+    grants, non-propagating grant writes and verbatim cwd/program paths), after which the suite
+    passes on developer Windows machines and the equivalent bubblewrap path is green on CI. The
+    remaining trigger is specific to the `windows-latest` runner image — the prime suspect is an
+    ancestor on the runner's profile/temp tree whose traversal grant `grant_ancestors_to`
+    silently skips by design — and does not reproduce on other Windows machines. Open; does not
+    affect the release publication gate.
+
+  Historical: the v0.2.3-era `Core (ubuntu-latest)` Clippy and `Core coverage ≥ 80%` failures
+  (those jobs lacked the `fontconfig` development package that `yeslogic-fontconfig-sys` locates
+  through pkg-config) were fixed by installing the Linux link dependencies in those jobs. As of
+  v0.3.2 the v0.3.1 note "no known pre-existing red state" above is superseded by the three
+  entries in this list.
 
 ## 2. Build the change summary
 
