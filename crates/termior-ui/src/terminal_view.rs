@@ -899,15 +899,24 @@ impl TerminalView {
             return;
         }
         let bytes = keystroke_to_pty_bytes(&ev.keystroke, *self.term.mode());
-        if ev.keystroke.key_char.is_some()
+        if ev
+            .keystroke
+            .key_char
+            .as_ref()
+            .is_some_and(|text| !text.is_empty() && text.chars().all(|ch| !ch.is_control()))
             && !modifiers.control
             && !modifiers.alt
             && !modifiers.platform
         {
-            // Committed text, including IME, is delivered through InputHandler.
+            // Only printable text is committed through InputHandler. macOS also
+            // sets key_char for Enter ("\n") and Tab ("\t"); those must use
+            // the terminal's control-key encoding instead.
             return;
         }
         if !bytes.is_empty() {
+            // Tell macOS the key was handled so AppKit does not dispatch it
+            // again through doCommandBySelector / the text input handler.
+            cx.stop_propagation();
             if let Err(e) = self.write_input(&bytes) {
                 log::warn!("PTY write error: {e}");
             }
@@ -2596,6 +2605,65 @@ mod protocol_tests {
     use alacritty_terminal::event::VoidListener;
     use gpui::{size, AppContext as _, TestAppContext};
     use termior_theme::default_theme;
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_enter_with_key_char_submits_to_real_pty() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("submitted");
+        let quoted_output = output.to_string_lossy().replace('\'', "'\\''");
+        let command = format!("printf submitted > '{quoted_output}'");
+        let mut cx = TestAppContext::single();
+        let bridge = TerminalBridge::spawn(&PtySessionConfig {
+            shell: Some(ShellKind::Bash),
+            shell_program: Some("/bin/bash".into()),
+            ..Default::default()
+        })
+        .expect("PTY spawn");
+        let window = cx.open_window(size(px(640.0), px(480.0)), move |_, cx| {
+            TerminalView::from_bridge(
+                bridge,
+                default_theme().palette().clone(),
+                TerminalSettings::default(),
+                UserKeymap::default(),
+                cx,
+            )
+        });
+        cx.update_window(window.into(), |terminal, window, cx| {
+            let terminal = terminal.downcast::<TerminalView>().unwrap();
+            let mut handler = TerminalInputHandler {
+                view: terminal.downgrade(),
+            };
+            handler.replace_text_in_range(None, &command, window, cx);
+            assert!(!output.exists(), "typing alone must not submit the command");
+            terminal.update(cx, |view, cx| {
+                view.handle_key_down(
+                    &KeyDownEvent {
+                        keystroke: gpui::Keystroke {
+                            modifiers: Modifiers::default(),
+                            key: "enter".into(),
+                            // Match gpui_macos::events, unlike simulated keys
+                            // that omit the native control character.
+                            key_char: Some("\n".into()),
+                        },
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        })
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read(&output).ok().as_deref() != Some(b"submitted") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Enter did not submit to PTY"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn terminal_grid_columns_track_pane_width_across_window_resize() {

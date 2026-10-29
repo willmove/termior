@@ -219,6 +219,15 @@ mod tests {
             b"\x7f"
         );
         assert_eq!(keystroke_to_pty_bytes(&ks("tab", None, m), mode), b"\t");
+        // Native macOS events include key_char even for these control keys.
+        assert_eq!(
+            keystroke_to_pty_bytes(&ks("enter", Some("\n"), m), mode),
+            b"\r"
+        );
+        assert_eq!(
+            keystroke_to_pty_bytes(&ks("tab", Some("\t"), m), mode),
+            b"\t"
+        );
         assert_eq!(
             keystroke_to_pty_bytes(&ks("escape", None, m), mode),
             b"\x1b"
