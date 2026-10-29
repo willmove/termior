@@ -1927,15 +1927,18 @@ impl gpui::Render for WorkspaceView {
                             .h_full()
                             .window_control_area(WindowControlArea::Drag)
                             // Windows：HTCAPTION 命中测试原生处理拖拽与双击。
-                            // Linux/BSD：gpui 后端不做窗口控制命中测试，拖拽
+                            // macOS 的自绘标题栏和 Linux/BSD：拖拽
                             // 与双击最大化由应用自己处理（对齐 Zed
                             // platform_title_bar 的 Linux 路径）。
-                            .when(handles_own_window_control_clicks(), |gap| {
-                                gap.on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(Self::start_titlebar_move),
-                                )
-                            }),
+                            .when(
+                                handles_own_window_control_clicks() || cfg!(target_os = "macos"),
+                                |gap| {
+                                    gap.on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::start_titlebar_move),
+                                    )
+                                },
+                            ),
                     )
                     .child(
                         // 标题栏操作区：打开工作区 + 通知 + 设置。

@@ -184,10 +184,9 @@ impl WorkspaceView {
             cx.notify();
         }
     }
-    /// Linux/BSD 标题栏拖拽的第一步：按下时 armed，真正的窗口移动在
-    /// [`Self::move_titlebar`] 的首个移动事件里交给合成器
-    /// （`start_window_move`），避免单纯点击也触发移动；双击按桌面约定
-    /// 最大化/还原（Windows 上由 HTCAPTION 原生处理，不进这里）。
+    /// 自绘标题栏拖拽：macOS 在按下时交给 AppKit；Linux/BSD 先 armed，
+    /// 再由 [`Self::move_titlebar`] 的首个移动事件交给合成器。
+    /// 双击遵循平台偏好（Windows 由 HTCAPTION 原生处理，不进这里）。
     pub(super) fn start_titlebar_move(
         &mut self,
         event: &MouseDownEvent,
@@ -196,7 +195,15 @@ impl WorkspaceView {
     ) {
         if event.click_count >= 2 {
             self.titlebar_move_armed = false;
-            window.zoom_window();
+            if cfg!(target_os = "macos") {
+                window.titlebar_double_click();
+            } else {
+                window.zoom_window();
+            }
+        } else if cfg!(target_os = "macos") {
+            // AppKit's drag API uses the current native mouse-down event.
+            self.titlebar_move_armed = false;
+            window.start_window_move();
         } else {
             self.titlebar_move_armed = true;
         }

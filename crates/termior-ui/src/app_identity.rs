@@ -27,6 +27,9 @@ pub fn main_window_options(bounds: WindowBounds) -> WindowOptions {
             traffic_light_position: Some(point(px(12.0), px((height::TITLE_BAR - 16.0) / 2.0))),
         }),
         window_decorations: Some(WindowDecorations::Client),
+        // macOS 27 otherwise delays/intercepts clicks in the transparent
+        // system titlebar while deciding whether to drag the main window.
+        app_owns_titlebar_drag: cfg!(target_os = "macos"),
         // Linux CSD：窗口四周的 resize 环带/阴影是透明像素，透出合成器桌面
         // （见 workspace_view::render_window_frame）。无合成器时 gpui 回退
         // Server 装饰，内容满幅绘制，透明背景无副作用。其他平台保持不透明。
@@ -72,9 +75,11 @@ mod tests {
         let bounds = WindowBounds::Windowed(gpui::Bounds::default());
         let main = main_window_options(bounds);
         assert!(main.titlebar.unwrap().appears_transparent);
+        assert_eq!(main.app_owns_titlebar_drag, cfg!(target_os = "macos"));
 
         let bounds = WindowBounds::Windowed(gpui::Bounds::default());
         let secondary = window_options(bounds);
         assert!(!secondary.titlebar.unwrap().appears_transparent);
+        assert!(!secondary.app_owns_titlebar_drag);
     }
 }
