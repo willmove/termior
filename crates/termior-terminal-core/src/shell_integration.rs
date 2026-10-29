@@ -85,11 +85,17 @@ fi
         "\
 # Termior shell integration (zsh) — .zshrc wrapper
 # Source the user's real zshrc.
+__termior_initial_prompt=$PS1
 if [ -n \"$TERMior_REAL_ZDOTDIR\" ] && [ -f \"$TERMior_REAL_ZDOTDIR/.zshrc\" ]; then
     source \"$TERMior_REAL_ZDOTDIR/.zshrc\"
 elif [ -f \"$HOME/.zshrc\" ]; then
     source \"$HOME/.zshrc\"
 fi
+
+() {{
+{colors}
+}}
+unset __termior_initial_prompt
 
 # --- Termior integration (OSC 7 / 133) ---
 export TERMior_HOSTNAME=\"${{TERMior_HOSTNAME:-$HOST}}\"
@@ -109,10 +115,11 @@ __termior_preexec() {{
 add-zsh-hook precmd __termior_precmd
 add-zsh-hook preexec __termior_preexec
 # Emit the input-end mark right after prompt is drawn.
-PS1=\"$(__termior_mark_input)$PS1\"
+PS1=\"$PS1%{{$(__termior_mark_input)%}}\"
 ",
         osc7 = osc7(),
         osc133 = osc133_prompt(),
+        colors = include_str!("shell_integration/zsh-colors.zsh"),
     );
 
     ShellIntegrationSnippets {
@@ -364,6 +371,119 @@ fn posix_display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    fn run_zsh(script: &str) -> std::process::Output {
+        std::process::Command::new("/bin/zsh")
+            .args(["-fic", script])
+            .env("TERM", "xterm-256color")
+            .env("LC_ALL", "en_US.UTF-8")
+            .env("HOME", "/nonexistent/termior-shell-test")
+            .env("TERMior_REAL_ZDOTDIR", "/nonexistent/termior-shell-test")
+            .env_remove("NO_COLOR")
+            .env_remove("TERMIOR_SHELL_COLORS")
+            .output()
+            .expect("run system zsh")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zsh_color_defaults_and_osc_hooks_load_together() {
+        let snippets = zsh_snippets();
+        let rc = &snippets
+            .files
+            .iter()
+            .find(|(name, _)| name == ".zshrc")
+            .unwrap()
+            .1;
+        let output = run_zsh(&format!(
+            "precmd_functions=(unrelated_autosuggestion_hook)\n{rc}\n{}",
+            r#"
+[[ $PS1 == *'%F{green}'* && $PS1 == *$'\e]133;B\a%}' ]] || exit 10
+[[ $aliases[ls] == 'ls -G' && $aliases[grep] == 'grep --color=auto' ]] || exit 11
+[[ $aliases[git] == 'git -c color.ui=auto' ]] || exit 12
+(( ${+functions[__termior_highlight]} )) || exit 13
+(( ${precmd_functions[(Ie)__termior_precmd]} )) || exit 14
+(( ${preexec_functions[(Ie)__termior_preexec]} )) || exit 15
+"#
+        ));
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn disabling_zsh_colors_keeps_shell_integration() {
+        let snippets = zsh_snippets();
+        let rc = &snippets
+            .files
+            .iter()
+            .find(|(name, _)| name == ".zshrc")
+            .unwrap()
+            .1;
+        for disable in ["NO_COLOR=''", "TERMIOR_SHELL_COLORS=0", "TERM=dumb"] {
+            let output = run_zsh(&format!(
+                "{disable}\n{rc}\n{}",
+                r#"
+[[ $PS1 != *'%F{'* ]] || exit 10
+(( ! ${+functions[__termior_highlight]} )) || exit 11
+(( ${precmd_functions[(Ie)__termior_precmd]} )) || exit 12
+(( ${preexec_functions[(Ie)__termior_preexec]} )) || exit 13
+"#
+            ));
+            assert!(output.status.success(), "{disable}: {output:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zsh_colors_preserve_user_prompt_aliases_and_highlighter() {
+        let colors = include_str!("shell_integration/zsh-colors.zsh");
+        let output = run_zsh(&format!(
+            "{}\n() {{\n{colors}\n}}\n{}",
+            r#"
+__termior_initial_prompt=$PS1
+PS1='custom> '
+alias ls='ls -la'
+grep() { :; }
+_zsh_highlight() { :; }
+"#,
+            r#"
+[[ $PS1 == 'custom> ' && $aliases[ls] == 'ls -la' ]] || exit 10
+(( ${+functions[grep]} && ! ${+aliases[grep]} )) || exit 11
+(( ! ${+functions[__termior_highlight]} )) || exit 12
+"#
+        ));
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn zsh_highlight_handles_unicode_incomplete_quotes_and_never_evaluates_input() {
+        let colors = include_str!("shell_integration/zsh-colors.zsh");
+        let output = run_zsh(&format!(
+            "__termior_initial_prompt=$PS1\n() {{\n{colors}\n}}\n{}",
+            r#"
+region_highlight=('0 1 bold memo=other')
+BUFFER='echo -n "中文" | grep text'
+__termior_highlight
+[[ ${region_highlight[1]} == '0 1 bold memo=other' ]] || exit 10
+[[ ${region_highlight[2]} == '0 4 fg=green memo=termior' ]] || exit 11
+[[ ${region_highlight[3]} == '5 7 fg=cyan memo=termior' ]] || exit 12
+[[ ${region_highlight[4]} == '8 12 fg=yellow memo=termior' ]] || exit 13
+BUFFER='echo "unfinished'
+__termior_highlight
+[[ ${region_highlight[-1]} == '5 16 fg=yellow memo=termior' ]] || exit 14
+BUFFER='echo "$(print -u2 __HIGHLIGHT_EXECUTED__)"'
+__termior_highlight
+[[ $BUFFER == 'echo "$(print -u2 __HIGHLIGHT_EXECUTED__)"' ]] || exit 15
+BUFFER=${(l:8193::x:)}
+__termior_highlight
+(( ${#region_highlight} == 1 )) || exit 16
+"#
+        ));
+        assert!(output.status.success(), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("__HIGHLIGHT_EXECUTED__"));
+    }
 
     #[test]
     fn zsh_uses_zdotdir_quartet() {

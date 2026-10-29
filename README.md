@@ -240,6 +240,12 @@ xattr -cr /Applications/Termior.app
 
 最新发布 tag 为 `v0.2.1`，工作区版本号定义在 [Cargo.toml](Cargo.toml)。
 
+### zsh 默认配色
+
+新建本地 zsh 终端时，shell integration 默认提供彩色提示符和轻量输入高亮：已识别命令为绿色、选项为青色、引号字符串为黄色、变量及管道等操作符为紫色。高亮使用 zsh 5.9+ 自带的 ZLE hook，不安装插件、不执行输入内容，也不替换 Enter、Tab 或其他按键绑定；它只做词法着色，不提供完整 shell 语法诊断，超过 8192 字符的输入跳过高亮。
+
+`ls`、`grep`、Git 默认使用自动颜色选项，重定向与管道保持普通文本。用户已有的提示符、同名别名/函数及 zsh-syntax-highlighting / fast-syntax-highlighting 优先保留；初始化脚本仅作用于当前会话，不改写 `.zshrc` 或 Git 配置，也不向 SSH 远端注入。设置 `NO_COLOR`（包括空值）、`TERM=dumb` 或 `TERMIOR_SHELL_COLORS=0` 后新建终端，可关闭 Termior 的这些配色默认值；用户自行加载的配色插件不受此开关管理。
+
 ### Workspace
 
 ```text
