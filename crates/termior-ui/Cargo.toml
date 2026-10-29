@@ -15,7 +15,8 @@ termior-ui-kit = { workspace = true }
 
 gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49" }
 # ssh_askpass 辅助进程模式自建 GPUI 应用实例（见 ssh_askpass.rs）。
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "3565c49", features = ["wayland", "x11"] }
+# SSH askpass 可独立创建应用，也需要 macOS 的真实字体后端。
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "3565c49", features = ["font-kit", "wayland", "x11"] }
 log = { workspace = true }
 termior-theme = { workspace = true }
 termior-terminal = { workspace = true }

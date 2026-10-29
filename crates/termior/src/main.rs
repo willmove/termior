@@ -75,6 +75,13 @@ fn main() {
             // 必须在建窗前解析：GPUI 找不到 family 时会静默回退到比例字体，
             // 终端网格宽和字形 advance 就会对不上（见 monospace_font 模块注释）。
             let text_system = cx.text_system().clone();
+            // A window can present successfully with GPUI's NoopTextSystem while
+            // every label and terminal glyph is invisible. Make the existing
+            // launch smoke reject that configuration before reporting success.
+            if smoke_test && text_system.all_font_names().is_empty() {
+                eprintln!("TERMIOR_SMOKE_FAILED: text backend exposes no fonts");
+                std::process::exit(1);
+            }
             termior_ui::monospace_font::init_default(&text_system);
             phase("fonts");
             let bounds = Bounds::centered(None, size(px(1180.0), px(760.0)), cx);

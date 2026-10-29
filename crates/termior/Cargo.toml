@@ -13,7 +13,8 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "3565c49" }
 # gpui_platform 的 default features 为空，且它以 default-features = false 依赖 gpui_linux；
 # 不显式打开 wayland / x11 时，Linux 下 current_platform() 会走到 unreachable!() 而 panic。
 # 这两个 feature 在非 Linux 目标上是空操作（gpui_linux 仅为 Linux target 依赖），与 zed 自身一致。
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "3565c49", features = ["wayland", "x11"] }
+# macOS 必须启用 font-kit，否则 GPUI 使用 NoopTextSystem，窗口有控件却没有文字。
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "3565c49", features = ["font-kit", "wayland", "x11"] }
 termior-ui = { workspace = true }
 termior-ui-kit = { workspace = true }
 termior-i18n = { workspace = true }
