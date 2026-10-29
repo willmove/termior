@@ -214,6 +214,7 @@ enum SplitMenuAction {
 pub struct WorkspaceView {
     pending_terminals: std::collections::HashSet<(TabId, PaneId)>,
     main_window: Option<gpui::AnyWindowHandle>,
+    settings_window: Option<gpui::WindowHandle<SettingsView>>,
     ssh_profiles: termior_ssh::Profiles,
     ssh_profiles_error: Option<String>,
     ssh_selected: Option<String>,
@@ -612,6 +613,7 @@ impl WorkspaceView {
             model,
             pending_terminals: Default::default(),
             main_window: None,
+            settings_window: None,
             ssh_profiles: termior_ssh::Profiles::default(),
             ssh_profiles_error: None,
             ssh_selected: None,
@@ -895,7 +897,7 @@ impl WorkspaceView {
     /// Opens the settings window then closes it via the same `remove_window` path as the
     /// title-bar close button, so CI / local smoke can assert no `window not found` log.
     /// Used by `scripts/settings-close-smoke.ps1`; normal launches never call this method.
-    pub fn start_settings_close_smoke(&self, cx: &mut Context<Self>) {
+    pub fn start_settings_close_smoke(&mut self, cx: &mut Context<Self>) {
         let Some(handle) = self.open_settings_window(cx) else {
             return;
         };
@@ -1016,7 +1018,7 @@ impl WorkspaceView {
 
     /// UI screenshot helper (`TERMIOR_OPEN_SETTINGS`): open settings without SendKeys.
     pub fn open_settings_for_ui_shot(
-        &self,
+        &mut self,
         cx: &mut Context<Self>,
     ) -> Option<gpui::WindowHandle<SettingsView>> {
         self.open_settings_window(cx)

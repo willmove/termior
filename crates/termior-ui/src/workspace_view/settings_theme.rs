@@ -3,6 +3,73 @@
 use super::helpers::map_appearance;
 use super::*;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{Modifiers, TestAppContext};
+
+    #[gpui::test]
+    fn settings_window_is_reused_activated_and_recreated_after_close(cx: &mut TestAppContext) {
+        let (workspace, cx) =
+            cx.add_window_view(|_, cx| WorkspaceView::new(std::env::temp_dir(), false, cx));
+        let first =
+            cx.update(|_, cx| workspace.update(cx, |ws, cx| ws.open_settings_window(cx).unwrap()));
+        cx.run_until_parked();
+        cx.update(|main, cx| {
+            assert_eq!(cx.windows().len(), 2);
+            assert_eq!(cx.active_window(), Some(first.into()));
+            main.activate_window();
+        });
+        // Both the toolbar and keyboard shortcut call this shared entry point.
+        for _ in 0..3 {
+            let reopened = cx.update(|_, cx| {
+                workspace.update(cx, |ws, cx| ws.open_settings_window(cx).unwrap())
+            });
+            assert_eq!(reopened.window_id(), first.window_id());
+        }
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(cx.windows().len(), 2);
+            assert_eq!(cx.active_window(), Some(first.into()));
+            first
+                .update(cx, |_, window, _| window.remove_window())
+                .unwrap();
+        });
+        let fresh =
+            cx.update(|_, cx| workspace.update(cx, |ws, cx| ws.open_settings_window(cx).unwrap()));
+        assert_ne!(fresh.window_id(), first.window_id());
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            assert_eq!(cx.windows().len(), 2);
+            assert_eq!(cx.active_window(), Some(fresh.into()));
+        });
+    }
+
+    #[gpui::test]
+    fn settings_toolbar_click_raises_one_window(cx: &mut TestAppContext) {
+        let (_, cx) =
+            cx.add_window_view(|_, cx| WorkspaceView::new(std::env::temp_dir(), false, cx));
+        cx.update(|window, cx| window.draw(cx).clear());
+        let button = cx
+            .debug_bounds("workspace-settings")
+            .expect("settings button");
+        for _ in 0..3 {
+            cx.update(|main, _| main.activate_window());
+            cx.simulate_click(button.center(), Modifiers::default());
+            cx.run_until_parked();
+            cx.update(|_, cx| {
+                let settings: Vec<_> = cx
+                    .windows()
+                    .into_iter()
+                    .filter_map(|window| window.downcast::<SettingsView>())
+                    .collect();
+                assert_eq!(settings.len(), 1);
+                assert_eq!(cx.active_window(), Some(settings[0].into()));
+            });
+        }
+    }
+}
+
 /// 从设置构造行内补全 [`InlineCompleter`]（与聊天 profile 同规则；密钥只读钥匙串，INV-5）。
 /// 复用于 `WorkspaceView::new`（此时 `self` 尚未建成）与 `build_completer`。
 pub(super) fn build_completer_from_settings(
@@ -131,16 +198,26 @@ impl WorkspaceView {
     }
     pub(super) fn open_settings(
         &mut self,
-        _event: &MouseDownEvent,
+        _event: &gpui::ClickEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        cx.stop_propagation();
         let _ = self.open_settings_window(cx);
     }
     pub(super) fn open_settings_window(
-        &self,
+        &mut self,
         cx: &mut Context<Self>,
     ) -> Option<gpui::WindowHandle<SettingsView>> {
+        if let Some(handle) = self.settings_window.take() {
+            if handle.entity(cx).is_ok() {
+                self.settings_window = Some(handle);
+                Self::activate_settings_window(handle, cx);
+                return Some(handle);
+            }
+            // Closing a window invalidates its handle, including programmatic
+            // remove_window calls that bypass on_window_should_close.
+        }
         let settings = self.settings.clone();
         let migration_error = self.migration_error.clone();
         let data_dir = self.data_dir.clone();
@@ -195,6 +272,8 @@ impl WorkspaceView {
                         cx,
                     )
                 });
+                window.set_window_title(&t!("chrome.settings"));
+                window.focus(&view.read(cx).focus_handle(cx), cx);
                 cx.subscribe(
                     &view,
                     move |_, _: &crate::settings_view::OpenSshManager, app| {
@@ -219,13 +298,29 @@ impl WorkspaceView {
                 view
             },
         ) {
-            Ok(handle) => Some(handle),
+            Ok(handle) => {
+                self.settings_window = Some(handle);
+                Self::activate_settings_window(handle, cx);
+                Some(handle)
+            }
             Err(error) => {
                 // 设置窗口打开失败不致命：记日志并保持工作区可用。
                 log::error!("failed to open settings window: {error}");
                 None
             }
         }
+    }
+
+    fn activate_settings_window(handle: gpui::WindowHandle<SettingsView>, cx: &mut Context<Self>) {
+        // Run after the originating mouse/key dispatch. On macOS, creating a
+        // window alone does not keep it in front of the window receiving the
+        // click. Reuse this path when bringing an existing window forward.
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                cx.activate(false);
+                window.activate_window();
+            });
+        });
     }
     fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         crate::updater::set_enabled(settings.automatic_updates, cx);

@@ -180,7 +180,7 @@ Termior 是一个从零开始设计的新项目，产品能力、交互模型与
 | FR-WS-09 | 状态栏以单一上下箭头按钮一键显示/隐藏 Composer，无二级菜单；底部/右侧停靠切换保留在 Composer 面板头；终端 tab 另有显示/隐藏终端区域按钮，作用于当前 tab 的全部分栏，隐藏只跳过渲染、不销毁 PTY。隐藏状态按 tab 持久化，Composer 可占满腾出的内容区，恢复终端后沿用原有停靠尺寸；状态栏按钮始终可用于恢复显示 | P0 |
 | FR-WS-06 | 自绘标题栏：标签栏与窗口控制合并为一行；操作区仅通知铃铛与设置；分栏入口在 pane 上下文菜单；主题选择在设置窗；工作区切换（本地 + Windows WSL）在状态栏 | P0（WSL 为 P1） |
 | FR-WS-08 | 每个 tab 持有独立的项目文件夹（`project_dir`）：打开文件夹（标题栏/状态栏按钮、`Cmd/Ctrl+O`）只重定向**活动 tab**，其他 tab 不受影响；运行中的本地终端注入 `cd` 同步（会话不中断）；本地 Tab 的文件浏览器、Git 面板与状态栏工作区名跟随活动 tab 的 `project_dir`；`project_dir` 不随 shell `cd`（OSC 7）漂移；活动 SSH/SFTP Tab 的文件浏览器改按 FR-SSH-07 显示远程 SFTP 上下文，但 Git、Agent 与本地 `project_dir` 不切换；全局 `root` 降为兑底（新建 tab 无继承来源、private terminal 使用） | P0 |
-| FR-WS-07 | 设置为独立 GPUI 窗口（`Cmd+,`），左侧竖向导航六页：General / Models / Themes / Shortcuts / Agents / About；自动保存（敏感凭据仍显式确认） | P0 |
+| FR-WS-07 | 设置为独立 GPUI 窗口（`Cmd+,`），每个工作区最多一个；工具栏、快捷键等入口打开时均激活并置前，已有窗口复用并保留页面和编辑状态，关闭后可重新创建。左侧竖向导航六页：General / Models / Themes / Shortcuts / Agents / About；自动保存（敏感凭据仍显式确认） | P0 |
 
 **验收标准**：终端 tab 中运行 `npm run dev`，切走再切回，输出无丢帧无重启；分栏内两个 PTY 独立收发；关闭窗口时所有布局状态持久化并在下次启动恢复（P1）。
 

@@ -2009,7 +2009,8 @@ impl gpui::Render for WorkspaceView {
                                     t!("chrome.settings"),
                                     &p,
                                 )
-                                .on_mouse_down(MouseButton::Left, cx.listener(Self::open_settings)),
+                                .debug_selector(|| "workspace-settings".into())
+                                .on_click(cx.listener(Self::open_settings)),
                             )
                             .when(crate::updater::ready(cx), |bar| {
                                 bar.child(
@@ -2019,16 +2020,16 @@ impl gpui::Render for WorkspaceView {
                                         ui::ButtonKind::Subtle,
                                         &p,
                                     )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            cx.stop_propagation();
                                             if let Some(handle) = this.open_settings_window(cx) {
                                                 let _ = handle.update(cx, |settings, _, cx| {
                                                     settings.show_about(cx)
                                                 });
                                             }
-                                        }),
-                                    ),
+                                        },
+                                    )),
                                 )
                             }),
                     )
