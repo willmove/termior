@@ -29,6 +29,7 @@
 
 - [`process/release-process.md`](process/release-process.md)：GitHub Release 发布流程。已发布说明的归档位置见该文第 7 节。
 - [`process/nightly-integration.md`](process/nightly-integration.md)：ignored 集成测试与 nightly 步骤。
+- [`process/desktop-license-review.md`](process/desktop-license-review.md)：Issue #64 的上游授权证据、完整 Windows 图核对、局部修复与待决 GPL 路径。
 - [`process/dependency-maintenance.md`](process/dependency-maintenance.md)：依赖升级节奏、GPUI 补丁核对与许可门禁。
 - [`process/github-issue-review-2026-10-26.md`](process/github-issue-review-2026-10-26.md)：全部开放 issue 的处理结果与人工验收清单。
 - [`process/agent-acceptance-2026-10-26.md`](process/agent-acceptance-2026-10-26.md)：桌面自动操作、真实后端、故障模拟与三平台 CI 的验收证据。
