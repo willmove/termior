@@ -42,37 +42,23 @@ Rust 固定在 `rust-toolchain.toml` 的 1.98.1；升级时同时更新 `clippy.
 
 升级前，cargo-deny 0.20.2 的 Windows 依赖图检查已报告许可失败：`gpui_shared_string`、`gpui_util` 缺少许可字段/可识别声明，`libbz2-rs-sys` 的 `bzip2-1.0.6` 不在允许列表，`zlog`、`ztracing`、`ztracing_macro` 声明 GPL-3.0-or-later。不能仅靠加入 GPL 或忽略未许可 crate 来宣称 MIT 项目的许可门禁通过；需要维护者核实授权或调整依赖。
 
-### 逐项核实（2026-10-27）
+### 专项复核（2026-10-30，更新 10-27 的初步结论）
 
-本机没有 `cargo-deny`，所以下面这些结论来自**直接读取依赖自身的 manifest 与 LICENSE 文件**，
-不是门禁输出：
+最新版本、上游授权证据、最小修复、完整 Windows 依赖路径、检查结果与 GPL 选项见
+[`desktop-license-review.md`](desktop-license-review.md)，机器可读快照见
+[`desktop-license-evidence.json`](desktop-license-evidence.json)。
 
-| crate | `Cargo.toml` 的 `license` | 仓库内 LICENSE 文件 |
-|---|---|---|
-| `gpui` | `Apache-2.0` | `LICENSE-APACHE` → `../../LICENSE-APACHE` |
-| `sum_tree` | `Apache-2.0` | `LICENSE-APACHE` → `../../LICENSE-APACHE` |
-| `gpui_shared_string` | **无字段** | `LICENSE-APACHE` → `../../LICENSE-APACHE` |
-| `gpui_util` | **无字段** | `LICENSE-APACHE` → `../../LICENSE-APACHE` |
-| `zlog` | `GPL-3.0-or-later` | `LICENSE-GPL` → `../../LICENSE-GPL` |
-| `ztracing` | `GPL-3.0-or-later` | `LICENSE-APACHE` → `../../LICENSE-APACHE` |
-| `ztracing_macro` | `GPL-3.0-or-later` | `LICENSE-APACHE` → `../../LICENSE-APACHE` |
-| `libbz2-rs-sys 0.2.5` | `bzip2-1.0.6`（非 SPDX） | `LICENSE` |
+本轮实测更正此前三点：
 
-三点结论：
+1. `bzip2-1.0.6` 是有效 SPDX 标识；cargo-deny 0.20.2 原本因未允许而拒绝，并非无法解析。
+2. 固定 revision 的 `ztracing`、`ztracing_macro` 同时含 Apache 和 GPL 许可链接，manifest
+   明确声明 GPL；不能据 Apache 文件擅自推定双授权。`zlog` 只有 GPL 许可链接。
+3. Linux 解析许可符号链接时，两个 GPUI crate 是缺字段警告；Windows 普通文本 checkout
+   仍有识别缺口。本轮以根许可正文和 manifest hash 澄清，没有忽略 crate。
 
-1. `gpui_shared_string` 与 `gpui_util` **缺的是元数据，不是授权**。两者各自指向仓库根的
-   `LICENSE-APACHE`，与 `gpui` 声明的许可一致；cargo-deny 读不到 SPDX 字段就判 unlicensed。
-2. `ztracing` 与 `ztracing_macro` 的 `Cargo.toml` 说 GPL，指向的却是 Apache 许可文件。这个
-   不一致需要上游确认，但它**不改变** cargo-deny 读到的声明。
-3. `bzip2-1.0.6` 是宽松许可，但 SPDX 解析器不认这个字符串。
-
-`deny.toml` 未被修改：允许列表没有放宽，`exceptions` 仍为空。Audit 工作流仍排除
-`termior`/`termior-ui`/`termior-ui-kit`，所以 **Audit 通过不代表完整桌面产物通过许可门禁**。
-
-剩下的三项（GPL 怎么办、`bzip2-1.0.6` 怎么办、两个 GPUI crate 的元数据缺口是向上游提 PR
-还是本地标 exception）是**分发决策**，记录在
-[#64](https://github.com/willmove/termior/issues/64)，保持开放与 `ready-for-human`。
-
+本轮新增的许可例外仅覆盖已核对发布包的 `libbz2-rs-sys@0.2.5`，通用 allow 没有扩大，
+GPL 仍被拒绝。在线检查新拉取的 advisory 数据库还报告两个漏洞项；不复用旧的通过结论，
+不在本轮混入升级或 ignore。#64 保持开放，需要维护者确认剩余的授权或替换策略。
 
 完整跨平台图还需要下载当前机器未缓存的 Linux/macOS crate。本次 Windows 检查不能替代三平台完整检查；升级后的实际结果见 [issue 核对记录](github-issue-review-2026-10-26.md)。
 

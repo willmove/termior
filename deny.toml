@@ -35,8 +35,31 @@ allow = [
 ]
 # 许可文本与 SPDX 标准文本的最低匹配置信度。
 confidence-threshold = 0.8
-# 按 crate 单独放行的许可（留空；实施时按 cargo deny check licenses 报错补充）。
-exceptions = []
+# 仅核准已核对发布包文本的确切版本；不扩大通用 allow。
+# 上游证据、发布包 SHA256、条款与分发边界见 docs/process/desktop-license-review.md。
+exceptions = [
+    { crate = "libbz2-rs-sys@0.2.5", allow = ["bzip2-1.0.6"] },
+]
+
+# Zed 3565c49 的这两个 crate 各自带有指向根 LICENSE-APACHE 的符号链接，
+# 但缺少 package.license。Windows checkout 可能将链接保留为路径文本。
+# 直接核对上游根许可正文及缺字段的 manifest；任一文本改变都必须重新核实。
+# 这是授权元数据澄清，不是跳过 crate 或推定整个 GPUI 依赖树为 Apache。
+[[licenses.clarify]]
+crate = "gpui_shared_string@0.1.0"
+expression = "Apache-2.0"
+license-files = [
+    { path = "../../LICENSE-APACHE", hash = 0x076d9a33 },
+    { path = "Cargo.toml", hash = 0x2960186d },
+]
+
+[[licenses.clarify]]
+crate = "gpui_util@0.1.0"
+expression = "Apache-2.0"
+license-files = [
+    { path = "../../LICENSE-APACHE", hash = 0x076d9a33 },
+    { path = "Cargo.toml", hash = 0xaffbf8a1 },
+]
 
 # ─────────────────────────────  bans  ─────────────────────────────
 [bans]

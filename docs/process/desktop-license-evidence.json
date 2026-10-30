@@ -1,0 +1,133 @@
+{
+  "reviewed_base": "6f95626c9f6429da4ed6ef4008fd511f529466f6",
+  "target": "x86_64-pc-windows-msvc",
+  "cargo_deny": "0.20.2",
+  "rust": "1.98.1",
+  "lockfile_sha256": "acdec09180ac34ab700b547ecadd4d6f747a2071b13ddc2641c60abafbe14331",
+  "advisory_db_revision": "2295466c4e9df26647fd67d8fa1c705ac2fc7f81",
+  "upstream_revision": "3565c49dad884e8437b86a1b1beaa76bfac67fc3",
+  "packages": [
+    {
+      "name": "async-compression",
+      "version": "0.4.42",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "manifest_license": "MIT OR Apache-2.0",
+      "manifest_sha256": "0d8f06280de77b9d13490f4c001a59c6329cc23df315c392afe8d2783e958214"
+    },
+    {
+      "name": "bzip2",
+      "version": "0.6.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "manifest_license": "MIT OR Apache-2.0",
+      "manifest_sha256": "0b6dbeefda81258ad2b2ffc0adbbe731f0c5c5f5e40b661c40fc237ac3337c5e"
+    },
+    {
+      "name": "compression-codecs",
+      "version": "0.4.38",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "manifest_license": "MIT OR Apache-2.0",
+      "manifest_sha256": "38c65edb8427857227c7e2d32691b6a191df0cb5e5ac37ae4fef19cfdf899915"
+    },
+    {
+      "name": "gpui",
+      "version": "0.2.2",
+      "source": "git+https://github.com/zed-industries/zed?rev=3565c49#3565c49dad884e8437b86a1b1beaa76bfac67fc3",
+      "manifest_license": "Apache-2.0",
+      "manifest_sha256": "813f49f189fa2ce71a8e52b3854a73521ceb2d5836ad23a978338692aa6a26f7"
+    },
+    {
+      "name": "gpui_shared_string",
+      "version": "0.1.0",
+      "source": "git+https://github.com/zed-industries/zed?rev=3565c49#3565c49dad884e8437b86a1b1beaa76bfac67fc3",
+      "manifest_license": null,
+      "manifest_sha256": "4fca4c0d09d629a6a18bbf1c887eeaaf617a10c12d16d84e8e671a29a568e213"
+    },
+    {
+      "name": "gpui_util",
+      "version": "0.1.0",
+      "source": "git+https://github.com/zed-industries/zed?rev=3565c49#3565c49dad884e8437b86a1b1beaa76bfac67fc3",
+      "manifest_license": null,
+      "manifest_sha256": "0e5fb2a0fefc68bb9f267535f28405c0520321e1f208dd7a6193d9faa323cc9b"
+    },
+    {
+      "name": "http_client",
+      "version": "0.1.0",
+      "source": "git+https://github.com/zed-industries/zed?rev=3565c49#3565c49dad884e8437b86a1b1beaa76bfac67fc3",
+      "manifest_license": "Apache-2.0",
+      "manifest_sha256": "e8a34387ae069d8eecf63fe276d2613a27fad21699ce1129c055db7ca5043c87"
+    },
+    {
+      "name": "libbz2-rs-sys",
+      "version": "0.2.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "manifest_license": "bzip2-1.0.6",
+      "manifest_sha256": "710d50ea93fc5979f7d9428537067b39bd617bc4427ba1f209b12e86aa799e10"
+    },
+    {
+      "name": "sum_tree",
+      "version": "0.1.0",
+      "source": "git+https://github.com/zed-industries/zed?rev=3565c49#3565c49dad884e8437b86a1b1beaa76bfac67fc3",
+      "manifest_license": "Apache-2.0",
+      "manifest_sha256": "c9d64fbe96a5b03354953f49dbbb653e370bbd11f09d405bea50a55d6578ea3e"
+    },
+    {
+      "name": "zlog",
+      "version": "0.1.0",
+      "source": "git+https://github.com/zed-industries/zed?rev=3565c49#3565c49dad884e8437b86a1b1beaa76bfac67fc3",
+      "manifest_license": "GPL-3.0-or-later",
+      "manifest_sha256": "740755e351826a6b534a3d49988b7ec76ddc02a0ce855906697db585fafdf4cb"
+    },
+    {
+      "name": "ztracing",
+      "version": "0.1.0",
+      "source": "git+https://github.com/zed-industries/zed?rev=3565c49#3565c49dad884e8437b86a1b1beaa76bfac67fc3",
+      "manifest_license": "GPL-3.0-or-later",
+      "manifest_sha256": "1be97e26d2ab89f6ce6493ee3240662430a9da8c258b61cf9f04073c049a6866"
+    },
+    {
+      "name": "ztracing_macro",
+      "version": "0.1.0",
+      "source": "git+https://github.com/zed-industries/zed?rev=3565c49#3565c49dad884e8437b86a1b1beaa76bfac67fc3",
+      "manifest_license": "GPL-3.0-or-later",
+      "manifest_sha256": "e084c795639e87d4b879a5dcde73003ae0ad48a9e8f95beda2b6119be613d0ed"
+    }
+  ],
+  "before": {
+    "license_rejected": [
+      "libbz2-rs-sys@0.2.5",
+      "zlog@0.1.0",
+      "ztracing@0.1.0",
+      "ztracing_macro@0.1.0"
+    ],
+    "missing_license_field_warnings": [
+      "gpui_shared_string@0.1.0",
+      "gpui_util@0.1.0"
+    ]
+  },
+  "after": {
+    "license_rejected": [
+      "zlog@0.1.0",
+      "ztracing@0.1.0",
+      "ztracing_macro@0.1.0"
+    ],
+    "missing_license_field_warnings": [],
+    "advisories": "FAILED",
+    "bans": "ok",
+    "licenses": "FAILED",
+    "sources": "ok"
+  },
+  "out_of_scope_advisories": [
+    "RUSTSEC-2026-0418",
+    "RUSTSEC-2026-0414"
+  ],
+  "validation": {
+    "full_check_before_exit": 5,
+    "full_check_after_exit": 5,
+    "license_only_after_exit": 4,
+    "windows_text_symlink_fixture_exit": 4,
+    "terminal_core_tests_passed": 67,
+    "ui_kit_without_gpui_tests_passed": 19,
+    "ui_lib_tests": "build blocked: missing dbus-1 development library; exit 101",
+    "package_validation": "static inclusion checks only; native installer not built"
+  }
+}

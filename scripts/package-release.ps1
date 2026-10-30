@@ -72,6 +72,7 @@ if (Test-Path -LiteralPath $stage) {
 New-Item -ItemType Directory -Path $stage | Out-Null
 
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE") -Destination $stage
+Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE-APACHE") -Destination $stage
 Copy-Item -LiteralPath (Join-Path $repoRoot "NOTICE") -Destination $stage
 Copy-Item -LiteralPath (Join-Path $repoRoot "README.md") -Destination $stage
 

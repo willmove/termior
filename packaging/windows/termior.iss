@@ -35,6 +35,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
     GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
+Source: "..\..\dist\termior-{#AppVersion}-windows-x86_64\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\termior-{#AppVersion}-windows-x86_64\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\dist\termior-{#AppVersion}-windows-x86_64\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\termior-{#AppVersion}-windows-x86_64\termior.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\dist\termior-{#AppVersion}-windows-x86_64\termior.ico"; DestDir: "{app}"; Flags: ignoreversion
 

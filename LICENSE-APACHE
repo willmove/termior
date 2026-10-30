@@ -1,6 +1,6 @@
-This file is retained solely for the vendored `vendor/gpui_windows` crate,
-which remains under the upstream Apache-2.0 license. The Termior project
-itself is licensed under the MIT License; see `LICENSE`.
+This file provides Apache-2.0 terms for third-party components, including
+vendored GPUI crates and the GPUI components identified in NOTICE.
+The Termior project itself is licensed under the MIT License; see LICENSE.
 
                                  Apache License
                            Version 2.0, January 2004
