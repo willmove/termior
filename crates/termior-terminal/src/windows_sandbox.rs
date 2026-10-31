@@ -1,18 +1,16 @@
 //! Windows AppContainer confinement (Stage D task 6.2).
 //!
-//! An AppContainer is a low-privilege Windows identity whose filesystem access is granted
-//! per directory through an ACL. A command launched inside the container can read and
-//! write the granted roots and nothing else, and it does not inherit the parent's
-//! environment or credentials.
+//! This prototype launches a low-privilege Windows identity with directory ACL grants,
+//! no network capabilities, and a rebuilt environment. It is not yet a verified
+//! per-workspace boundary: its shared SID retains grants from other environments.
 //!
-//! The escape suite in `termior-agent-host` uses this module to prove the confinement
-//! actually holds. Capabilities this module cannot enforce stay unsupported so a task
-//! that requires them fails closed.
+//! The agent-host escape suite exercises the prototype independently of production
+//! capability policy. Profile availability alone must never enable verified isolation.
 
 use std::path::Path;
 
-/// AppContainer profile name. All Termior sandboxed tasks share one profile so the
-/// granted ACLs stay stable across restarts and a task can recover its own environment.
+/// Shared prototype profile name. Grants survive restarts and are shared by every
+/// instance; production isolation stays unsupported until identity/grant cleanup is scoped.
 pub const APP_CONTAINER_NAME: &str = "TermiorSandbox";
 
 /// Errors from the AppContainer backend.
@@ -38,7 +36,7 @@ impl std::fmt::Display for AppContainerError {
 
 impl std::error::Error for AppContainerError {}
 
-/// Whether this machine can resolve an AppContainer profile.
+/// Whether this machine can create/reuse a profile. This is not an isolation probe.
 pub fn app_container_available() -> bool {
     AppContainer::resolve(APP_CONTAINER_NAME).is_ok()
 }

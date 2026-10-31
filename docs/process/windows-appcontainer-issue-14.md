@@ -38,7 +38,11 @@ cargo fmt --all -- --check
 
 ## 结果与限制
 
-本地宿主是 Linux，未安装 Rust，不能将静态审阅称为 Windows 运行验证。固定主干已在 [真实 Windows 作业](https://github.com/willmove/termior/actions/runs/41249693899/job/124680421008) 再次复现错误 2（0 passed / 1 failed），包括仅做路径/句柄修复的早期候选仍无法启动系统 cmd.exe。Profile 创建修复后的候选结果待独立 runner 原始日志核实。
+本地宿主是 Linux，未安装 Rust，不能将静态审阅称为 Windows 运行验证。固定主干已在 [真实 Windows 作业](https://github.com/willmove/termior/actions/runs/41249693899/job/124680421008) 再次复现错误 2（0 passed / 1 failed），包括仅做路径/句柄修复的早期候选仍无法启动系统 cmd.exe。[Profile 修复候选 c8b28a5](https://github.com/willmove/termior/actions/runs/41249917723/job/124681095269) 已在真实 Windows 启动成功：低层 15 passed / 3 failed，复制 EXE/token/canonical cwd/stdin EOF、授权目录读写、同级访问拒绝和环境隔离通过。剩余失败包括网络返回超时而非 WSAEACCES、旧 icacls 解析以及子进程打开 NUL 的错误 5；escape suite 已通过首轮文件断言，在 child spawn 报错 5，未完成后续探测。最新候选仍待完整结果。
+
+子进程 fixture 改用沙箱内文件做标准流，仍要求真实子进程执行和隔离断言，不修改宿主 NUL 设备 ACL。普通工具使用 NUL 的兼容性仍是限制，不能宣称全面支持。微软 [MXC 原始说明](https://github.com/microsoft/mxc/blob/main/docs/host-prep.md) 记录了该 AppContainer 设备访问前提。
+
+网络保留连接必须失败的断言，并增加监听端未接收到沙箱连接及测试前后宿主均可达的双向对照；拒绝可以表现为 PermissionDenied 或 TimedOut，不将“进程没运行”或任意异常当作阻断。
 
 ACL 保留测试此前跳过 icacls 首行，漏掉与路径同行的首个 ACE；授权重排后可能误报主体条目被删除。修正为去掉路径前缀后读取全部 ACE，并要求 icacls 本身成功，保留原有完整条目比较断言。
 

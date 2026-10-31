@@ -2,8 +2,8 @@
 //!
 //! These tests run the actual Windows API. They prove that a command inside the
 //! container can read the granted workspace and cannot read a sibling directory.
-//! A platform without a usable AppContainer profile skips instead of reporting a
-//! false pass.
+//! A missing profile or failed launch is a validation failure, never evidence that
+//! access was denied by a working sandbox.
 
 #![cfg(windows)]
 
@@ -162,10 +162,12 @@ fn a_confined_command_cannot_reach_the_network() {
     if let Ok(target) = std::fs::read_to_string("network-target.txt") {
         let error = TcpStream::connect_timeout(&target.parse().unwrap(), Duration::from_secs(2))
             .expect_err("confined process reached the host listener");
-        assert_eq!(
-            error.raw_os_error(),
-            Some(10013),
-            "must be WSAEACCES, not an unreachable target"
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected connection failure: {error}"
         );
         std::fs::write("network-result.txt", "denied").unwrap();
         return;
@@ -179,6 +181,9 @@ fn a_confined_command_cannot_reach_the_network() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     TcpStream::connect_timeout(&address, Duration::from_millis(500)).unwrap();
+    // Drain the positive control, then observe the listener during the confined dial.
+    drop(listener.accept().unwrap());
+    listener.set_nonblocking(true).unwrap();
     std::fs::write(workspace.join("network-target.txt"), address.to_string()).unwrap();
     container.grant_with_ancestors(&workspace).unwrap();
     let mut child = container
@@ -193,6 +198,14 @@ fn a_confined_command_cannot_reach_the_network() {
         std::fs::read_to_string(workspace.join("network-result.txt")).unwrap(),
         "denied"
     );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "listener accepted a sandbox connection"
+    );
+    // The target must remain reachable after the negative control as well.
+    TcpStream::connect_timeout(&address, Duration::from_millis(500)).unwrap();
+    drop(listener.accept().unwrap());
 }
 
 /// A piped confined process reports its standard output and exits with its exit code.
@@ -242,13 +255,13 @@ fn a_confined_command_can_run_system_binaries_without_an_explicit_grant() {
         .grant_with_ancestors(&workspace)
         .expect("the workspace grant must succeed");
 
-    for program in ["cmd.exe", "where.exe", "whoami.exe"] {
+    for program in ["cmd.exe /c exit /b 0", "where.exe cmd.exe", "whoami.exe"] {
         let code = run(
             &container,
-            &["/c".into(), format!("{program} > nul")],
+            &["/c".into(), format!("{program} > system-tool.stdout")],
             &workspace,
         );
-        println!("{program}: exit={code:?}");
+        assert_eq!(code, Some(0), "system program did not run: {program}");
     }
 }
 
@@ -624,9 +637,13 @@ fn job_cleanup_stops_descendants_on_kill_and_drop() {
         std::fs::write("job-probe.mode", "sleeper").unwrap();
         let _child = Command::new(std::env::current_exe().unwrap())
             .args([NAME, "--exact", "--test-threads=1"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdin(Stdio::from(std::fs::File::open("job-probe.mode").unwrap()))
+            .stdout(Stdio::from(
+                std::fs::File::create("job-child.stdout").unwrap(),
+            ))
+            .stderr(Stdio::from(
+                std::fs::File::create("job-child.stderr").unwrap(),
+            ))
             .spawn()
             .unwrap();
         let start = Instant::now();

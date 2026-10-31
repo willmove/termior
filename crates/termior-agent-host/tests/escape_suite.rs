@@ -517,7 +517,7 @@ fn payload_child(task: &EscapeTask) {
     write_task(Path::new("."), &nested);
     let status = Command::new(std::env::current_exe().unwrap())
         .args([TEST_NAME, "--exact", "--test-threads=1", "--nocapture"])
-        .stdin(Stdio::null())
+        .stdin(payload_stdin())
         .status()
         .unwrap_or_else(|error| panic!("child spawn failed: {error}"));
     assert!(status.success(), "nested filesystem probe failed");
@@ -535,9 +535,9 @@ fn payload_orphan() {
     );
     let child = Command::new(std::env::current_exe().unwrap())
         .args([TEST_NAME, "--exact", "--test-threads=1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdin(payload_stdin())
+        .stdout(payload_output("orphan.stdout"))
+        .stderr(payload_output("orphan.stderr"))
         .spawn()
         .unwrap_or_else(|error| panic!("orphan spawn failed: {error}"));
     let start = Instant::now();
@@ -621,4 +621,31 @@ fn read_pipe(pipe: Option<impl Read>) -> String {
     let mut buffer = String::new();
     let _ = pipe.read_to_string(&mut buffer);
     buffer
+}
+
+// Do not require access to the host NUL device to test process inheritance.
+// Windows AppContainer may deny that device; sandbox-local files keep all I/O
+// inside the granted root without changing host device or directory ACLs.
+fn payload_stdin() -> Stdio {
+    #[cfg(windows)]
+    {
+        fs::write("payload.stdin", b"").unwrap();
+        Stdio::from(fs::File::open("payload.stdin").unwrap())
+    }
+    #[cfg(not(windows))]
+    {
+        Stdio::null()
+    }
+}
+
+fn payload_output(name: &str) -> Stdio {
+    #[cfg(windows)]
+    {
+        Stdio::from(fs::File::create(name).unwrap())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        Stdio::null()
+    }
 }
