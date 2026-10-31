@@ -502,7 +502,7 @@ fn granting_a_directory_keeps_the_other_principals_entries() {
     for entry in &before {
         assert!(
             after.contains(entry),
-            "the grant dropped the {entry:?} entry of {}",
+            "the grant dropped the {entry:?} entry of {}; before={before:?}; after={after:?}",
             directory.display()
         );
     }
