@@ -2,7 +2,7 @@
 
 Stage D 在副作用前写入 hash-chained journal，并用原子 snapshot 恢复任务。正在执行且重启后无法确认的模型、工具和命令统一恢复为 unknown，不自动重放。
 
-审批、worktree、sandbox 和文件恢复的使用边界见 [用户说明](../user/agent-runtime.md)。Windows 的完整 sandbox 后端仍需实现；现有 escape suite 证明的是其 fail-closed 行为。
+审批、worktree、sandbox 和文件恢复的使用边界见 [用户说明](../user/agent-runtime.md)。Windows 已有 AppContainer 原型，但完整安全契约尚未验证；生产能力保持 fail-closed，底层原型须单独执行真实逃逸测试。详见 [Issue #14 专项复核](windows-appcontainer-issue-14.md)。
 
 ## 自动化验证
 
@@ -18,11 +18,11 @@ cargo test -p termior-agent-host --test escape_suite
 
 测试覆盖 journal 尾部半记录修复、中段篡改隔离、未知事件保留、SHA-256 hash chain、每个关键事件在写入前/中/后的 fault injection（含一次真实进程退出）、secret 写盘脱敏、snapshot+replay、unknown 恢复、新 attempt ID、内容寻址 checkpoint、用户后改冲突、路径逃逸/符号链接/硬链接拒绝、worktree 创建与安全清理、sandbox required capability fail-closed、三平台 black-box escape suite 和 retention 清理顺序。
 
-Escape suite 在 Core 矩阵的 Ubuntu、macOS、Windows 上随 `cargo test` 运行。Linux 需要 `bwrap`（CI 安装 `bubblewrap`，并关闭 `kernel.apparmor_restrict_unprivileged_userns`，否则 `--unshare-net` 在配置 loopback 时会因缺少 `CAP_NET_ADMIN` 失败）。macOS 使用 `sandbox-exec`，profile 带上 dyld 启动所需的 `file-map-executable` 与 mach 基线允许项。任一逃逸成功都会让该作业失败。当前 Windows 没有经黑盒验证的文件/网络/凭据隔离，套件断言 `prepare` fail closed，并且不会启动 payload。
+Escape suite 在 Core 矩阵的 Ubuntu、macOS、Windows 上随 `cargo test` 运行。Linux 需要 `bwrap`（CI 安装 `bubblewrap`，并关闭 `kernel.apparmor_restrict_unprivileged_userns`，否则 `--unshare-net` 在配置 loopback 时会因缺少 `CAP_NET_ADMIN` 失败）。macOS 使用 `sandbox-exec`，profile 带上 dyld 启动所需的 `file-map-executable` 与 mach 基线允许项。任一逃逸成功都会让该作业失败。当前 Windows 没有经黑盒验证的文件/网络/凭据隔离，生产 `sandbox_contract` 断言 `prepare` fail closed；Windows escape suite 独立启动原型 payload，启动失败或逃逸成功均判失败，不能用拒绝启动代替原型验证。
 
 ## 桌面复验与已自动覆盖的场景
 
-2026-10-27 补上祖先目录穿越授权后，Windows CI 上的逃逸套件重新通过；证据与边界见 [自动执行记录（2026-10-27）](agent-acceptance-2026-10-27.md)。
+此前 2026-10-27 记录声称 Windows 逃逸套件通过，但 2026-10-28 的原始日志仍显示 payload 启动错误 2。该历史声明不代表当前主干已通过，必须以 [Issue #14 专项复核](windows-appcontainer-issue-14.md) 的真实 Windows 证据为准。
 
 
 2026-10-26 已读取三平台 Core 的真实 escape/fault 日志，并运行本机真实文件 checkpoint/worktree、journal 恢复及桌面审批中强退/重启。8.1 完成。非 PTY Windows 后台命令现也绑定 Job Object；真实 owner 进程被强制终止的回归验证无后台残留。该进程清理能力不代表文件、网络或凭据隔离。详见 [自动执行记录](agent-acceptance-2026-10-26.md)。
@@ -43,6 +43,6 @@ Escape suite 在 Core 矩阵的 Ubuntu、macOS、Windows 上随 `cargo test` 运
 |---|---|---|---|
 | Linux + `bwrap` | verified | verified | 系统库目录只读，工作区绑定到 `/workspace`，不挂载宿主根；清空环境；默认 unshare network/PID，沙箱退出后不留子进程 |
 | macOS + `sandbox-exec` | verified | verified | profile 默认拒绝；允许 dyld/libsystem 启动（含根 vnode 的 literal 读取，不含子树），只允许工作区写入和系统目录读取，默认拒绝网络，清空环境，退出时结束进程组 |
-| Windows | unsupported | verified | 当前没有经黑盒验证的文件/网络/凭据隔离；required 请求拒绝执行，escape suite 断言 fail closed |
+| Windows | unsupported | verified | 当前没有经黑盒验证的文件/网络/凭据隔离；required 请求拒绝执行；escape suite 单独验证未发布的原型 |
 
 Windows 不会把普通进程或 Job Object 描述成完整 sandbox。选择 sandboxed 且要求上述能力时会 fail closed。direct/worktree 也不会被显示为 sandboxed。

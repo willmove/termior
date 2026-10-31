@@ -512,37 +512,13 @@ impl SandboxBackend for WindowsAppContainerSandbox {
     }
 
     fn probe(&self) -> BTreeMap<SandboxCapability, TrustLevel> {
-        let available = termior_terminal::windows_sandbox::app_container_available();
+        // Resolving a SID is not a launch or isolation test. The current prototype
+        // also shares one identity and retains ACL grants across environments.
+        // Keep the release path closed until these boundaries have real evidence.
         BTreeMap::from([
-            (
-                SandboxCapability::Filesystem,
-                if available {
-                    TrustLevel::Verified
-                } else {
-                    TrustLevel::Unsupported
-                },
-            ),
-            // The container requests no network capability, so a confined process has
-            // no network access at all. Network access is therefore denied, not merely
-            // unmeasured, which makes the capability verifiable.
-            (
-                SandboxCapability::Network,
-                if available {
-                    TrustLevel::Verified
-                } else {
-                    TrustLevel::Unsupported
-                },
-            ),
-            // The confined process starts from a rebuilt environment and runs under a
-            // separate low-privilege identity, so the parent's credentials are absent.
-            (
-                SandboxCapability::Credentials,
-                if available {
-                    TrustLevel::Verified
-                } else {
-                    TrustLevel::Unsupported
-                },
-            ),
+            (SandboxCapability::Filesystem, TrustLevel::Unsupported),
+            (SandboxCapability::Network, TrustLevel::Unsupported),
+            (SandboxCapability::Credentials, TrustLevel::Unsupported),
             (SandboxCapability::ProcessTree, TrustLevel::Verified),
         ])
     }

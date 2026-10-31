@@ -1,8 +1,8 @@
 //! Black-box escape suite for sandboxed execution (Stage D task 6.6).
 //!
-//! A verified platform must fail every probe below. A platform that cannot enforce the
-//! capability (Windows today) must fail closed and must not launch the payload. Any
-//! successful escape fails the test.
+//! A verified platform must fail every escape probe below. Windows exercises the
+//! unverified AppContainer prototype directly; production fail-closed policy has its
+//! own contract tests. A launch failure or any successful escape fails validation.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -13,8 +13,11 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use termior_agent_host::{
-    PlatformSandbox, SandboxBackend, SandboxCapability, SandboxError, SandboxRequest, TrustLevel,
+    PlatformSandbox, SandboxBackend, SandboxCapability, SandboxError, TrustLevel,
 };
+
+#[cfg(not(windows))]
+use termior_agent_host::SandboxRequest;
 
 const SECRET: &str = "termior-escape-secret-value";
 const TASK_FILE: &str = "termior-escape-task.json";
@@ -69,9 +72,9 @@ fn run_suite() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, work.join("planted-symlink")).unwrap();
 
-    // The payload runs from the test binary's own directory. On Windows the sandbox
-    // grants access per directory, so the payload's directory must be reachable too.
-    grant_payload_access();
+    // Stage before granting: only the workspace is shared, never target/debug/deps.
+    #[cfg(windows)]
+    let _ = payload_exe(&work);
 
     match prepare(&work) {
         Err(error) => assert_all_scenarios_fail_closed(&error, &work, &outside),
@@ -93,22 +96,30 @@ fn run_suite() {
     }
 }
 
-/// Make the payload binary readable and executable inside the sandbox.
+// Exercise the unverified Windows prototype directly. Production capability policy
+// is tested separately in sandbox_contract; it must not make this escape test pass
+// merely by refusing to launch. No production opt-in or permission widening is added.
 #[cfg(windows)]
-fn grant_payload_access() {
-    let exe = std::env::current_exe().unwrap();
-    let directory = exe
-        .parent()
-        .expect("the test binary has a parent directory");
-    // The ancestors need a traversal grant too: a confined token cannot walk
-    // down to the payload when the directories above it belong to the build
-    // account alone.
-    termior_terminal::windows_sandbox::grant_directory_with_ancestors(directory)
-        .expect("the payload directory must be shareable with the sandbox");
+fn test_environment(work: &Path) -> Result<termior_agent_host::ExecutionEnvironment, SandboxError> {
+    let root = work.canonicalize().unwrap();
+    termior_terminal::windows_sandbox::grant_directory_with_ancestors(&root)
+        .expect("candidate workspace grant must succeed");
+    Ok(termior_agent_host::ExecutionEnvironment {
+        id: "appcontainer-candidate-test".into(),
+        kind: termior_agent_host::EnvironmentKind::Sandboxed,
+        host: "windows".into(),
+        root: root.clone(),
+        writable_paths: vec![root],
+        capabilities: std::collections::BTreeMap::new(),
+        backend_owner: "unverified-appcontainer-test".into(),
+        verified_at_ms: None,
+    })
 }
 
 #[cfg(not(windows))]
-fn grant_payload_access() {}
+fn test_environment(work: &Path) -> Result<termior_agent_host::ExecutionEnvironment, SandboxError> {
+    PlatformSandbox.prepare(&sandbox_request(work))
+}
 
 fn assert_all_scenarios_fail_closed(error: &SandboxError, work: &Path, outside: &Path) {
     let probe = PlatformSandbox.probe();
@@ -270,10 +281,8 @@ fn assert_orphan_does_not_survive(work: &Path) {
 
 fn launch_harness() {
     let work = PathBuf::from(std::env::var("TERMIOR_ESCAPE_WORK").unwrap());
-    let request = sandbox_request(&work);
-    let environment = PlatformSandbox
-        .prepare(&request)
-        .expect("harness was launched even though the sandbox fails closed");
+    let environment =
+        test_environment(&work).expect("harness was launched even though the sandbox fails closed");
     let (status, stdout, stderr) = spawn_payload(&environment, &work);
     assert!(
         status.success(),
@@ -283,9 +292,10 @@ fn launch_harness() {
 }
 
 fn prepare(work: &Path) -> Result<(), SandboxError> {
-    PlatformSandbox.prepare(&sandbox_request(work)).map(|_| ())
+    test_environment(work).map(|_| ())
 }
 
+#[cfg(not(windows))]
 fn sandbox_request(work: &Path) -> SandboxRequest {
     SandboxRequest {
         id: "escape".into(),
@@ -322,11 +332,9 @@ fn run_mode_unchecked(work: &Path, mode: &str, outside: &Path, pwned: &Path, tar
             targets: targets.to_vec(),
         },
     );
-    let environment = PlatformSandbox
-        .prepare(&sandbox_request(work))
-        .unwrap_or_else(|error| {
-            panic!("{mode} prepare failed after the suite saw a sandbox: {error}")
-        });
+    let environment = test_environment(work).unwrap_or_else(|error| {
+        panic!("{mode} prepare failed after the suite saw a sandbox: {error}")
+    });
     let (status, stdout, stderr) = spawn_payload(&environment, work);
     assert!(
         status.success(),
@@ -340,6 +348,7 @@ fn spawn_payload(
     work: &Path,
 ) -> (ExitStatus, String, String) {
     let exe = payload_exe(work);
+    #[cfg(not(windows))]
     let command = PlatformSandbox
         .wrap_command(
             environment,
@@ -353,6 +362,19 @@ fn spawn_payload(
             false,
         )
         .unwrap_or_else(|error| panic!("wrap_command failed: {error}"));
+    #[cfg(windows)]
+    let command = termior_agent_host::SandboxCommand {
+        program: exe.display().to_string(),
+        args: vec![
+            TEST_NAME.into(),
+            "--exact".into(),
+            "--test-threads=1".into(),
+            "--nocapture".into(),
+        ],
+        cwd: environment.root.clone(),
+        clear_environment: true,
+        app_container: true,
+    };
     let mut child = command
         .spawn()
         .unwrap_or_else(|error| panic!("sandbox spawn failed: {error}"));
@@ -388,8 +410,11 @@ fn spawn_payload(
 fn payload_exe(work: &Path) -> std::path::PathBuf {
     let source = std::env::current_exe().unwrap();
     let staged = work.join("escape-payload.exe");
-    fs::copy(&source, &staged)
-        .unwrap_or_else(|error| panic!("cannot stage the payload next to the sandbox: {error}"));
+    if !staged.exists() {
+        fs::copy(&source, &staged).unwrap_or_else(|error| {
+            panic!("cannot stage the payload next to the sandbox: {error}")
+        });
+    }
     staged
 }
 
@@ -492,7 +517,7 @@ fn payload_child(task: &EscapeTask) {
     write_task(Path::new("."), &nested);
     let status = Command::new(std::env::current_exe().unwrap())
         .args([TEST_NAME, "--exact", "--test-threads=1", "--nocapture"])
-        .stdin(Stdio::null())
+        .stdin(payload_stdin())
         .status()
         .unwrap_or_else(|error| panic!("child spawn failed: {error}"));
     assert!(status.success(), "nested filesystem probe failed");
@@ -510,9 +535,9 @@ fn payload_orphan() {
     );
     let child = Command::new(std::env::current_exe().unwrap())
         .args([TEST_NAME, "--exact", "--test-threads=1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdin(payload_stdin())
+        .stdout(payload_output("orphan.stdout"))
+        .stderr(payload_output("orphan.stderr"))
         .spawn()
         .unwrap_or_else(|error| panic!("orphan spawn failed: {error}"));
     let start = Instant::now();
@@ -596,4 +621,31 @@ fn read_pipe(pipe: Option<impl Read>) -> String {
     let mut buffer = String::new();
     let _ = pipe.read_to_string(&mut buffer);
     buffer
+}
+
+// Do not require access to the host NUL device to test process inheritance.
+// Windows AppContainer may deny that device; sandbox-local files keep all I/O
+// inside the granted root without changing host device or directory ACLs.
+fn payload_stdin() -> Stdio {
+    #[cfg(windows)]
+    {
+        fs::write("payload.stdin", b"").unwrap();
+        Stdio::from(fs::File::open("payload.stdin").unwrap())
+    }
+    #[cfg(not(windows))]
+    {
+        Stdio::null()
+    }
+}
+
+fn payload_output(name: &str) -> Stdio {
+    #[cfg(windows)]
+    {
+        Stdio::from(fs::File::create(name).unwrap())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        Stdio::null()
+    }
 }

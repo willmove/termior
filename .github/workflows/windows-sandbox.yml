@@ -1,0 +1,67 @@
+name: Windows AppContainer validation
+on:
+  pull_request:
+    paths:
+      - 'crates/termior-terminal/**'
+      - 'crates/termior-agent-host/**'
+      - '.github/workflows/windows-sandbox.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  appcontainer:
+    name: AppContainer (${{ matrix.variant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [baseline, candidate]
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      # Separate runners are essential: baseline ACL/Profile mutations must not
+      # contaminate the candidate's access checks. Build cache contains no ACLs.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.variant == 'baseline' && '6f95626c9f6429da4ed6ef4008fd511f529466f6' || github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-appcontainer-${{ matrix.variant }}-${{ hashFiles('Cargo.lock') }}
+      - name: Reproduce pinned main (diagnostic)
+        if: matrix.variant == 'baseline'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          cargo test --locked -p termior-agent-host --test escape_suite -- --nocapture --test-threads=1 2>&1 | Tee-Object evidence/baseline.log
+          $result = $LASTEXITCODE
+          "baseline=6f95626c9f6429da4ed6ef4008fd511f529466f6 exit=$result" | Set-Content evidence/baseline-result.txt
+          # Preserve failures as evidence; this diagnostic is not an acceptance gate.
+          exit 0
+      - name: Validate candidate confinement (independent of workspace Clippy)
+        if: matrix.variant == 'candidate'
+        shell: pwsh
+        env:
+          RUST_BACKTRACE: 1
+        run: |
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          $failed = $false
+          cargo test --locked -p termior-terminal --test windows_appcontainer -- --nocapture --test-threads=1 2>&1 | Tee-Object evidence/appcontainer.log
+          if ($LASTEXITCODE -ne 0) { $failed = $true }
+          cargo test --locked -p termior-agent-host --test sandbox_contract --test escape_suite -- --nocapture --test-threads=1 2>&1 | Tee-Object evidence/contracts-and-escape.log
+          if ($LASTEXITCODE -ne 0) { $failed = $true }
+          if ($failed) { exit 1 }
+      - name: Check Rust formatting
+        if: always() && matrix.variant == 'candidate'
+        run: cargo fmt --all -- --check
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-appcontainer-evidence-${{ matrix.variant }}
+          path: evidence/
+          if-no-files-found: error

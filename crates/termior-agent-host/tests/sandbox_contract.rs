@@ -154,18 +154,29 @@ fn platform_command_wrapper_fails_closed_or_uses_the_verified_native_boundary() 
 #[test]
 fn the_windows_backend_reports_the_appcontainer_probe() {
     let probe = termior_agent_host::WindowsAppContainerSandbox.probe();
-    let available = termior_terminal::windows_sandbox::app_container_available();
     for capability in [
         SandboxCapability::Filesystem,
         SandboxCapability::Network,
         SandboxCapability::Credentials,
     ] {
-        let expected = if available {
-            TrustLevel::Verified
-        } else {
-            TrustLevel::Unsupported
+        assert_eq!(
+            probe.get(&capability),
+            Some(&TrustLevel::Unsupported),
+            "{capability:?}"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let request = SandboxRequest {
+            id: "unverified-windows".into(),
+            root: root.path().into(),
+            required: vec![capability],
+            allow_network: false,
         };
-        assert_eq!(probe.get(&capability), Some(&expected), "{capability:?}");
+        assert_eq!(
+            termior_agent_host::WindowsAppContainerSandbox
+                .prepare(&request)
+                .unwrap_err(),
+            SandboxError::RequiredCapabilityUnavailable(capability)
+        );
     }
     assert_eq!(
         probe.get(&SandboxCapability::ProcessTree),

@@ -2,8 +2,8 @@
 //!
 //! These tests run the actual Windows API. They prove that a command inside the
 //! container can read the granted workspace and cannot read a sibling directory.
-//! A platform without a usable AppContainer profile skips instead of reporting a
-//! false pass.
+//! A missing profile or failed launch is a validation failure, never evidence that
+//! access was denied by a working sandbox.
 
 #![cfg(windows)]
 
@@ -22,8 +22,7 @@ fn cmd() -> String {
 
 fn require_container() -> Option<AppContainer> {
     if !app_container_available() {
-        eprintln!("skipping: this machine has no usable AppContainer profile");
-        return None;
+        panic!("Windows validation requires a usable AppContainer identity");
     }
     Some(AppContainer::resolve(APP_CONTAINER_NAME).expect("the AppContainer profile must resolve"))
 }
@@ -46,7 +45,7 @@ fn a_confined_command_can_read_the_granted_workspace() {
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(workspace.join("inside.txt"), b"inside-value").unwrap();
     container
-        .grant(&workspace)
+        .grant_with_ancestors(&workspace)
         .expect("the workspace grant must succeed");
 
     let code = run(
@@ -69,7 +68,7 @@ fn a_confined_command_cannot_read_a_sibling_directory() {
     std::fs::create_dir_all(&outside).unwrap();
     std::fs::write(outside.join("secret.txt"), b"outside-secret").unwrap();
     container
-        .grant(&workspace)
+        .grant_with_ancestors(&workspace)
         .expect("the workspace grant must succeed");
 
     let code = run(
@@ -80,11 +79,7 @@ fn a_confined_command_cannot_read_a_sibling_directory() {
         ],
         &workspace,
     );
-    assert_ne!(
-        code,
-        Some(0),
-        "the confined command read a directory outside the granted workspace"
-    );
+    assert_eq!(code, Some(1), "type must execute and report access denied");
 }
 
 #[test]
@@ -96,7 +91,7 @@ fn a_confined_command_cannot_write_outside_the_granted_workspace() {
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     container
-        .grant(&workspace)
+        .grant_with_ancestors(&workspace)
         .expect("the workspace grant must succeed");
     let target = root.path().join("escaped.txt");
 
@@ -108,11 +103,7 @@ fn a_confined_command_cannot_write_outside_the_granted_workspace() {
         ],
         &workspace,
     );
-    assert_ne!(
-        code,
-        Some(0),
-        "the confined command wrote outside the workspace"
-    );
+    assert_eq!(code, Some(1), "redirection must execute and report denial");
     assert!(
         !target.exists(),
         "a file was created outside the granted workspace"
@@ -128,7 +119,7 @@ fn a_confined_command_does_not_inherit_the_parent_environment() {
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     container
-        .grant(&workspace)
+        .grant_with_ancestors(&workspace)
         .expect("the workspace grant must succeed");
 
     // The marker is set in the parent's environment. A confined command must not see it.
@@ -167,44 +158,54 @@ fn granting_a_directory_that_cannot_be_shared_is_an_error_not_a_silent_grant() {
 #[test]
 fn a_confined_command_cannot_reach_the_network() {
     use std::net::{TcpListener, TcpStream};
-    use std::time::Duration;
-
-    let Some(container) = require_container() else {
+    const NAME: &str = "a_confined_command_cannot_reach_the_network";
+    if let Ok(target) = std::fs::read_to_string("network-target.txt") {
+        let error = TcpStream::connect_timeout(&target.parse().unwrap(), Duration::from_secs(2))
+            .expect_err("confined process reached the host listener");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected connection failure: {error}"
+        );
+        std::fs::write("network-result.txt", "denied").unwrap();
         return;
-    };
+    }
+    let container = require_container().unwrap();
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
-    container
-        .grant(&workspace)
-        .expect("the workspace grant must succeed");
-
+    let image = workspace.join("network-probe.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    // Control: the host process reaches the same listener.
-    assert!(
-        TcpStream::connect_timeout(&address.parse().unwrap(), Duration::from_millis(500)).is_ok(),
-        "the host must be able to reach the control listener"
+    let address = listener.local_addr().unwrap();
+    TcpStream::connect_timeout(&address, Duration::from_millis(500)).unwrap();
+    // Drain the positive control, then observe the listener during the confined dial.
+    drop(listener.accept().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    std::fs::write(workspace.join("network-target.txt"), address.to_string()).unwrap();
+    container.grant_with_ancestors(&workspace).unwrap();
+    let mut child = container
+        .spawn(
+            &image,
+            &[NAME.into(), "--exact".into(), "--test-threads=1".into()],
+            &workspace,
+        )
+        .unwrap();
+    assert_eq!(child.wait(Duration::from_secs(20)), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("network-result.txt")).unwrap(),
+        "denied"
     );
-
-    let script = format!("powershell -NoProfile -ExecutionPolicy Bypass -File probe.ps1 {address}");
-    std::fs::write(
-        workspace.join("probe.ps1"),
-        "$client = New-Object System.Net.Sockets.TcpClient\n\
-         try {\n\
-         \x20 $client.Connect($args[0])\n\
-         \x20 exit 0\n\
-         } catch {\n\
-         \x20 exit 7\n\
-         }\n",
-    )
-    .unwrap();
-    let code = run(&container, &["/c".into(), script], &workspace);
-    assert_ne!(
-        code,
-        Some(0),
-        "the confined command reached the loopback listener"
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "listener accepted a sandbox connection"
     );
+    // The target must remain reachable after the negative control as well.
+    TcpStream::connect_timeout(&address, Duration::from_millis(500)).unwrap();
+    drop(listener.accept().unwrap());
 }
 
 /// A piped confined process reports its standard output and exits with its exit code.
@@ -219,7 +220,7 @@ fn a_piped_confined_command_reports_its_output() {
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     container
-        .grant(&workspace)
+        .grant_with_ancestors(&workspace)
         .expect("the workspace grant must succeed");
 
     let mut process = container
@@ -251,16 +252,16 @@ fn a_confined_command_can_run_system_binaries_without_an_explicit_grant() {
     let workspace = root.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     container
-        .grant(&workspace)
+        .grant_with_ancestors(&workspace)
         .expect("the workspace grant must succeed");
 
-    for program in ["cmd.exe", "where.exe", "whoami.exe"] {
+    for program in ["cmd.exe /c exit /b 0", "where.exe cmd.exe", "whoami.exe"] {
         let code = run(
             &container,
-            &["/c".into(), format!("{program} > nul")],
+            &["/c".into(), format!("{program} > system-tool.stdout")],
             &workspace,
         );
-        println!("{program}: exit={code:?}");
+        assert_eq!(code, Some(0), "system program did not run: {program}");
     }
 }
 
@@ -275,8 +276,10 @@ fn a_confined_command_can_run_a_program_under_the_user_profile() {
     let directory = std::env::temp_dir().join("termior-appcontainer-profile-probe");
     std::fs::create_dir_all(&directory).unwrap();
     let payload = directory.join("probe.cmd");
-    std::fs::write(&payload, "@echo /b 0\n").unwrap();
-    container.grant(&directory).expect("the grant must succeed");
+    std::fs::write(&payload, "@exit /b 0\n").unwrap();
+    container
+        .grant_with_ancestors(&directory)
+        .expect("the grant must succeed");
 
     // The payload is named relative to the working directory. `cmd.exe /c` has its
     // own quoting rules for an absolute path with spaces in it, and the path is not
@@ -305,7 +308,9 @@ fn a_confined_command_can_run_a_program_below_a_restricted_directory() {
     let target = leaf.join("payload.exe");
     std::fs::copy(&exe, &target).unwrap();
 
-    container.grant(&leaf).expect("the grant must succeed");
+    container
+        .grant_with_ancestors(&leaf)
+        .expect("the grant must succeed");
 
     let code = run(&container, &["/c".into(), "echo ok".into()], &leaf);
     println!("restricted leaf exit={code:?}");
@@ -339,13 +344,9 @@ fn a_confined_command_can_run_a_program_below_a_private_ancestor() {
 
     // The ancestor grants the container nothing: only the user may enter it.
     let ancestor = root.join("a");
-    let granted = container.grant_with_ancestors(&leaf);
-    if granted.is_err() {
-        // A machine that does not let the user change the ACL cannot reproduce
-        // the condition; the grant itself is still exercised by the tests above.
-        eprintln!("skipping: the ancestor grant failed: {granted:?}");
-        return;
-    }
+    container
+        .grant_with_ancestors(&leaf)
+        .expect("ancestor grant must succeed");
 
     // The ancestor must stay unreadable for the container: only traversal was
     // granted, not the right to list or read it.
@@ -383,7 +384,7 @@ fn a_confined_command_starts_in_a_verbatim_working_directory() {
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(workspace.join("inside.txt"), b"inside-value").unwrap();
     container
-        .grant(&workspace)
+        .grant_with_ancestors(&workspace)
         .expect("the workspace grant must succeed");
 
     // The verbatim form of the same directory.
@@ -422,7 +423,9 @@ fn granting_a_directory_keeps_the_hosts_own_access() {
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("before.txt"), b"before").unwrap();
 
-    container.grant(&directory).expect("the grant must succeed");
+    container
+        .grant_with_ancestors(&directory)
+        .expect("the grant must succeed");
 
     // The host can still read its own file, and can still write into the directory.
     assert_eq!(
@@ -464,11 +467,9 @@ fn the_traversal_grant_on_an_ancestor_leaves_the_files_below_it_alone() {
 
     // Grant traversal on the ancestor alone: the workspace below it is not
     // part of this grant.
-    let granted = container.grant_with_ancestors(&child);
-    if granted.is_err() {
-        eprintln!("skipping: the ancestor grant failed: {granted:?}");
-        return;
-    }
+    container
+        .grant_with_ancestors(&child)
+        .expect("ancestor grant must succeed");
 
     let after = acl_entries(&file);
     assert_eq!(
@@ -492,14 +493,16 @@ fn granting_a_directory_keeps_the_other_principals_entries() {
     std::fs::write(&file, b"kept").unwrap();
 
     let before = acl_entries(&directory);
-    container.grant(&directory).expect("the grant must succeed");
+    container
+        .grant_with_ancestors(&directory)
+        .expect("the grant must succeed");
     let after = acl_entries(&directory);
 
     // Everything that was there before is still there, plus the container entry.
     for entry in &before {
         assert!(
             after.contains(entry),
-            "the grant dropped the {entry:?} entry of {}",
+            "the grant dropped the {entry:?} entry of {}; before={before:?}; after={after:?}",
             directory.display()
         );
     }
@@ -514,10 +517,233 @@ fn acl_entries(path: &Path) -> Vec<String> {
         .arg(path)
         .output()
         .expect("icacls must run");
+    assert!(output.status.success(), "icacls failed: {:?}", output);
     let text = String::from_utf8_lossy(&output.stdout);
+    let prefix = path.display().to_string();
+    // icacls prints the first ACE on the same line as the path. Dropping that
+    // line loses a different principal when Windows reorders the merged ACL.
     text.lines()
-        .skip(1)
-        .map(|line| line.trim().to_owned())
-        .filter(|line| !line.is_empty() && !line.starts_with("Successfully processed"))
+        .map(|line| line.strip_prefix(&prefix).unwrap_or(line).trim().to_owned())
+        .filter(|line| line.contains(":("))
         .collect()
+}
+
+/// Reproduce the CI launch shape with a real image, spaces, and a canonical cwd.
+/// The child must execute, prove its token, read a fixture, and observe stdin EOF.
+#[test]
+fn a_copied_image_runs_with_a_confined_token_and_closed_stdin() {
+    const NAME: &str = "a_copied_image_runs_with_a_confined_token_and_closed_stdin";
+    if Path::new("image-probe.marker").exists() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{GetTokenInformation, TokenIsAppContainer, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token = std::ptr::null_mut();
+        // SAFETY: token and result buffers are valid out-pointers.
+        unsafe {
+            assert_ne!(
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token),
+                0
+            );
+            let mut confined = 0u32;
+            let mut size = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenIsAppContainer,
+                &mut confined as *mut u32 as *mut std::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+                &mut size,
+            );
+            CloseHandle(token);
+            assert_ne!(ok, 0);
+            assert_eq!(confined, 1, "payload did not receive an AppContainer token");
+        }
+        assert_eq!(
+            std::fs::read_to_string("inside.txt").unwrap(),
+            "inside-value"
+        );
+        if std::fs::read_to_string("image-probe.marker").unwrap() == "piped" {
+            use std::io::Read;
+            let mut input = Vec::new();
+            assert_eq!(std::io::stdin().read_to_end(&mut input).unwrap(), 0);
+        }
+        std::fs::write("image-probe.result", "executed").unwrap();
+        return;
+    }
+    let container = require_container().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let work = root
+        .path()
+        .join("private ancestor")
+        .join("workspace with spaces");
+    std::fs::create_dir_all(&work).unwrap();
+    let image = work.join("copied payload.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
+    std::fs::write(work.join("inside.txt"), "inside-value").unwrap();
+    std::fs::write(work.join("image-probe.marker"), "plain").unwrap();
+    container.grant_with_ancestors(&work).unwrap();
+    let args = vec![NAME.into(), "--exact".into(), "--test-threads=1".into()];
+    let mut plain = container
+        .spawn(
+            &image.canonicalize().unwrap(),
+            &args,
+            &work.canonicalize().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(plain.wait(Duration::from_secs(20)), Some(0));
+    assert_eq!(
+        std::fs::read_to_string(work.join("image-probe.result")).unwrap(),
+        "executed"
+    );
+    std::fs::remove_file(work.join("image-probe.result")).unwrap();
+    std::fs::write(work.join("image-probe.marker"), "piped").unwrap();
+    let mut piped = container
+        .spawn_piped(
+            &image.canonicalize().unwrap(),
+            &args,
+            &work.canonicalize().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        piped.wait(Duration::from_secs(20)),
+        Some(0),
+        "stdin must reach EOF without leaking its host handle"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.join("image-probe.result")).unwrap(),
+        "executed"
+    );
+}
+
+/// kill and Drop must bound the entire tree for both launch APIs.
+#[test]
+fn job_cleanup_stops_descendants_on_kill_and_drop() {
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Instant;
+    const NAME: &str = "job_cleanup_stops_descendants_on_kill_and_drop";
+    if let Ok(mode) = std::fs::read_to_string("job-probe.mode") {
+        if mode == "sleeper" {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(10) {
+                std::fs::write(
+                    "job-probe.heartbeat",
+                    start.elapsed().as_nanos().to_string(),
+                )
+                .unwrap();
+                thread::sleep(Duration::from_millis(50));
+            }
+            return;
+        }
+        std::fs::write("job-probe.mode", "sleeper").unwrap();
+        let _child = Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--test-threads=1"])
+            .stdin(Stdio::from(std::fs::File::open("job-probe.mode").unwrap()))
+            .stdout(Stdio::from(
+                std::fs::File::create("job-child.stdout").unwrap(),
+            ))
+            .stderr(Stdio::from(
+                std::fs::File::create("job-child.stderr").unwrap(),
+            ))
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        while !Path::new("job-probe.heartbeat").exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "descendant never ran"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::write("job-probe.ready", "ready").unwrap();
+        thread::sleep(Duration::from_secs(10));
+        return;
+    }
+    let container = require_container().unwrap();
+    for piped in [false, true] {
+        for kill in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let work = root.path().join("work");
+            std::fs::create_dir(&work).unwrap();
+            let exe = work.join("job-probe.exe");
+            std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+            std::fs::write(work.join("job-probe.mode"), "root").unwrap();
+            container.grant_with_ancestors(&work).unwrap();
+            let args = vec![NAME.into(), "--exact".into(), "--test-threads=1".into()];
+            let mut plain = None;
+            let mut pipes = None;
+            if piped {
+                pipes = Some(container.spawn_piped(&exe, &args, &work).unwrap());
+            } else {
+                plain = Some(container.spawn(&exe, &args, &work).unwrap());
+            }
+            let start = Instant::now();
+            while !work.join("job-probe.ready").exists() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "root/descendant failed to start"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            if kill {
+                if let Some(process) = plain.as_mut() {
+                    process.kill();
+                }
+                if let Some(process) = pipes.as_mut() {
+                    process.kill();
+                }
+                // Keep the Job handle alive: kill itself must terminate the tree.
+            } else {
+                drop(plain.take());
+                drop(pipes.take());
+            }
+            thread::sleep(Duration::from_millis(300));
+            let first = std::fs::read(work.join("job-probe.heartbeat")).unwrap();
+            thread::sleep(Duration::from_millis(300));
+            assert_eq!(
+                std::fs::read(work.join("job-probe.heartbeat")).unwrap(),
+                first,
+                "descendant survived: piped={piped}, kill={kill}"
+            );
+        }
+    }
+}
+
+/// A derived SID alone must never masquerade as a registered profile.
+#[test]
+fn resolving_a_new_identity_really_creates_its_profile() {
+    use windows_sys::Win32::Security::FreeSid;
+    use windows_sys::Win32::Security::Isolation::CreateAppContainerProfile;
+    let unique = format!(
+        "Termior.ProfileProbe.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let container = AppContainer::resolve(&unique).unwrap();
+    let wide: Vec<u16> = unique.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sid = std::ptr::null_mut();
+    // SAFETY: valid strings and out-pointer; a duplicate must report ALREADY_EXISTS.
+    let result = unsafe {
+        CreateAppContainerProfile(
+            wide.as_ptr(),
+            wide.as_ptr(),
+            wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            &mut sid,
+        )
+    };
+    if !sid.is_null() {
+        unsafe {
+            FreeSid(sid);
+        }
+    }
+    drop(container);
+    termior_terminal::windows_sandbox::delete_profile(&unique);
+    assert_eq!(
+        result, 0x8007_00B7u32 as i32,
+        "resolve returned a SID without creating the profile data store"
+    );
 }
