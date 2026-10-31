@@ -687,3 +687,43 @@ fn job_cleanup_stops_descendants_on_kill_and_drop() {
         }
     }
 }
+
+/// A derived SID alone must never masquerade as a registered profile.
+#[test]
+fn resolving_a_new_identity_really_creates_its_profile() {
+    use windows_sys::Win32::Security::FreeSid;
+    use windows_sys::Win32::Security::Isolation::CreateAppContainerProfile;
+    let unique = format!(
+        "Termior.ProfileProbe.{}.{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let container = AppContainer::resolve(&unique).unwrap();
+    let wide: Vec<u16> = unique.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut sid = std::ptr::null_mut();
+    // SAFETY: valid strings and out-pointer; a duplicate must report ALREADY_EXISTS.
+    let result = unsafe {
+        CreateAppContainerProfile(
+            wide.as_ptr(),
+            wide.as_ptr(),
+            wide.as_ptr(),
+            std::ptr::null(),
+            0,
+            &mut sid,
+        )
+    };
+    if !sid.is_null() {
+        unsafe {
+            FreeSid(sid);
+        }
+    }
+    drop(container);
+    termior_terminal::windows_sandbox::delete_profile(&unique);
+    assert_eq!(
+        result, 0x8007_00B7u32 as i32,
+        "resolve returned a SID without creating the profile data store"
+    );
+}

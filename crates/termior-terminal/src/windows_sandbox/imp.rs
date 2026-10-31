@@ -16,7 +16,7 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    GetLengthSid, InitializeSecurityDescriptor, MakeSelfRelativeSD, SetFileSecurityW,
+    FreeSid, GetLengthSid, InitializeSecurityDescriptor, MakeSelfRelativeSD, SetFileSecurityW,
     SetSecurityDescriptorDacl, ACL, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES,
     SUB_CONTAINERS_AND_OBJECTS_INHERIT,
 };
@@ -109,9 +109,6 @@ impl AppContainer {
     /// Resolve, creating if needed, the AppContainer profile SID.
     pub fn resolve(name: &str) -> Result<Self, AppContainerError> {
         let wide = wide_null(name);
-        if let Some(sid) = derive_sid(&wide) {
-            return Ok(Self { sid });
-        }
         let mut created: PSID = std::ptr::null_mut();
         // SAFETY: the profile name, display name, and description are valid null-terminated
         // UTF-16 strings; no capabilities are requested, so the capability pointer is null
@@ -129,9 +126,13 @@ impl AppContainer {
         if created_result >= 0 && !created.is_null() {
             return Ok(Self { sid: created });
         }
-        // Another process may have created the profile between the derive and the create.
-        if let Some(sid) = derive_sid(&wide) {
-            return Ok(Self { sid });
+        // Deriving a SID does not create the profile's data store. Only reuse a
+        // derived SID after Windows confirms that the profile already exists.
+        const PROFILE_ALREADY_EXISTS: i32 = 0x8007_00B7u32 as i32;
+        if created_result == PROFILE_ALREADY_EXISTS {
+            if let Some(sid) = derive_sid(&wide) {
+                return Ok(Self { sid });
+            }
         }
         Err(AppContainerError::Profile(format!(
             "cannot create the Windows AppContainer profile {name}: hr={created_result:#x}"
@@ -202,7 +203,7 @@ impl Drop for AppContainer {
         if !self.sid.is_null() {
             // SAFETY: `self.sid` was allocated by the AppContainer API and is freed once.
             unsafe {
-                LocalFree(self.sid);
+                FreeSid(self.sid);
             }
         }
     }
@@ -712,8 +713,14 @@ fn spawn_in_container(
 ) -> Result<ConfinedProcess, AppContainerError> {
     let job = Job::new()?;
     let job_list = [job.handle];
+    let capabilities = SECURITY_CAPABILITIES {
+        AppContainerSid: container.sid(),
+        CapabilityCount: 0,
+        Capabilities: std::ptr::null_mut(),
+        Reserved: 0,
+    };
     let mut attribute_list = AttributeList::new(2)?;
-    // Attribute values must stay alive until CreateProcessW returns.
+    // Attribute values outlive the list, including its destructor.
     let assigned = unsafe {
         UpdateProcThreadAttribute(
             attribute_list.pointer(),
@@ -731,12 +738,6 @@ fn spawn_in_container(
             std::io::Error::last_os_error()
         )));
     }
-    let capabilities = SECURITY_CAPABILITIES {
-        AppContainerSid: container.sid(),
-        CapabilityCount: 0,
-        Capabilities: std::ptr::null_mut(),
-        Reserved: 0,
-    };
     // SAFETY: `attribute_list` is initialized and `capabilities` outlives the call.
     let updated = unsafe {
         UpdateProcThreadAttribute(
@@ -835,13 +836,13 @@ fn spawn_piped_in_container(
     let job = Job::new()?;
     let job_list = [job.handle];
 
-    let mut attribute_list = AttributeList::new(3)?;
     let capabilities = SECURITY_CAPABILITIES {
         AppContainerSid: container.sid(),
         CapabilityCount: 0,
         Capabilities: std::ptr::null_mut(),
         Reserved: 0,
     };
+    let mut attribute_list = AttributeList::new(3)?;
     // SAFETY: `attribute_list` is initialized with two entries and `capabilities`
     // outlives the call.
     let updated = unsafe {

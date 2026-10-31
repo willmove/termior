@@ -8,6 +8,14 @@
 - 当前主干已在 `wide_path` 剥离 cwd 前缀。单凭日志里的原始 cwd 不能证明 Windows API 实际收到相同字符串，也不能据此确认错误 2 根因。
 - 当前主干 `probe()` 只依赖 SID/Profile 可解析；这不是进程启动、网络或凭据隔离证据。Windows 原型共享 `TermiorSandbox` SID，目录授权长期保留，`cleanup()` 空实现；跨工作区边界尚未成立。
 
+## Profile 与 API 契约缺陷
+
+`resolve()` 先调用 Derive SID，成功就返回，可能根本没有创建 Profile 数据目录。已改为先 Create，仅在 Windows 明确返回 `ERROR_ALREADY_EXISTS` 时派生 SID；其余创建错误必须保留。新增唯一名称测试，通过第二次 Create 必须返回 `ERROR_ALREADY_EXISTS` 来证明 Profile 确实注册。SID 使用 API 规定的 `FreeSid` 释放。
+
+这是一条比路径前缀更直接的错误 2 候选原因，但仍须真实 Windows 基线/候选结果才能确认，不能仅凭代码审阅宣布根因。
+
+微软原始契约：[创建及复用 Profile](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer)、[Create 返回值与释放方法](https://learn.microsoft.com/en-us/windows/win32/api/userenv/nf-userenv-createappcontainerprofile)、[属性值须存活至属性列表销毁](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute)。
+
 ## 修复与验证策略
 
 保留 Windows 文件/网络/凭据 `unsupported`，请求这些能力时在 ACL 修改之前拒绝执行。进程树保留既有 Job Object 能力；不把它当作其他能力证据。能力矩阵直接使用生产 probe，无测试开关可以将生产能力提升为 Verified。
