@@ -5,7 +5,7 @@ use std::fs::File;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use windows_sys::Win32::Foundation::GENERIC_READ;
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, SetHandleInformation, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, SetHandleInformation, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W,
     NO_MULTIPLE_TRUSTEE, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
@@ -23,13 +23,13 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapAlloc, HeapFree, HEAP_ZERO_MEMORY};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
+    InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
     WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
     PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
@@ -210,6 +210,7 @@ impl Drop for AppContainer {
 pub struct ConfinedProcess {
     pid: u32,
     handle: HANDLE,
+    job: Job,
 }
 
 impl ConfinedProcess {
@@ -221,7 +222,7 @@ impl ConfinedProcess {
     pub fn kill(&mut self) {
         // SAFETY: the handle is owned by this struct and open for the call.
         unsafe {
-            TerminateProcess(self.handle, 1);
+            TerminateJobObject(self.job.handle, 1);
         }
     }
 
@@ -243,6 +244,9 @@ impl ConfinedProcess {
         if ok == 0 {
             None
         } else {
+            // The root has exited. Stop descendants before callers drain pipes,
+            // otherwise an orphan holding stdout open can block them indefinitely.
+            self.kill();
             Some(code)
         }
     }
@@ -262,9 +266,6 @@ pub struct PipedConfinedProcess {
     inner: ConfinedProcess,
     stdout: Option<File>,
     stderr: Option<File>,
-    /// Kept alive so the job object stays open while the confined process runs.
-    /// Dropping it closes the handle and kills every descendant.
-    _job: Job,
 }
 
 impl PipedConfinedProcess {
@@ -520,15 +521,15 @@ fn grant_to(
             path.display()
         )));
     }
-    match propagation {
-        Propagation::Inherited => write_dacl_with_propagation(path, merged)?,
-        Propagation::None => write_dacl_without_propagation(path, merged)?,
-    }
+    let result = match propagation {
+        Propagation::Inherited => write_dacl_with_propagation(path, merged),
+        Propagation::None => write_dacl_without_propagation(path, merged),
+    };
     // SAFETY: the ACL was allocated by `SetEntriesInAclW` and is freed exactly once.
     unsafe {
         LocalFree(merged as *mut std::ffi::c_void);
     }
-    Ok(())
+    result
 }
 
 /// Write `dacl` onto `path` and push it onto the objects below it.
@@ -594,7 +595,7 @@ fn open_for_security_write(path: &Path) -> Result<HANDLE, AppContainerError> {
             std::ptr::null_mut(),
         )
     };
-    if handle.is_null() {
+    if handle == INVALID_HANDLE_VALUE {
         return Err(AppContainerError::Acl(format!(
             "cannot open {} for a security write: os error {}",
             path.display(),
@@ -707,7 +708,27 @@ fn spawn_in_container(
     args: &[String],
     cwd: &Path,
 ) -> Result<ConfinedProcess, AppContainerError> {
-    let mut attribute_list = AttributeList::new(1)?;
+    let job = Job::new()?;
+    let job_list = [job.handle];
+    let mut attribute_list = AttributeList::new(2)?;
+    // Attribute values must stay alive until CreateProcessW returns.
+    let assigned = unsafe {
+        UpdateProcThreadAttribute(
+            attribute_list.pointer(),
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            job_list.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(&job_list),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    if assigned == 0 {
+        return Err(AppContainerError::Spawn(format!(
+            "cannot assign the sandbox job object: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
     let capabilities = SECURITY_CAPABILITIES {
         AppContainerSid: container.sid(),
         CapabilityCount: 0,
@@ -737,6 +758,7 @@ fn spawn_in_container(
     };
     startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
     let mut command_line = wide_null(&build_command_line(program, args));
+    let wide_program = wide_path(program);
     let wide_cwd = wide_path(cwd);
     // An explicit environment block. Passing null would inherit the parent's
     // environment, which leaks credentials into the sandbox. Windows itself needs a few
@@ -757,7 +779,7 @@ fn spawn_in_container(
     // out-parameter.
     let created = unsafe {
         CreateProcessW(
-            std::ptr::null(),
+            wide_program.as_ptr(),
             command_line.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
@@ -778,9 +800,12 @@ fn spawn_in_container(
             std::io::Error::last_os_error()
         )));
     }
+    // SAFETY: CreateProcessW returned an owned thread handle.
+    unsafe { CloseHandle(information.hThread) };
     Ok(ConfinedProcess {
         pid: information.dwProcessId,
         handle: information.hProcess,
+        job,
     })
 }
 
@@ -809,69 +834,67 @@ fn spawn_piped_in_container(
     let job_list = [job.handle];
 
     let mut attribute_list = AttributeList::new(3)?;
-    {
-        let capabilities = SECURITY_CAPABILITIES {
-            AppContainerSid: container.sid(),
-            CapabilityCount: 0,
-            Capabilities: std::ptr::null_mut(),
-            Reserved: 0,
-        };
-        // SAFETY: `attribute_list` is initialized with two entries and `capabilities`
-        // outlives the call.
-        let updated = unsafe {
-            UpdateProcThreadAttribute(
-                attribute_list.pointer(),
-                0,
-                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                &capabilities as *const SECURITY_CAPABILITIES as *const std::ffi::c_void,
-                std::mem::size_of::<SECURITY_CAPABILITIES>(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        if updated == 0 {
-            return Err(AppContainerError::Spawn(
-                "cannot set the AppContainer security capabilities".into(),
-            ));
-        }
-        // SAFETY: `attribute_list` is initialized and `handle_list` is a valid array of
-        // open inheritable handles that outlives the call.
-        let updated = unsafe {
-            UpdateProcThreadAttribute(
-                attribute_list.pointer(),
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                handle_list.as_ptr() as *const std::ffi::c_void,
-                std::mem::size_of_val(&handle_list),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        if updated == 0 {
-            return Err(AppContainerError::Spawn(format!(
-                "cannot set the inherited handle list: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        // SAFETY: `attribute_list` is initialized and `job_list` is a valid array of
-        // job handles that outlives the call.
-        let updated = unsafe {
-            UpdateProcThreadAttribute(
-                attribute_list.pointer(),
-                0,
-                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-                job_list.as_ptr() as *const std::ffi::c_void,
-                std::mem::size_of_val(&job_list),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        if updated == 0 {
-            return Err(AppContainerError::Spawn(format!(
-                "cannot assign the sandbox job object: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
+    let capabilities = SECURITY_CAPABILITIES {
+        AppContainerSid: container.sid(),
+        CapabilityCount: 0,
+        Capabilities: std::ptr::null_mut(),
+        Reserved: 0,
+    };
+    // SAFETY: `attribute_list` is initialized with two entries and `capabilities`
+    // outlives the call.
+    let updated = unsafe {
+        UpdateProcThreadAttribute(
+            attribute_list.pointer(),
+            0,
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+            &capabilities as *const SECURITY_CAPABILITIES as *const std::ffi::c_void,
+            std::mem::size_of::<SECURITY_CAPABILITIES>(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    if updated == 0 {
+        return Err(AppContainerError::Spawn(
+            "cannot set the AppContainer security capabilities".into(),
+        ));
+    }
+    // SAFETY: `attribute_list` is initialized and `handle_list` is a valid array of
+    // open inheritable handles that outlives the call.
+    let updated = unsafe {
+        UpdateProcThreadAttribute(
+            attribute_list.pointer(),
+            0,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+            handle_list.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(&handle_list),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    if updated == 0 {
+        return Err(AppContainerError::Spawn(format!(
+            "cannot set the inherited handle list: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `attribute_list` is initialized and `job_list` is a valid array of
+    // job handles that outlives the call.
+    let updated = unsafe {
+        UpdateProcThreadAttribute(
+            attribute_list.pointer(),
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            job_list.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(&job_list),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    if updated == 0 {
+        return Err(AppContainerError::Spawn(format!(
+            "cannot assign the sandbox job object: {}",
+            std::io::Error::last_os_error()
+        )));
     }
 
     let mut startup = STARTUPINFOEXW {
@@ -885,6 +908,7 @@ fn spawn_piped_in_container(
     startup.StartupInfo.hStdError = stderr.child;
 
     let mut command_line = wide_null(&build_command_line(program, args));
+    let wide_program = wide_path(program);
     let wide_cwd = wide_path(cwd);
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     let entries = build_environment_block(&system_root, cwd);
@@ -902,7 +926,7 @@ fn spawn_piped_in_container(
     // valid out-parameter.
     let created = unsafe {
         CreateProcessW(
-            std::ptr::null(),
+            wide_program.as_ptr(),
             command_line.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
@@ -936,11 +960,12 @@ fn spawn_piped_in_container(
     let stderr_parent = stderr.parent;
     stdout.parent = None;
     stderr.parent = None;
-    stdin.parent = None;
+    // Dropping stdin closes the parent write end and delivers EOF to the child.
     Ok(PipedConfinedProcess {
         inner: ConfinedProcess {
             pid: information.dwProcessId,
             handle: information.hProcess,
+            job,
         },
         stdout: stdout_parent.map(|handle| {
             // SAFETY: the handle was created by `CreatePipe` and is not owned elsewhere.
@@ -950,7 +975,6 @@ fn spawn_piped_in_container(
             // SAFETY: the handle was created by `CreatePipe` and is not owned elsewhere.
             unsafe { File::from_raw_handle(handle.cast()) }
         }),
-        _job: job,
     })
 }
 

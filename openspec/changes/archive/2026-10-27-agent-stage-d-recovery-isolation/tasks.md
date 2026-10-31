@@ -48,7 +48,7 @@
 ## 6. 平台 Sandbox
 
 - [x] 6.1 定义 `SandboxBackend` 纯接口和 fake backend contract suite
-- [x] 6.2 实现 Windows backend：受限身份/文件 ACL 或经 prototype 选定机制、网络策略、Job Object 进程树和 cleanup
+- [ ] 6.2 实现 Windows backend：受限身份/文件 ACL 或经 prototype 选定机制、网络策略、Job Object 进程树和 cleanup
 - [x] 6.3 实现 macOS backend：经 prototype 选定的原生机制、目录/network/credential/process 限制和 cleanup
 - [x] 6.4 实现 Linux backend：经 prototype 选定的 namespace/seccomp/文件/network/process 组合和 capability probe
 - [x] 6.5 所有 backend 在 prepare 后运行 capability probe；required 不满足则 fail closed
@@ -125,3 +125,15 @@ AppContainer token 需要先**走到**工作区才能打开它，而工作区上
 
 - **真实模型质量**：能力矩阵与逃逸套件比较的是协议与隔离，不是答案质量。
 - **真实磁盘耗尽**：`nfr-residual` 测的是长期运行的残留斜率，不是把磁盘写满。
+
+## Issue #14 专项复核（2026-11-01，取代上文 Windows 完成声明）
+
+历史勾选和“Windows 九项全部通过”不能作为当前验收证据。已核实 2026-10-28 Core 在启动 payload 时失败，尚未运行隔离断言。6.2 重新打开。生产 Windows 文件、网络、凭据能力保持 unsupported；Profile/SID 可解析不构成验证。
+
+- [x] 撤回 Profile 可用即 Verified 的能力声明，要求隔离时保持 fail-closed
+- [ ] 真实 Windows 上重现固定主干并验证候选修复（独立 Windows AppContainer validation CI）
+- [ ] 验证真实 EXE、扩展路径、祖先 ACL、文件/网络/环境凭据、子进程与退出清理
+- [ ] 解决共享 SID 跨工作区授权累积与 ACL/profile 撤销；补齐跨环境黑盒用例
+- [ ] Windows junction/reparse point、真实公网正向对照、Credential Manager/DPAPI 等边界取得有效证据
+
+专项范围、命令、证据和限制见 [复核记录](../../../../docs/process/windows-appcontainer-issue-14.md)。
