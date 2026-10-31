@@ -38,7 +38,9 @@ cargo fmt --all -- --check
 
 ## 结果与限制
 
-本地宿主是 Linux，未安装 Rust，不能将静态审阅称为 Windows 运行验证。Windows 结果待 CI 原始日志核实。
+本地宿主是 Linux，未安装 Rust，不能将静态审阅称为 Windows 运行验证。固定主干已在 [真实 Windows 作业](https://github.com/willmove/termior/actions/runs/41249693899/job/124680421008) 再次复现错误 2（0 passed / 1 failed），包括仅做路径/句柄修复的早期候选仍无法启动系统 cmd.exe。Profile 创建修复后的候选结果待独立 runner 原始日志核实。
+
+ACL 保留测试此前跳过 icacls 首行，漏掉与路径同行的首个 ACE；授权重排后可能误报主体条目被删除。修正为去掉路径前缀后读取全部 ACE，并要求 icacls 本身成功，保留原有完整条目比较断言。
 
 | 边界 | 生产状态 | 验证范围/剩余工作 |
 |---|---|---|

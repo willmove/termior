@@ -84,3 +84,7 @@ task events、输出 chunks、Context Item、Hook/MCP 诊断和 crash log 统一
 3. 加 checkpoint，再加 worktree；两者各自独立发布
 4. 先上线 execution descriptor/direct/worktree 透明度，再按平台逐一开放 sandboxed profile
 5. 只有 escape suite 通过的平台/profile 才显示为 available
+
+## Issue #14 Windows 复核修订（2026-11-01）
+
+AppContainer Profile/SID 可用仅代表可用性前提，不代表 Filesystem、Network 或 Credentials 已验证。生产 probe 对这三项返回 unsupported，required 请求必须在目录授权前被拒绝。单工作区黑盒测试与生产能力契约分别验证，原型测试必须实际运行 payload，不得因生产拒绝而算通过。共享 SID 的授权累积、ACL/profile 撤销及未覆盖的 reparse point、公网正向对照与凭据存储边界未解决前，不启用完整 Windows sandbox。6.2 保持未完成；结果及复现命令见 docs/process/windows-appcontainer-issue-14.md。

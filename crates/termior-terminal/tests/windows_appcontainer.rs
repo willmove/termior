@@ -504,11 +504,14 @@ fn acl_entries(path: &Path) -> Vec<String> {
         .arg(path)
         .output()
         .expect("icacls must run");
+    assert!(output.status.success(), "icacls failed: {:?}", output);
     let text = String::from_utf8_lossy(&output.stdout);
+    let prefix = path.display().to_string();
+    // icacls prints the first ACE on the same line as the path. Dropping that
+    // line loses a different principal when Windows reorders the merged ACL.
     text.lines()
-        .skip(1)
-        .map(|line| line.trim().to_owned())
-        .filter(|line| !line.is_empty() && !line.starts_with("Successfully processed"))
+        .map(|line| line.strip_prefix(&prefix).unwrap_or(line).trim().to_owned())
+        .filter(|line| line.contains(":("))
         .collect()
 }
 
