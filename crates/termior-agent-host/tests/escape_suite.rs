@@ -1,8 +1,8 @@
 //! Black-box escape suite for sandboxed execution (Stage D task 6.6).
 //!
-//! A verified platform must fail every probe below. A platform that cannot enforce the
-//! capability (Windows today) must fail closed and must not launch the payload. Any
-//! successful escape fails the test.
+//! A verified platform must fail every escape probe below. Windows exercises the
+//! unverified AppContainer prototype directly; production fail-closed policy has its
+//! own contract tests. A launch failure or any successful escape fails validation.
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -281,8 +281,8 @@ fn assert_orphan_does_not_survive(work: &Path) {
 
 fn launch_harness() {
     let work = PathBuf::from(std::env::var("TERMIOR_ESCAPE_WORK").unwrap());
-    let environment = test_environment(&work)
-        .expect("harness was launched even though the sandbox fails closed");
+    let environment =
+        test_environment(&work).expect("harness was launched even though the sandbox fails closed");
     let (status, stdout, stderr) = spawn_payload(&environment, &work);
     assert!(
         status.success(),
@@ -332,10 +332,9 @@ fn run_mode_unchecked(work: &Path, mode: &str, outside: &Path, pwned: &Path, tar
             targets: targets.to_vec(),
         },
     );
-    let environment = test_environment(work)
-        .unwrap_or_else(|error| {
-            panic!("{mode} prepare failed after the suite saw a sandbox: {error}")
-        });
+    let environment = test_environment(work).unwrap_or_else(|error| {
+        panic!("{mode} prepare failed after the suite saw a sandbox: {error}")
+    });
     let (status, stdout, stderr) = spawn_payload(&environment, work);
     assert!(
         status.success(),
@@ -366,7 +365,12 @@ fn spawn_payload(
     #[cfg(windows)]
     let command = termior_agent_host::SandboxCommand {
         program: exe.display().to_string(),
-        args: vec![TEST_NAME.into(), "--exact".into(), "--test-threads=1".into(), "--nocapture".into()],
+        args: vec![
+            TEST_NAME.into(),
+            "--exact".into(),
+            "--test-threads=1".into(),
+            "--nocapture".into(),
+        ],
         cwd: environment.root.clone(),
         clear_environment: true,
         app_container: true,
@@ -407,8 +411,9 @@ fn payload_exe(work: &Path) -> std::path::PathBuf {
     let source = std::env::current_exe().unwrap();
     let staged = work.join("escape-payload.exe");
     if !staged.exists() {
-        fs::copy(&source, &staged)
-            .unwrap_or_else(|error| panic!("cannot stage the payload next to the sandbox: {error}"));
+        fs::copy(&source, &staged).unwrap_or_else(|error| {
+            panic!("cannot stage the payload next to the sandbox: {error}")
+        });
     }
     staged
 }

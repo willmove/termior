@@ -162,7 +162,11 @@ fn a_confined_command_cannot_reach_the_network() {
     if let Ok(target) = std::fs::read_to_string("network-target.txt") {
         let error = TcpStream::connect_timeout(&target.parse().unwrap(), Duration::from_secs(2))
             .expect_err("confined process reached the host listener");
-        assert_eq!(error.raw_os_error(), Some(10013), "must be WSAEACCES, not an unreachable target");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(10013),
+            "must be WSAEACCES, not an unreachable target"
+        );
         std::fs::write("network-result.txt", "denied").unwrap();
         return;
     }
@@ -177,9 +181,18 @@ fn a_confined_command_cannot_reach_the_network() {
     TcpStream::connect_timeout(&address, Duration::from_millis(500)).unwrap();
     std::fs::write(workspace.join("network-target.txt"), address.to_string()).unwrap();
     container.grant_with_ancestors(&workspace).unwrap();
-    let mut child = container.spawn(&image, &[NAME.into(), "--exact".into(), "--test-threads=1".into()], &workspace).unwrap();
+    let mut child = container
+        .spawn(
+            &image,
+            &[NAME.into(), "--exact".into(), "--test-threads=1".into()],
+            &workspace,
+        )
+        .unwrap();
     assert_eq!(child.wait(Duration::from_secs(20)), Some(0));
-    assert_eq!(std::fs::read_to_string(workspace.join("network-result.txt")).unwrap(), "denied");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("network-result.txt")).unwrap(),
+        "denied"
+    );
 }
 
 /// A piped confined process reports its standard output and exits with its exit code.
@@ -251,7 +264,9 @@ fn a_confined_command_can_run_a_program_under_the_user_profile() {
     std::fs::create_dir_all(&directory).unwrap();
     let payload = directory.join("probe.cmd");
     std::fs::write(&payload, "@exit /b 0\n").unwrap();
-    container.grant_with_ancestors(&directory).expect("the grant must succeed");
+    container
+        .grant_with_ancestors(&directory)
+        .expect("the grant must succeed");
 
     // The payload is named relative to the working directory. `cmd.exe /c` has its
     // own quoting rules for an absolute path with spaces in it, and the path is not
@@ -280,7 +295,9 @@ fn a_confined_command_can_run_a_program_below_a_restricted_directory() {
     let target = leaf.join("payload.exe");
     std::fs::copy(&exe, &target).unwrap();
 
-    container.grant_with_ancestors(&leaf).expect("the grant must succeed");
+    container
+        .grant_with_ancestors(&leaf)
+        .expect("the grant must succeed");
 
     let code = run(&container, &["/c".into(), "echo ok".into()], &leaf);
     println!("restricted leaf exit={code:?}");
@@ -314,7 +331,9 @@ fn a_confined_command_can_run_a_program_below_a_private_ancestor() {
 
     // The ancestor grants the container nothing: only the user may enter it.
     let ancestor = root.join("a");
-    container.grant_with_ancestors(&leaf).expect("ancestor grant must succeed");
+    container
+        .grant_with_ancestors(&leaf)
+        .expect("ancestor grant must succeed");
 
     // The ancestor must stay unreadable for the container: only traversal was
     // granted, not the right to list or read it.
@@ -391,7 +410,9 @@ fn granting_a_directory_keeps_the_hosts_own_access() {
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("before.txt"), b"before").unwrap();
 
-    container.grant_with_ancestors(&directory).expect("the grant must succeed");
+    container
+        .grant_with_ancestors(&directory)
+        .expect("the grant must succeed");
 
     // The host can still read its own file, and can still write into the directory.
     assert_eq!(
@@ -433,7 +454,9 @@ fn the_traversal_grant_on_an_ancestor_leaves_the_files_below_it_alone() {
 
     // Grant traversal on the ancestor alone: the workspace below it is not
     // part of this grant.
-    container.grant_with_ancestors(&child).expect("ancestor grant must succeed");
+    container
+        .grant_with_ancestors(&child)
+        .expect("ancestor grant must succeed");
 
     let after = acl_entries(&file);
     assert_eq!(
@@ -457,7 +480,9 @@ fn granting_a_directory_keeps_the_other_principals_entries() {
     std::fs::write(&file, b"kept").unwrap();
 
     let before = acl_entries(&directory);
-    container.grant_with_ancestors(&directory).expect("the grant must succeed");
+    container
+        .grant_with_ancestors(&directory)
+        .expect("the grant must succeed");
     let after = acl_entries(&directory);
 
     // Everything that was there before is still there, plus the container entry.
@@ -499,17 +524,27 @@ fn a_copied_image_runs_with_a_confined_token_and_closed_stdin() {
         let mut token = std::ptr::null_mut();
         // SAFETY: token and result buffers are valid out-pointers.
         unsafe {
-            assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token), 0);
+            assert_ne!(
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token),
+                0
+            );
             let mut confined = 0u32;
             let mut size = 0u32;
-            let ok = GetTokenInformation(token, TokenIsAppContainer,
+            let ok = GetTokenInformation(
+                token,
+                TokenIsAppContainer,
                 &mut confined as *mut u32 as *mut std::ffi::c_void,
-                std::mem::size_of::<u32>() as u32, &mut size);
+                std::mem::size_of::<u32>() as u32,
+                &mut size,
+            );
             CloseHandle(token);
             assert_ne!(ok, 0);
             assert_eq!(confined, 1, "payload did not receive an AppContainer token");
         }
-        assert_eq!(std::fs::read_to_string("inside.txt").unwrap(), "inside-value");
+        assert_eq!(
+            std::fs::read_to_string("inside.txt").unwrap(),
+            "inside-value"
+        );
         if std::fs::read_to_string("image-probe.marker").unwrap() == "piped" {
             use std::io::Read;
             let mut input = Vec::new();
@@ -520,7 +555,10 @@ fn a_copied_image_runs_with_a_confined_token_and_closed_stdin() {
     }
     let container = require_container().unwrap();
     let root = tempfile::tempdir().unwrap();
-    let work = root.path().join("private ancestor").join("workspace with spaces");
+    let work = root
+        .path()
+        .join("private ancestor")
+        .join("workspace with spaces");
     std::fs::create_dir_all(&work).unwrap();
     let image = work.join("copied payload.exe");
     std::fs::copy(std::env::current_exe().unwrap(), &image).unwrap();
@@ -528,12 +566,124 @@ fn a_copied_image_runs_with_a_confined_token_and_closed_stdin() {
     std::fs::write(work.join("image-probe.marker"), "plain").unwrap();
     container.grant_with_ancestors(&work).unwrap();
     let args = vec![NAME.into(), "--exact".into(), "--test-threads=1".into()];
-    let mut plain = container.spawn(&image.canonicalize().unwrap(), &args, &work.canonicalize().unwrap()).unwrap();
+    let mut plain = container
+        .spawn(
+            &image.canonicalize().unwrap(),
+            &args,
+            &work.canonicalize().unwrap(),
+        )
+        .unwrap();
     assert_eq!(plain.wait(Duration::from_secs(20)), Some(0));
-    assert_eq!(std::fs::read_to_string(work.join("image-probe.result")).unwrap(), "executed");
+    assert_eq!(
+        std::fs::read_to_string(work.join("image-probe.result")).unwrap(),
+        "executed"
+    );
     std::fs::remove_file(work.join("image-probe.result")).unwrap();
     std::fs::write(work.join("image-probe.marker"), "piped").unwrap();
-    let mut piped = container.spawn_piped(&image.canonicalize().unwrap(), &args, &work.canonicalize().unwrap()).unwrap();
-    assert_eq!(piped.wait(Duration::from_secs(20)), Some(0), "stdin must reach EOF without leaking its host handle");
-    assert_eq!(std::fs::read_to_string(work.join("image-probe.result")).unwrap(), "executed");
+    let mut piped = container
+        .spawn_piped(
+            &image.canonicalize().unwrap(),
+            &args,
+            &work.canonicalize().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        piped.wait(Duration::from_secs(20)),
+        Some(0),
+        "stdin must reach EOF without leaking its host handle"
+    );
+    assert_eq!(
+        std::fs::read_to_string(work.join("image-probe.result")).unwrap(),
+        "executed"
+    );
+}
+
+/// kill and Drop must bound the entire tree for both launch APIs.
+#[test]
+fn job_cleanup_stops_descendants_on_kill_and_drop() {
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Instant;
+    const NAME: &str = "job_cleanup_stops_descendants_on_kill_and_drop";
+    if let Ok(mode) = std::fs::read_to_string("job-probe.mode") {
+        if mode == "sleeper" {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(10) {
+                std::fs::write(
+                    "job-probe.heartbeat",
+                    start.elapsed().as_nanos().to_string(),
+                )
+                .unwrap();
+                thread::sleep(Duration::from_millis(50));
+            }
+            return;
+        }
+        std::fs::write("job-probe.mode", "sleeper").unwrap();
+        let _child = Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--test-threads=1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        while !Path::new("job-probe.heartbeat").exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "descendant never ran"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::write("job-probe.ready", "ready").unwrap();
+        thread::sleep(Duration::from_secs(10));
+        return;
+    }
+    let container = require_container().unwrap();
+    for piped in [false, true] {
+        for kill in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let work = root.path().join("work");
+            std::fs::create_dir(&work).unwrap();
+            let exe = work.join("job-probe.exe");
+            std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+            std::fs::write(work.join("job-probe.mode"), "root").unwrap();
+            container.grant_with_ancestors(&work).unwrap();
+            let args = vec![NAME.into(), "--exact".into(), "--test-threads=1".into()];
+            let mut plain = None;
+            let mut pipes = None;
+            if piped {
+                pipes = Some(container.spawn_piped(&exe, &args, &work).unwrap());
+            } else {
+                plain = Some(container.spawn(&exe, &args, &work).unwrap());
+            }
+            let start = Instant::now();
+            while !work.join("job-probe.ready").exists() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "root/descendant failed to start"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            if kill {
+                if let Some(process) = plain.as_mut() {
+                    process.kill();
+                }
+                if let Some(process) = pipes.as_mut() {
+                    process.kill();
+                }
+                // Keep the Job handle alive: kill itself must terminate the tree.
+            } else {
+                drop(plain.take());
+                drop(pipes.take());
+            }
+            thread::sleep(Duration::from_millis(300));
+            let first = std::fs::read(work.join("job-probe.heartbeat")).unwrap();
+            thread::sleep(Duration::from_millis(300));
+            assert_eq!(
+                std::fs::read(work.join("job-probe.heartbeat")).unwrap(),
+                first,
+                "descendant survived: piped={piped}, kill={kill}"
+            );
+        }
+    }
 }

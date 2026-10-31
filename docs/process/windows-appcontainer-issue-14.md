@@ -26,7 +26,7 @@ cargo test --locked -p termior-agent-host --test sandbox_contract --test escape_
 cargo fmt --all -- --check
 ```
 
-独立工作流 `.github/workflows/windows-sandbox.yml` 在真实 Windows runner 上先执行固定主干 escape suite，并将其退出码单独记录，再执行候选版本两组测试。候选测试任何失败均使作业失败；不依赖 workspace Clippy 先通过。原始日志作为 `windows-appcontainer-evidence` 上传。
+独立工作流 `.github/workflows/windows-sandbox.yml` 在两个独立的真实 Windows runner 上分别执行固定主干 escape suite（单独记录退出码）和候选版本两组测试，避免基线留下的 ACL/Profile 授权污染候选测试。候选测试任何失败均使作业失败；不依赖 workspace Clippy 先通过。原始日志作为 `windows-appcontainer-evidence-baseline` / `windows-appcontainer-evidence-candidate` 上传。
 
 ## 结果与限制
 

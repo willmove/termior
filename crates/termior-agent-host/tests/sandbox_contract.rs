@@ -159,7 +159,11 @@ fn the_windows_backend_reports_the_appcontainer_probe() {
         SandboxCapability::Network,
         SandboxCapability::Credentials,
     ] {
-        assert_eq!(probe.get(&capability), Some(&TrustLevel::Unsupported), "{capability:?}");
+        assert_eq!(
+            probe.get(&capability),
+            Some(&TrustLevel::Unsupported),
+            "{capability:?}"
+        );
         let root = tempfile::tempdir().unwrap();
         let request = SandboxRequest {
             id: "unverified-windows".into(),
@@ -168,7 +172,9 @@ fn the_windows_backend_reports_the_appcontainer_probe() {
             allow_network: false,
         };
         assert_eq!(
-            termior_agent_host::WindowsAppContainerSandbox.prepare(&request).unwrap_err(),
+            termior_agent_host::WindowsAppContainerSandbox
+                .prepare(&request)
+                .unwrap_err(),
             SandboxError::RequiredCapabilityUnavailable(capability)
         );
     }
