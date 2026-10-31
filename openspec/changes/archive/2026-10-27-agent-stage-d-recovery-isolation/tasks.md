@@ -131,8 +131,8 @@ AppContainer token 需要先**走到**工作区才能打开它，而工作区上
 历史勾选和“Windows 九项全部通过”不能作为当前验收证据。已核实 2026-10-28 Core 在启动 payload 时失败，尚未运行隔离断言。6.2 重新打开。生产 Windows 文件、网络、凭据能力保持 unsupported；Profile/SID 可解析不构成验证。
 
 - [x] 撤回 Profile 可用即 Verified 的能力声明，要求隔离时保持 fail-closed
-- [ ] 真实 Windows 上重现固定主干并验证候选修复（独立 Windows AppContainer validation CI）
-- [ ] 验证真实 EXE、扩展路径、祖先 ACL、文件/网络/环境凭据、子进程与退出清理
+- [x] 真实 Windows 上重现固定主干，并执行候选用例、记录原始结果（独立 Windows AppContainer validation CI）
+- [ ] 完成 Windows 后端验收：真实 EXE/路径、文件/网络/环境、子进程/退出已运行；低层仍 16 passed / 2 failed（系统工具 smoke、ACL 显式/继承标志保留）
 - [ ] 解决共享 SID 跨工作区授权累积与 ACL/profile 撤销；补齐跨环境黑盒用例
 - [ ] Windows junction/reparse point、真实公网正向对照、Credential Manager/DPAPI 等边界取得有效证据
 

@@ -46,11 +46,29 @@ cargo fmt --all -- --check
 
 ACL 保留测试此前跳过 icacls 首行，漏掉与路径同行的首个 ACE；授权重排后可能误报主体条目被删除。修正为去掉路径前缀后读取全部 ACE，并要求 icacls 本身成功，保留原有完整条目比较断言。
 
+最终读取的代码版本为 `dd9893cc849b505a0a89c3603b5d2792c40085b6`，运行环境为 GitHub 托管 Windows runner，参见 [原始作业日志](https://github.com/willmove/termior/actions/runs/41250661974/job/124683318076)。
+
+| 检查 | 实际结果 |
+|---|---|
+| 固定主干 escape suite | 错误 2 再现，0 passed / 1 failed |
+| 候选 `black_box_escape_suite` | 1 passed / 0 failed，真实 payload 执行 |
+| 候选 `sandbox_contract` | 6 passed / 0 failed，生产 unsupported 与拒绝行为通过 |
+| 候选 `windows_appcontainer` | 16 passed / 2 failed / 0 ignored |
+| `cargo fmt --all -- --check` | 通过 |
+| 常规 Core CI | 仍受既有 `settings_theme.rs` 的 `items_after_test_module` Clippy 错误阻塞，未视为通过 |
+
+低层失败保持原断言：
+
+1. `where.exe cmd.exe` 系统工具 smoke 返回 1，不能宣称通用系统工具兼容。未扩大系统目录/设备授权。
+2. ACL 保留：授权前 SYSTEM、Administrators、宿主用户均为 `(OI)(CI)(F)`；授权后均为 `(I)(OI)(CI)(F)`。权限掩码未丢失，但显式/继承标志变化，不满足原样保留断言。保留红灯与完整 before/after 证据；不靠忽略 `(I)` 或改变目录继承保护来强行通过。
+
+Job 两种启动的 kill/drop 子树心跳检查、复制 EXE 的 token/扩展路径/stdin EOF、授权工作区、拒绝同级读写、环境变量和受控网络对照均取得通过证据。Windows escape suite 已跑到孤儿清理并完成，不再在启动处中断。整套专项作业仍然失败，PR 保持草稿，Issue #14 不关闭，Stage D 6.2 不勾选完成。后续仅文档修改不构成重新运行代码后的新验收证据。
+
 | 边界 | 生产状态 | 验证范围/剩余工作 |
 |---|---|---|
 | 文件 | unsupported | 单工作区读写与父/同级目录、硬链接；共享 SID 授权累积、ACL 撤销、junction/reparse point 尚未解决 |
 | 网络 | unsupported | 回环/可用私网有宿主连通对照；TEST-NET 地址失败不证明真实公网隔离，需真实公网正向对照及 IPv6/UDP 等测试 |
 | 凭据 | unsupported | 重建环境与环境 secret；不能据此推导 Credential Manager、DPAPI、宿主凭据文件均不可访问 |
-| 进程树 | verified（既有 Job Object） | 候选增加两种启动的 Job 生命周期；真实 Windows 退出、kill/drop 结果仍待验证 |
+| 进程树 | verified（既有 Job Object） | 两种启动的 kill/drop 与 escape suite 孤儿退出检查通过；不等同于所有宿主崩溃情形均已覆盖 |
 
 即便单工作区测试通过，也不能启用完整 Windows sandbox：仍须完成每环境独立身份/授权与清理及上述边界验证。Issue #14 保持开放，不因本 PR 自动关闭。
